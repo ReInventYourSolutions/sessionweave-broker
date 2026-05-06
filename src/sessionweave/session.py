@@ -127,8 +127,11 @@ class Session:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             handle = p.connection_ref
             if handle is not None:
+                # handle is a ConnectionHandle (set by join/resume)
                 self._connections.unbind(handle)  # type: ignore[arg-type]
+            self._buffers.pop(participant_id, None)
             self.bump_activity()
+            self._cancel_inflight_for_sender(participant_id, reason="sender_gone")
             self._notify_others(
                 exclude_pid=participant_id,
                 name="participant.left",
@@ -309,8 +312,71 @@ class Session:
         return buf
 
     def _enqueue_eviction(self, pid: str, reason: str) -> None:
-        # Wired up in Task 13 (cancellation paths). For now: no-op.
-        pass
+        # Called by _deliver_or_buffer when buffer cap is exceeded.
+        self._evict(pid, reason=reason)
+
+    def _cancel_inflight_for_sender(self, sender_id: str, reason: str) -> None:
+        to_close: list[str] = []
+        for cid, t in self._inflight.items():
+            if t.sender_id == sender_id:
+                for pending_pid in t.pending_recipients():
+                    self._deliver_or_buffer(
+                        pending_pid,
+                        "command.cancelled",
+                        {"command_id": cid, "reason": reason},
+                    )
+                to_close.append(cid)
+        for cid in to_close:
+            self._inflight.pop(cid, None)
+
+    def _evict(self, pid: str, reason: str) -> None:
+        p = self._participants.pop(pid, None)
+        if p is None:
+            return
+        self._buffers.pop(pid, None)
+        self._cancel_inflight_for_sender(pid, reason="sender_gone")
+        self._notify_others(
+            exclude_pid=pid,
+            name="participant.left",
+            payload={"participant_id": pid, "reason": reason},
+        )
+
+    def tick(self, *, now: datetime | None = None) -> None:
+        """Periodic housekeeping: close expired trackers and evict
+        offline-past-grace participants. Called by the registry's loop or
+        directly in tests. Synchronous; assumes single-threaded scheduling.
+        Must NOT be called while a tool call holds `self.lock` mid-await.
+        """
+        moment = now or _utcnow()
+        # 1. Expired trackers
+        expired_cids = [cid for cid, t in self._inflight.items() if t.is_expired(moment)]
+        for cid in expired_cids:
+            t = self._inflight.pop(cid)
+            self._deliver_or_buffer(
+                t.sender_id,
+                "command.completed",
+                {
+                    "command_id": cid,
+                    "received_count": t.received_count,
+                    "expected_count": t.expected_count,
+                    "reason": "ttl_expired",
+                },
+            )
+            for pending_pid in t.pending_recipients():
+                self._deliver_or_buffer(
+                    pending_pid,
+                    "command.cancelled",
+                    {"command_id": cid, "reason": "ttl_expired"},
+                )
+        # 2. Offline-grace eviction
+        evicted: list[str] = []
+        for pid, p in self._participants.items():
+            if p.online:
+                continue
+            if (moment - p.last_online_at).total_seconds() >= self.config.offline_grace_seconds:
+                evicted.append(pid)
+        for pid in evicted:
+            self._evict(pid, reason="offline_timeout")
 
     def handle_disconnect(self, handle: ConnectionHandle) -> None:
         """Mark a participant offline and notify others.
