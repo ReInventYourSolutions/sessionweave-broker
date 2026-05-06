@@ -8,13 +8,14 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
 from sessionweave.mcp_adapter import HandleRegistry
+from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import (
     ToolDeps,
@@ -147,7 +148,8 @@ def build_app() -> Starlette:
     """Build the Starlette app exposing the MCP endpoint and health probes."""
     deps_cfg = load_deployment_defaults(os.environ)
     connections = ConnectionManager()
-    registry = SessionRegistry(deps_cfg, connections)
+    metrics = Metrics()
+    registry = SessionRegistry(deps_cfg, connections, metrics=metrics)
     handles = HandleRegistry()
     tool_deps = ToolDeps(registry)
 
@@ -164,6 +166,9 @@ def build_app() -> Starlette:
     async def readyz(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ready"})
 
+    async def metrics_endpoint(request: Request) -> Response:
+        return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
+
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with AsyncExitStack() as stack:
@@ -176,6 +181,7 @@ def build_app() -> Starlette:
         routes=[
             Route("/healthz", healthz),
             Route("/readyz", readyz),
+            Route("/metrics", metrics_endpoint),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,
@@ -183,6 +189,7 @@ def build_app() -> Starlette:
     app.state.registry = registry
     app.state.connections = connections
     app.state.handles = handles
+    app.state.metrics = metrics
     app.state.state = state
     return app
 

@@ -10,6 +10,7 @@ from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
 from sessionweave.dispatcher import RoundRobinPicker, decide_dispatch
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.metrics import Metrics
 from sessionweave.models import CommandTracker, Participant
 from sessionweave.notifications import BufferOverflow, NotificationBuffer
 from sessionweave.schemas import (
@@ -43,6 +44,7 @@ class Session:
         "_created_at",
         "_inflight",
         "_last_activity_at",
+        "_metrics",
         "_participants",
         "_picker",
         "config",
@@ -55,6 +57,7 @@ class Session:
         session_id: str,
         config: SessionConfig,
         connections: ConnectionManager,
+        metrics: Metrics | None = None,
     ) -> None:
         now = _utcnow()
         self.session_id = session_id
@@ -67,6 +70,7 @@ class Session:
         self._created_at: datetime = now
         self.lock = asyncio.Lock()
         self._connections = connections
+        self._metrics = metrics
 
     # --- read-only helpers ---
 
@@ -113,6 +117,8 @@ class Session:
             self._connections.bind(handle, self.session_id, p.participant_id)
             self._participants[p.participant_id] = p
             self.bump_activity()
+            if self._metrics is not None:
+                self._metrics.participants_active.labels(online="true").inc()
             self._notify_others(
                 exclude_pid=p.participant_id,
                 name="participant.joined",
@@ -131,6 +137,9 @@ class Session:
                 self._connections.unbind(handle)  # type: ignore[arg-type]
             self._buffers.pop(participant_id, None)
             self.bump_activity()
+            if self._metrics is not None:
+                online_label = "true" if p.online else "false"
+                self._metrics.participants_active.labels(online=online_label).dec()
             self._cancel_inflight_for_sender(participant_id, reason="sender_gone")
             self._notify_others(
                 exclude_pid=participant_id,
@@ -202,6 +211,10 @@ class Session:
             )
             self._inflight[command_id] = tracker
             self.bump_activity()
+            if self._metrics is not None:
+                self._metrics.commands_total.labels(
+                    dispatch_mode=dispatch.value
+                ).inc()
             for recipient_id in decision.recipients:
                 self._deliver_or_buffer(
                     recipient_id,
@@ -228,6 +241,10 @@ class Session:
                     },
                 )
                 self._inflight.pop(command_id, None)
+                if self._metrics is not None:
+                    self._metrics.command_completed_total.labels(
+                        reason="all_responded"
+                    ).inc()
             return SessionSendOutput(command_id=command_id, delivered_to=list(decision.recipients))
 
     async def respond(
@@ -269,6 +286,10 @@ class Session:
                         "reason": "all_responded",
                     },
                 )
+                if self._metrics is not None:
+                    self._metrics.command_completed_total.labels(
+                        reason="all_responded"
+                    ).inc()
                 # Keep the tracker in _inflight until TTL so that a late
                 # duplicate respond raises ALREADY_RESPONDED rather than
                 # COMMAND_NOT_FOUND.  TTL-based eviction is handled in Task 13.
@@ -328,12 +349,17 @@ class Session:
                 to_close.append(cid)
         for cid in to_close:
             self._inflight.pop(cid, None)
+            if self._metrics is not None:
+                self._metrics.command_cancelled_total.labels(reason=reason).inc()
 
     def _evict(self, pid: str, reason: str) -> None:
         p = self._participants.pop(pid, None)
         if p is None:
             return
         self._buffers.pop(pid, None)
+        if self._metrics is not None:
+            online_label = "true" if p.online else "false"
+            self._metrics.participants_active.labels(online=online_label).dec()
         self._cancel_inflight_for_sender(pid, reason="sender_gone")
         self._notify_others(
             exclude_pid=pid,
@@ -362,12 +388,20 @@ class Session:
                     "reason": "ttl_expired",
                 },
             )
+            if self._metrics is not None:
+                self._metrics.command_completed_total.labels(
+                    reason="ttl_expired"
+                ).inc()
             for pending_pid in t.pending_recipients():
                 self._deliver_or_buffer(
                     pending_pid,
                     "command.cancelled",
                     {"command_id": cid, "reason": "ttl_expired"},
                 )
+                if self._metrics is not None:
+                    self._metrics.command_cancelled_total.labels(
+                        reason="ttl_expired"
+                    ).inc()
         # 2. Offline-grace eviction
         evicted: list[str] = []
         for pid, p in self._participants.items():
@@ -387,9 +421,14 @@ class Session:
                 handle = p.connection_ref
                 if handle is not None:
                     self._connections.unbind(handle)  # type: ignore[arg-type]
+            if self._metrics is not None:
+                online_label = "true" if p.online else "false"
+                self._metrics.participants_active.labels(online=online_label).dec()
             self._buffers.pop(pid, None)
         self._participants.clear()
         self._inflight.clear()
+        if self._metrics is not None:
+            self._metrics.session_ended_total.labels(reason=reason).inc()
 
     def handle_disconnect(self, handle: ConnectionHandle) -> None:
         """Mark a participant offline and notify others.
@@ -411,6 +450,9 @@ class Session:
         p.last_online_at = _utcnow()
         p.connection_ref = None
         self._connections.unbind(handle)
+        if self._metrics is not None:
+            self._metrics.participants_active.labels(online="true").dec()
+            self._metrics.participants_active.labels(online="false").inc()
         self._notify_others(
             exclude_pid=pid,
             name="participant.updated",
@@ -428,6 +470,9 @@ class Session:
             p.connection_ref = handle
             p.last_online_at = _utcnow()
             self.bump_activity()
+            if was_offline and self._metrics is not None:
+                self._metrics.participants_active.labels(online="false").dec()
+                self._metrics.participants_active.labels(online="true").inc()
             buf = self._buffers.pop(participant_id, None)
             if buf is not None:
                 for item in buf.drain():

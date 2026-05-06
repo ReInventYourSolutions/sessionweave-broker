@@ -9,6 +9,7 @@ from typing import Any
 from sessionweave.config import DeploymentDefaults, apply_overrides
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.metrics import Metrics
 from sessionweave.session import Session
 
 
@@ -23,18 +24,27 @@ def _isoformat(dt: datetime) -> str:
 class SessionRegistry:
     """Owns the session map and runs the idle-TTL housekeeping loop."""
 
-    __slots__ = ("_connections", "_defaults", "_lock", "_loop_task", "_sessions")
+    __slots__ = (
+        "_connections",
+        "_defaults",
+        "_lock",
+        "_loop_task",
+        "_metrics",
+        "_sessions",
+    )
 
     def __init__(
         self,
         defaults: DeploymentDefaults,
         connections: ConnectionManager,
+        metrics: Metrics | None = None,
     ) -> None:
         self._defaults = defaults
         self._sessions: dict[str, Session] = {}
         self._connections = connections
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
+        self._metrics = metrics
 
     @property
     def connections(self) -> ConnectionManager:
@@ -48,8 +58,10 @@ class SessionRegistry:
         )
         async with self._lock:
             sid = str(uuid.uuid4())
-            sess = Session(sid, cfg, self._connections)
+            sess = Session(sid, cfg, self._connections, metrics=self._metrics)
             self._sessions[sid] = sess
+            if self._metrics is not None:
+                self._metrics.sessions_active.inc()
             return sid, _isoformat(sess.expires_at()), asdict(cfg)
 
     def get_or_raise(self, session_id: str) -> Session:
@@ -69,6 +81,8 @@ class SessionRegistry:
         for sid in expired:
             sess = self._sessions.pop(sid)
             sess.broadcast_session_ended(reason="idle_ttl")
+            if self._metrics is not None:
+                self._metrics.sessions_active.dec()
 
     async def start(self, *, interval_seconds: float = 1.0) -> None:
         async def _runner() -> None:
@@ -88,6 +102,10 @@ class SessionRegistry:
                 await self._loop_task
             except asyncio.CancelledError:
                 pass
-        for sess in list(self._sessions.values()):
+        ended = list(self._sessions.values())
+        for sess in ended:
             sess.broadcast_session_ended(reason=reason)
+        if self._metrics is not None and ended:
+            for _ in ended:
+                self._metrics.sessions_active.dec()
         self._sessions.clear()
