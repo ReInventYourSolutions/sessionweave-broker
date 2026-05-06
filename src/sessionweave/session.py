@@ -316,14 +316,37 @@ class Session:
         if p is None:
             return
         if p.online:
-            self._connections.send(self.session_id, pid, name, payload)
-            return
+            handle = self._connections.handle_for(self.session_id, pid)
+            if handle is not None and handle.is_alive():
+                self._connections.send(self.session_id, pid, name, payload)
+                return
+            # Handle vanished or transport is dead: transition to offline
+            # before falling through to the buffer path.
+            self._mark_offline(pid)
         try:
             buf = self._buffer_for(pid)
             buf.enqueue({"_name": name, "_payload": payload})
         except BufferOverflow:
             # Cap exceeded — escalate to eviction. Implemented in Task 13.
             self._enqueue_eviction(pid, reason="offline_timeout")
+
+    def _mark_offline(self, pid: str) -> None:
+        p = self._participants.get(pid)
+        if p is None or not p.online:
+            return
+        p.online = False
+        p.last_online_at = _utcnow()
+        if p.connection_ref is not None:
+            self._connections.unbind(p.connection_ref)  # type: ignore[arg-type]
+        p.connection_ref = None
+        if self._metrics is not None:
+            self._metrics.participants_active.labels(online="true").dec()
+            self._metrics.participants_active.labels(online="false").inc()
+        self._notify_others(
+            exclude_pid=pid,
+            name="participant.updated",
+            payload={"participant": p.to_public().model_dump()},
+        )
 
     def _buffer_for(self, pid: str) -> NotificationBuffer:
         buf = self._buffers.get(pid)
@@ -374,6 +397,13 @@ class Session:
         Must NOT be called while a tool call holds `self.lock` mid-await.
         """
         moment = now or _utcnow()
+        # 0. Detect handles that closed without an explicit leave/disconnect.
+        for pid, p in list(self._participants.items()):
+            if not p.online or p.connection_ref is None:
+                continue
+            handle: ConnectionHandle = p.connection_ref  # type: ignore[assignment]
+            if not handle.is_alive():
+                self._mark_offline(pid)
         # 1. Expired trackers
         expired_cids = [cid for cid, t in self._inflight.items() if t.is_expired(moment)]
         for cid in expired_cids:

@@ -53,7 +53,16 @@ class MCPConnectionHandle:
         task.add_done_callback(self._pending.discard)
 
     def is_alive(self) -> bool:
-        return self._alive
+        if not self._alive:
+            return False
+        # The MCP transport closes ``_write_stream`` when the client
+        # session ends (HTTP disconnect or session DELETE). Latch the
+        # observation so subsequent checks short-circuit.
+        ws = getattr(self._session, "_write_stream", None)
+        if ws is not None and getattr(ws, "_closed", False):
+            self._alive = False
+            return False
+        return True
 
     def mark_dead(self) -> None:
         self._alive = False

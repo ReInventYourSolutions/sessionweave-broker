@@ -9,12 +9,15 @@ from tests.integration.client import sw_client
 from tests.integration.harness import relay_subprocess
 
 
-async def _wait_for(predicate: Any, *, timeout: float = 2.0) -> None:
+async def _wait_for(
+    predicate: Any, *, timeout: float = 2.0, message: str = "predicate not met"
+) -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if predicate():
             return
         await asyncio.sleep(0.05)
+    raise AssertionError(message)
 
 
 @pytest.mark.integration
