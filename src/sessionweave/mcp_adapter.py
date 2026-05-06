@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+import logging
+from typing import TYPE_CHECKING, Any, cast
+
+from mcp.types import Notification
 
 if TYPE_CHECKING:  # pragma: no cover
     from mcp.server.session import ServerSession
+
+
+logger = logging.getLogger(__name__)
+
+# Parametrized so ``params`` is accepted as an arbitrary ``dict[str, Any]``.
+# Without this, Pydantic coerces the params field through the default
+# ``NotificationParams`` model and silently drops every key except ``_meta``.
+_RelayNotification = Notification[dict[str, Any], str]
 
 
 class MCPConnectionHandle:
@@ -12,33 +24,51 @@ class MCPConnectionHandle:
     One adapter exists per MCP client connection. It is the stable identity
     used by ``ConnectionManager`` to bind/unbind a participant.
 
-    The ``send`` path here is a no-op for Task 16. Real MCP notification
-    fan-out is wired in Task 17.
+    ``send`` schedules an MCP JSON-RPC notification fire-and-forget on the
+    running event loop. The Session/Registry callers are synchronous and
+    typically hold a per-session lock; deferring the actual write avoids
+    blocking those critical sections.
     """
 
-    __slots__ = ("_alive", "_session")
+    __slots__ = ("_alive", "_pending", "_session")
 
     def __init__(self, session: ServerSession) -> None:
         self._session = session
         self._alive = True
+        self._pending: set[asyncio.Task[None]] = set()
 
     @property
     def server_session(self) -> ServerSession:
         return self._session
 
     def send(self, name: str, payload: dict[str, Any]) -> None:
-        # Task 17 will translate (name, payload) into an MCP JSON-RPC
-        # notification and dispatch via ``self._session.send_notification``.
-        # For now we drop the message; unit tests cover the buffering /
-        # delivery decision via fakes, so end-to-end MCP notifications are
-        # validated in Task 17 once this path is implemented.
-        _ = (name, payload)
+        if not self._alive:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no running loop
+            return
+        task = loop.create_task(self._dispatch(name, payload))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     def is_alive(self) -> bool:
         return self._alive
 
     def mark_dead(self) -> None:
         self._alive = False
+
+    async def _dispatch(self, name: str, payload: dict[str, Any]) -> None:
+        notif = _RelayNotification(method=name, params=payload)
+        try:
+            # ServerSession.send_notification uses notification.model_dump()
+            # at runtime; the static SendNotificationT bound is too narrow
+            # for our custom-method notifications. The wire result is a
+            # plain JSON-RPC notification with method=name, params=payload.
+            await self._session.send_notification(cast(Any, notif))
+        except Exception as exc:  # pragma: no cover - transport failure paths
+            logger.debug("dropping notification %s: %s", name, exc)
+            self._alive = False
 
 
 class HandleRegistry:
