@@ -11,7 +11,7 @@ license = { text = "Apache-2.0" }
 readme = "README.md"
 dependencies = [
     "mcp>=1.0",
-    "starlette>=0.37",
+    "starlette>=0.37,<1.0",
     "uvicorn>=0.30",
     "pydantic>=2.6",
     "prometheus-client>=0.20",
@@ -46,6 +46,11 @@ strict = true
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

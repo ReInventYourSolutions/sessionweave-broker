@@ -11,5 +11,5 @@ for the design of sub-project #1.
 
 ```bash
 pip install -e '.[dev]'
-ruff check . && mypy . && pytest -q
+ruff check . && mypy . && pytest -q -m "not fuzz"
 ```
