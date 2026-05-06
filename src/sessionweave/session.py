@@ -11,6 +11,7 @@ from sessionweave.connections import ConnectionHandle, ConnectionManager
 from sessionweave.dispatcher import RoundRobinPicker, decide_dispatch
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.models import CommandTracker, Participant
+from sessionweave.notifications import BufferOverflow, NotificationBuffer
 from sessionweave.schemas import (
     DispatchMode,
     ParticipantPublic,
@@ -37,6 +38,7 @@ class Session:
     """
 
     __slots__ = (
+        "_buffers",
         "_connections",
         "_created_at",
         "_inflight",
@@ -59,6 +61,7 @@ class Session:
         self.config = config
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
+        self._buffers: dict[str, NotificationBuffer] = {}
         self._picker = RoundRobinPicker()
         self._last_activity_at: datetime = now
         self._created_at: datetime = now
@@ -285,11 +288,79 @@ class Session:
         return requested
 
     def _deliver_or_buffer(self, pid: str, name: str, payload: dict[str, Any]) -> None:
-        # In Task 12 we wire the buffer for offline-in-grace participants.
-        # For now, online-only delivery; offline = silent drop.
         p = self._participants.get(pid)
-        if p is not None and p.online:
+        if p is None:
+            return
+        if p.online:
             self._connections.send(self.session_id, pid, name, payload)
+            return
+        try:
+            buf = self._buffer_for(pid)
+            buf.enqueue({"_name": name, "_payload": payload})
+        except BufferOverflow:
+            # Cap exceeded — escalate to eviction. Implemented in Task 13.
+            self._enqueue_eviction(pid, reason="offline_timeout")
+
+    def _buffer_for(self, pid: str) -> NotificationBuffer:
+        buf = self._buffers.get(pid)
+        if buf is None:
+            buf = NotificationBuffer(self.config.max_pending_notifications_per_participant)
+            self._buffers[pid] = buf
+        return buf
+
+    def _enqueue_eviction(self, pid: str, reason: str) -> None:
+        # Wired up in Task 13 (cancellation paths). For now: no-op.
+        pass
+
+    def handle_disconnect(self, handle: ConnectionHandle) -> None:
+        """Mark a participant offline and notify others.
+
+        Called synchronously from MCP transport callbacks (within the asyncio
+        event loop). Does NOT acquire ``self.lock`` because it is invoked only
+        when no Session coroutine is mid-await (cooperative multitasking
+        guarantee). If callers cannot guarantee this, make this ``async`` and
+        acquire the lock instead.
+        """
+        binding = self._connections.session_for(handle)
+        if binding is None or binding[0] != self.session_id:
+            return
+        pid = binding[1]
+        p = self._participants.get(pid)
+        if p is None:
+            return
+        p.online = False
+        p.last_online_at = _utcnow()
+        p.connection_ref = None
+        self._connections.unbind(handle)
+        self._notify_others(
+            exclude_pid=pid,
+            name="participant.updated",
+            payload={"participant": p.to_public().model_dump()},
+        )
+
+    async def resume(self, handle: ConnectionHandle, participant_id: str) -> None:
+        async with self.lock:
+            p = self._participants.get(participant_id)
+            if p is None:
+                raise ToolError(ErrorCode.PARTICIPANT_NOT_FOUND, "no such participant in session")
+            was_offline = not p.online
+            self._connections.bind(handle, self.session_id, participant_id)
+            p.online = True
+            p.connection_ref = handle
+            p.last_online_at = _utcnow()
+            self.bump_activity()
+            buf = self._buffers.pop(participant_id, None)
+            if buf is not None:
+                for item in buf.drain():
+                    self._connections.send(
+                        self.session_id, participant_id, item["_name"], item["_payload"]
+                    )
+            if was_offline:
+                self._notify_others(
+                    exclude_pid=participant_id,
+                    name="participant.updated",
+                    payload={"participant": p.to_public().model_dump()},
+                )
 
     def _notify_others(
         self,
@@ -298,9 +369,7 @@ class Session:
         name: str,
         payload: dict[str, Any],
     ) -> None:
-        for pid, p in self._participants.items():
+        for pid in list(self._participants.keys()):
             if pid == exclude_pid:
                 continue
-            if p.online:
-                self._connections.send(self.session_id, pid, name, payload)
-            # offline participants will be handled in Task 12 with the buffer
+            self._deliver_or_buffer(pid, name, payload)
