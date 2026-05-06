@@ -52,8 +52,11 @@ async def test_sigterm_exits_cleanly() -> None:
         # uvicorn runs lifespan shutdown on SIGTERM, then re-raises the
         # signal so the OS-level exit code is -SIGTERM. Treat both that
         # and a clean ``sys.exit(0)`` as graceful termination.
+        stderr_tail = b""
+        if proc.stderr is not None:
+            stderr_tail = proc.stderr.read() or b""
         assert rc in (0, -signal.SIGTERM), (
-            f"unexpected exit code {rc}. stderr={proc.stderr.read()!r}"
+            f"unexpected exit code {rc}. stderr={stderr_tail!r}"
         )
     finally:
         if proc.poll() is None:

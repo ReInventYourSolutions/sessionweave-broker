@@ -6,7 +6,8 @@ from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 def test_increment_commands_total() -> None:
     m = Metrics()
     m.commands_total.labels(dispatch_mode="all").inc()
-    samples = list(m.commands_total.collect()[0].samples)
+    metric = next(iter(m.commands_total.collect()))
+    samples = list(metric.samples)
     assert any(
         s.value == 1 and s.labels.get("dispatch_mode") == "all"
         for s in samples
