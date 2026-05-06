@@ -52,6 +52,13 @@ module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
+[[tool.mypy.overrides]]
+# FastMCP's tool decorator detects Context parameters via inspect.isclass,
+# which only matches an unparameterized `Context` annotation. Keep the
+# bare form here and silence the strict generic-args check for this shim.
+module = "sessionweave.server"
+disallow_any_generics = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
