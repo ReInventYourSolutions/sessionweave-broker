@@ -64,12 +64,23 @@ def apply_overrides(
         candidate[key] = value
 
     merged = replace(defaults, **candidate)
-    _validate(merged, bounds)
+    _validate(merged, bounds, overridden=set(candidate))
     return merged
 
 
-def _validate(cfg: SessionConfig, b: ConfigBounds) -> None:
+def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | None = None) -> None:
+    """Validate cfg against bounds.
+
+    When *overridden* is provided, only fields in that set are range-checked
+    against the operator bounds.  This lets deployment defaults be set outside
+    the client-facing range (e.g. a very short idle_ttl for testing) while
+    still enforcing bounds on client-supplied values.
+    The cross-field constraint ``default_command_timeout_seconds <=
+    max_command_timeout_seconds`` is enforced whenever either field is touched.
+    """
     def check(field: str, value: int, lo: int, hi: int | None) -> None:
+        if overridden is not None and field not in overridden:
+            return
         if value < lo or (hi is not None and value > hi):
             raise ToolError(
                 ErrorCode.INVALID_CONFIG,
@@ -95,12 +106,18 @@ def _validate(cfg: SessionConfig, b: ConfigBounds) -> None:
         b.max_command_timeout_seconds_min,
         b.max_command_timeout_seconds_max,
     )
-    check(
+    # Cross-field: default_command_timeout_seconds <= max_command_timeout_seconds.
+    # Enforce whenever either is being overridden (or when called unconditionally).
+    if overridden is None or overridden & {
         "default_command_timeout_seconds",
-        cfg.default_command_timeout_seconds,
-        b.default_command_timeout_seconds_min,
-        cfg.max_command_timeout_seconds,
-    )
+        "max_command_timeout_seconds",
+    }:
+        check(
+            "default_command_timeout_seconds",
+            cfg.default_command_timeout_seconds,
+            b.default_command_timeout_seconds_min,
+            cfg.max_command_timeout_seconds,
+        )
     check(
         "offline_grace_seconds",
         cfg.offline_grace_seconds,

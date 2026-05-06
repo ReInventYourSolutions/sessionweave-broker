@@ -378,6 +378,19 @@ class Session:
         for pid in evicted:
             self._evict(pid, reason="offline_timeout")
 
+    def broadcast_session_ended(self, *, reason: str) -> None:
+        for pid, p in list(self._participants.items()):
+            if p.online:
+                self._connections.send(
+                    self.session_id, pid, "session.ended", {"reason": reason}
+                )
+                handle = p.connection_ref
+                if handle is not None:
+                    self._connections.unbind(handle)  # type: ignore[arg-type]
+            self._buffers.pop(pid, None)
+        self._participants.clear()
+        self._inflight.clear()
+
     def handle_disconnect(self, handle: ConnectionHandle) -> None:
         """Mark a participant offline and notify others.
 
