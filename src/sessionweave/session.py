@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
-from sessionweave.dispatcher import RoundRobinPicker
+from sessionweave.dispatcher import RoundRobinPicker, decide_dispatch
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.models import CommandTracker, Participant
-from sessionweave.schemas import ParticipantPublic
+from sessionweave.schemas import (
+    DispatchMode,
+    ParticipantPublic,
+    SessionSendOutput,
+    Target,
+)
 
 _UNSET: Any = object()
 
@@ -153,6 +160,136 @@ class Session:
                 payload={"participant": p.to_public().model_dump()},
             )
             return p.to_public()
+
+    # --- command lifecycle ---
+
+    async def send(
+        self,
+        *,
+        sender_id: str,
+        dispatch: DispatchMode,
+        target: Target,
+        payload: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> SessionSendOutput:
+        async with self.lock:
+            if sender_id not in self._participants:
+                raise ToolError(ErrorCode.NOT_IN_SESSION, "sender not in session")
+            self._enforce_payload_size(payload)
+            decision = decide_dispatch(
+                roster=self._participants,
+                sender_id=sender_id,
+                dispatch=dispatch,
+                target=target,
+                picker=self._picker,
+            )
+            ttl = self._clamp_timeout(timeout_seconds)
+            now = _utcnow()
+            command_id = str(uuid.uuid4())
+            tracker = CommandTracker(
+                command_id=command_id,
+                sender_id=sender_id,
+                dispatch_mode=dispatch,
+                dispatched_to=list(decision.recipients),
+                created_at=now,
+                deadline=now + timedelta(seconds=ttl),
+            )
+            self._inflight[command_id] = tracker
+            self.bump_activity()
+            for recipient_id in decision.recipients:
+                self._deliver_or_buffer(
+                    recipient_id,
+                    "command.received",
+                    {
+                        "command_id": command_id,
+                        "sender_id": sender_id,
+                        "dispatch_mode": dispatch.value,
+                        "dispatched_to": list(decision.recipients),
+                        "payload": payload,
+                        "expires_at": _isoformat(tracker.deadline),
+                    },
+                )
+            # If no recipients (e.g., any with no online match), close immediately
+            if not decision.recipients:
+                self._deliver_or_buffer(
+                    sender_id,
+                    "command.completed",
+                    {
+                        "command_id": command_id,
+                        "received_count": 0,
+                        "expected_count": 0,
+                        "reason": "all_responded",
+                    },
+                )
+                self._inflight.pop(command_id, None)
+            return SessionSendOutput(command_id=command_id, delivered_to=list(decision.recipients))
+
+    async def respond(
+        self,
+        *,
+        responder_id: str,
+        command_id: str,
+        status: str,
+        payload: dict[str, Any],
+    ) -> None:
+        async with self.lock:
+            tracker = self._inflight.get(command_id)
+            if tracker is None or tracker.is_expired():
+                raise ToolError(ErrorCode.COMMAND_NOT_FOUND, "command unknown or expired")
+            if responder_id not in tracker.dispatched_to:
+                raise ToolError(ErrorCode.NOT_A_RECIPIENT, "not a recipient of this command")
+            if responder_id in tracker.responses_received:
+                raise ToolError(ErrorCode.ALREADY_RESPONDED, "already responded")
+            tracker.responses_received.add(responder_id)
+            self.bump_activity()
+            self._deliver_or_buffer(
+                tracker.sender_id,
+                "result.received",
+                {
+                    "command_id": command_id,
+                    "responder_id": responder_id,
+                    "status": status,
+                    "payload": payload,
+                },
+            )
+            if tracker.is_complete():
+                self._deliver_or_buffer(
+                    tracker.sender_id,
+                    "command.completed",
+                    {
+                        "command_id": command_id,
+                        "received_count": tracker.received_count,
+                        "expected_count": tracker.expected_count,
+                        "reason": "all_responded",
+                    },
+                )
+                # Keep the tracker in _inflight until TTL so that a late
+                # duplicate respond raises ALREADY_RESPONDED rather than
+                # COMMAND_NOT_FOUND.  TTL-based eviction is handled in Task 13.
+
+    def _enforce_payload_size(self, payload: dict[str, Any]) -> None:
+        size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        if size > self.config.max_payload_bytes:
+            raise ToolError(
+                ErrorCode.PAYLOAD_TOO_LARGE,
+                f"payload {size} > max {self.config.max_payload_bytes}",
+            )
+
+    def _clamp_timeout(self, requested: int | None) -> int:
+        if requested is None:
+            return self.config.default_command_timeout_seconds
+        if requested < 1:
+            return 1
+        if requested > self.config.max_command_timeout_seconds:
+            return self.config.max_command_timeout_seconds
+        return requested
+
+    def _deliver_or_buffer(self, pid: str, name: str, payload: dict[str, Any]) -> None:
+        # In Task 12 we wire the buffer for offline-in-grace participants.
+        # For now, online-only delivery; offline = silent drop.
+        p = self._participants.get(pid)
+        if p is not None and p.online:
+            self._connections.send(self.session_id, pid, name, payload)
 
     def _notify_others(
         self,
