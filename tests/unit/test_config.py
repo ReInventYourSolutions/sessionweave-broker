@@ -61,6 +61,16 @@ def test_apply_overrides_rejects_unknown_key() -> None:
         apply_overrides(SessionConfig(), bounds, {"hax": True})
 
 
+def test_apply_overrides_cross_field_default_timeout_breaks_when_only_max_lowered() -> None:
+    """If a client lowers max_command_timeout_seconds below the default's default,
+    the cross-field invariant must fire."""
+    bounds = ConfigBounds.builtin()
+    base = SessionConfig(default_command_timeout_seconds=60, max_command_timeout_seconds=300)
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(base, bounds, {"max_command_timeout_seconds": 30})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+
 def test_load_deployment_defaults_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SW_DEFAULT_MAX_PARTICIPANTS", "4")
     monkeypatch.setenv("SW_MAX_MAX_PARTICIPANTS", "8")

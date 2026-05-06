@@ -106,18 +106,25 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
         b.max_command_timeout_seconds_min,
         b.max_command_timeout_seconds_max,
     )
-    # Cross-field: default_command_timeout_seconds <= max_command_timeout_seconds.
-    # Enforce whenever either is being overridden (or when called unconditionally).
-    if overridden is None or overridden & {
+    # Per-field bounds check for default_command_timeout_seconds (subject to override guard).
+    check(
         "default_command_timeout_seconds",
-        "max_command_timeout_seconds",
-    }:
-        check(
-            "default_command_timeout_seconds",
-            cfg.default_command_timeout_seconds,
-            b.default_command_timeout_seconds_min,
-            cfg.max_command_timeout_seconds,
-        )
+        cfg.default_command_timeout_seconds,
+        b.default_command_timeout_seconds_min,
+        None,
+    )
+    # Cross-field invariant: enforce when either timeout field is overridden.
+    if (
+        overridden is None
+        or "default_command_timeout_seconds" in overridden
+        or "max_command_timeout_seconds" in overridden
+    ):
+        if cfg.default_command_timeout_seconds > cfg.max_command_timeout_seconds:
+            raise ToolError(
+                ErrorCode.INVALID_CONFIG,
+                f"default_command_timeout_seconds={cfg.default_command_timeout_seconds} "
+                f"exceeds max_command_timeout_seconds={cfg.max_command_timeout_seconds}",
+            )
     check(
         "offline_grace_seconds",
         cfg.offline_grace_seconds,
