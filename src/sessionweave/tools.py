@@ -11,6 +11,8 @@ from sessionweave.schemas import (
     SessionCheckInboxOutput,
     SessionCreateInput,
     SessionCreateOutput,
+    SessionDescribeInput,
+    SessionDescribeOutput,
     SessionJoinInput,
     SessionJoinOutput,
     SessionListParticipantsOutput,
@@ -50,6 +52,24 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
     )
     return SessionCreateOutput(
         session_id=sid, expires_at=expires_at, config=cfg, purpose=purpose
+    ).model_dump()
+
+
+async def session_describe(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+    """Read-only snapshot of a session: purpose + config + roster.
+
+    Does NOT bind the calling MCP connection to a participant. Use it as a
+    pre-flight before deciding whether to ``session_join`` and which role
+    to take.
+    """
+    inp = SessionDescribeInput.model_validate(payload)
+    sess = deps.registry.get_or_raise(inp.session_id)
+    return SessionDescribeOutput(
+        session_id=sess.session_id,
+        expires_at=sess.expires_at_iso(),
+        config=asdict(sess.config),
+        purpose=sess.purpose,
+        roster=sess.roster_snapshot(),
     ).model_dump()
 
 
