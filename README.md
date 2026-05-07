@@ -165,6 +165,14 @@ Graceful shutdown: SIGTERM runs the lifespan shutdown, broadcasts
 captured signal, so the OS-level exit code is `-SIGTERM` rather than `0` —
 that's expected.
 
+## Claude Code skill
+
+[`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
+is a Claude Code skill that documents the participation protocol (server
+mode + client mode + resume + dispatch). Symlink it into `~/.claude/skills/`
+to make every Claude Code session aware of how to drive this relay — see
+[`skills/README.md`](skills/README.md) for the one-line install.
+
 ## Roadmap
 
 Each sub-project gets its own design spec under `docs/superpowers/specs/` and
