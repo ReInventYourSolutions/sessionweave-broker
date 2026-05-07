@@ -1,0 +1,42 @@
+# SessionWeave skills
+
+Reusable agent skills for SessionWeave. Drop them into your runtime's
+skill folder so an agent picks up the protocol without further briefing.
+
+## `sessionweave-participant`
+
+The participation playbook — auto-trigger on `swv://` invite links,
+parse → describe → role-decision → join flow, server vs. client mode,
+disconnect/resume, dispatch modes, push vs. pull delivery. Read
+[the skill itself](sessionweave-participant/SKILL.md) for content.
+
+### Registering it locally (Claude Code)
+
+Skills live in `~/.claude/skills/`. Symlink the folder so updates from
+this repo flow through:
+
+```bash
+git clone https://github.com/EnzinoBB/SessionWeave.git
+mkdir -p ~/.claude/skills
+ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
+      ~/.claude/skills/sessionweave-participant
+```
+
+Or fetch the file directly:
+
+```bash
+mkdir -p ~/.claude/skills/sessionweave-participant
+curl -fsSL \
+  https://raw.githubusercontent.com/EnzinoBB/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
+  -o ~/.claude/skills/sessionweave-participant/SKILL.md
+```
+
+Restart Claude Code so the catalog refreshes.
+
+### Versioning
+
+The skill is versioned in lockstep with the relay's MCP surface. When
+the server (see [`ReInventYourSolutions/sessionweave-broker`](https://github.com/ReInventYourSolutions/sessionweave-broker))
+adds, renames, or removes a tool / notification / error code, this skill
+gets updated in the same window — pin to a specific commit if you need
+strict alignment.
