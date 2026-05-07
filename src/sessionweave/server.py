@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any
+
+from mcp.server.fastmcp import Context, FastMCP
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Mount, Route
+
+from sessionweave.config import load_deployment_defaults
+from sessionweave.connections import ConnectionManager
+from sessionweave.errors import ToolError
+from sessionweave.mcp_adapter import HandleRegistry
+from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
+from sessionweave.registry import SessionRegistry
+from sessionweave.tools import (
+    ToolDeps,
+    session_check_inbox,
+    session_create,
+    session_join,
+    session_leave,
+    session_list_participants,
+    session_respond,
+    session_resume,
+    session_send,
+    session_update_self,
+)
+
+
+def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
+    mcp = FastMCP("sessionweave")
+
+    def _handle_for(ctx: Context) -> Any:
+        return handles.for_session(ctx.session)
+
+    @mcp.tool(name="session_create")
+    async def session_create_tool(
+        config: dict[str, Any] | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        return await session_create(deps, {"config": config})
+
+    @mcp.tool(name="session_join")
+    async def session_join_tool(
+        session_id: str,
+        role: str | None = None,
+        objective: str | None = None,
+        capabilities: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        delivery_mode: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        payload: dict[str, Any] = {"session_id": session_id}
+        if role is not None:
+            payload["role"] = role
+        if objective is not None:
+            payload["objective"] = objective
+        if capabilities is not None:
+            payload["capabilities"] = capabilities
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if delivery_mode is not None:
+            payload["delivery_mode"] = delivery_mode
+        return await session_join(deps, _handle_for(ctx), payload)
+
+    @mcp.tool(name="session_resume")
+    async def session_resume_tool(
+        session_id: str,
+        participant_id: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_resume(
+            deps,
+            _handle_for(ctx),
+            {"session_id": session_id, "participant_id": participant_id},
+        )
+
+    @mcp.tool(name="session_leave")
+    async def session_leave_tool(ctx: Context | None = None) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_leave(deps, _handle_for(ctx))
+
+    @mcp.tool(name="session_update_self")
+    async def session_update_self_tool(
+        role: str | None = None,
+        objective: str | None = None,
+        capabilities: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        payload: dict[str, Any] = {}
+        if role is not None:
+            payload["role"] = role
+        if objective is not None:
+            payload["objective"] = objective
+        if capabilities is not None:
+            payload["capabilities"] = capabilities
+        if metadata is not None:
+            payload["metadata"] = metadata
+        return await session_update_self(deps, _handle_for(ctx), payload)
+
+    @mcp.tool(name="session_list_participants")
+    async def session_list_participants_tool(
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_list_participants(deps, _handle_for(ctx))
+
+    @mcp.tool(name="session_check_inbox")
+    async def session_check_inbox_tool(
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_check_inbox(deps, _handle_for(ctx))
+
+    @mcp.tool(name="session_send")
+    async def session_send_tool(
+        dispatch: str,
+        target: dict[str, Any],
+        payload: dict[str, Any],
+        timeout_seconds: int | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        body: dict[str, Any] = {
+            "dispatch": dispatch,
+            "target": target,
+            "payload": payload,
+        }
+        if timeout_seconds is not None:
+            body["timeout_seconds"] = timeout_seconds
+        return await session_send(deps, _handle_for(ctx), body)
+
+    @mcp.tool(name="session_respond")
+    async def session_respond_tool(
+        command_id: str,
+        payload: dict[str, Any],
+        status: str = "ok",
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_respond(
+            deps,
+            _handle_for(ctx),
+            {"command_id": command_id, "payload": payload, "status": status},
+        )
+
+    return mcp
+
+
+def build_app() -> Starlette:
+    """Build the Starlette app exposing the MCP endpoint and health probes."""
+    deps_cfg = load_deployment_defaults(os.environ)
+    connections = ConnectionManager()
+    metrics = Metrics()
+    registry = SessionRegistry(deps_cfg, connections, metrics=metrics)
+    handles = HandleRegistry()
+    tool_deps = ToolDeps(registry)
+
+    mcp = _build_fastmcp(tool_deps, handles)
+    mcp_app = mcp.streamable_http_app()
+
+    state: dict[str, bool] = {"draining": False}
+
+    async def healthz(request: Request) -> JSONResponse:
+        if state["draining"]:
+            return JSONResponse({"status": "draining"}, status_code=503)
+        return JSONResponse({"status": "ok"})
+
+    async def readyz(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ready"})
+
+    async def metrics_endpoint(request: Request) -> Response:
+        return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            await registry.start()
+            stack.push_async_callback(_drain_registry, registry, state)
+            await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
+            yield
+
+    app = Starlette(
+        routes=[
+            Route("/healthz", healthz),
+            Route("/readyz", readyz),
+            Route("/metrics", metrics_endpoint),
+            Mount("/", app=mcp_app),
+        ],
+        lifespan=lifespan,
+    )
+    app.state.registry = registry
+    app.state.connections = connections
+    app.state.handles = handles
+    app.state.metrics = metrics
+    app.state.state = state
+    return app
+
+
+async def _drain_registry(registry: SessionRegistry, state: dict[str, bool]) -> None:
+    state["draining"] = True
+    await registry.shutdown(reason="server_shutdown")
+
+
+__all__ = ["ToolError", "build_app"]
