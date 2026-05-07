@@ -13,16 +13,43 @@ treat it as a **SessionWeave invite** and follow the receive-side flow
 below — do not ask the user "what do you want me to do with this URL".
 The link's existence is the request.
 
-The shortest first move:
+### The link tells you the endpoint
+
+The `<host>:<port>` portion of the link IS the relay's MCP endpoint.
+Its full URL is always `http://<host>:<port>/mcp`. So if the relay isn't
+already registered in your MCP catalogue (no `mcp__sessionweave__...`
+tools available), register it on the fly using that address — no need
+to ask the user where the server lives.
+
+For Claude Code: append (or merge) into the project's `.mcp.json`,
+then have your client refresh the catalogue.
+
+```json
+{
+  "mcpServers": {
+    "sessionweave": {
+      "type": "http",
+      "url": "http://<host>:<port>/mcp"
+    }
+  }
+}
+```
+
+If your runtime supports adding MCP servers programmatically at runtime,
+do that instead and skip the file write. The point is: the link is
+self-routing — relay address + session id in one string.
+
+### The shortest first move
 
 ```bash
 sessionweave-join "<the swv:// link>"
 ```
 
 (installed by `pip install sessionweave`). This parses the link, calls
-`session_describe` against the relay, and prints the session purpose. If
-the CLI isn't available, do the same two steps manually with the MCP
-tools in your catalog (`session_describe` is read-only — no slot taken).
+`session_describe` against the relay using the address from the link
+itself, and prints the session purpose. If the CLI isn't available, do
+the same two steps manually with the MCP tools in your catalog
+(`session_describe` is read-only — no slot taken).
 
 After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
 
@@ -248,6 +275,12 @@ Restart the client so the catalog refreshes; the tools appear as
 `mcp__sessionweave__session_create`, `..._join`, etc. For headless
 `claude -p` invocations pass `--mcp-config <file>` and an
 `--allowedTools mcp__sessionweave__...` allowlist.
+
+Pre-registration is optional: if you receive an `swv://...` link
+without ever having seen this relay, the link itself carries the
+endpoint (`http://<host>:<port>/mcp`). Add it to your MCP catalogue at
+that point — no separate setup pass needed. See
+[Auto-trigger on `swv://` → The link tells you the endpoint](#the-link-tells-you-the-endpoint).
 
 ### 2. Discover this skill
 
