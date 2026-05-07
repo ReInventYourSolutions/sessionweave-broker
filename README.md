@@ -70,16 +70,61 @@ async with streamablehttp_client("http://127.0.0.1:8765/mcp") as (read, write, _
 A second agent on a different MCP connection joins the same `session_id` and
 the two can now exchange commands and results through the dispatch tools.
 
+## Invite links (`swv://...`)
+
+Sharing only a `session_id` forces a side-channel "what should I do once
+I'm in?" briefing. Invite links collapse that into one self-describing
+string:
+
+```
+swv://<host>:<port>/<session_id>#<base64url-json-purpose>
+```
+
+The fragment carries a `purpose` payload — protocol kind, role
+assignment, free-form instructions — that the relay also persists on
+the session, so any joiner sees the same brief whether they parsed the
+fragment or joined by id alone:
+
+```python
+from sessionweave.invite import create_link, parse_link
+
+# Host side: build the link after session_create.
+purpose = {
+    "kind": "tic-tac-toe-v1",
+    "your_role": "O",
+    "your_capabilities": ["tictactoe-o"],
+    "delivery_mode": "pull",
+    "instructions": "X moves first; reply via session_respond, then send your move.",
+}
+out = await session.call_tool("session_create", {"purpose": purpose})
+link = create_link("http://127.0.0.1:8765/mcp", out["session_id"], purpose)
+
+# Joiner side: one call gives you everything you need.
+inv = parse_link(link)
+# inv.relay_url, inv.session_id, inv.purpose
+```
+
+`purpose` is capped at 16 KiB JSON; oversized payloads return
+`invalid_config`. Encoding is purely client-side — the relay never
+parses the link itself.
+
+When an agent receives a link with a `kind` it knows, it dispatches
+straight to the appropriate handler. When it doesn't, it falls back to
+`purpose["instructions"]` (natural language) and decides what to do.
+The skill at [`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
+documents the full receive-side flow.
+
 ## MCP tool surface
 
 | tool | purpose |
 |---|---|
-| `session_create` | Create a session; returns `session_id` and the effective config. |
-| `session_join` | Bind the calling MCP connection to a new participant in a session. |
-| `session_resume` | Re-bind a fresh MCP connection to an existing `participant_id`. |
+| `session_create` | Create a session; returns `session_id`, effective config, and any `purpose` you passed in. |
+| `session_join` | Bind the calling MCP connection to a new participant. Optional `delivery_mode = "push"` (default) or `"pull"` chooses how server events reach you. |
+| `session_resume` | Re-bind a fresh MCP connection to an existing `participant_id`. Echoes `purpose` back. |
 | `session_leave` | Leave the session (broadcast to others). |
 | `session_update_self` | Replace fields on the caller's participant; broadcast. |
 | `session_list_participants` | Snapshot of the roster. |
+| `session_check_inbox` | Drain pending events for the caller. Required when joined with `delivery_mode="pull"`. |
 | `session_send` | Dispatch a command (`all` / `any` / `specific`) to others. |
 | `session_respond` | Respond to a previously received command. |
 
@@ -165,13 +210,61 @@ Graceful shutdown: SIGTERM runs the lifespan shutdown, broadcasts
 captured signal, so the OS-level exit code is `-SIGTERM` rather than `0` —
 that's expected.
 
-## Claude Code skill
+## Setting up an agent
 
-[`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
-is a Claude Code skill that documents the participation protocol (server
-mode + client mode + resume + dispatch). Symlink it into `~/.claude/skills/`
-to make every Claude Code session aware of how to drive this relay — see
-[`skills/README.md`](skills/README.md) for the one-line install.
+To make a Claude Code (or any MCP-capable) agent participate, do three
+things:
+
+### 1. Register the relay in MCP
+
+Drop a `.mcp.json` next to the project the agent works in, or merge into
+the user-level config:
+
+```json
+{
+  "mcpServers": {
+    "sessionweave": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+Restart the client so the catalog refreshes. The tools appear as
+`mcp__sessionweave__session_create`, `..._join`, etc. For headless
+`claude -p` invocations pass `--mcp-config <file>` and an
+`--allowedTools mcp__sessionweave__...` allowlist.
+
+### 2. Install the participation skill
+
+Symlink (or copy) [`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
+into `~/.claude/skills/` so the agent learns *how* to use the relay
+(modes, dispatch, invite links, recovery):
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/sessionweave-participant" ~/.claude/skills/sessionweave-participant
+```
+
+The symlink keeps the skill in sync with future relay updates.
+
+### 3. (Optional) Install the Python helper
+
+If the agent has Python + the `mcp` SDK available, install the package
+in a venv so it can use `sessionweave.invite.parse_link` /
+`create_link` directly when handling `swv://` links:
+
+```bash
+pip install -e .
+```
+
+Once these three are in place an agent can:
+
+- Receive an `swv://` link, parse it, `session_join` with the
+  prescribed role, and act per `purpose.kind` or `purpose.instructions`.
+- Create a session for someone else, set `purpose`, hand the user the
+  generated link, and play the host side.
 
 ## Roadmap
 
