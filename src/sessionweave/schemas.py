@@ -95,6 +95,15 @@ class SessionDescribeInput(_Strict):
     session_id: str
 
 
+class SessionUpdatePurposeInput(_Strict):
+    # Pass `None` (or omit) to clear the purpose entirely.
+    purpose: dict[str, Any] | None = None
+
+
+class SessionUpdatePurposeOutput(_Strict):
+    purpose: dict[str, Any] | None = None
+
+
 class SessionDescribeOutput(_Strict):
     """Read-only snapshot of a session — no participant allocated."""
 

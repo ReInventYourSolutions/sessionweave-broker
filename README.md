@@ -132,6 +132,7 @@ New code should not emit them: keep the briefing on the server.
 |---|---|
 | `session_create` | Create a session; returns `session_id`, effective config, and any `purpose` you passed in. |
 | `session_describe` | Read-only snapshot: `{config, purpose, roster}` without allocating a participant. Pre-flight for invite-link recipients. |
+| `session_update_purpose` | Replace the session's `purpose` (or clear it) and broadcast `session.purpose_updated` to other participants. |
 | `session_join` | Bind the calling MCP connection to a new participant. Optional `delivery_mode = "push"` (default) or `"pull"` chooses how server events reach you. |
 | `session_resume` | Re-bind a fresh MCP connection to an existing `participant_id`. Echoes `purpose` back. |
 | `session_leave` | Leave the session (broadcast to others). |
@@ -143,8 +144,10 @@ New code should not emit them: keep the briefing on the server.
 
 Server-emitted notifications: `participant.joined`, `participant.updated`,
 `participant.left`, `command.received`, `result.received`,
-`command.completed`, `command.cancelled`, `session.ended`. Each carries a
-structured payload — see [the design spec][spec] §3 for full schemas.
+`command.completed`, `command.cancelled`, `session.purpose_updated`,
+`session.ended`. Each carries a structured payload — see
+[the design spec][spec] §3 for the schemas (the spec predates
+`session.purpose_updated`; see the skill for that one).
 
 ## Dispatch model
 
@@ -262,15 +265,23 @@ ln -s "$PWD/skills/sessionweave-participant" ~/.claude/skills/sessionweave-parti
 
 The symlink keeps the skill in sync with future relay updates.
 
-### 3. (Optional) Install the Python helper
+### 3. Install the Python helper + `sessionweave-join` CLI
 
-If the agent has Python + the `mcp` SDK available, install the package
-in a venv so it can use `sessionweave.invite.parse_link` /
-`create_link` directly when handling `swv://` links:
+Install the package in a venv. This gives the agent both the importable
+helpers (`sessionweave.invite.parse_link` / `create_link`) and the
+`sessionweave-join` CLI:
 
 ```bash
 pip install -e .
+
+sessionweave-join "swv://127.0.0.1:8765/<sid>"
+# Prints relay url, session id, purpose kind, role assignment, and
+# instructions in human-readable form. Add --json for machine output.
 ```
+
+`sessionweave-join` is the canonical "I just received an invite link,
+what is it?" entry point. It does **not** join the session — it only
+parses + describes — leaving the join decision to the caller.
 
 Once these three are in place an agent can:
 
