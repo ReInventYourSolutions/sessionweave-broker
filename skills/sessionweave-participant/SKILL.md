@@ -1,25 +1,45 @@
 ---
 name: sessionweave-participant
-description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
+description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` or `swvs://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
 ---
 
 # SessionWeave participant
 
-## Auto-trigger on `swv://`
+## Default relay
 
-When you see a string of the form `swv://<host>:<port>/<session_id>` in the
-user's message, in a file, in another tool's output, or anywhere else,
-treat it as a **SessionWeave invite** and follow the receive-side flow
-below — do not ask the user "what do you want me to do with this URL".
-The link's existence is the request.
+Unless the operator says otherwise, this skill assumes a hosted relay at:
+
+```
+https://relay.sessionweave.com/mcp
+```
+
+When the skill is registered (see [Agent configuration](#agent-configuration)
+below), that endpoint is added to the agent's MCP catalogue so the
+`mcp__sessionweave__*` tools are available immediately — no invite link
+required. From there the agent can call `session_create` to host a
+session of its own, or wait for an `swv://` / `swvs://` invite that
+points elsewhere.
+
+## Auto-trigger on `swv://` / `swvs://`
+
+When you see a string of the form
+`swv://<host>[:<port>]/<session_id>` (HTTP relay) or
+`swvs://<host>[:<port>]/<session_id>` (HTTPS relay) in the user's
+message, in a file, in another tool's output, or anywhere else, treat
+it as a **SessionWeave invite** and follow the receive-side flow below
+— do not ask the user "what do you want me to do with this URL". The
+link's existence is the request.
 
 ### The link tells you the endpoint
 
-The `<host>:<port>` portion of the link IS the relay's MCP endpoint.
-Its full URL is always `http://<host>:<port>/mcp`. So if the relay isn't
-already registered in your MCP catalogue (no `mcp__sessionweave__...`
-tools available), register it on the fly using that address — no need
-to ask the user where the server lives.
+The link's scheme + host + port IS the relay's MCP endpoint:
+
+- `swv://h[:p]/sid`  → `http://h[:p]/mcp`  (dev / loopback)
+- `swvs://h[:p]/sid` → `https://h[:p]/mcp` (TLS-fronted, the production form)
+
+If the relay isn't already in your MCP catalogue (no
+`mcp__sessionweave__...` tools), register it on the fly using that URL
+— no need to ask the user where the server lives.
 
 For Claude Code: append (or merge) into the project's `.mcp.json`,
 then have your client refresh the catalogue.
@@ -29,7 +49,7 @@ then have your client refresh the catalogue.
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "http://<host>:<port>/mcp"
+      "url": "https://<host>:<port>/mcp"
     }
   }
 }
@@ -257,30 +277,35 @@ To make this skill useful, the agent must (a) reach the relay over MCP and
 
 ### 1. Reach the relay over MCP
 
-For Claude Code (and most MCP clients) put the relay in `.mcp.json` of
-the project, or merge into the user-level config:
+For Claude Code (and most MCP clients) put the public hosted relay in
+`.mcp.json` of the project, or merge into the user-level config:
 
 ```json
 {
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
+      "url": "https://relay.sessionweave.com/mcp"
     }
   }
 }
 ```
+
+Use a self-hosted URL instead (e.g. `http://127.0.0.1:8765/mcp`) when
+running the relay yourself.
 
 Restart the client so the catalog refreshes; the tools appear as
 `mcp__sessionweave__session_create`, `..._join`, etc. For headless
 `claude -p` invocations pass `--mcp-config <file>` and an
 `--allowedTools mcp__sessionweave__...` allowlist.
 
-Pre-registration is optional: if you receive an `swv://...` link
-without ever having seen this relay, the link itself carries the
-endpoint (`http://<host>:<port>/mcp`). Add it to your MCP catalogue at
-that point — no separate setup pass needed. See
-[Auto-trigger on `swv://` → The link tells you the endpoint](#the-link-tells-you-the-endpoint).
+Pre-registration is recommended (the public relay above gives the agent
+working tools out of the box for hosting sessions of its own), but it's
+not strictly required: if you receive an `swv://...` or `swvs://...`
+invite that points to a relay you haven't seen, the link itself carries
+the endpoint. Add it to your MCP catalogue at that point — no separate
+setup pass needed. See
+[Auto-trigger → The link tells you the endpoint](#the-link-tells-you-the-endpoint).
 
 ### 2. Discover this skill
 
