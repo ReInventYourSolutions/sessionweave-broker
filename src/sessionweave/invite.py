@@ -1,20 +1,20 @@
 """Invite link helpers.
 
-A SessionWeave invite link is a single self-describing string that an agent
-can read and act on without an out-of-band briefing. Schema:
+A SessionWeave invite link is a compact, opaque pointer to a session:
 
-    swv://<host>[:<port>]/<session_id>[#<base64url-json-purpose>]
+    swv://<host>[:<port>]/<session_id>
 
-- The fragment, when present, is base64url-encoded JSON describing the
-  ``purpose`` of the session (intent, role assignment, free-form
-  instructions).
-- The relay HTTP URL is reconstructed as ``http://<host>[:<port>]/mcp``.
-  Use ``relay_url=`` overrides if the relay is on a different path.
+The recipient calls ``session_describe`` against the relay to discover the
+session's ``purpose`` (intent, role assignment, instructions). That payload
+is persisted server-side, so it's the single source of truth — the link
+itself stays minimal.
 
-The relay never sees the link itself — encoding/decoding is purely
-client-side. The ``purpose`` payload is also persisted on the relay (sent
-through ``session_create``), so a recipient who joins the session by id
-alone still sees the same purpose echoed back from the server.
+Legacy ``swv://...#<base64url-json>`` links carrying an embedded purpose
+in the URL fragment are still parsed (``parse_link`` returns
+``InviteLink.purpose``) for backward compatibility. New code should not
+emit them; ``create_link`` no longer accepts a purpose argument.
+
+The relay never sees the link — encoding/decoding is purely client-side.
 """
 from __future__ import annotations
 
@@ -53,27 +53,21 @@ def _b64url_decode(fragment: str) -> dict[str, Any]:
     return obj
 
 
-def create_link(
-    relay_url: str,
-    session_id: str,
-    purpose: dict[str, Any] | None = None,
-) -> str:
-    """Build an ``swv://`` invite link.
+def create_link(relay_url: str, session_id: str) -> str:
+    """Build a compact ``swv://`` invite link.
 
     ``relay_url`` is the relay's HTTP MCP endpoint
     (e.g. ``http://127.0.0.1:8765/mcp``). The link's host and port mirror
-    the relay's; the path falls back to the part before ``/mcp``.
+    the relay's. To learn the session's purpose, the recipient calls
+    ``session_describe`` against the relay — the link does not carry that
+    payload.
     """
     if not session_id:
         raise ValueError("session_id is required")
     parsed = urlparse(relay_url)
     if not parsed.netloc:
         raise ValueError(f"relay_url missing host: {relay_url!r}")
-    netloc = parsed.netloc
-    fragment = ""
-    if purpose:
-        fragment = "#" + _b64url_encode(purpose)
-    return f"{DEFAULT_SCHEME}://{netloc}/{session_id}{fragment}"
+    return f"{DEFAULT_SCHEME}://{parsed.netloc}/{session_id}"
 
 
 def parse_link(link: str) -> InviteLink:

@@ -72,23 +72,21 @@ the two can now exchange commands and results through the dispatch tools.
 
 ## Invite links (`swv://...`)
 
-Sharing only a `session_id` forces a side-channel "what should I do once
-I'm in?" briefing. Invite links collapse that into one self-describing
-string:
+The hand-off shape is a compact pointer to a session:
 
 ```
-swv://<host>:<port>/<session_id>#<base64url-json-purpose>
+swv://<host>:<port>/<session_id>
 ```
 
-The fragment carries a `purpose` payload — protocol kind, role
-assignment, free-form instructions — that the relay also persists on
-the session, so any joiner sees the same brief whether they parsed the
-fragment or joined by id alone:
+The link is just an addressable reference. The session's **purpose**
+(what to do, which role to take, which protocol to follow) lives
+server-side and is fetched by the recipient via `session_describe` —
+a read-only tool that does NOT allocate a participant.
 
 ```python
 from sessionweave.invite import create_link, parse_link
 
-# Host side: build the link after session_create.
+# Host side: set purpose at create time, emit the compact link.
 purpose = {
     "kind": "tic-tac-toe-v1",
     "your_role": "O",
@@ -97,28 +95,43 @@ purpose = {
     "instructions": "X moves first; reply via session_respond, then send your move.",
 }
 out = await session.call_tool("session_create", {"purpose": purpose})
-link = create_link("http://127.0.0.1:8765/mcp", out["session_id"], purpose)
+link = create_link("http://127.0.0.1:8765/mcp", out["session_id"])
+# link == "swv://127.0.0.1:8765/<sid>"   — nothing else encoded
 
-# Joiner side: one call gives you everything you need.
+# Joiner side: parse the link, look up the purpose, decide a role, join.
 inv = parse_link(link)
-# inv.relay_url, inv.session_id, inv.purpose
+desc = await session.call_tool("session_describe", {"session_id": inv.session_id})
+# desc["purpose"] == the host's purpose dict
 ```
 
 `purpose` is capped at 16 KiB JSON; oversized payloads return
 `invalid_config`. Encoding is purely client-side — the relay never
 parses the link itself.
 
-When an agent receives a link with a `kind` it knows, it dispatches
-straight to the appropriate handler. When it doesn't, it falls back to
-`purpose["instructions"]` (natural language) and decides what to do.
-The skill at [`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
+The recipient's decision tree on `desc["purpose"]`:
+
+- `your_role` set → assume that role.
+- `available_roles: [...]` set → pick one (autonomously when the choice
+  is unambiguous, otherwise ask the user).
+- Neither — only `instructions` — the brief is open-ended; reason about
+  it, ask the user if needed.
+
+For known protocols an agent dispatches by `purpose.kind`; for unknown
+kinds it falls back to `purpose.instructions`. The skill at
+[`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
 documents the full receive-side flow.
+
+Legacy links carrying a base64url JSON fragment
+(`swv://h:p/<sid>#<blob>`) are still understood by `parse_link`
+(`inv.purpose` populated from the fragment) for backward compatibility.
+New code should not emit them: keep the briefing on the server.
 
 ## MCP tool surface
 
 | tool | purpose |
 |---|---|
 | `session_create` | Create a session; returns `session_id`, effective config, and any `purpose` you passed in. |
+| `session_describe` | Read-only snapshot: `{config, purpose, roster}` without allocating a participant. Pre-flight for invite-link recipients. |
 | `session_join` | Bind the calling MCP connection to a new participant. Optional `delivery_mode = "push"` (default) or `"pull"` chooses how server events reach you. |
 | `session_resume` | Re-bind a fresh MCP connection to an existing `participant_id`. Echoes `purpose` back. |
 | `session_leave` | Leave the session (broadcast to others). |

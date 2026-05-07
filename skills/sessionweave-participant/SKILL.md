@@ -33,53 +33,84 @@ Skip if: you only need to call tools on one MCP server directly. SessionWeave is
 
 ## Invite links (`swv://...`)
 
-The fastest way to hand off a session to another agent is a single
-self-describing string:
+The hand-off shape is a compact pointer to a session:
 
 ```
-swv://<host>:<port>/<session_id>#<base64url-json-purpose>
+swv://<host>:<port>/<session_id>
 ```
 
-Encoding is purely client-side (the relay never sees the link). The
-fragment is base64url JSON describing the **purpose**: who joins, with
-which role, what protocol, what to do. That same payload is also
-persisted on the relay and echoed back from every `session_join` /
-`session_resume`, so a recipient who only got the `session_id` (no
-fragment) sees the same brief.
+The link is just an addressable reference. The session's actual
+**purpose** (what to do, which role to take, which protocol to follow)
+is persisted server-side and read back via `session_describe` — a
+read-only tool that does NOT bind your connection to a participant.
+Encoding/decoding the link is purely client-side; the relay never sees
+the link itself.
 
-### When you receive a link
+### Receiving a link — decision flow
 
-1. Parse it. From Python: `from sessionweave.invite import parse_link; inv = parse_link(link)` →
-   gives `inv.relay_url`, `inv.session_id`, `inv.purpose`.
-2. Inspect `inv.purpose["kind"]`:
-   - **Known kind with a handler/skill** → dispatch to it. Read
-     `your_role`, `your_capabilities`, `delivery_mode`, then call
-     `session_join` and follow the protocol.
-   - **Unknown kind** → fall back to `purpose["instructions"]` (natural
-     language). Plan an action sequence from there before joining.
-3. `session_join` with the role/capabilities from `purpose`. Save your
-   `participant_id` for `session_resume` on disconnect.
+1. **Parse.** `from sessionweave.invite import parse_link; inv = parse_link(link)`
+   → `inv.relay_url`, `inv.session_id`. (Legacy links may carry a
+   fragment-encoded purpose; ``parse_link`` returns it as ``inv.purpose``
+   for backward compat, but new code shouldn't rely on it.)
+2. **Describe.** `session_describe {session_id: inv.session_id}` →
+   returns `{config, purpose, roster}` without allocating a participant
+   slot.
+3. **Decide your role**:
+   - `purpose.your_role` is set ⇒ assume that exact role with
+     `purpose.your_capabilities`.
+   - `purpose.available_roles: [{role, capabilities?, description?}, ...]`
+     is set ⇒ pick one. If the choice is unambiguous given your context,
+     pick autonomously; otherwise show the list to the user and ask.
+   - Neither is set ⇒ the brief is open-ended. Read `purpose.instructions`
+     (natural language), reason about what role makes sense, and ask the
+     user before joining if you're unsure.
+4. **Dispatch by `purpose.kind`**:
+   - Known kind with a handler/skill ⇒ run that handler with the chosen
+     role + capabilities + `purpose.delivery_mode` (if any).
+   - Unknown kind ⇒ follow `purpose.instructions` step by step.
+5. **Join.** `session_join` with the role/capabilities you decided on.
+   Save your `participant_id` for `session_resume` on disconnect.
 
-### When you create a link
+### Creating a link — host side
 
-For known protocols, mirror the shape:
+When you set up a session for someone else, set `purpose` on
+`session_create` and emit the compact link. Two `purpose` shapes are
+common:
+
+**Single prescribed role** (e.g. tic-tac-toe — the joiner is O):
 
 ```python
 purpose = {
     "kind": "tic-tac-toe-v1",
     "your_role": "O",
     "your_capabilities": ["tictactoe-o"],
-    "delivery_mode": "pull",                # if relevant for the joiner
-    "instructions": "Sei Player O; X muove per primo; ...",
-    "launcher_hint": "python /tmp/.../play_via_link.py <link>",  # optional
+    "delivery_mode": "pull",
+    "instructions": "Sei Player O. X muove per primo. ...",
+}
+```
+
+**Pick-from-list** (e.g. brainstorm meeting with several seats):
+
+```python
+purpose = {
+    "kind": "brainstorm-v1",
+    "available_roles": [
+        {"role": "moderator",  "capabilities": ["mod"],
+         "description": "Drives the agenda, summarises."},
+        {"role": "contributor", "capabilities": ["contrib"],
+         "description": "Brings ideas and reactions."},
+        {"role": "observer",    "capabilities": ["obs"],
+         "description": "Read-only — listens and reports."},
+    ],
+    "instructions": "Topic: <…>. Pick the seat that fits your charter.",
 }
 ```
 
 Then:
 
 ```python
-out = await session.call_tool("session_create", {"purpose": purpose})
-link = create_link(relay_http_url, out["session_id"], purpose)
+out  = await session.call_tool("session_create", {"purpose": purpose})
+link = create_link(relay_http_url, out["session_id"])
 print(link)  # hand THIS string to the user; nothing else needed
 ```
 
@@ -88,18 +119,17 @@ print(link)  # hand THIS string to the user; nothing else needed
 - The relay caps `purpose` at 16 KiB JSON; oversized payloads return
   `invalid_config`.
 - Fields beyond `kind` / `your_role` / `your_capabilities` /
-  `instructions` / `delivery_mode` / `launcher_hint` are free-form —
-  add anything your protocol needs (game rules, auth tokens once #3
-  lands, etc.).
-- Do **not** put secrets in the fragment unless the link is shared over
-  a private channel — the fragment is plain (base64url) and could be
-  logged by anything that captures the link.
+  `available_roles` / `instructions` / `delivery_mode` are free-form —
+  add anything your protocol needs (game rules, ground truth, etc.).
+- The link itself is the address; sensitive briefing material should
+  live in the server-side `purpose`, not in any fragment.
 
 ## Quick reference
 
 | Tool | When |
 |---|---|
 | `session_create {config?, purpose?}` | Open a new session. Returns `session_id` (and `purpose` echo). |
+| `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster}` without allocating a participant. Use as pre-flight before deciding to join. |
 | `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`. `delivery_mode` is `"push"` (default) or `"pull"`. |
 | `session_resume {session_id, participant_id}` | Re-attach after a disconnect. |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |

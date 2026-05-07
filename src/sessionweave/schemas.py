@@ -91,6 +91,20 @@ class SessionListParticipantsOutput(_Strict):
     roster: list[ParticipantPublic]
 
 
+class SessionDescribeInput(_Strict):
+    session_id: str
+
+
+class SessionDescribeOutput(_Strict):
+    """Read-only snapshot of a session — no participant allocated."""
+
+    session_id: str
+    expires_at: str
+    config: dict[str, int]
+    purpose: dict[str, Any] | None = None
+    roster: list[ParticipantPublic]
+
+
 class InboxMessage(_Strict):
     name: str
     payload: dict[str, Any]

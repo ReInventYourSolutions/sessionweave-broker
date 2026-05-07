@@ -21,6 +21,7 @@ from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
     session_create,
+    session_describe,
     session_join,
     session_leave,
     session_list_participants,
@@ -46,6 +47,13 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
         return await session_create(
             deps, {"config": config, "purpose": purpose}
         )
+
+    @mcp.tool(name="session_describe")
+    async def session_describe_tool(
+        session_id: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        return await session_describe(deps, {"session_id": session_id})
 
     @mcp.tool(name="session_join")
     async def session_join_tool(
