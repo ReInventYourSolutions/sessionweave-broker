@@ -13,16 +13,29 @@ disconnect/resume, dispatch modes, push vs. pull delivery. Read
 ### Registering it locally (Claude Code)
 
 Skills live in `~/.claude/skills/`. Symlink the folder so updates from
-this repo flow through:
+this repo flow through, and add the hosted relay to your project's MCP
+config so the tools show up immediately:
 
 ```bash
 git clone https://github.com/EnzinoBB/SessionWeave.git
 mkdir -p ~/.claude/skills
 ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
       ~/.claude/skills/sessionweave-participant
+
+# In the project where you want the tools available:
+cat > .mcp.json <<'JSON'
+{
+  "mcpServers": {
+    "sessionweave": {
+      "type": "http",
+      "url": "https://relay.sessionweave.com/mcp"
+    }
+  }
+}
+JSON
 ```
 
-Or fetch the file directly:
+Or fetch only the skill (no clone):
 
 ```bash
 mkdir -p ~/.claude/skills/sessionweave-participant
@@ -31,7 +44,7 @@ curl -fsSL \
   -o ~/.claude/skills/sessionweave-participant/SKILL.md
 ```
 
-Restart Claude Code so the catalog refreshes.
+Restart Claude Code so both catalogues refresh.
 
 ### Versioning
 
