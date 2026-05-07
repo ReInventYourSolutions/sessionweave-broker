@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -11,6 +12,8 @@ from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.metrics import Metrics
 from sessionweave.session import Session
+
+_MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
 
 
 def _utcnow() -> datetime:
@@ -51,18 +54,33 @@ class SessionRegistry:
         return self._connections
 
     async def create(
-        self, overrides: dict[str, Any]
-    ) -> tuple[str, str, dict[str, int]]:
+        self,
+        overrides: dict[str, Any],
+        purpose: dict[str, Any] | None = None,
+    ) -> tuple[str, str, dict[str, int], dict[str, Any] | None]:
         cfg = apply_overrides(
             self._defaults.defaults, self._defaults.bounds, overrides
         )
+        if purpose is not None:
+            size = len(json.dumps(purpose, separators=(",", ":")).encode("utf-8"))
+            if size > _MAX_PURPOSE_BYTES:
+                raise ToolError(
+                    ErrorCode.INVALID_CONFIG,
+                    f"purpose {size} bytes exceeds cap of {_MAX_PURPOSE_BYTES}",
+                )
         async with self._lock:
             sid = str(uuid.uuid4())
-            sess = Session(sid, cfg, self._connections, metrics=self._metrics)
+            sess = Session(
+                sid,
+                cfg,
+                self._connections,
+                metrics=self._metrics,
+                purpose=purpose,
+            )
             self._sessions[sid] = sess
             if self._metrics is not None:
                 self._metrics.sessions_active.inc()
-            return sid, _isoformat(sess.expires_at()), asdict(cfg)
+            return sid, _isoformat(sess.expires_at()), asdict(cfg), purpose
 
     def get_or_raise(self, session_id: str) -> Session:
         sess = self._sessions.get(session_id)

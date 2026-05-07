@@ -49,6 +49,7 @@ class Session:
         "_picker",
         "config",
         "lock",
+        "purpose",
         "session_id",
     )
 
@@ -58,6 +59,7 @@ class Session:
         config: SessionConfig,
         connections: ConnectionManager,
         metrics: Metrics | None = None,
+        purpose: dict[str, Any] | None = None,
     ) -> None:
         now = _utcnow()
         self.session_id = session_id
@@ -71,6 +73,7 @@ class Session:
         self.lock = asyncio.Lock()
         self._connections = connections
         self._metrics = metrics
+        self.purpose: dict[str, Any] | None = purpose
 
     # --- read-only helpers ---
 

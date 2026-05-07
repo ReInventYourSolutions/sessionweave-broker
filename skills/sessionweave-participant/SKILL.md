@@ -27,15 +27,79 @@ In `pull` mode the receive pattern becomes: do work → call `session_check_inbo
 
 - Two or more agents need to coordinate across machines or processes (e.g. one agent runs a server you want to test, another agent issues requests).
 - The MCP tool catalog includes `session_create`, `session_join`, `session_send`, etc. — those are the relay tools.
-- The user gives you a `session_id` and asks you to join, or asks you to expose/consume a capability.
+- The user gives you a `session_id` (or an `swv://` invite link) and asks you to join, or asks you to expose/consume a capability.
 
 Skip if: you only need to call tools on one MCP server directly. SessionWeave is for *agent-to-agent* coordination.
+
+## Invite links (`swv://...`)
+
+The fastest way to hand off a session to another agent is a single
+self-describing string:
+
+```
+swv://<host>:<port>/<session_id>#<base64url-json-purpose>
+```
+
+Encoding is purely client-side (the relay never sees the link). The
+fragment is base64url JSON describing the **purpose**: who joins, with
+which role, what protocol, what to do. That same payload is also
+persisted on the relay and echoed back from every `session_join` /
+`session_resume`, so a recipient who only got the `session_id` (no
+fragment) sees the same brief.
+
+### When you receive a link
+
+1. Parse it. From Python: `from sessionweave.invite import parse_link; inv = parse_link(link)` →
+   gives `inv.relay_url`, `inv.session_id`, `inv.purpose`.
+2. Inspect `inv.purpose["kind"]`:
+   - **Known kind with a handler/skill** → dispatch to it. Read
+     `your_role`, `your_capabilities`, `delivery_mode`, then call
+     `session_join` and follow the protocol.
+   - **Unknown kind** → fall back to `purpose["instructions"]` (natural
+     language). Plan an action sequence from there before joining.
+3. `session_join` with the role/capabilities from `purpose`. Save your
+   `participant_id` for `session_resume` on disconnect.
+
+### When you create a link
+
+For known protocols, mirror the shape:
+
+```python
+purpose = {
+    "kind": "tic-tac-toe-v1",
+    "your_role": "O",
+    "your_capabilities": ["tictactoe-o"],
+    "delivery_mode": "pull",                # if relevant for the joiner
+    "instructions": "Sei Player O; X muove per primo; ...",
+    "launcher_hint": "python /tmp/.../play_via_link.py <link>",  # optional
+}
+```
+
+Then:
+
+```python
+out = await session.call_tool("session_create", {"purpose": purpose})
+link = create_link(relay_http_url, out["session_id"], purpose)
+print(link)  # hand THIS string to the user; nothing else needed
+```
+
+### Constraints
+
+- The relay caps `purpose` at 16 KiB JSON; oversized payloads return
+  `invalid_config`.
+- Fields beyond `kind` / `your_role` / `your_capabilities` /
+  `instructions` / `delivery_mode` / `launcher_hint` are free-form —
+  add anything your protocol needs (game rules, auth tokens once #3
+  lands, etc.).
+- Do **not** put secrets in the fragment unless the link is shared over
+  a private channel — the fragment is plain (base64url) and could be
+  logged by anything that captures the link.
 
 ## Quick reference
 
 | Tool | When |
 |---|---|
-| `session_create {config?}` | Open a new session. Returns `session_id`. |
+| `session_create {config?, purpose?}` | Open a new session. Returns `session_id` (and `purpose` echo). |
 | `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`. `delivery_mode` is `"push"` (default) or `"pull"`. |
 | `session_resume {session_id, participant_id}` | Re-attach after a disconnect. |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |
@@ -105,6 +169,58 @@ To stay compatible with every MCP client, the relay tunnels application events t
 ## Error catalogue
 
 `not_in_session`, `already_in_session`, `session_not_found`, `session_full`, `payload_too_large`, `invalid_dispatch_filters`, `invalid_targets`, `command_not_found`, `not_a_recipient`, `already_responded`, `participant_not_found`, `invalid_config`. All carry a human-readable `message`.
+
+## Agent configuration
+
+To make this skill useful, the agent must (a) reach the relay over MCP and
+(b) discover this document.
+
+### 1. Reach the relay over MCP
+
+For Claude Code (and most MCP clients) put the relay in `.mcp.json` of
+the project, or merge into the user-level config:
+
+```json
+{
+  "mcpServers": {
+    "sessionweave": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+Restart the client so the catalog refreshes; the tools appear as
+`mcp__sessionweave__session_create`, `..._join`, etc. For headless
+`claude -p` invocations pass `--mcp-config <file>` and an
+`--allowedTools mcp__sessionweave__...` allowlist.
+
+### 2. Discover this skill
+
+Symlink (or copy) the directory into the agent's skills folder:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s /path/to/sessionweave/skills/sessionweave-participant \
+      ~/.claude/skills/sessionweave-participant
+```
+
+Symlinking keeps the skill in sync with future relay updates.
+
+### 3. (Optional) Install the Python helper
+
+If your agent has Python + the `mcp` SDK available, install the package
+in a venv so it can use `sessionweave.invite.parse_link` /
+`create_link` directly:
+
+```bash
+pip install -e /path/to/sessionweave
+```
+
+The launcher pattern in this skill (parse link → dispatch by `kind`) is
+implemented in `play_via_link.py` in the demo workspace, but any agent
+can replicate it inline.
 
 ## Versioning
 

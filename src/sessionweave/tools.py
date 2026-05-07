@@ -45,9 +45,11 @@ def _session_for_handle(
 
 async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
     inp = SessionCreateInput.model_validate(payload)
-    sid, expires_at, cfg = await deps.registry.create(inp.config or {})
+    sid, expires_at, cfg, purpose = await deps.registry.create(
+        inp.config or {}, purpose=inp.purpose
+    )
     return SessionCreateOutput(
-        session_id=sid, expires_at=expires_at, config=cfg
+        session_id=sid, expires_at=expires_at, config=cfg, purpose=purpose
     ).model_dump()
 
 
@@ -73,6 +75,7 @@ async def session_join(
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),
         config=asdict(sess.config),
+        purpose=sess.purpose,
     ).model_dump()
 
 
@@ -90,6 +93,7 @@ async def session_resume(
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),
         config=asdict(sess.config),
+        purpose=sess.purpose,
     ).model_dump()
 
 
