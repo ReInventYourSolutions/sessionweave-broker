@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -32,9 +33,39 @@ from sessionweave.tools import (
     session_update_self,
 )
 
+_LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+
+
+def _allowed_hosts() -> list[str]:
+    """Build the DNS-rebinding ``allowed_hosts`` list for FastMCP.
+
+    Defaults to loopback only (matches FastMCP's stock policy). Extra
+    hosts come from ``SW_ALLOWED_HOSTS`` (comma-separated, e.g.
+    ``relay.sessionweave.com,relay.sessionweave.com:443``). Wildcard
+    port patterns (``host:*``) are honoured by the upstream middleware.
+    """
+    extra = os.environ.get("SW_ALLOWED_HOSTS", "").strip()
+    parsed: list[str] = []
+    if extra:
+        parsed = [tok.strip() for tok in extra.split(",") if tok.strip()]
+    # De-duplicate while keeping insertion order: loopback first, custom next.
+    seen: set[str] = set()
+    out: list[str] = []
+    for host in [*_LOOPBACK_HOSTS, *parsed]:
+        if host not in seen:
+            seen.add(host)
+            out.append(host)
+    return out
+
 
 def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
-    mcp = FastMCP("sessionweave")
+    mcp = FastMCP(
+        "sessionweave",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=_allowed_hosts(),
+        ),
+    )
 
     def _handle_for(ctx: Context) -> Any:
         return handles.for_session(ctx.session)

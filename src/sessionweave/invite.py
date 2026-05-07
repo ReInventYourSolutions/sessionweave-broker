@@ -2,12 +2,21 @@
 
 A SessionWeave invite link is a compact, opaque pointer to a session:
 
-    swv://<host>[:<port>]/<session_id>
+    swv://<host>[:<port>]/<session_id>     (HTTP relay)
+    swvs://<host>[:<port>]/<session_id>    (HTTPS relay)
 
 The recipient calls ``session_describe`` against the relay to discover the
 session's ``purpose`` (intent, role assignment, instructions). That payload
 is persisted server-side, so it's the single source of truth — the link
 itself stays minimal.
+
+The two schemes mirror ``http://`` vs ``https://``:
+
+- ``swv://h:p/sid``  → relay URL is ``http://h:p/mcp``  (dev / loopback)
+- ``swvs://h[:p]/sid`` → relay URL is ``https://h[:p]/mcp`` (production)
+
+``create_link`` picks the scheme automatically from the ``relay_url`` you
+pass in. ``parse_link`` accepts either scheme.
 
 Legacy ``swv://...#<base64url-json>`` links carrying an embedded purpose
 in the URL fragment are still parsed (``parse_link`` returns
@@ -24,15 +33,21 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
-DEFAULT_SCHEME = "swv"
+SCHEME_HTTP = "swv"
+SCHEME_HTTPS = "swvs"
+_VALID_SCHEMES = (SCHEME_HTTP, SCHEME_HTTPS)
 DEFAULT_HTTP_PATH = "/mcp"
+
+# Re-exported for callers that pinned the old constant name. The default
+# meaning is "the HTTP-flavoured invite scheme".
+DEFAULT_SCHEME = SCHEME_HTTP
 
 
 @dataclass(frozen=True, slots=True)
 class InviteLink:
-    """Decoded view of an ``swv://`` invite link."""
+    """Decoded view of an ``swv://`` / ``swvs://`` invite link."""
 
-    relay_url: str  # full HTTP URL of the MCP endpoint, e.g. http://h:p/mcp
+    relay_url: str  # full URL of the MCP endpoint, e.g. https://h/mcp
     session_id: str
     purpose: dict[str, Any] | None
 
@@ -53,29 +68,50 @@ def _b64url_decode(fragment: str) -> dict[str, Any]:
     return obj
 
 
-def create_link(relay_url: str, session_id: str) -> str:
-    """Build a compact ``swv://`` invite link.
+def _scheme_for(http_scheme: str) -> str:
+    """Map an HTTP relay scheme to the corresponding invite scheme."""
+    if http_scheme == "https":
+        return SCHEME_HTTPS
+    if http_scheme == "http":
+        return SCHEME_HTTP
+    raise ValueError(
+        f"relay_url must use http or https scheme, got {http_scheme!r}"
+    )
 
-    ``relay_url`` is the relay's HTTP MCP endpoint
-    (e.g. ``http://127.0.0.1:8765/mcp``). The link's host and port mirror
-    the relay's. To learn the session's purpose, the recipient calls
-    ``session_describe`` against the relay — the link does not carry that
-    payload.
+
+def create_link(relay_url: str, session_id: str) -> str:
+    """Build a compact invite link from the relay's HTTP(S) MCP endpoint.
+
+    Scheme mapping:
+
+    - ``http://h:p/mcp``  →  ``swv://h:p/<sid>``
+    - ``https://h[:p]/mcp`` →  ``swvs://h[:p]/<sid>``
+
+    The recipient learns the session's purpose by calling
+    ``session_describe`` against the relay — the link does not carry it.
     """
     if not session_id:
         raise ValueError("session_id is required")
     parsed = urlparse(relay_url)
     if not parsed.netloc:
         raise ValueError(f"relay_url missing host: {relay_url!r}")
-    return f"{DEFAULT_SCHEME}://{parsed.netloc}/{session_id}"
+    invite_scheme = _scheme_for(parsed.scheme)
+    netloc = parsed.netloc
+    # Strip the default port for HTTPS so links stay tidy on hosted relays.
+    if invite_scheme == SCHEME_HTTPS and netloc.endswith(":443"):
+        netloc = netloc[: -len(":443")]
+    elif invite_scheme == SCHEME_HTTP and netloc.endswith(":80"):
+        netloc = netloc[: -len(":80")]
+    return f"{invite_scheme}://{netloc}/{session_id}"
 
 
 def parse_link(link: str) -> InviteLink:
-    """Parse a string that may be an ``swv://`` invite link."""
+    """Parse a string that may be an ``swv://`` or ``swvs://`` invite link."""
     parsed = urlparse(link)
-    if parsed.scheme != DEFAULT_SCHEME:
+    if parsed.scheme not in _VALID_SCHEMES:
         raise ValueError(
-            f"unexpected scheme {parsed.scheme!r}; expected {DEFAULT_SCHEME!r}"
+            f"unexpected scheme {parsed.scheme!r}; "
+            f"expected one of {_VALID_SCHEMES}"
         )
     if not parsed.netloc:
         raise ValueError("invite link missing host")
@@ -90,8 +126,17 @@ def parse_link(link: str) -> InviteLink:
             purpose = _b64url_decode(parsed.fragment)
         except Exception as exc:
             raise ValueError(f"invalid invite fragment: {exc}") from exc
-    relay_url = f"http://{parsed.netloc}{DEFAULT_HTTP_PATH}"
+    http_scheme = "https" if parsed.scheme == SCHEME_HTTPS else "http"
+    relay_url = f"{http_scheme}://{parsed.netloc}{DEFAULT_HTTP_PATH}"
     return InviteLink(relay_url=relay_url, session_id=session_id, purpose=purpose)
 
 
-__all__ = ["DEFAULT_HTTP_PATH", "DEFAULT_SCHEME", "InviteLink", "create_link", "parse_link"]
+__all__ = [
+    "DEFAULT_HTTP_PATH",
+    "DEFAULT_SCHEME",
+    "SCHEME_HTTP",
+    "SCHEME_HTTPS",
+    "InviteLink",
+    "create_link",
+    "parse_link",
+]
