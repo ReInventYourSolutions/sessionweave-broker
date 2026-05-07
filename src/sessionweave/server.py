@@ -40,9 +40,12 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
     @mcp.tool(name="session_create")
     async def session_create_tool(
         config: dict[str, Any] | None = None,
+        purpose: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        return await session_create(deps, {"config": config})
+        return await session_create(
+            deps, {"config": config, "purpose": purpose}
+        )
 
     @mcp.tool(name="session_join")
     async def session_join_tool(

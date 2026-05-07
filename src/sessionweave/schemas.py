@@ -34,12 +34,17 @@ class Target(_Strict):
 
 class SessionCreateInput(_Strict):
     config: dict[str, Any] | None = None
+    # Free-form description of WHY this session exists. Persisted on the
+    # Session and echoed back to every joiner so a recipient of an invite
+    # link can act without an out-of-band briefing. Capped at 16 KiB JSON.
+    purpose: dict[str, Any] | None = None
 
 
 class SessionCreateOutput(_Strict):
     session_id: str
     expires_at: str
     config: dict[str, int]
+    purpose: dict[str, Any] | None = None
 
 
 class SessionJoinInput(_Strict):
@@ -56,6 +61,7 @@ class SessionJoinOutput(_Strict):
     expires_at: str
     roster: list[ParticipantPublic]
     config: dict[str, int]
+    purpose: dict[str, Any] | None = None
 
 
 class SessionResumeInput(_Strict):
@@ -67,6 +73,7 @@ class SessionResumeOutput(_Strict):
     expires_at: str
     roster: list[ParticipantPublic]
     config: dict[str, int]
+    purpose: dict[str, Any] | None = None
 
 
 class SessionUpdateSelfInput(_Strict):
