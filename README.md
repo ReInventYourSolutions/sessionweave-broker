@@ -1,10 +1,16 @@
-# SessionWeave
+# SessionWeaveMCP
 
-> Neutral, MCP-native rendezvous for multi-agent collaboration.
+> The MCP relay implementation behind [SessionWeave](https://github.com/EnzinoBB/SessionWeave).
+
+This repository contains the **server side** of SessionWeave — the relay
+that brokers messages between AI agents. For the **client side** (what
+an agent does to participate in a session, including the Claude Code
+skill and the user-facing overview) see the companion repo
+[`EnzinoBB/SessionWeave`](https://github.com/EnzinoBB/SessionWeave).
 
 SessionWeave lets two or more AI agents work together inside a shared **session**
 without any of them having to know about the others up front. An agent connects
-over MCP, joins a session by ID, sends commands, receives results — all while
+over MCP, joins a session by id, sends commands, receives results — all while
 keeping its own conversation context private and local.
 
 The relay only brokers messages. It never holds an agent's history.
@@ -117,9 +123,9 @@ The recipient's decision tree on `desc["purpose"]`:
   it, ask the user if needed.
 
 For known protocols an agent dispatches by `purpose.kind`; for unknown
-kinds it falls back to `purpose.instructions`. The skill at
-[`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
-documents the full receive-side flow.
+kinds it falls back to `purpose.instructions`. The
+[`sessionweave-participant`](https://github.com/EnzinoBB/SessionWeave/tree/main/skills/sessionweave-participant)
+skill (in the client repo) documents the full receive-side flow.
 
 Legacy links carrying a base64url JSON fragment
 (`swv://h:p/<sid>#<blob>`) are still understood by `parse_link`
@@ -254,16 +260,29 @@ Restart the client so the catalog refreshes. The tools appear as
 
 ### 2. Install the participation skill
 
-Symlink (or copy) [`skills/sessionweave-participant`](skills/sessionweave-participant/SKILL.md)
-into `~/.claude/skills/` so the agent learns *how* to use the relay
-(modes, dispatch, invite links, recovery):
+The skill lives in the client repo
+[`EnzinoBB/SessionWeave`](https://github.com/EnzinoBB/SessionWeave/tree/main/skills/sessionweave-participant).
+Symlink (or copy) it into `~/.claude/skills/` so the agent learns *how*
+to use the relay (modes, dispatch, invite links, recovery):
 
 ```bash
+git clone https://github.com/EnzinoBB/SessionWeave.git
 mkdir -p ~/.claude/skills
-ln -s "$PWD/skills/sessionweave-participant" ~/.claude/skills/sessionweave-participant
+ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
+      ~/.claude/skills/sessionweave-participant
 ```
 
-The symlink keeps the skill in sync with future relay updates.
+Or fetch the file directly:
+
+```bash
+mkdir -p ~/.claude/skills/sessionweave-participant
+curl -fsSL \
+  https://raw.githubusercontent.com/EnzinoBB/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
+  -o ~/.claude/skills/sessionweave-participant/SKILL.md
+```
+
+A symlink against a clone keeps the skill in sync with future client-repo
+updates.
 
 ### 3. Install the Python helper + `sessionweave-join` CLI
 
