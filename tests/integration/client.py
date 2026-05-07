@@ -7,53 +7,42 @@ from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import Notification
-from pydantic import RootModel
-
-
-class _PermissiveServerNotification(
-    RootModel[Notification[dict[str, Any] | None, str]]
-):
-    """Accept any JSON-RPC notification regardless of method.
-
-    The MCP ``ClientSession`` defaults to ``ServerNotification`` (a closed
-    union of standard methods) and silently drops messages that fail
-    validation. The relay sends application-level notifications such as
-    ``participant.joined`` whose method strings are not in that union, so
-    the test client substitutes this permissive type.
-    """
 
 
 @contextlib.asynccontextmanager
 async def sw_client(base_url: str) -> AsyncIterator[Client]:
-    """Open an MCP ClientSession over Streamable HTTP against the relay."""
+    """Open an MCP ClientSession over Streamable HTTP against the relay.
+
+    The relay tunnels its application events through ``notifications/message``
+    (LoggingMessageNotification) with ``logger == "sessionweave"`` and
+    ``data == {"_name": ..., "_payload": ...}``. We register a
+    ``logging_callback`` to extract those into the test client's
+    ``on_notification`` hook.
+    """
     url = f"{base_url}/mcp"
     async with streamablehttp_client(url) as (read, write, _):
         client_holder: list[Client] = []
 
-        async def message_handler(message: Any) -> None:
+        async def logging_callback(params: Any) -> None:
             client = client_holder[0] if client_holder else None
             if client is None:
                 return
-            root = getattr(message, "root", None)
-            if root is None or not hasattr(root, "method"):
+            if getattr(params, "logger", None) != "sessionweave":
                 return
-            params = getattr(root, "params", None)
-            params_dump: dict[str, Any]
-            if params is None:
-                params_dump = {}
-            elif hasattr(params, "model_dump"):
-                params_dump = params.model_dump(mode="json", by_alias=False)
-            elif isinstance(params, dict):
-                params_dump = params
-            else:
-                params_dump = {}
-            await client._dispatch_notification(root.method, params_dump)
+            data = getattr(params, "data", None)
+            if not isinstance(data, dict):
+                return
+            name = data.get("_name")
+            payload = data.get("_payload") or {}
+            if not isinstance(name, str):
+                return
+            if not isinstance(payload, dict):
+                payload = {}
+            await client._dispatch_notification(name, payload)
 
         async with ClientSession(
-            read, write, message_handler=message_handler
+            read, write, logging_callback=logging_callback
         ) as session:
-            session._receive_notification_type = _PermissiveServerNotification
             await session.initialize()
             client = Client(session)
             client_holder.append(client)

@@ -102,6 +102,7 @@ class Session:
         objective: str | None = None,
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        delivery_mode: str = "push",
     ) -> Participant:
         async with self.lock:
             if len(self._participants) >= self.config.max_participants:
@@ -111,6 +112,7 @@ class Session:
                 objective=objective,
                 capabilities=capabilities or [],
                 metadata=metadata or {},
+                delivery_mode=delivery_mode,
             )
             p.online = True
             p.connection_ref = handle
@@ -175,6 +177,26 @@ class Session:
                 payload={"participant": p.to_public().model_dump()},
             )
             return p.to_public()
+
+    async def check_inbox(self, participant_id: str) -> list[dict[str, Any]]:
+        """Drain and return any buffered notifications for ``participant_id``.
+
+        Used by ``delivery_mode=pull`` clients (and any client that wants to
+        flush the offline buffer mid-session). Returns each entry as
+        ``{"name": <event>, "payload": {...}}``.
+        """
+        async with self.lock:
+            p = self._participants.get(participant_id)
+            if p is None:
+                raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            self.bump_activity()
+            buf = self._buffers.pop(participant_id, None)
+            if buf is None:
+                return []
+            return [
+                {"name": item["_name"], "payload": item["_payload"]}
+                for item in buf.drain()
+            ]
 
     # --- command lifecycle ---
 
@@ -315,7 +337,10 @@ class Session:
         p = self._participants.get(pid)
         if p is None:
             return
-        if p.online:
+        # ``pull`` clients always go to the buffer regardless of online status —
+        # they drain it via session_check_inbox. We skip the push path entirely
+        # so the same notification isn't delivered twice.
+        if p.online and p.delivery_mode == "push":
             handle = self._connections.handle_for(self.session_id, pid)
             if handle is not None and handle.is_alive():
                 self._connections.send(self.session_id, pid, name, payload)

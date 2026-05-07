@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-from mcp.types import Notification
+from mcp.types import (
+    LoggingMessageNotification,
+    LoggingMessageNotificationParams,
+    ServerNotification,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from mcp.server.session import ServerSession
@@ -12,10 +16,12 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Parametrized so ``params`` is accepted as an arbitrary ``dict[str, Any]``.
-# Without this, Pydantic coerces the params field through the default
-# ``NotificationParams`` model and silently drops every key except ``_meta``.
-_RelayNotification = Notification[dict[str, Any], str]
+# Wire format for relay events. We tunnel application notifications through
+# the standard ``notifications/message`` (LoggingMessageNotification) channel
+# so that any spec-conforming MCP client surfaces them — custom-method
+# notifications get dropped at the client's ServerNotification validator.
+# Recipients extract ``data._name`` and ``data._payload``.
+_LOGGER_NAME = "sessionweave"
 
 
 class MCPConnectionHandle:
@@ -68,13 +74,17 @@ class MCPConnectionHandle:
         self._alive = False
 
     async def _dispatch(self, name: str, payload: dict[str, Any]) -> None:
-        notif = _RelayNotification(method=name, params=payload)
+        notif = ServerNotification(
+            LoggingMessageNotification(
+                params=LoggingMessageNotificationParams(
+                    level="info",
+                    logger=_LOGGER_NAME,
+                    data={"_name": name, "_payload": payload},
+                ),
+            ),
+        )
         try:
-            # ServerSession.send_notification uses notification.model_dump()
-            # at runtime; the static SendNotificationT bound is too narrow
-            # for our custom-method notifications. The wire result is a
-            # plain JSON-RPC notification with method=name, params=payload.
-            await self._session.send_notification(cast(Any, notif))
+            await self._session.send_notification(notif)
         except Exception as exc:  # pragma: no cover - transport failure paths
             logger.debug("dropping notification %s: %s", name, exc)
             self._alive = False

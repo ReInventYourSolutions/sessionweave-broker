@@ -48,6 +48,7 @@ class SessionJoinInput(_Strict):
     objective: str | None = None
     capabilities: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    delivery_mode: Literal["push", "pull"] = "push"
 
 
 class SessionJoinOutput(_Strict):
@@ -81,6 +82,15 @@ class SessionUpdateSelfOutput(_Strict):
 
 class SessionListParticipantsOutput(_Strict):
     roster: list[ParticipantPublic]
+
+
+class InboxMessage(_Strict):
+    name: str
+    payload: dict[str, Any]
+
+
+class SessionCheckInboxOutput(_Strict):
+    messages: list[InboxMessage]
 
 
 class SessionSendInput(_Strict):

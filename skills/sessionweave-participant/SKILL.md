@@ -14,6 +14,15 @@ SessionWeave is an MCP relay that lets multiple agents exchange commands inside 
 
 **Invariant:** one MCP connection participates in **at most one** session at a time. The `session_id` and your `participant_id` are the only credentials — keep both until the session ends.
 
+## Delivery modes
+
+Pick one when calling `session_join`:
+
+- **`delivery_mode: "push"`** (default) — the relay sends events as MCP `notifications/message` (LoggingMessageNotification, `logger="sessionweave"`). Use if your MCP client surfaces server logs to the model.
+- **`delivery_mode: "pull"`** — the relay routes ALL events into the participant's buffer; nothing is pushed. Drain with `session_check_inbox` between actions. Use if your client doesn't surface logging notifications to the model (e.g. headless `claude -p` instances).
+
+In `pull` mode the receive pattern becomes: do work → call `session_check_inbox` → handle events → repeat.
+
 ## When to use
 
 - Two or more agents need to coordinate across machines or processes (e.g. one agent runs a server you want to test, another agent issues requests).
@@ -27,11 +36,12 @@ Skip if: you only need to call tools on one MCP server directly. SessionWeave is
 | Tool | When |
 |---|---|
 | `session_create {config?}` | Open a new session. Returns `session_id`. |
-| `session_join {session_id, role?, capabilities?, objective?, metadata?}` | Bind this connection as a new participant. Returns `participant_id`. |
+| `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`. `delivery_mode` is `"push"` (default) or `"pull"`. |
 | `session_resume {session_id, participant_id}` | Re-attach after a disconnect. |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |
 | `session_update_self {role?, objective?, capabilities?, metadata?}` | Replace fields (no merge). Omitted = unchanged. |
 | `session_list_participants {}` | Snapshot of the roster. |
+| `session_check_inbox {}` | Drain pending notifications for the caller. Returns `{messages: [{name, payload}, ...]}`. Required when joined with `delivery_mode="pull"`. |
 | `session_send {dispatch, target, payload, timeout_seconds?}` | Dispatch a command. |
 | `session_respond {command_id, status?, payload}` | Respond to a command you received. `status` defaults to `"ok"`. |
 
@@ -87,6 +97,10 @@ The buffered notifications flush in order on the new transport. Past the grace w
 ## Notifications catalogue
 
 `participant.joined`, `participant.updated` (covers online/offline flips and capability/metadata changes), `participant.left` (`reason`: `left` \| `offline_timeout`), `command.received`, `result.received`, `command.completed` (`reason`: `all_responded` \| `ttl_expired`), `command.cancelled` (`reason`: `ttl_expired` \| `sender_gone`), `session.ended` (`reason`: `idle_ttl` \| `server_shutdown`).
+
+### Wire format (interop note)
+
+To stay compatible with every MCP client, the relay tunnels application events through the standard `notifications/message` (LoggingMessageNotification) channel. Each notification arrives as a log entry with `logger = "sessionweave"` and `data = {"_name": "<event>", "_payload": {...}}`. Push it through your client's logging callback or transcript surface, then unwrap `data._name` and `data._payload`. Custom-method JSON-RPC notifications would be dropped by the standard MCP client validator — that's why we tunnel.
 
 ## Error catalogue
 

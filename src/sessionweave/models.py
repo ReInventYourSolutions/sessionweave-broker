@@ -29,6 +29,11 @@ class Participant:
     last_online_at: datetime = field(default_factory=_utcnow)
     pending_notifications: deque[Any] = field(default_factory=deque)
     connection_ref: object | None = None  # opaque handle, set by ConnectionManager
+    # ``push`` (default) ⇒ relay sends notifications via MCP transport.
+    # ``pull``           ⇒ relay routes ALL notifications into the participant's
+    # buffer, drained via session_check_inbox. Use for clients that don't
+    # surface server notifications to their model.
+    delivery_mode: str = "push"
 
     @staticmethod
     def create(
@@ -36,6 +41,7 @@ class Participant:
         objective: str | None = None,
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        delivery_mode: str = "push",
     ) -> Participant:
         return Participant(
             participant_id=str(uuid.uuid4()),
@@ -44,6 +50,7 @@ class Participant:
             capabilities=capabilities or [],
             metadata=metadata or {},
             joined_at=_utcnow(),
+            delivery_mode=delivery_mode,
         )
 
     def to_public(self) -> ParticipantPublic:

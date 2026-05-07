@@ -7,6 +7,8 @@ from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import (
+    InboxMessage,
+    SessionCheckInboxOutput,
     SessionCreateInput,
     SessionCreateOutput,
     SessionJoinInput,
@@ -64,6 +66,7 @@ async def session_join(
         objective=inp.objective,
         capabilities=inp.capabilities,
         metadata=inp.metadata,
+        delivery_mode=inp.delivery_mode,
     )
     return SessionJoinOutput(
         participant_id=p.participant_id,
@@ -122,6 +125,16 @@ async def session_list_participants(
 ) -> dict[str, Any]:
     sess, _ = _session_for_handle(deps, handle)
     return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
+
+
+async def session_check_inbox(
+    deps: ToolDeps, handle: ConnectionHandle
+) -> dict[str, Any]:
+    sess, pid = _session_for_handle(deps, handle)
+    items = await sess.check_inbox(pid)
+    return SessionCheckInboxOutput(
+        messages=[InboxMessage(name=i["name"], payload=i["payload"]) for i in items]
+    ).model_dump()
 
 
 async def session_send(

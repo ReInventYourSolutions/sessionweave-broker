@@ -19,6 +19,7 @@ from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import (
     ToolDeps,
+    session_check_inbox,
     session_create,
     session_join,
     session_leave,
@@ -50,6 +51,7 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
         objective: str | None = None,
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        delivery_mode: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         assert ctx is not None
@@ -62,6 +64,8 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
             payload["capabilities"] = capabilities
         if metadata is not None:
             payload["metadata"] = metadata
+        if delivery_mode is not None:
+            payload["delivery_mode"] = delivery_mode
         return await session_join(deps, _handle_for(ctx), payload)
 
     @mcp.tool(name="session_resume")
@@ -108,6 +112,13 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
     ) -> dict[str, Any]:
         assert ctx is not None
         return await session_list_participants(deps, _handle_for(ctx))
+
+    @mcp.tool(name="session_check_inbox")
+    async def session_check_inbox_tool(
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_check_inbox(deps, _handle_for(ctx))
 
     @mcp.tool(name="session_send")
     async def session_send_tool(
