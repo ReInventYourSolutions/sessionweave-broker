@@ -28,6 +28,7 @@ from sessionweave.tools import (
     session_respond,
     session_resume,
     session_send,
+    session_update_purpose,
     session_update_self,
 )
 
@@ -54,6 +55,16 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         return await session_describe(deps, {"session_id": session_id})
+
+    @mcp.tool(name="session_update_purpose")
+    async def session_update_purpose_tool(
+        purpose: dict[str, Any] | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        return await session_update_purpose(
+            deps, _handle_for(ctx), {"purpose": purpose}
+        )
 
     @mcp.tool(name="session_join")
     async def session_join_tool(

@@ -20,6 +20,8 @@ from sessionweave.schemas import (
     SessionResumeInput,
     SessionResumeOutput,
     SessionSendInput,
+    SessionUpdatePurposeInput,
+    SessionUpdatePurposeOutput,
     SessionUpdateSelfInput,
     SessionUpdateSelfOutput,
 )
@@ -53,6 +55,17 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
     return SessionCreateOutput(
         session_id=sid, expires_at=expires_at, config=cfg, purpose=purpose
     ).model_dump()
+
+
+async def session_update_purpose(
+    deps: ToolDeps,
+    handle: ConnectionHandle,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    sess, pid = _session_for_handle(deps, handle)
+    inp = SessionUpdatePurposeInput.model_validate(payload)
+    new_purpose = await sess.update_purpose(pid, inp.purpose)
+    return SessionUpdatePurposeOutput(purpose=new_purpose).model_dump()
 
 
 async def session_describe(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:

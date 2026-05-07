@@ -11,9 +11,9 @@ from sessionweave.config import DeploymentDefaults, apply_overrides
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.metrics import Metrics
-from sessionweave.session import Session
+from sessionweave.session import MAX_PURPOSE_BYTES, Session
 
-_MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
+_MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES
 
 
 def _utcnow() -> datetime:

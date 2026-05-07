@@ -21,6 +21,8 @@ from sessionweave.schemas import (
 )
 
 _UNSET: Any = object()
+MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
+_MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
 
 
 def _utcnow() -> datetime:
@@ -180,6 +182,38 @@ class Session:
                 payload={"participant": p.to_public().model_dump()},
             )
             return p.to_public()
+
+    async def update_purpose(
+        self,
+        requester_id: str,
+        new_purpose: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Replace ``self.purpose`` and notify the rest of the session.
+
+        Any participant can update the purpose. Cap mirrors session_create
+        (16 KiB JSON). On success emits ``session.purpose_updated`` to
+        every other participant with the new payload.
+        """
+        async with self.lock:
+            if requester_id not in self._participants:
+                raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            if new_purpose is not None:
+                size = len(
+                    json.dumps(new_purpose, separators=(",", ":")).encode("utf-8")
+                )
+                if size > _MAX_PURPOSE_BYTES:
+                    raise ToolError(
+                        ErrorCode.INVALID_CONFIG,
+                        f"purpose {size} bytes exceeds cap of {_MAX_PURPOSE_BYTES}",
+                    )
+            self.purpose = new_purpose
+            self.bump_activity()
+            self._notify_others(
+                exclude_pid=requester_id,
+                name="session.purpose_updated",
+                payload={"purpose": new_purpose},
+            )
+            return new_purpose
 
     async def check_inbox(self, participant_id: str) -> list[dict[str, Any]]:
         """Drain and return any buffered notifications for ``participant_id``.

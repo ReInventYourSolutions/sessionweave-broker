@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 sessionweave = "sessionweave.main:cli"
+sessionweave-join = "sessionweave.launch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sessionweave"]

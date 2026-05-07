@@ -1,9 +1,30 @@
 ---
 name: sessionweave-participant
-description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous) — covers server mode (offering a capability) and client mode (dispatching commands across machines).
+description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
 ---
 
 # SessionWeave participant
+
+## Auto-trigger on `swv://`
+
+When you see a string of the form `swv://<host>:<port>/<session_id>` in the
+user's message, in a file, in another tool's output, or anywhere else,
+treat it as a **SessionWeave invite** and follow the receive-side flow
+below — do not ask the user "what do you want me to do with this URL".
+The link's existence is the request.
+
+The shortest first move:
+
+```bash
+sessionweave-join "<the swv:// link>"
+```
+
+(installed by `pip install sessionweave`). This parses the link, calls
+`session_describe` against the relay, and prints the session purpose. If
+the CLI isn't available, do the same two steps manually with the MCP
+tools in your catalog (`session_describe` is read-only — no slot taken).
+
+After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
 
 ## Overview
 
@@ -48,13 +69,14 @@ the link itself.
 
 ### Receiving a link — decision flow
 
-1. **Parse.** `from sessionweave.invite import parse_link; inv = parse_link(link)`
+1. **Parse.** Either run `sessionweave-join "<link>"` (if installed) or
+   `from sessionweave.invite import parse_link; inv = parse_link(link)`
    → `inv.relay_url`, `inv.session_id`. (Legacy links may carry a
    fragment-encoded purpose; ``parse_link`` returns it as ``inv.purpose``
    for backward compat, but new code shouldn't rely on it.)
 2. **Describe.** `session_describe {session_id: inv.session_id}` →
    returns `{config, purpose, roster}` without allocating a participant
-   slot.
+   slot. (`sessionweave-join` does this for you and prints the result.)
 3. **Decide your role**:
    - `purpose.your_role` is set ⇒ assume that exact role with
      `purpose.your_capabilities`.
@@ -130,6 +152,7 @@ print(link)  # hand THIS string to the user; nothing else needed
 |---|---|
 | `session_create {config?, purpose?}` | Open a new session. Returns `session_id` (and `purpose` echo). |
 | `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster}` without allocating a participant. Use as pre-flight before deciding to join. |
+| `session_update_purpose {purpose?}` | Replace the session's purpose mid-flight (or `null` to clear). Broadcasts `session.purpose_updated` to others. Caller must be in the session. |
 | `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`. `delivery_mode` is `"push"` (default) or `"pull"`. |
 | `session_resume {session_id, participant_id}` | Re-attach after a disconnect. |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |
@@ -190,7 +213,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 
 ## Notifications catalogue
 
-`participant.joined`, `participant.updated` (covers online/offline flips and capability/metadata changes), `participant.left` (`reason`: `left` \| `offline_timeout`), `command.received`, `result.received`, `command.completed` (`reason`: `all_responded` \| `ttl_expired`), `command.cancelled` (`reason`: `ttl_expired` \| `sender_gone`), `session.ended` (`reason`: `idle_ttl` \| `server_shutdown`).
+`participant.joined`, `participant.updated` (covers online/offline flips and capability/metadata changes), `participant.left` (`reason`: `left` \| `offline_timeout`), `command.received`, `result.received`, `command.completed` (`reason`: `all_responded` \| `ttl_expired`), `command.cancelled` (`reason`: `ttl_expired` \| `sender_gone`), `session.purpose_updated` (`{purpose}` — emitted to other participants when someone calls `session_update_purpose`), `session.ended` (`reason`: `idle_ttl` \| `server_shutdown`).
 
 ### Wire format (interop note)
 
