@@ -81,6 +81,40 @@ async def test_check_inbox_unknown_participant_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pull_resume_does_not_drain_buffer() -> None:
+    """Resume must keep the buffer intact for pull-mode participants.
+
+    Pull clients do not consume push notifications, so flushing the buffer
+    on resume would silently drop everything — their next call to
+    session_check_inbox would return empty.
+    """
+    sess = Session("s", _config(), ConnectionManager())
+    h_sender = FakeHandle()
+    sender = await sess.join(h_sender, role="s")
+    h_recv = FakeHandle()
+    recv = await sess.join(
+        h_recv, role="r", capabilities=["sec"], delivery_mode="pull"
+    )
+
+    # Buffer two notifications targeting the pull participant.
+    await sess.send(
+        sender_id=sender.participant_id,
+        dispatch=DispatchMode.SPECIFIC,
+        target=Target(participant_ids=[recv.participant_id]),
+        payload={"x": 1},
+    )
+
+    # Simulate a client reconnect: a fresh handle resumes the participant.
+    h_recv2 = FakeHandle()
+    await sess.resume(h_recv2, recv.participant_id)
+    assert h_recv2.sent == [], "pull-mode resume must NOT push the buffer"
+
+    # The next inbox poll must still see the buffered notification.
+    inbox = await sess.check_inbox(recv.participant_id)
+    assert any(m["name"] == "command.received" for m in inbox)
+
+
+@pytest.mark.asyncio
 async def test_push_default_still_delivers_via_handle() -> None:
     sess = Session("s", _config(), ConnectionManager())
     h_sender = FakeHandle()

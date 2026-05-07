@@ -528,12 +528,20 @@ class Session:
             if was_offline and self._metrics is not None:
                 self._metrics.participants_active.labels(online="false").dec()
                 self._metrics.participants_active.labels(online="true").inc()
-            buf = self._buffers.pop(participant_id, None)
-            if buf is not None:
-                for item in buf.drain():
-                    self._connections.send(
-                        self.session_id, participant_id, item["_name"], item["_payload"]
-                    )
+            # Pull-mode participants drain their own buffer via
+            # session_check_inbox; flushing here would push events through
+            # the transport and lose them (their model only sees synchronous
+            # tool results, not server logs).
+            if p.delivery_mode != "pull":
+                buf = self._buffers.pop(participant_id, None)
+                if buf is not None:
+                    for item in buf.drain():
+                        self._connections.send(
+                            self.session_id,
+                            participant_id,
+                            item["_name"],
+                            item["_payload"],
+                        )
             if was_offline:
                 self._notify_others(
                     exclude_pid=participant_id,
