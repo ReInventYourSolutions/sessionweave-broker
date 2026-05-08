@@ -155,14 +155,23 @@ async def events_ws(websocket: WebSocket) -> None:
                 await closer
             except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
-        # Drain anything the producer enqueued while we were tearing down.
+        # Detach FIRST so no new events can land on the queue. detach
+        # acquires the session lock, which serialises against any
+        # _deliver_or_buffer fan-out — once it returns, the subscriber
+        # is gone and any leftover items in the queue are events that
+        # landed before the subscriber was removed. THEN drain the
+        # queue and push everything to the per-participant buffer in
+        # one go. The previous order (drain → detach) had a race where
+        # an event arriving between the drain and detach acquiring the
+        # lock would be lost.
+        await session.detach_subscriber(pid, callback)
         while True:
             try:
-                pending = queue.get_nowait()
+                undelivered.append(queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
-            undelivered.append(pending)
-        await session.detach_subscriber(pid, callback, recover=undelivered or None)
+        if undelivered:
+            await session.requeue_to_buffer(pid, undelivered)
 
 
 def routes() -> list[WebSocketRoute]:
