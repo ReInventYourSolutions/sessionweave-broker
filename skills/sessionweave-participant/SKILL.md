@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.8.0
+version: 0.9.0
 description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` or `swvs://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.8.0** — when reporting your behaviour or filing
+> **Skill version: 0.9.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -108,6 +108,71 @@ the same two steps manually with the MCP tools in your catalog
 (`session_describe` is read-only — no slot taken).
 
 After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
+
+### Fallback — plain HTTP `/v1/...` (relay ≥ 0.8.0)
+
+If your runtime has no MCP support at all, prefer the relay's REST
+surface — it mirrors every MCP tool one-for-one and is far less fragile
+than rolling your own MCP-over-HTTP. The contract:
+
+- Bearer token IS the `participant_id` returned by `POST
+  /v1/sessions/{sid}/participants` (sub-project #3 will swap this for
+  a JWT). Send it as `Authorization: Bearer <participant_id>` on every
+  authenticated route.
+- HTTP joiners are always `delivery_mode=pull`; drain notifications
+  with `POST /v1/sessions/{sid}/participants/me/inbox/drain` between
+  actions.
+- Discover the relay's transports + version at `GET /v1/info`.
+
+Minimal round trip:
+
+```bash
+RELAY=https://relay.sessionweave.com
+
+# create
+SID=$(curl -sS -X POST "$RELAY/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d '{"purpose":{"kind":"smoke","instructions":"hi"}}' \
+  | jq -r .session_id)
+
+# join (response = participant_id + participant_token; they're equal in #1)
+TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
+  -H 'content-type: application/json' \
+  -d '{"role":"observer"}' \
+  | jq -r .participant_token)
+
+# send a command
+curl -sS -X POST "$RELAY/v1/sessions/$SID/commands" \
+  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"dispatch":"broadcast","target":{},"payload":{"q":"ping"}}'
+
+# drain pending events
+curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
+  -H "authorization: Bearer $TOK"
+```
+
+For real-time push (avoid polling), upgrade to a WebSocket:
+
+```
+wss://relay.sessionweave.com/v1/sessions/<sid>/participants/me/events?token=<participant_token>
+```
+
+Each frame is a single JSON object `{"name": "<event>", "payload":
+{...}}` matching the inbox-drain schema. The handler atomically drains
+the per-participant buffer at attach-time, so you don't need a separate
+REST drain to seed the socket. On disconnect the buffer resumes
+accumulating — if your client drops mid-session, reconnect and read
+whatever lands either over the new socket (initial drain on attach) or
+via REST inbox-drain.
+
+The token query param is the only way to authenticate the upgrade
+because browsers can't set custom headers on a WebSocket handshake. If
+you have control over headers, both `?token=...` and `Authorization:
+Bearer ...` work — but the query param is the documented contract.
+
+Use this surface for runtimes that don't ship MCP. The MCP path is
+still the primary contract for Claude Code, opencode, etc.; only fall
+back here if MCP truly isn't available.
 
 ### Fallback — speaking MCP over raw HTTP
 
@@ -706,7 +771,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.8.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.9.0 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
