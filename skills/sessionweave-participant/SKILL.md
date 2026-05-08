@@ -73,6 +73,64 @@ the same two steps manually with the MCP tools in your catalog
 
 After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
 
+### Fallback — speaking MCP over raw HTTP
+
+If your runtime has neither (a) the relay registered as an MCP server
+nor (b) `pip install sessionweave` available, and you must drive the
+relay from a shell or generic HTTP client, follow the **full Streamable
+HTTP MCP protocol**. Cutting corners is the most common reason agents
+trip over `-32602 "Invalid request parameters"`.
+
+The protocol is **stateful** and requires three steps before any tool
+call:
+
+1. **`initialize`** — POST to the relay endpoint. Capture the
+   `mcp-session-id` header from the response. All subsequent requests
+   MUST include that header.
+2. **`notifications/initialized`** — POST a JSON-RPC notification (no
+   `id` field) to confirm the handshake. Server replies `202`.
+3. **`tools/call`** — and only now you can run a tool. The tool name
+   goes inside `params.name`, the arguments inside `params.arguments`.
+   The JSON-RPC `method` is the literal string `"tools/call"`, NOT the
+   tool name.
+
+```bash
+RELAY=https://relay.sessionweave.com/mcp
+
+# 1) initialize → grab mcp-session-id
+curl -sS -D /tmp/init.headers -X POST "$RELAY" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"my-agent","version":"0"},"capabilities":{}}}'
+SID=$(grep -i 'mcp-session-id' /tmp/init.headers | tr -d '\r' | awk -F': ' '{print $2}')
+
+# 2) notifications/initialized
+curl -sS -X POST "$RELAY" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "mcp-session-id: $SID" \
+  --data '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3) tools/call session_create  (or session_describe / session_join / …)
+curl -sS -X POST "$RELAY" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "mcp-session-id: $SID" \
+  --data '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_create","arguments":{"purpose":{"kind":"smoke-test-v1","instructions":"hello"}}}}'
+```
+
+Common mistakes that produce `-32602`:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every call returns `-32602` | Sent `{"method":"session_create",...}` | Use `{"method":"tools/call","params":{"name":"session_create","arguments":{...}}}` |
+| First `tools/call` returns error | Skipped `initialize` | Run `initialize` first, then notifications/initialized |
+| Calls work once, then fail | Reused session header from a different process | Capture `mcp-session-id` per process and include on every POST |
+| `406 Not Acceptable` | Missing event-stream `Accept` | `Accept: application/json, text/event-stream` |
+
+For an interactive session that needs to *receive* notifications
+(`command.received`, etc.), don't roll your own SSE: pull a real MCP
+SDK (Python, TypeScript, Go) and use its `ClientSession`. Raw HTTP is
+fine for one-shot tool calls, painful for streams.
+
 ## Overview
 
 SessionWeave is an MCP relay that lets multiple agents exchange commands inside a shared **session** without holding their conversational context. As a participant you operate in one of two modes:
@@ -257,6 +315,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Ignoring `command.completed` | Only then are all responders in (or the deadline expired). Don't act on partial results unless you mean to. |
 | Calling tools without joining first | Returns `not_in_session`. Always `session_join` / `session_resume` before send/respond. |
 | Treating session state as durable | State is in-memory only — restart of the relay loses everything. Idle sessions also expire after `idle_ttl_seconds` (default 30 min). |
+| Driving the relay with raw HTTP without `initialize` | Returns `-32602 "Invalid request parameters"`. Streamable HTTP is stateful — see [Fallback — speaking MCP over raw HTTP](#fallback--speaking-mcp-over-raw-http). |
 
 ## Notifications catalogue
 
