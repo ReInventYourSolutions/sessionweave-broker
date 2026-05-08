@@ -87,14 +87,29 @@ async def events_ws(websocket: WebSocket) -> None:
         # falls back to the buffer.
         queue.put_nowait((name, payload))
 
-    # Items the callback had handed us but the socket failed to deliver
-    # before disconnect. detach_subscriber pushes them back to the
+    # Items the callback handed us but the socket failed to deliver
+    # before disconnect. detach_subscriber pushes them back onto the
     # per-participant buffer so a REST drain (or a fresh WS attach) can
     # recover them — otherwise _deliver_or_buffer saw the callback
     # succeed and never wrote the event anywhere durable.
     undelivered: list[tuple[str, dict[str, Any]]] = []
 
+    # We must concurrently await ``websocket.receive()`` so a peer-side
+    # close is observed even when our send loop is blocked in
+    # ``queue.get()`` waiting for events. Without this, a closed socket
+    # behind a reverse proxy can stay "alive" from Starlette's
+    # perspective until the next ``send_json`` actually fails — by
+    # which time we've already handed the event to (an effectively
+    # dead) ``send_json`` and counted it delivered.
+    async def _watch_close() -> None:
+        try:
+            while True:
+                await websocket.receive()
+        except WebSocketDisconnect:
+            return
+
     backlog = await session.attach_subscriber(pid, callback)
+    closer: asyncio.Task[None] | None = None
     try:
         for item in backlog:
             name = item["name"]
@@ -104,8 +119,26 @@ async def events_ws(websocket: WebSocket) -> None:
             except WebSocketDisconnect:
                 undelivered.append((name, payload))
                 raise
+
+        closer = asyncio.create_task(_watch_close())
         while True:
-            name, payload = await queue.get()
+            getter: asyncio.Task[tuple[str, dict[str, Any]]] = asyncio.create_task(
+                queue.get()
+            )
+            done, _pending = await asyncio.wait(
+                {getter, closer}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if closer in done:
+                # Peer closed — abandon the in-flight getter and exit. If
+                # an event happened to land in the queue between the
+                # close being observed and us bailing out, the
+                # finally-block drain will catch it.
+                getter.cancel()
+                break
+            name, payload = getter.result()
+            if closer.done():
+                undelivered.append((name, payload))
+                break
             try:
                 await websocket.send_json({"name": name, "payload": payload})
             except WebSocketDisconnect:
@@ -116,6 +149,12 @@ async def events_ws(websocket: WebSocket) -> None:
     except Exception:
         log.exception("WebSocket events handler crashed for session=%s pid=%s", sid, pid)
     finally:
+        if closer is not None and not closer.done():
+            closer.cancel()
+            try:
+                await closer
+            except (asyncio.CancelledError, WebSocketDisconnect):
+                pass
         # Drain anything the producer enqueued while we were tearing down.
         while True:
             try:
