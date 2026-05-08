@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.9.0
-description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` or `swvs://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
+version: 0.10.0
+description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.9.0** — when reporting your behaviour or filing
+> **Skill version: 0.10.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -14,18 +14,133 @@ description: Use when an agent must join, host, or test through a SessionWeave r
 
 ## Default relay
 
-Unless the operator says otherwise, this skill assumes a hosted relay at:
+Unless the operator says otherwise, this skill assumes the hosted
+relay at:
 
 ```
-https://relay.sessionweave.com/mcp
+https://relay.sessionweave.com
 ```
 
-When the skill is registered (see [Agent configuration](#agent-configuration)
-below), that endpoint is added to the agent's MCP catalogue so the
-`mcp__sessionweave__*` tools are available immediately — no invite link
-required. From there the agent can call `session_create` to host a
-session of its own, or wait for an `swv://` / `swvs://` invite that
-points elsewhere.
+That base URL hosts every transport the relay speaks:
+
+- `POST /v1/sessions`, `POST /v1/sessions/{sid}/participants`,
+  `POST /v1/sessions/{sid}/commands`, … — the **REST surface**
+  ([full list](#primary-path-http-api--sdk-no-mcp-required)).
+- `wss://.../v1/sessions/{sid}/participants/me/events?token=…` —
+  the **WebSocket events stream** for live push (use it instead of
+  busy-polling the inbox).
+- `POST /mcp` — the optional MCP endpoint, if your runtime has MCP
+  tooling and you'd rather drive the relay through tool calls
+  ([details](#optional-mcp-integration)).
+
+## Primary path: HTTP API + SDK (no MCP required)
+
+The relay's REST surface mirrors every MCP tool one-for-one and adds
+a WebSocket events endpoint for live push. This is the recommended
+path for ALL agent runtimes — Python scripts, headless workers,
+Lambda handlers, JS/TS frontends, runtimes without MCP support.
+Even Claude Code can drive the relay this way; the choice between
+REST/WS and MCP is purely operator preference once both work.
+
+### Easiest: use the official SDK
+
+The Python SDK (`sessionweave-client`, in
+[`SDK/python/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python))
+wraps every endpoint with typed exceptions and an async event stream:
+
+```bash
+pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/python'
+```
+
+```python
+import asyncio
+from sessionweave_client import SessionWeaveClient
+
+async def main() -> None:
+    async with SessionWeaveClient() as client:        # default: relay.sessionweave.com
+        sess = await client.create_session(purpose={"kind": "demo"})
+        me = await client.join(sess["session_id"], role="worker", capabilities=["respond"])
+        async with me.events() as stream:             # live WS push
+            async for evt in stream:
+                if evt.name == "command.received":
+                    await me.respond(evt.payload["command_id"], payload={"a": "..."})
+                    break
+        await me.leave()
+
+asyncio.run(main())
+```
+
+Vendor-neutral examples (Anthropic, OpenAI, plain) live under
+[`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
+
+### Or speak the REST + WS protocol directly
+
+The wire contract is small enough that you can drive it from `curl`,
+JS `fetch`, Go, or any HTTP client. Auth shape (sub-project #1):
+the bearer token IS the `participant_id` returned by `POST
+/v1/sessions/{sid}/participants` — pass it as `Authorization: Bearer
+<participant_id>` on every authenticated route. Sub-project #3 will
+swap that for a JWT without changing the surface.
+
+```bash
+RELAY=https://relay.sessionweave.com
+
+# 1. Create a session.
+SID=$(curl -sS -X POST "$RELAY/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d '{"purpose":{"kind":"smoke","instructions":"echo what you receive"}}' \
+  | jq -r .session_id)
+
+# 2. Join — response includes participant_id and participant_token (equal in #1).
+TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
+  -H 'content-type: application/json' \
+  -d '{"role":"observer"}' \
+  | jq -r .participant_token)
+
+# 3. Send a command.
+curl -sS -X POST "$RELAY/v1/sessions/$SID/commands" \
+  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"dispatch":"all","target":{"capability":"respond"},"payload":{"q":"ping"}}'
+
+# 4. Drain pending events (REST clients are pull-mode by definition).
+curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
+  -H "authorization: Bearer $TOK"
+```
+
+For real-time push, upgrade to a WebSocket:
+
+```
+wss://relay.sessionweave.com/v1/sessions/<sid>/participants/me/events?token=<token>
+```
+
+Each frame is `{"name": "<event>", "payload": {...}}` — same shape as
+`inbox/drain` returns. The relay drains any pending buffered events at
+attach time and forwards them over the socket before the live stream
+begins, so a fresh connection doesn't need a separate REST drain. On
+disconnect anything the relay handed to the WS subscriber but couldn't
+deliver is pushed back to the per-participant buffer; reconnect *or*
+call `inbox/drain` to recover.
+
+The `?token=` query param is the only way to authenticate the WS
+upgrade because browsers can't set custom headers on the handshake;
+the same token works in `Authorization: Bearer …` on REST.
+
+Endpoint catalogue:
+
+| Verb | Path | Purpose |
+|------|------|---------|
+| GET  | `/v1/info` | Relay name, version, transports list |
+| POST | `/v1/sessions` | Create a session (`purpose`, `config`) |
+| GET  | `/v1/sessions/{sid}` | Describe a session (read-only) |
+| PATCH | `/v1/sessions/{sid}/purpose` | Update the purpose (auth required) |
+| POST | `/v1/sessions/{sid}/participants` | Join — returns `participant_id` + `participant_token` |
+| GET  | `/v1/sessions/{sid}/participants` | Roster (auth required) |
+| PATCH | `/v1/sessions/{sid}/participants/me` | Update self (role / capabilities / metadata) |
+| DELETE | `/v1/sessions/{sid}/participants/me` | Leave |
+| POST | `/v1/sessions/{sid}/participants/me/inbox/drain` | Pop buffered events |
+| POST | `/v1/sessions/{sid}/commands` | Dispatch a command (`specific` / `all` / `any`) |
+| POST | `/v1/sessions/{sid}/commands/{cid}/responses` | Respond to a command |
+| WS   | `/v1/sessions/{sid}/participants/me/events?token=…` | Live event stream |
 
 ## Auto-trigger on `swv://` / `swvs://`
 
@@ -39,42 +154,74 @@ link's existence is the request.
 
 ### The link tells you the endpoint
 
-The link's scheme + host + port IS the relay's MCP endpoint:
+The link's scheme + host + port IS the relay's base URL — same one
+you'd hit for `/v1/...`, `/mcp`, or the WS upgrade:
 
-- `swv://h[:p]/sid`  → `http://h[:p]/mcp`  (dev / loopback)
-- `swvs://h[:p]/sid` → `https://h[:p]/mcp` (TLS-fronted, the production form)
+- `swv://h[:p]/sid`  → `http://h[:p]`   (dev / loopback)
+- `swvs://h[:p]/sid` → `https://h[:p]`  (TLS-fronted, the production form)
 
-### Bootstrap order — persist FIRST, then act
+The session id is the path tail — you do NOT need to call any "decode
+the link" tool; just split on `/`.
 
-If the relay isn't already in your MCP catalogue (no
-`mcp__sessionweave__...` tools listed for you), do these two things,
-**in this order**:
+### The shortest first move
 
-1. **Persist the MCP entry** so future runs of this runtime have the
-   tools loaded automatically. Don't skip this step "for now" — solving
-   the immediate task with raw HTTP and forgetting to write the file
-   leaves the next conversation in the same friction.
-2. **Drive the current session** through the [raw-HTTP fallback](#fallback--speaking-mcp-over-raw-http)
-   below. The `.mcp.json` you just wrote needs a runtime restart to
-   take effect, which you can't do mid-session — so the *current* call
-   has to go over HTTP. Subsequent runs use the native tools.
+Describe the session before joining. With the SDK:
 
-Concretely, write a minimal `.mcp.json` (project-local for Claude Code
-and most coding agents; user-level if your runtime prefers it). The
-URL is the one you decoded from the link:
+```python
+from sessionweave_client import SessionWeaveClient
+async with SessionWeaveClient(base_url="https://<host>[:<port>]") as c:
+    info = await c.describe("<sid>")
+    print(info.purpose)
+```
+
+Or with curl:
+
+```bash
+curl -sS "https://<host>[:<port>]/v1/sessions/<sid>" | jq .purpose
+```
+
+`describe` is read-only — it doesn't take a slot in the roster, so you
+can call it as often as you like before deciding whether to join. The
+returned `purpose` is the contract: it tells you what the session is
+for, which role to take (`your_role` if prescribed, or pick from
+`available_roles`), and how the protocol is structured.
+
+If your runtime has the relay registered as an MCP server, you can
+call `session_describe` through that catalogue instead — same data,
+same contract. See [Optional MCP integration](#optional-mcp-integration).
+
+After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
+
+## Optional MCP integration
+
+If your runtime has MCP tooling (Claude Code, opencode, etc.), you can
+drive the relay through tool calls instead of REST. The MCP catalogue
+mirrors the REST endpoints one-for-one — `session_create`,
+`session_describe`, `session_join`, `session_send`, `session_respond`,
+`session_check_inbox`, `session_update_self`, `session_update_purpose`,
+`session_list_participants`, `session_leave`, `session_resume`. Live
+events arrive as `LoggingMessageNotification` entries with
+`logger="sessionweave"` and `data = {"_name": "<event>", "_payload": {...}}`.
+
+The MCP path is purely an alternative — every behaviour described in
+the rest of this skill works the same regardless of which transport you
+use. Pick MCP if your runtime already speaks it; otherwise stay on
+REST + WS.
+
+### Registering the relay as an MCP server
+
+Write a `.mcp.json` (location depends on the runtime):
 
 ```json
 {
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "https://<host>[:<port>]/mcp"
+      "url": "https://relay.sessionweave.com/mcp"
     }
   }
 }
 ```
-
-Common per-runtime locations (check yours; this is a moving target):
 
 | Runtime | File |
 |---|---|
@@ -82,118 +229,35 @@ Common per-runtime locations (check yours; this is a moving target):
 | Claude Code (user)    | `~/.claude/.mcp.json` |
 | opencode (user)       | `~/.config/opencode/mcp.json` (or whatever its docs say) |
 
-After writing the file, **tell the user**:
+After writing the file, restart the runtime so the catalogue refreshes.
+For the *current* session — where the file you just wrote isn't yet
+loaded — drive the relay over REST as documented above; subsequent runs
+get the native tools.
 
-> "I've added SessionWeave to your MCP config at `<path>`. Restart the
-> runtime to load the native tools; until then I'm using the raw-HTTP
-> fallback for this session."
+If your runtime exposes a programmatic "add MCP server" call, use it
+instead of editing the file.
 
-If your runtime exposes a programmatic "add MCP server" call (some do),
-use it instead of editing the file — the effect is the same and may
-not require a restart.
+### Speaking MCP over raw HTTP (last resort)
 
-The point: the link is self-routing — relay address + session id in
-one string.
-
-### The shortest first move
-
-```bash
-sessionweave-join "<the swv:// link>"
-```
-
-(installed by `pip install sessionweave`). This parses the link, calls
-`session_describe` against the relay using the address from the link
-itself, and prints the session purpose. If the CLI isn't available, do
-the same two steps manually with the MCP tools in your catalog
-(`session_describe` is read-only — no slot taken).
-
-After the describe, follow [Receiving a link → decision flow](#receiving-a-link--decision-flow).
-
-### Fallback — plain HTTP `/v1/...` (relay ≥ 0.8.0)
-
-If your runtime has no MCP support at all, prefer the relay's REST
-surface — it mirrors every MCP tool one-for-one and is far less fragile
-than rolling your own MCP-over-HTTP. The contract:
-
-- Bearer token IS the `participant_id` returned by `POST
-  /v1/sessions/{sid}/participants` (sub-project #3 will swap this for
-  a JWT). Send it as `Authorization: Bearer <participant_id>` on every
-  authenticated route.
-- HTTP joiners are always `delivery_mode=pull`; drain notifications
-  with `POST /v1/sessions/{sid}/participants/me/inbox/drain` between
-  actions.
-- Discover the relay's transports + version at `GET /v1/info`.
-
-Minimal round trip:
-
-```bash
-RELAY=https://relay.sessionweave.com
-
-# create
-SID=$(curl -sS -X POST "$RELAY/v1/sessions" \
-  -H 'content-type: application/json' \
-  -d '{"purpose":{"kind":"smoke","instructions":"hi"}}' \
-  | jq -r .session_id)
-
-# join (response = participant_id + participant_token; they're equal in #1)
-TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
-  -H 'content-type: application/json' \
-  -d '{"role":"observer"}' \
-  | jq -r .participant_token)
-
-# send a command
-curl -sS -X POST "$RELAY/v1/sessions/$SID/commands" \
-  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
-  -d '{"dispatch":"broadcast","target":{},"payload":{"q":"ping"}}'
-
-# drain pending events
-curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
-  -H "authorization: Bearer $TOK"
-```
-
-For real-time push (avoid polling), upgrade to a WebSocket:
-
-```
-wss://relay.sessionweave.com/v1/sessions/<sid>/participants/me/events?token=<participant_token>
-```
-
-Each frame is a single JSON object `{"name": "<event>", "payload":
-{...}}` matching the inbox-drain schema. The handler atomically drains
-the per-participant buffer at attach-time, so you don't need a separate
-REST drain to seed the socket. On disconnect the buffer resumes
-accumulating — if your client drops mid-session, reconnect and read
-whatever lands either over the new socket (initial drain on attach) or
-via REST inbox-drain.
-
-The token query param is the only way to authenticate the upgrade
-because browsers can't set custom headers on a WebSocket handshake. If
-you have control over headers, both `?token=...` and `Authorization:
-Bearer ...` work — but the query param is the documented contract.
-
-Use this surface for runtimes that don't ship MCP. The MCP path is
-still the primary contract for Claude Code, opencode, etc.; only fall
-back here if MCP truly isn't available.
-
-### Fallback — speaking MCP over raw HTTP
-
-If your runtime has neither (a) the relay registered as an MCP server
-nor (b) `pip install sessionweave` available, and you must drive the
-relay from a shell or generic HTTP client, follow the **full Streamable
-HTTP MCP protocol**. Cutting corners is the most common reason agents
-trip over `-32602 "Invalid request parameters"`.
+If you genuinely have no MCP client available *and* can't use the SDK
+or REST surface, you can still POST raw MCP/JSON-RPC against
+`https://<host>/mcp`. This is fragile and almost never the right
+choice — the REST surface above does the same thing in a few lines of
+shell. Only reach for raw MCP when the relay supplies tools that are
+genuinely MCP-only and the REST surface doesn't cover them (none, as
+of sub-project #1).
 
 The protocol is **stateful** and requires three steps before any tool
 call:
 
-1. **`initialize`** — POST to the relay endpoint. Capture the
-   `mcp-session-id` header from the response. All subsequent requests
-   MUST include that header.
-2. **`notifications/initialized`** — POST a JSON-RPC notification (no
-   `id` field) to confirm the handshake. Server replies `202`.
-3. **`tools/call`** — and only now you can run a tool. The tool name
-   goes inside `params.name`, the arguments inside `params.arguments`.
-   The JSON-RPC `method` is the literal string `"tools/call"`, NOT the
-   tool name.
+1. **`initialize`** — POST to `https://<host>/mcp`. Capture the
+   `mcp-session-id` response header. Every subsequent request MUST
+   include it.
+2. **`notifications/initialized`** — POST a JSON-RPC notification
+   (no `id`) to confirm the handshake. Server replies `202`.
+3. **`tools/call`** — only now can you run a tool. The tool name is
+   `params.name`, args are `params.arguments`. JSON-RPC `method` is
+   the literal string `"tools/call"`, NOT the tool name.
 
 ```bash
 RELAY=https://relay.sessionweave.com/mcp
@@ -227,34 +291,36 @@ Common mistakes that produce `-32602`:
 | Calls work once, then fail | Reused session header from a different process | Capture `mcp-session-id` per process and include on every POST |
 | `406 Not Acceptable` | Missing event-stream `Accept` | `Accept: application/json, text/event-stream` |
 
-For an interactive session that needs to *receive* notifications
-(`command.received`, etc.), don't roll your own SSE: pull a real MCP
-SDK (Python, TypeScript, Go) and use its `ClientSession`. Raw HTTP is
-fine for one-shot tool calls, painful for streams.
+For an interactive session that needs to *receive* notifications,
+don't roll your own SSE — use the WebSocket events endpoint
+(documented in [Primary path](#primary-path-http-api--sdk-no-mcp-required))
+or pull a real MCP SDK and use its `ClientSession`.
 
 ## Overview
 
-SessionWeave is an MCP relay that lets multiple agents exchange commands inside a shared **session** without holding their conversational context. As a participant you operate in one of two modes:
+SessionWeave is a transport-agnostic relay that lets multiple agents exchange commands inside a shared **session** without holding their conversational context. As a participant you operate in one of two modes:
 
 - **Server mode** — you offer a capability; you join, advertise it, then respond to incoming commands.
 - **Client mode** — you need a capability; you create or join a session, dispatch commands, await results.
 
-**Invariant:** one MCP connection participates in **at most one** session at a time. The `session_id` and your `participant_id` are the only credentials — keep both until the session ends.
+**Invariant:** one connection participates in **at most one** session at a time. The `session_id` and your `participant_token` (which equals your `participant_id` in sub-project #1) are the only credentials — keep both until the session ends.
 
 ## Delivery modes
 
-Pick one when calling `session_join`:
+Two consumption patterns; pick the one your transport allows:
 
-- **`delivery_mode: "push"`** (default) — the relay sends events as MCP `notifications/message` (LoggingMessageNotification, `logger="sessionweave"`). Use if your MCP client surfaces server logs to the model.
-- **`delivery_mode: "pull"`** — the relay routes ALL events into the participant's buffer; nothing is pushed. Drain with `session_check_inbox` between actions. Use if your client doesn't surface logging notifications to the model (e.g. headless `claude -p` instances).
+- **Push** — events arrive in real time. Available via the WebSocket events endpoint (`wss://.../events?token=…`) over HTTP, or as MCP `notifications/message` (LoggingMessageNotification, `logger="sessionweave"`) when you've joined through MCP. Use if your client can surface live frames or server-side log notifications to the model.
+- **Pull** — events accumulate in the per-participant buffer; you drain with `POST /v1/sessions/{sid}/participants/me/inbox/drain` (REST) or `session_check_inbox` (MCP). Use if your runtime is request/response only or doesn't surface push notifications to the model. **All HTTP REST clients are pull-mode by definition** — REST has no persistent transport for server-pushed events; pair it with the WS endpoint if you want push.
 
-In `pull` mode the receive pattern becomes: do work → call `session_check_inbox` → handle events → repeat.
+When joining through MCP, set this explicitly: `delivery_mode: "push"` (the default — uses LoggingMessageNotification) or `delivery_mode: "pull"`. REST joiners are always pull, regardless of body argument.
+
+In pull mode the receive pattern is: do work → drain → handle events → repeat.
 
 ## When to use
 
 - Two or more agents need to coordinate across machines or processes (e.g. one agent runs a server you want to test, another agent issues requests).
-- The MCP tool catalog includes `session_create`, `session_join`, `session_send`, etc. — those are the relay tools.
-- The user gives you a `session_id` (or an `swv://` invite link) and asks you to join, or asks you to expose/consume a capability.
+- You can speak HTTP + (optionally) WebSocket. That covers virtually every runtime — Python scripts, OpenAI / Anthropic SDK workers, Node, Go, Lambda, JS/TS frontends, headless coding agents.
+- The user gives you a `session_id` or an `swv://` / `swvs://` invite link and asks you to join, or to expose/consume a capability.
 
 Skip if: you only need to call tools on one MCP server directly. SessionWeave is for *agent-to-agent* coordination.
 
@@ -696,13 +762,35 @@ To stay compatible with every MCP client, the relay tunnels application events t
 
 ## Agent configuration
 
-To make this skill useful, the agent must (a) reach the relay over MCP and
-(b) discover this document.
+To make this skill useful, the agent needs to (a) reach the relay and
+(b) discover this document. The relay is reachable two ways — pick
+whichever fits your runtime.
 
-### 1. Reach the relay over MCP
+### 1. Reach the relay
 
-For Claude Code (and most MCP clients) put the public hosted relay in
-`.mcp.json` of the project, or merge into the user-level config:
+**Option A — HTTP API + SDK (no MCP required, the recommended default).**
+Anything that can do HTTP and WebSocket already has what it needs; the
+[Primary path](#primary-path-http-api--sdk-no-mcp-required) section above
+covers the contract end-to-end. For Python:
+
+```bash
+pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/python'
+```
+
+```python
+async with SessionWeaveClient() as c:        # default: relay.sessionweave.com
+    sess = await c.create_session(purpose={"kind": "demo"})
+    me = await c.join(sess["session_id"], role="worker")
+    ...
+```
+
+For other languages, point any HTTP+WS client at
+`https://relay.sessionweave.com` and follow the [endpoint
+catalogue](#or-speak-the-rest--ws-protocol-directly).
+
+**Option B — MCP integration (only if your runtime already speaks MCP).**
+Put the relay in `.mcp.json` (project-local for Claude Code and most
+coding agents; user-level if your runtime prefers it):
 
 ```json
 {
@@ -716,20 +804,17 @@ For Claude Code (and most MCP clients) put the public hosted relay in
 ```
 
 Use a self-hosted URL instead (e.g. `http://127.0.0.1:8765/mcp`) when
-running the relay yourself.
+running the relay yourself. Restart the client so the catalogue
+refreshes; the tools appear as `mcp__sessionweave__session_create`,
+`..._join`, etc. For headless `claude -p` invocations pass
+`--mcp-config <file>` and an `--allowedTools mcp__sessionweave__...`
+allowlist.
 
-Restart the client so the catalog refreshes; the tools appear as
-`mcp__sessionweave__session_create`, `..._join`, etc. For headless
-`claude -p` invocations pass `--mcp-config <file>` and an
-`--allowedTools mcp__sessionweave__...` allowlist.
-
-Pre-registration is recommended (the public relay above gives the agent
-working tools out of the box for hosting sessions of its own), but it's
-not strictly required: if you receive an `swv://...` or `swvs://...`
-invite that points to a relay you haven't seen, the link itself carries
-the endpoint. Add it to your MCP catalogue at that point — no separate
-setup pass needed. See
-[Auto-trigger → The link tells you the endpoint](#the-link-tells-you-the-endpoint).
+Pre-registration is convenient but not required for either option:
+when an `swv://...` / `swvs://...` invite points to a relay you haven't
+seen, the link itself carries the endpoint. Use the [base URL it
+encodes](#the-link-tells-you-the-endpoint) directly with the SDK / REST
+or, if you'd prefer MCP, add it to your MCP catalogue at that point.
 
 ### 2. Discover this skill
 
@@ -737,25 +822,11 @@ Symlink (or copy) the directory into the agent's skills folder:
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -s /path/to/sessionweave/skills/sessionweave-participant \
+ln -s /path/to/SessionWeave/skills/sessionweave-participant \
       ~/.claude/skills/sessionweave-participant
 ```
 
-Symlinking keeps the skill in sync with future relay updates.
-
-### 3. (Optional) Install the Python helper
-
-If your agent has Python + the `mcp` SDK available, install the package
-in a venv so it can use `sessionweave.invite.parse_link` /
-`create_link` directly:
-
-```bash
-pip install -e /path/to/sessionweave
-```
-
-The launcher pattern in this skill (parse link → dispatch by `kind`) is
-implemented in `play_via_link.py` in the demo workspace, but any agent
-can replicate it inline.
+Symlinking keeps the skill in sync with future updates.
 
 ## Versioning
 
@@ -771,7 +842,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.9.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.10.0 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
