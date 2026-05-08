@@ -12,9 +12,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
+from sessionweave import __version__
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
+from sessionweave.http_api import routes as http_api_routes
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
@@ -224,11 +226,24 @@ def build_app() -> Starlette:
 
     async def healthz(request: Request) -> JSONResponse:
         if state["draining"]:
-            return JSONResponse({"status": "draining"}, status_code=503)
-        return JSONResponse({"status": "ok"})
+            return JSONResponse(
+                {"status": "draining", "version": __version__},
+                status_code=503,
+            )
+        return JSONResponse({"status": "ok", "version": __version__})
 
     async def readyz(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ready"})
+        return JSONResponse({"status": "ready", "version": __version__})
+
+    async def info(request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "name": "sessionweave",
+                "version": __version__,
+                "subproject": "#1 (anonymous, transient, in-memory)",
+                "transports": ["mcp", "http"],
+            }
+        )
 
     async def metrics_endpoint(request: Request) -> Response:
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
@@ -245,7 +260,9 @@ def build_app() -> Starlette:
         routes=[
             Route("/healthz", healthz),
             Route("/readyz", readyz),
+            Route("/v1/info", info),
             Route("/metrics", metrics_endpoint),
+            *http_api_routes(),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,
@@ -254,6 +271,7 @@ def build_app() -> Starlette:
     app.state.connections = connections
     app.state.handles = handles
     app.state.metrics = metrics
+    app.state.tool_deps = tool_deps
     app.state.state = state
     return app
 
