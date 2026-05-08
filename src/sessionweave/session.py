@@ -102,6 +102,28 @@ class Session:
     def expires_at_iso(self) -> str:
         return _isoformat(self.expires_at())
 
+    def next_deadline(self) -> datetime:
+        """Soonest moment when ``tick`` could need to do work for this
+        session. The registry uses this to drive a min-heap so it can
+        skip sessions whose next event is far in the future, instead of
+        scanning every entry every tick.
+
+        Includes:
+          * idle TTL expiry
+          * any inflight command tracker's TTL deadline
+          * the offline-grace deadline of any offline participant
+
+        The returned datetime is always timezone-aware (UTC).
+        """
+        candidates: list[datetime] = [self.expires_at()]
+        for tracker in self._inflight.values():
+            candidates.append(tracker.deadline)
+        grace = timedelta(seconds=self.config.offline_grace_seconds)
+        for p in self._participants.values():
+            if not p.online and p.last_online_at is not None:
+                candidates.append(p.last_online_at + grace)
+        return min(candidates)
+
     # --- activity tracking ---
 
     def bump_activity(self, *, at: datetime | None = None) -> None:
@@ -527,20 +549,41 @@ class Session:
             payload={"participant_id": pid, "reason": reason},
         )
 
-    def tick(self, *, now: datetime | None = None) -> None:
-        """Periodic housekeeping: close expired trackers and evict
-        offline-past-grace participants. Called by the registry's loop or
-        directly in tests. Synchronous; assumes single-threaded scheduling.
-        Must NOT be called while a tool call holds `self.lock` mid-await.
+    def detect_disconnects(self) -> bool:
+        """Cheap presence sweep: mark offline any participant whose
+        connection handle has died (silent client crash, transport
+        closed without explicit leave). Called by the registry on every
+        cycle so transitions to ``offline`` happen promptly even when
+        the session has no near-term heap deadline.
+
+        Returns ``True`` if any participant transitioned to offline —
+        the caller (registry) should re-push the session onto the heap
+        because ``next_deadline`` may have shortened to the new
+        ``offline_grace`` deadline.
         """
-        moment = now or _utcnow()
-        # 0. Detect handles that closed without an explicit leave/disconnect.
+        changed = False
         for pid, p in list(self._participants.items()):
             if not p.online or p.connection_ref is None:
                 continue
             handle: ConnectionHandle = p.connection_ref  # type: ignore[assignment]
             if not handle.is_alive():
                 self._mark_offline(pid)
+                changed = True
+        return changed
+
+    def tick(self, *, now: datetime | None = None) -> None:
+        """Periodic housekeeping: close expired trackers and evict
+        offline-past-grace participants. Called by the registry's loop
+        when this session's heap deadline fires. Synchronous; assumes
+        single-threaded scheduling. Must NOT be called while a tool call
+        holds ``self.lock`` mid-await.
+        """
+        moment = now or _utcnow()
+        # 0. Detect handles that closed without an explicit leave/disconnect.
+        #    The registry already runs detect_disconnects() each cycle, so
+        #    this is mostly a belt-and-braces check for callers (and tests)
+        #    that invoke ``tick`` directly.
+        self.detect_disconnects()
         # 1. Expired trackers
         expired_cids = [cid for cid, t in self._inflight.items() if t.is_expired(moment)]
         for cid in expired_cids:
