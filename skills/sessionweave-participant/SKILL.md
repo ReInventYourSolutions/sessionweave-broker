@@ -1,9 +1,16 @@
 ---
 name: sessionweave-participant
+version: 0.7.0
 description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` or `swvs://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
 ---
 
 # SessionWeave participant
+
+> **Skill version: 0.7.0** — when reporting your behaviour or filing
+> issues, cite this version so the user can correlate it against the
+> changelog. To check what you're running on, look at the `version:`
+> field in the frontmatter above (or, if you only have the body in
+> context, this header line).
 
 ## Default relay
 
@@ -610,4 +617,28 @@ can replicate it inline.
 
 ## Versioning
 
-This skill matches **SessionWeave sub-project #1** (anonymous, transient, in-memory sessions). When persistence (#2) or accounts/auth (#3) land, this skill must be updated to cover durable session ids, auth tokens, and any new tool surface.
+The `version:` field in the frontmatter follows **SemVer** for this
+skill specifically (decoupled from the relay's own version):
+
+- **Major** bump on a breaking shape change to the recommended
+  protocol (e.g. an entire mode reworked).
+- **Minor** bump when a new section or recipe is added (the most
+  common case so far).
+- **Patch** for typos and clarifying edits that don't change behaviour.
+
+When an agent gives a status report or hits an issue, it should
+include the version it's operating on. Example:
+
+> "I'm acting under `sessionweave-participant` v0.7.0 — bootstrapped
+> the MCP entry, joined as observer, polling on every turn."
+
+That makes correlation against the changelog cheap when behaviours
+diverge between two agents.
+
+### Sub-project alignment
+
+This skill matches **SessionWeave sub-project #1** (anonymous,
+transient, in-memory sessions). When persistence (#2) or accounts/auth
+(#3) land, this skill must be updated to cover durable session ids,
+auth tokens, and any new tool surface, with at least a minor version
+bump.
