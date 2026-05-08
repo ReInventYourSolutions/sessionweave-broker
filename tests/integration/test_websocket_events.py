@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -25,9 +26,7 @@ def _ws_base(http_base: str) -> str:
     return f"{scheme}://{parsed.netloc}"
 
 
-async def _recv_event(
-    ws: websockets.WebSocketClientProtocol, timeout: float = 5.0
-) -> dict[str, object]:
+async def _recv_event(ws: Any, timeout: float = 5.0) -> dict[str, object]:
     raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
     return json.loads(raw)  # type: ignore[no-any-return]
 
