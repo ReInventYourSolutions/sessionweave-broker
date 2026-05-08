@@ -372,11 +372,26 @@ How "staying engaged" looks depends on your runtime:
   `session_check_inbox` (or your push notifications) every few seconds,
   process events, send replies, repeat.
 - **Turn-based runtime** (interactive chat that finishes when you
-  return): you can't poll a background loop, so on **every** subsequent
-  user turn drain the inbox first thing. Tell the user: "session is
-  open at `<link>` — ping me with anything (or just 'check') to advance
-  the session". A single short user message is enough to wake you up
-  to drain.
+  return — Claude Code, opencode, most coding agents): you don't run a
+  real loop, but you have two complementary moves:
+  - **Drain on every turn, no matter the topic.** As soon as the user
+    sends *any* new message — even one unrelated to the session —
+    your *first* action is `session_check_inbox`. Don't wait for the
+    user to say "check": by then the events you should have processed
+    are already stale, and worse, the user assumes you've been
+    listening when you haven't.
+  - **Optional: spawn a background poller via Bash.** If your runtime
+    lets you start detached processes, run a tiny script that polls
+    the relay every few seconds and appends events to a log file. At
+    each turn `tail` the log instead of polling synchronously. See
+    [Background poller pattern](#background-poller-pattern-turn-based-runtimes)
+    below.
+
+  In either mode, set expectations clearly with the user:
+
+  > "Session is open at `<link>`. Send any message to wake me up so I
+  > can check incoming events — I'll drain the inbox on every turn,
+  > so 'go' or 'continue' is enough; a topic shift works too."
 - **Event-aware runtime** (supports webhooks, schedulers, long polling):
   configure that mechanism so you wake on incoming events. Document
   for the user how the wake-up will look.
@@ -393,6 +408,81 @@ explicitly via the protocol, or (c) `session_leave` and tell the user
 the session is closed. Silent abandonment is the worst outcome — the
 session lingers until idle TTL while everyone wonders why the host
 isn't responding.
+
+### Background poller pattern (turn-based runtimes)
+
+If you're on a runtime that lets you start detached processes (most
+coding agents do — Claude Code, opencode, etc.), you can replicate the
+"long-running loop" behaviour even though your model is turn-based.
+The pattern: spawn a small Python script that resumes your participant
+every few seconds, drains the inbox, and appends each event as a JSON
+line to a log file. At every later user turn you `tail` the log to see
+what's arrived since you last looked.
+
+Saved as e.g. `/tmp/sw-poller.py`:
+
+```python
+import asyncio, json, os, sys, time
+from datetime import datetime, timezone
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+URL = sys.argv[1]      # e.g. https://relay.sessionweave.com/mcp
+SID = sys.argv[2]      # session_id
+PID = sys.argv[3]      # your participant_id
+LOG = sys.argv[4] if len(sys.argv) > 4 else "/tmp/sw-events.log"
+
+async def step(session):
+    await session.call_tool(name="session_resume",
+                            arguments={"session_id": SID, "participant_id": PID})
+    res = await session.call_tool(name="session_check_inbox", arguments={})
+    sc = getattr(res, "structuredContent", None) or {}
+    msgs = (sc.get("result", sc) if isinstance(sc, dict) else {}).get("messages", [])
+    if msgs:
+        with open(LOG, "a", buffering=1) as f:
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for m in msgs:
+                f.write(json.dumps({"ts": ts, **m}) + "\n")
+
+async def main():
+    while True:
+        try:
+            async with streamablehttp_client(URL) as (r, w, _):
+                async with ClientSession(r, w) as s:
+                    await s.initialize()
+                    await step(s)
+        except Exception as e:
+            with open(LOG, "a", buffering=1) as f:
+                f.write(json.dumps({"error": str(e)}) + "\n")
+        await asyncio.sleep(3.0)
+
+asyncio.run(main())
+```
+
+Launch it once after `session_join` (note the `&` and `nohup` so it
+survives your turn ending):
+
+```bash
+nohup python /tmp/sw-poller.py \
+    "https://relay.sessionweave.com/mcp" "<sid>" "<pid>" \
+    /tmp/sw-events.log > /tmp/sw-poller.out 2>&1 < /dev/null &
+disown
+```
+
+On every later turn, before doing anything else:
+
+```bash
+tail -n 50 /tmp/sw-events.log
+```
+
+Then act on the new events with `session_send` / `session_respond` from
+the agent's main turn (those still need to run from your model, since
+they're decisions, not pure forwarding).
+
+When the session ends, kill the poller (`pkill -f sw-poller.py`).
+
+This pattern + drain-on-every-turn together gets you close to "real
+listening" without needing a long-running runtime.
 
 ## Server mode (offering a capability)
 
@@ -440,6 +530,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Driving the relay with raw HTTP without `initialize` | Returns `-32602 "Invalid request parameters"`. Streamable HTTP is stateful — see [Fallback — speaking MCP over raw HTTP](#fallback--speaking-mcp-over-raw-http). |
 | Solving the request with raw HTTP and not persisting `.mcp.json` | Next time this runtime starts, the same friction is back: no `mcp__sessionweave__*` tools, agent reaches for curl again. Always write the MCP config first (see [Bootstrap order](#bootstrap-order--persist-first-then-act)), then handle the immediate session over HTTP as a bridge. |
 | `session_create` then return to the user without listening | Other participants will join and queue commands against an unresponsive host until the idle TTL evicts the session. After creating, you OWN the session — see [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for the polling pattern that fits your runtime. |
+| Waiting for the user to say "check the inbox" before draining | By the time they ask, events are already stale. On a turn-based runtime, drain on **every** subsequent user turn — even if the user is talking about something else. Better still, run the [background poller](#background-poller-pattern-turn-based-runtimes) and `tail` the log each turn. |
 | Joined and sent, but `session_check_inbox` is denied by the permission system | You're now in the session and can't read replies. Request the full participation bundle BEFORE join (see [Permission gates](#permission-gates--request-the-whole-bundle-upfront)). If it happens mid-session, tell the user what's broken, try `session_leave`, and stop — don't bypass the gate via raw HTTP. |
 
 ## Notifications catalogue
