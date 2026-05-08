@@ -16,6 +16,7 @@ from sessionweave import __version__
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
+from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.http_api import routes as http_api_routes
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
@@ -241,7 +242,7 @@ def build_app() -> Starlette:
                 "name": "sessionweave",
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
-                "transports": ["mcp", "http"],
+                "transports": ["mcp", "http", "ws"],
             }
         )
 
@@ -263,6 +264,7 @@ def build_app() -> Starlette:
             Route("/v1/info", info),
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
+            *events_ws_routes(),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,
