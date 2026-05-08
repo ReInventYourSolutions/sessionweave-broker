@@ -303,18 +303,42 @@ class Session:
         self,
         participant_id: str,
         callback: Callable[[str, dict[str, Any]], None],
+        *,
+        recover: list[tuple[str, dict[str, Any]]] | None = None,
     ) -> None:
-        """Remove a previously-attached subscriber. Idempotent."""
+        """Remove a previously-attached subscriber. Idempotent.
+
+        ``recover`` carries any events that the subscriber had received
+        via its callback but could not actually deliver to its consumer
+        before disconnecting (typical: a WebSocket handler whose queue
+        held items while the socket closed). Those events are pushed
+        back onto the per-participant buffer so a subsequent REST
+        ``inbox/drain`` (or a fresh WS attach) recovers them — without
+        this, ``_deliver_or_buffer`` saw the callback succeed and never
+        wrote the event anywhere durable.
+        """
         async with self.lock:
             subs = self._subscribers.get(participant_id)
-            if not subs:
-                return
-            try:
-                subs.remove(callback)
-            except ValueError:
-                return
-            if not subs:
-                self._subscribers.pop(participant_id, None)
+            if subs:
+                try:
+                    subs.remove(callback)
+                except ValueError:
+                    pass
+                if not subs:
+                    self._subscribers.pop(participant_id, None)
+            if recover and participant_id in self._participants:
+                buf = self._buffer_for(participant_id)
+                for name, payload in recover:
+                    try:
+                        buf.enqueue({"_name": name, "_payload": payload})
+                    except BufferOverflow:
+                        # If the buffer is already full the participant is
+                        # clearly past its grace; let the normal eviction
+                        # path catch them on the next tick.
+                        self._enqueue_eviction(
+                            participant_id, reason="offline_timeout"
+                        )
+                        break
 
     # --- command lifecycle ---
 

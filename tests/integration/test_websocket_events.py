@@ -191,6 +191,77 @@ async def test_ws_replays_pending_buffer_on_attach() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_ws_recovers_undelivered_events_to_buffer_on_disconnect() -> None:
+    """If a broadcast fans out to a WS subscriber but the socket has
+    already gone away (the queue.get → send_json → disconnect race),
+    the events must end up in the per-participant buffer so a REST
+    drain (or a fresh WS attach) can still recover them. Without this
+    the subscriber callback succeeded silently and the event was lost.
+    """
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        sender = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+            )
+        ).json()
+        receiver = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants", json={"role": "receiver"}
+            )
+        ).json()
+        sender_h = {"Authorization": f"Bearer {sender['participant_token']}"}
+        receiver_h = {"Authorization": f"Bearer {receiver['participant_token']}"}
+
+        ws_url = (
+            f"{_ws_base(base)}/v1/sessions/{sid}/participants/me/events"
+            f"?token={receiver['participant_token']}"
+        )
+
+        # Open the WS, then close it abruptly *without* draining anything.
+        ws = await websockets.connect(ws_url)
+        await ws.close()
+        # Give the server a moment to tear down the subscriber.
+        await asyncio.sleep(0.2)
+
+        # Now broadcast. With the bug, the event would be delivered to
+        # the (already-orphaned) subscriber callback and lost; with the
+        # fix, the recover path puts it on the buffer.
+        send = await c.post(
+            f"/v1/sessions/{sid}/commands",
+            headers=sender_h,
+            json={
+                "dispatch": "specific",
+                "target": {"participant_ids": [receiver["participant_id"]]},
+                "payload": {"q": "after-flicker"},
+                "timeout_seconds": 30,
+            },
+        )
+        assert send.status_code == 201
+        cid = send.json()["command_id"]
+
+        # REST drain must surface the event. We retry briefly to absorb
+        # any teardown latency.
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            drain = await c.post(
+                f"/v1/sessions/{sid}/participants/me/inbox/drain",
+                headers=receiver_h,
+            )
+            names = [m["name"] for m in drain.json()["messages"]]
+            if "command.received" in names:
+                # And the command_id matches what we sent.
+                got = next(
+                    m for m in drain.json()["messages"] if m["name"] == "command.received"
+                )
+                assert got["payload"]["command_id"] == cid
+                break
+        else:
+            pytest.fail("event not recovered to the buffer after WS disconnect")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_ws_rejects_missing_token() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
         sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
