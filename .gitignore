@@ -14,3 +14,4 @@ htmlcov/
 # Local artefacts dropped in the repo root by tooling
 SessionWeave-handoff*.zip
 *.handoff.zip
+.claude/

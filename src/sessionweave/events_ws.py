@@ -87,21 +87,43 @@ async def events_ws(websocket: WebSocket) -> None:
         # falls back to the buffer.
         queue.put_nowait((name, payload))
 
+    # Items the callback had handed us but the socket failed to deliver
+    # before disconnect. detach_subscriber pushes them back to the
+    # per-participant buffer so a REST drain (or a fresh WS attach) can
+    # recover them — otherwise _deliver_or_buffer saw the callback
+    # succeed and never wrote the event anywhere durable.
+    undelivered: list[tuple[str, dict[str, Any]]] = []
+
     backlog = await session.attach_subscriber(pid, callback)
     try:
         for item in backlog:
-            await websocket.send_json(
-                {"name": item["name"], "payload": item["payload"]}
-            )
+            name = item["name"]
+            payload = item["payload"]
+            try:
+                await websocket.send_json({"name": name, "payload": payload})
+            except WebSocketDisconnect:
+                undelivered.append((name, payload))
+                raise
         while True:
             name, payload = await queue.get()
-            await websocket.send_json({"name": name, "payload": payload})
+            try:
+                await websocket.send_json({"name": name, "payload": payload})
+            except WebSocketDisconnect:
+                undelivered.append((name, payload))
+                raise
     except WebSocketDisconnect:
         pass
     except Exception:
         log.exception("WebSocket events handler crashed for session=%s pid=%s", sid, pid)
     finally:
-        await session.detach_subscriber(pid, callback)
+        # Drain anything the producer enqueued while we were tearing down.
+        while True:
+            try:
+                pending = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            undelivered.append(pending)
+        await session.detach_subscriber(pid, callback, recover=undelivered or None)
 
 
 def routes() -> list[WebSocketRoute]:
