@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -49,6 +50,7 @@ class Session:
         "_metrics",
         "_participants",
         "_picker",
+        "_subscribers",
         "config",
         "lock",
         "purpose",
@@ -69,6 +71,14 @@ class Session:
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
+        # Per-participant push subscribers (e.g. WebSocket events handlers).
+        # A subscriber is a sync callback ``(name: str, payload: dict) ->
+        # None`` invoked from inside ``_deliver_or_buffer`` while ``self.lock``
+        # is held — callbacks must not block on the lock or do heavy work.
+        # Typical implementation: ``queue.put_nowait`` on an asyncio queue.
+        self._subscribers: dict[
+            str, list[Callable[[str, dict[str, Any]], None]]
+        ] = {}
         self._picker = RoundRobinPicker()
         self._last_activity_at: datetime = now
         self._created_at: datetime = now
@@ -235,6 +245,55 @@ class Session:
                 for item in buf.drain()
             ]
 
+    async def attach_subscriber(
+        self,
+        participant_id: str,
+        callback: Callable[[str, dict[str, Any]], None],
+    ) -> list[dict[str, Any]]:
+        """Atomically drain pending buffered notifications and register a
+        live event callback. Returns the drained backlog as a list of
+        ``{"name": ..., "payload": ...}`` entries — the caller forwards
+        these over its transport before streaming subsequent live events.
+
+        The callback is invoked synchronously from inside
+        ``_deliver_or_buffer`` while ``self.lock`` is held. It must not
+        block on the lock or do significant work; the typical pattern is
+        ``queue.put_nowait`` on an ``asyncio.Queue``. If the callback
+        raises (e.g. queue is full), the event falls through to the
+        regular buffer so it isn't silently dropped.
+        """
+        async with self.lock:
+            if participant_id not in self._participants:
+                raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            buf = self._buffers.pop(participant_id, None)
+            backlog: list[dict[str, Any]] = (
+                [
+                    {"name": item["_name"], "payload": item["_payload"]}
+                    for item in buf.drain()
+                ]
+                if buf is not None
+                else []
+            )
+            self._subscribers.setdefault(participant_id, []).append(callback)
+            return backlog
+
+    async def detach_subscriber(
+        self,
+        participant_id: str,
+        callback: Callable[[str, dict[str, Any]], None],
+    ) -> None:
+        """Remove a previously-attached subscriber. Idempotent."""
+        async with self.lock:
+            subs = self._subscribers.get(participant_id)
+            if not subs:
+                return
+            try:
+                subs.remove(callback)
+            except ValueError:
+                return
+            if not subs:
+                self._subscribers.pop(participant_id, None)
+
     # --- command lifecycle ---
 
     async def send(
@@ -383,8 +442,24 @@ class Session:
                 self._connections.send(self.session_id, pid, name, payload)
                 return
             # Handle vanished or transport is dead: transition to offline
-            # before falling through to the buffer path.
+            # before falling through to the buffer/subscribers path.
             self._mark_offline(pid)
+        # WebSocket-style subscribers replace the buffer when present so we
+        # don't double-deliver. attach_subscriber drains the buffer atomically
+        # at attach-time, and detach_subscriber resumes buffering for events
+        # that arrive after disconnect. Subscriber failures fall through to
+        # the buffer so a slow consumer doesn't drop events silently.
+        subs = self._subscribers.get(pid)
+        if subs:
+            delivered = False
+            for cb in tuple(subs):
+                try:
+                    cb(name, payload)
+                    delivered = True
+                except Exception:
+                    pass
+            if delivered:
+                return
         try:
             buf = self._buffer_for(pid)
             buf.enqueue({"_name": name, "_payload": payload})
