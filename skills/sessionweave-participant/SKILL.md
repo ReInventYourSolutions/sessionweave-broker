@@ -301,12 +301,54 @@ print(link)  # hand THIS string to the user; nothing else needed
 - `all` — requires `target.role` or `target.capability`. Fans out to every match online.
 - `any` — requires `target.role` or `target.capability`. Picks one (round-robin).
 
+## After creating a session — stay engaged
+
+A session is **not a one-shot tool call**. Once you `session_create` +
+`session_join`, the relay considers you the active host: other
+participants will join, send commands, and expect you to react. If you
+hand the link to the user and stop there, the session goes silent and
+the join attempts queue up against an unresponsive party.
+
+Default behaviour, unless `purpose` says otherwise: **stay in the loop
+until the session ends**. End conditions are reaching the goal stated
+in `purpose`, the user telling you to leave, or `session.ended` /
+`participant.left` arriving on your inbox.
+
+How "staying engaged" looks depends on your runtime:
+
+- **Long-running runtime** (background process, persistent loop, headless
+  CLI like `claude -p`): run an actual loop. Drain
+  `session_check_inbox` (or your push notifications) every few seconds,
+  process events, send replies, repeat.
+- **Turn-based runtime** (interactive chat that finishes when you
+  return): you can't poll a background loop, so on **every** subsequent
+  user turn drain the inbox first thing. Tell the user: "session is
+  open at `<link>` — ping me with anything (or just 'check') to advance
+  the session". A single short user message is enough to wake you up
+  to drain.
+- **Event-aware runtime** (supports webhooks, schedulers, long polling):
+  configure that mechanism so you wake on incoming events. Document
+  for the user how the wake-up will look.
+
+Whatever the runtime, on the way out be explicit:
+
+> "I've created session `<id>` (link: `<swvs://...>`). I will stay
+> engaged until <end condition from purpose>. I'll drain the inbox on
+> every turn and respond to commands as they arrive."
+
+Hard rule: **don't `session_create` and immediately drop ownership.**
+Either (a) keep watching, (b) hand the host role to another participant
+explicitly via the protocol, or (c) `session_leave` and tell the user
+the session is closed. Silent abandonment is the worst outcome — the
+session lingers until idle TTL while everyone wonders why the host
+isn't responding.
+
 ## Server mode (offering a capability)
 
 1. **Open or join.** If you're starting fresh: `session_create` then tell the user the returned `session_id`. If they gave you one: skip ahead.
 2. **Advertise.** `session_join {session_id, role: "<service-name>", capabilities: ["<capX>", "<capY>"]}`. Capabilities are the strings clients will filter on.
 3. **Persist your `participant_id`.** You'll need it for `session_resume` on disconnect.
-4. **Listen.** The relay sends `command.received` notifications: `{command_id, sender_id, dispatch_mode, dispatched_to, payload, expires_at}`.
+4. **Listen.** The relay sends `command.received` notifications: `{command_id, sender_id, dispatch_mode, dispatched_to, payload, expires_at}`. See [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for how to keep the listening loop alive on your runtime.
 5. **Respond once per command.** Do the work, then `session_respond {command_id, status: "ok"|"error", payload: <result>}`. Respond before `expires_at` or you'll get `command_not_found`.
 
 ## Client mode (dispatching commands)
@@ -346,6 +388,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Treating session state as durable | State is in-memory only — restart of the relay loses everything. Idle sessions also expire after `idle_ttl_seconds` (default 30 min). |
 | Driving the relay with raw HTTP without `initialize` | Returns `-32602 "Invalid request parameters"`. Streamable HTTP is stateful — see [Fallback — speaking MCP over raw HTTP](#fallback--speaking-mcp-over-raw-http). |
 | Solving the request with raw HTTP and not persisting `.mcp.json` | Next time this runtime starts, the same friction is back: no `mcp__sessionweave__*` tools, agent reaches for curl again. Always write the MCP config first (see [Bootstrap order](#bootstrap-order--persist-first-then-act)), then handle the immediate session over HTTP as a bridge. |
+| `session_create` then return to the user without listening | Other participants will join and queue commands against an unresponsive host until the idle TTL evicts the session. After creating, you OWN the session — see [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for the polling pattern that fits your runtime. |
 
 ## Notifications catalogue
 
