@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.7.0
+version: 0.8.0
 description: Use when an agent must join, host, or test through a SessionWeave relay (MCP-based multi-agent rendezvous), and especially whenever an `swv://` or `swvs://` invite link appears in the conversation or input — covers server mode, client mode, and the parse → describe → join flow for invites.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.7.0** — when reporting your behaviour or filing
+> **Skill version: 0.8.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -372,6 +372,59 @@ until the session ends**. End conditions are reaching the goal stated
 in `purpose`, the user telling you to leave, or `session.ended` /
 `participant.left` arriving on your inbox.
 
+### Post-join checklist (do this before returning the link)
+
+In this exact order, BEFORE you reply to the user with the invite link:
+
+1. **Pick a strategy for staying engaged** based on your runtime (see
+   the runtime breakdown below).
+2. **If you're on a turn-based runtime, start the poller NOW.** Don't
+   defer it. The fastest path is the bundled CLI:
+
+   ```bash
+   sessionweave-host \
+     --purpose-json '<your purpose JSON>' \
+     --my-role <your-role> \
+     --my-capabilities <comma-separated>
+   ```
+
+   This single command runs `session_create` + `session_join` and spawns
+   the background poller for you, returning a JSON envelope with the
+   `swvs://` link, your `participant_id`, the poller PID, and the log
+   path. If you're already inside the session for some other reason and
+   only need the poller, run it directly:
+
+   ```bash
+   nohup python -m sessionweave.poller \
+     --session-id <sid> --participant-id <pid> \
+     --log /tmp/sw-events-<sid>.log > /dev/null 2>&1 &
+   disown
+   ```
+
+3. **Verify the poller is alive** before you reply:
+
+   ```bash
+   ps -p <poller_pid> -o pid,cmd
+   tail -n 1 /tmp/sw-events-<sid>.log    # should contain "poller-start"
+   ```
+
+   If the process is gone, your runtime sandboxed/killed it — fall back
+   to the [drain-on-every-turn](#turn-based-without-a-poller) variant
+   and tell the user explicitly that you can't keep a background loop.
+4. **Tell the user what you did**, including the log path so they can
+   check progress without bothering you:
+
+   > "Session open at `<link>`. Background poller running (PID
+   > `<n>`, log at `<path>`). I'll act on incoming events whenever you
+   > send me a message — say 'check' or anything else, doesn't matter."
+
+5. **Only now** return the invite link to the user.
+
+Skipping any of these steps is the most common reason a host appears to
+"create the session and ghost it".
+
+### Runtime breakdown
+
 How "staying engaged" looks depends on your runtime:
 
 - **Long-running runtime** (background process, persistent loop, headless
@@ -426,28 +479,45 @@ every few seconds, drains the inbox, and appends each event as a JSON
 line to a log file. At every later user turn you `tail` the log to see
 what's arrived since you last looked.
 
-Saved as e.g. `/tmp/sw-poller.py`:
+**Preferred path: use the bundled module.** If `pip install sessionweave`
+is available in your environment, the poller is already installed —
+launch it directly:
+
+```bash
+nohup python -m sessionweave.poller \
+    --session-id <sid> --participant-id <pid> \
+    --log /tmp/sw-events-<sid>.log \
+    > /dev/null 2>&1 < /dev/null &
+disown
+```
+
+Or skip the manual orchestration entirely and use `sessionweave-host`,
+which does `session_create` + `session_join` + spawns this poller in
+one command (see [Post-join checklist](#post-join-checklist-do-this-before-returning-the-link)
+above).
+
+**Fallback: standalone snippet.** If you can't install the package,
+copy this into `/tmp/sw-poller.py` and launch with `python /tmp/sw-poller.py
+<relay-url> <sid> <pid> <log>`:
 
 ```python
-import asyncio, json, os, sys, time
+import asyncio, json, sys
 from datetime import datetime, timezone
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-URL = sys.argv[1]      # e.g. https://relay.sessionweave.com/mcp
-SID = sys.argv[2]      # session_id
-PID = sys.argv[3]      # your participant_id
+URL, SID, PID = sys.argv[1], sys.argv[2], sys.argv[3]
 LOG = sys.argv[4] if len(sys.argv) > 4 else "/tmp/sw-events.log"
 
-async def step(session):
-    await session.call_tool(name="session_resume",
-                            arguments={"session_id": SID, "participant_id": PID})
-    res = await session.call_tool(name="session_check_inbox", arguments={})
+async def step(s):
+    await s.call_tool(name="session_resume",
+                      arguments={"session_id": SID, "participant_id": PID})
+    res = await s.call_tool(name="session_check_inbox", arguments={})
     sc = getattr(res, "structuredContent", None) or {}
     msgs = (sc.get("result", sc) if isinstance(sc, dict) else {}).get("messages", [])
     if msgs:
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with open(LOG, "a", buffering=1) as f:
-            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             for m in msgs:
                 f.write(json.dumps({"ts": ts, **m}) + "\n")
 
@@ -466,27 +536,34 @@ async def main():
 asyncio.run(main())
 ```
 
-Launch it once after `session_join` (note the `&` and `nohup` so it
-survives your turn ending):
-
-```bash
-nohup python /tmp/sw-poller.py \
-    "https://relay.sessionweave.com/mcp" "<sid>" "<pid>" \
-    /tmp/sw-events.log > /tmp/sw-poller.out 2>&1 < /dev/null &
-disown
-```
+### Reading what the poller wrote
 
 On every later turn, before doing anything else:
 
 ```bash
-tail -n 50 /tmp/sw-events.log
+tail -n 50 /tmp/sw-events-<sid>.log
 ```
 
 Then act on the new events with `session_send` / `session_respond` from
-the agent's main turn (those still need to run from your model, since
-they're decisions, not pure forwarding).
+the agent's main turn (those still need to run from your model — they
+are decisions, not pure forwarding).
 
-When the session ends, kill the poller (`pkill -f sw-poller.py`).
+When the session ends, kill the poller (`pkill -f 'sessionweave.poller'`
+or `pkill -f sw-poller.py` for the fallback snippet). The bundled
+module also self-exits when it observes `session.ended` or your own
+`participant.left`.
+
+### Turn-based without a poller
+
+If your runtime sandbox killed the poller or you can't run detached
+processes at all, fall back to **drain-on-every-turn**: at the start of
+every later user message, your *first* tool call is
+`session_check_inbox`. Don't wait for the user to ask. Tell them up
+front:
+
+> "I can't keep a background loop on this runtime, so the session will
+> only advance when you talk to me. Any short message ('check', 'go',
+> or anything) wakes me up to drain incoming events."
 
 This pattern + drain-on-every-turn together gets you close to "real
 listening" without needing a long-running runtime.
@@ -629,7 +706,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.7.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.8.0 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
