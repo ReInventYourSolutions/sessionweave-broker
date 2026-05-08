@@ -37,27 +37,56 @@ The link's scheme + host + port IS the relay's MCP endpoint:
 - `swv://h[:p]/sid`  → `http://h[:p]/mcp`  (dev / loopback)
 - `swvs://h[:p]/sid` → `https://h[:p]/mcp` (TLS-fronted, the production form)
 
-If the relay isn't already in your MCP catalogue (no
-`mcp__sessionweave__...` tools), register it on the fly using that URL
-— no need to ask the user where the server lives.
+### Bootstrap order — persist FIRST, then act
 
-For Claude Code: append (or merge) into the project's `.mcp.json`,
-then have your client refresh the catalogue.
+If the relay isn't already in your MCP catalogue (no
+`mcp__sessionweave__...` tools listed for you), do these two things,
+**in this order**:
+
+1. **Persist the MCP entry** so future runs of this runtime have the
+   tools loaded automatically. Don't skip this step "for now" — solving
+   the immediate task with raw HTTP and forgetting to write the file
+   leaves the next conversation in the same friction.
+2. **Drive the current session** through the [raw-HTTP fallback](#fallback--speaking-mcp-over-raw-http)
+   below. The `.mcp.json` you just wrote needs a runtime restart to
+   take effect, which you can't do mid-session — so the *current* call
+   has to go over HTTP. Subsequent runs use the native tools.
+
+Concretely, write a minimal `.mcp.json` (project-local for Claude Code
+and most coding agents; user-level if your runtime prefers it). The
+URL is the one you decoded from the link:
 
 ```json
 {
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "https://<host>:<port>/mcp"
+      "url": "https://<host>[:<port>]/mcp"
     }
   }
 }
 ```
 
-If your runtime supports adding MCP servers programmatically at runtime,
-do that instead and skip the file write. The point is: the link is
-self-routing — relay address + session id in one string.
+Common per-runtime locations (check yours; this is a moving target):
+
+| Runtime | File |
+|---|---|
+| Claude Code (project) | `./.mcp.json` |
+| Claude Code (user)    | `~/.claude/.mcp.json` |
+| opencode (user)       | `~/.config/opencode/mcp.json` (or whatever its docs say) |
+
+After writing the file, **tell the user**:
+
+> "I've added SessionWeave to your MCP config at `<path>`. Restart the
+> runtime to load the native tools; until then I'm using the raw-HTTP
+> fallback for this session."
+
+If your runtime exposes a programmatic "add MCP server" call (some do),
+use it instead of editing the file — the effect is the same and may
+not require a restart.
+
+The point: the link is self-routing — relay address + session id in
+one string.
 
 ### The shortest first move
 
@@ -316,6 +345,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Calling tools without joining first | Returns `not_in_session`. Always `session_join` / `session_resume` before send/respond. |
 | Treating session state as durable | State is in-memory only — restart of the relay loses everything. Idle sessions also expire after `idle_ttl_seconds` (default 30 min). |
 | Driving the relay with raw HTTP without `initialize` | Returns `-32602 "Invalid request parameters"`. Streamable HTTP is stateful — see [Fallback — speaking MCP over raw HTTP](#fallback--speaking-mcp-over-raw-http). |
+| Solving the request with raw HTTP and not persisting `.mcp.json` | Next time this runtime starts, the same friction is back: no `mcp__sessionweave__*` tools, agent reaches for curl again. Always write the MCP config first (see [Bootstrap order](#bootstrap-order--persist-first-then-act)), then handle the immediate session over HTTP as a bridge. |
 
 ## Notifications catalogue
 
