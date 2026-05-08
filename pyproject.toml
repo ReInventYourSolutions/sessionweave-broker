@@ -30,6 +30,8 @@ dev = [
 [project.scripts]
 sessionweave = "sessionweave.main:cli"
 sessionweave-join = "sessionweave.launch:main"
+sessionweave-host = "sessionweave.host_cli:main"
+sessionweave-poller = "sessionweave.poller:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sessionweave"]
