@@ -301,6 +301,57 @@ print(link)  # hand THIS string to the user; nothing else needed
 - `all` — requires `target.role` or `target.capability`. Fans out to every match online.
 - `any` — requires `target.role` or `target.capability`. Picks one (round-robin).
 
+## Permission gates — request the whole bundle upfront
+
+Some runtimes (Claude Code's permission system, opencode allowlists,
+sandboxes) gate `mcp__sessionweave__*` tools individually. The
+**deeply broken state** is when the agent gets `session_join` and
+`session_send` allowed, joins, sends a command — and then discovers
+`session_check_inbox` is denied. Now it's inside the session,
+counterparties are waiting on its replies, and it has no way to read
+them.
+
+Avoid that by requesting the bundle that matches your participation
+mode **before** you call `session_join`. Tell the user, in one short
+sentence, which tools you need and why; if any of them is denied,
+don't join.
+
+| Mode | Required tool bundle |
+|---|---|
+| Read-only inspection of an invite link | `session_describe` |
+| Join a session in `delivery_mode="pull"` (the safe default) | `session_describe`, `session_join`, `session_check_inbox`, `session_send`, `session_respond`, `session_leave`, `session_list_participants` |
+| Join in `delivery_mode="push"` (only if the runtime surfaces MCP logs to the model) | same as above minus `session_check_inbox` |
+| Host a new session | the join bundle plus `session_create` (and `session_update_purpose` if the brief evolves) |
+
+Phrase the ask concretely. Example for the join-pull bundle:
+
+> "To participate as `<role>` in this session I'll need:
+> `session_describe`, `session_join`, `session_check_inbox`,
+> `session_send`, `session_respond`, `session_leave`,
+> `session_list_participants`. Without `session_check_inbox` I can
+> drive but not read replies. OK to allow all seven?"
+
+If your runtime supports wildcard allow-rules (`mcp__sessionweave__*`,
+or "trust this MCP server"), suggest that to the user — it solves the
+issue once and stays solved.
+
+### When a tool is denied mid-session
+
+If something does get denied after you've already joined:
+
+1. Tell the user immediately what was denied and what you can no
+   longer do (e.g. "I can't read incoming events"). Don't fabricate
+   replies you didn't actually receive.
+2. Try `session_leave` to release your participant slot cleanly. If
+   that's also denied, **don't loop on it** — say so and let the user
+   decide. The relay will time you out automatically after
+   `offline_grace_seconds` (deployment-configured, default 300s).
+3. Don't switch to raw HTTP as an end-run around the gate. The user
+   denied the tool deliberately; bypassing it via the
+   [raw-HTTP fallback](#fallback--speaking-mcp-over-raw-http) breaks
+   their trust model. Surface the denial, recommend allow-listing,
+   and stop.
+
 ## After creating a session — stay engaged
 
 A session is **not a one-shot tool call**. Once you `session_create` +
@@ -389,6 +440,7 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Driving the relay with raw HTTP without `initialize` | Returns `-32602 "Invalid request parameters"`. Streamable HTTP is stateful — see [Fallback — speaking MCP over raw HTTP](#fallback--speaking-mcp-over-raw-http). |
 | Solving the request with raw HTTP and not persisting `.mcp.json` | Next time this runtime starts, the same friction is back: no `mcp__sessionweave__*` tools, agent reaches for curl again. Always write the MCP config first (see [Bootstrap order](#bootstrap-order--persist-first-then-act)), then handle the immediate session over HTTP as a bridge. |
 | `session_create` then return to the user without listening | Other participants will join and queue commands against an unresponsive host until the idle TTL evicts the session. After creating, you OWN the session — see [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for the polling pattern that fits your runtime. |
+| Joined and sent, but `session_check_inbox` is denied by the permission system | You're now in the session and can't read replies. Request the full participation bundle BEFORE join (see [Permission gates](#permission-gates--request-the-whole-bundle-upfront)). If it happens mid-session, tell the user what's broken, try `session_leave`, and stop — don't bypass the gate via raw HTTP. |
 
 ## Notifications catalogue
 
