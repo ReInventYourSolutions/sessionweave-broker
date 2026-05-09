@@ -1,0 +1,535 @@
+openapi: 3.0.3
+info:
+  title: SessionWeave Relay
+  version: "0.10.1"
+  description: |
+    SessionWeave is a transport-agnostic rendezvous for multi-agent
+    collaboration. The relay brokers messages between participants
+    inside named **sessions** without holding any agent's history.
+
+    This document describes the **REST surface** at `/v1/...` plus the
+    WebSocket events stream. The relay also exposes an MCP catalogue
+    at `/mcp` that mirrors every endpoint here as a tool — see the
+    repo README for the MCP-side contract.
+
+    **Auth (sub-project #1):** the bearer token IS the `participant_id`
+    returned on join. Send as `Authorization: Bearer <participant_id>`
+    on every authenticated route, or as the `?token=…` query parameter
+    on the WebSocket upgrade. Sub-project #3 will swap this for a JWT
+    without changing the surface.
+
+    Source: <https://github.com/ReInventYourSolutions/sessionweave-broker>
+  contact:
+    name: SessionWeave
+    url: https://sessionweave.com
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://relay.sessionweave.com
+    description: Hosted production relay
+  - url: http://127.0.0.1:8765
+    description: Local dev relay (default port from `sessionweave --host 127.0.0.1 --port 8765`)
+
+tags:
+  - name: meta
+    description: Health and discovery
+  - name: sessions
+    description: Session lifecycle
+  - name: participants
+    description: Participant lifecycle (join / leave / drain)
+  - name: commands
+    description: Dispatch and respond
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token (= `participant_id` in sub-project #1) returned by
+        `POST /v1/sessions/{sid}/participants`.
+
+  schemas:
+    Purpose:
+      type: object
+      description: Session purpose JSON; max 16 KiB. Schema is open by design.
+      example:
+        kind: tic-tac-toe-v1
+        your_role: O
+        instructions: X moves first; reply via session_respond, then send your move.
+      additionalProperties: true
+
+    SessionConfig:
+      type: object
+      properties:
+        max_participants: { type: integer, example: 16 }
+        max_payload_bytes: { type: integer, example: 262144 }
+        idle_ttl_seconds: { type: integer, example: 1800 }
+        default_command_timeout_seconds: { type: integer, example: 60 }
+        max_command_timeout_seconds: { type: integer, example: 300 }
+        offline_grace_seconds: { type: integer, example: 300 }
+        max_pending_notifications_per_participant: { type: integer, example: 1000 }
+
+    ParticipantPublic:
+      type: object
+      properties:
+        participant_id: { type: string, format: uuid }
+        role: { type: string, nullable: true, example: worker }
+        objective: { type: string, nullable: true }
+        capabilities:
+          type: array
+          items: { type: string }
+          example: [respond, echo]
+        metadata:
+          type: object
+          additionalProperties: true
+        joined_at: { type: string, format: date-time }
+        online: { type: boolean }
+
+    Session:
+      type: object
+      properties:
+        session_id: { type: string, format: uuid }
+        expires_at: { type: string, format: date-time }
+        config:
+          $ref: '#/components/schemas/SessionConfig'
+        purpose:
+          $ref: '#/components/schemas/Purpose'
+          nullable: true
+        roster:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParticipantPublic'
+
+    JoinRequest:
+      type: object
+      properties:
+        role: { type: string, example: worker }
+        objective: { type: string, example: "respond to incoming questions" }
+        capabilities:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+        delivery_mode:
+          type: string
+          enum: [push, pull]
+          description: Ignored on REST joins (always pull); honoured on MCP joins.
+
+    JoinResponse:
+      type: object
+      properties:
+        participant_id: { type: string, format: uuid }
+        participant_token:
+          type: string
+          format: uuid
+          description: |
+            The bearer token to use on subsequent authenticated calls.
+            Equal to `participant_id` in sub-project #1.
+        role: { type: string, nullable: true }
+        session_id: { type: string, format: uuid }
+
+    Target:
+      type: object
+      description: |
+        Recipient filter. With `dispatch=specific`, set
+        `participant_ids`; with `all` / `any`, set at least one of
+        `role` / `capability`.
+      properties:
+        participant_ids:
+          type: array
+          items: { type: string, format: uuid }
+        role: { type: string }
+        capability: { type: string }
+
+    SendCommandRequest:
+      type: object
+      required: [dispatch, target, payload]
+      properties:
+        dispatch:
+          type: string
+          enum: [specific, all, any]
+        target:
+          $ref: '#/components/schemas/Target'
+        payload:
+          type: object
+          additionalProperties: true
+          description: Free-form command body, capped at `max_payload_bytes`.
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          description: Clamped to `max_command_timeout_seconds`.
+
+    SendCommandResponse:
+      type: object
+      properties:
+        command_id: { type: string, format: uuid }
+        delivered_to:
+          type: array
+          items: { type: string, format: uuid }
+
+    RespondCommandRequest:
+      type: object
+      required: [status, payload]
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        payload:
+          type: object
+          additionalProperties: true
+
+    InboxEvent:
+      type: object
+      properties:
+        name:
+          type: string
+          enum:
+            - participant.joined
+            - participant.updated
+            - participant.left
+            - command.received
+            - command.cancelled
+            - result.received
+            - command.completed
+            - session.purpose_updated
+            - session.ended
+        payload:
+          type: object
+          additionalProperties: true
+
+    InboxDrainResponse:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxEvent'
+
+    LeaveRequest:
+      type: object
+      description: Optional body on DELETE /participants/me.
+      properties:
+        feedback:
+          type: object
+          description: |
+            Structured exit report (4 KiB cap). Skill v0.11.0+ makes
+            this part of the standard close-out flow. The relay
+            propagates it on the broadcast `participant.left` event.
+          additionalProperties: true
+          example:
+            summary: echo handled 2 commands cleanly
+            rating: 5
+            issues: []
+            metrics:
+              commands_received: 2
+              commands_responded: 2
+
+    UpdatePurposeRequest:
+      type: object
+      properties:
+        purpose:
+          $ref: '#/components/schemas/Purpose'
+          nullable: true
+
+    UpdateSelfRequest:
+      type: object
+      properties:
+        role: { type: string }
+        objective: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum:
+                - session_not_found
+                - participant_not_found
+                - command_not_found
+                - not_in_session
+                - already_in_session
+                - session_full
+                - already_responded
+                - not_a_recipient
+                - payload_too_large
+                - invalid_dispatch_filters
+                - invalid_targets
+                - invalid_config
+                - validation_error
+            message:
+              type: string
+
+paths:
+  /v1/info:
+    get:
+      tags: [meta]
+      summary: Relay name, version, transport list
+      responses:
+        '200':
+          description: Always 200 while the relay is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, example: sessionweave }
+                  version: { type: string, example: "0.10.1" }
+                  subproject: { type: string }
+                  transports:
+                    type: array
+                    items: { type: string, enum: [mcp, http, ws] }
+
+  /v1/sessions:
+    post:
+      tags: [sessions]
+      summary: Create a session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                purpose:
+                  $ref: '#/components/schemas/Purpose'
+                config:
+                  $ref: '#/components/schemas/SessionConfig'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          description: validation_error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/sessions/{sid}:
+    parameters:
+      - name: sid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [sessions]
+      summary: Describe a session (read-only)
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '404':
+          description: session_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/sessions/{sid}/purpose:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [sessions]
+      summary: Update the session's `purpose` (broadcasts session.purpose_updated)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdatePurposeRequest' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { description: not_in_session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/sessions/{sid}/participants:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [participants]
+      summary: Join a session
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinRequest' }
+      responses:
+        '201':
+          description: Joined
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JoinResponse' }
+        '404':
+          description: session_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: session_full
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    get:
+      tags: [participants]
+      summary: List the session roster
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Roster
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roster:
+                    type: array
+                    items: { $ref: '#/components/schemas/ParticipantPublic' }
+        '401':
+          description: not_in_session
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/sessions/{sid}/participants/me:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [participants]
+      summary: Update your participant record (broadcasts participant.updated)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateSelfRequest' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantPublic' }
+    delete:
+      tags: [participants]
+      summary: Leave the session — optionally with structured `feedback`
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LeaveRequest' }
+      responses:
+        '204':
+          description: Left
+        '413':
+          description: payload_too_large (feedback over 4 KiB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/sessions/{sid}/participants/me/inbox/drain:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [participants]
+      summary: Drain pending events for the calling participant
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Events
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxDrainResponse' }
+        '401':
+          description: not_in_session
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/sessions/{sid}/participants/me/events:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - name: token
+        in: query
+        required: true
+        schema: { type: string, format: uuid }
+        description: |
+          Bearer token (== participant_id in sub-project #1). Required
+          here because browsers can't set custom headers on a WebSocket
+          upgrade.
+    get:
+      tags: [participants]
+      summary: WebSocket events stream — upgrade to wss/ws
+      description: |
+        Each frame is one JSON object `{"name": "<event>", "payload":
+        {...}}` matching the inbox-drain schema. The relay drains any
+        pending buffered events at attach time and forwards them over
+        the socket before the live stream begins.
+
+        On disconnect, in-flight events the relay had handed to the
+        WS subscriber but couldn't actually deliver are pushed back to
+        the per-participant buffer; reconnect or call `inbox/drain` to
+        recover.
+      responses:
+        '101':
+          description: Switching Protocols (WebSocket upgrade)
+
+  /v1/sessions/{sid}/commands:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [commands]
+      summary: Dispatch a command
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendCommandRequest' }
+      responses:
+        '201':
+          description: Dispatched
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendCommandResponse' }
+        '413':
+          description: payload_too_large
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: invalid_dispatch_filters / invalid_targets
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/sessions/{sid}/commands/{cid}/responses:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: cid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [commands]
+      summary: Respond to a command
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RespondCommandRequest' }
+      responses:
+        '201':
+          description: Recorded
+        '404':
+          description: command_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: already_responded
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: not_a_recipient
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

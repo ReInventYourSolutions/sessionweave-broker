@@ -23,14 +23,20 @@ The relay only brokers messages. It never holds an agent's history.
 ## Why
 
 Today, getting two agents to collaborate means custom plumbing on both sides.
-SessionWeave gives every MCP-capable agent the same primitive: open a session,
+SessionWeave gives any HTTP-capable agent the same primitive: open a session,
 share what you choose to share, ignore everything else.
 
-- **MCP-native** — the only thing an agent needs is an MCP client.
+- **Three transports, one contract** — pick whatever fits your runtime: a REST
+  surface (`/v1/...`), a WebSocket events stream (`wss://.../events?token=…`),
+  or MCP tool calls (`/mcp`). Every transport speaks the same protocol.
 - **Local context, shared session** — agents keep their own state; only what
   they explicitly send becomes session-visible.
 - **Anonymous baseline, registered upgrades** — anyone can spin up a session
   anonymously today; persistence and richer services land in later sub-projects.
+
+The relay is in production at [`relay.sessionweave.com`](https://relay.sessionweave.com)
+(version surfaced at `GET /v1/info`). The Python client SDK lives in the
+[client repo's `SDK/python/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python).
 
 ## Quick start
 
@@ -50,10 +56,16 @@ docker run --rm -p 8765:8765 sessionweave:dev
 
 The relay exposes:
 
-- `POST /mcp` — MCP Streamable HTTP endpoint for agents
+- **REST** — `/v1/sessions`, `/v1/sessions/{sid}/...` — full CRUD over the protocol
+- **WebSocket** — `/v1/sessions/{sid}/participants/me/events?token=<bearer>` — live event stream
+- **MCP** — `POST /mcp` — Streamable HTTP endpoint with the same tool catalogue
+- `GET /v1/info` — name, version, transports list
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)
+
+See the [REST + WS surface](#rest--websocket-surface) section below for the
+endpoint catalogue. The MCP tool catalogue is documented further down.
 
 ## Talking to the relay (Python MCP client)
 
@@ -131,6 +143,72 @@ Legacy links carrying a base64url JSON fragment
 (`swv://h:p/<sid>#<blob>`) are still understood by `parse_link`
 (`inv.purpose` populated from the fragment) for backward compatibility.
 New code should not emit them: keep the briefing on the server.
+
+## REST + WebSocket surface
+
+For runtimes without MCP support, drive the relay through plain HTTP.
+The contract is one-for-one with the MCP tools.
+
+| Verb | Path | Purpose |
+|------|------|---------|
+| `GET` | `/v1/info` | Relay name, version, transports list |
+| `POST` | `/v1/sessions` | Create a session (`purpose`, `config`) |
+| `GET` | `/v1/sessions/{sid}` | Describe a session (read-only) |
+| `PATCH` | `/v1/sessions/{sid}/purpose` | Update the purpose (auth required) |
+| `POST` | `/v1/sessions/{sid}/participants` | Join — returns `participant_id` + `participant_token` |
+| `GET` | `/v1/sessions/{sid}/participants` | Roster (auth required) |
+| `PATCH` | `/v1/sessions/{sid}/participants/me` | Update self (role / capabilities / metadata) |
+| `DELETE` | `/v1/sessions/{sid}/participants/me` | Leave; optional JSON body with `feedback` |
+| `POST` | `/v1/sessions/{sid}/participants/me/inbox/drain` | Pop buffered events |
+| `POST` | `/v1/sessions/{sid}/commands` | Dispatch a command (`specific` / `all` / `any`) |
+| `POST` | `/v1/sessions/{sid}/commands/{cid}/responses` | Respond to a command |
+| `WS` | `/v1/sessions/{sid}/participants/me/events?token=…` | Live event stream |
+
+Auth (sub-project #1): the bearer token IS the `participant_id` returned
+on join. Send as `Authorization: Bearer <participant_id>` on every
+authenticated route, or as `?token=…` on the WS upgrade. Sub-project #3
+will swap this for a JWT without changing the surface.
+
+REST joiners are pull-mode by definition; pair with the WS endpoint for
+push delivery, or poll `inbox/drain`. Each WS frame is a single JSON
+object `{"name": "<event>", "payload": {...}}` matching the
+`inbox/drain` schema.
+
+```bash
+RELAY=https://relay.sessionweave.com
+
+# Create + join + send + drain
+SID=$(curl -sS -X POST "$RELAY/v1/sessions" -H 'content-type: application/json' \
+  -d '{"purpose":{"kind":"smoke"}}' | jq -r .session_id)
+TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
+  -H 'content-type: application/json' -d '{"role":"observer"}' | jq -r .participant_token)
+curl -sS -X POST "$RELAY/v1/sessions/$SID/commands" \
+  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"dispatch":"all","target":{"capability":"respond"},"payload":{"q":"hi"}}'
+curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
+  -H "authorization: Bearer $TOK"
+```
+
+The Python SDK in [`EnzinoBB/SessionWeave/SDK/python/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python)
+wraps every endpoint with typed exceptions and an async event stream.
+
+### Exit feedback (mandatory convention, relay 0.10.0+)
+
+`session_leave` (MCP) and `DELETE /v1/sessions/{sid}/participants/me` (REST)
+both accept an optional `feedback` parameter — a free-form JSON object
+(4 KiB cap) describing how the session went from the leaver's side.
+The relay propagates it on the `participant.left` event so the host
+collects per-worker exit reports without instrumenting the workers
+themselves. Recommended shape (per skill v0.11.0+):
+
+```json
+{
+  "summary": "echo handled 2 commands cleanly",
+  "rating": 5,
+  "issues": [],
+  "metrics": {"commands_received": 2, "commands_responded": 2}
+}
+```
 
 ## MCP tool surface
 
@@ -234,20 +312,47 @@ that's expected.
 
 ## Setting up an agent
 
-To make a Claude Code (or any MCP-capable) agent participate, do three
-things:
+Two paths — pick whichever matches your runtime.
 
-### 1. Register the relay in MCP
+### Path A — Python SDK (recommended for non-MCP runtimes)
 
-Drop a `.mcp.json` next to the project the agent works in, or merge into
-the user-level config:
+```bash
+pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/python'
+```
+
+```python
+import asyncio
+from sessionweave_client import SessionWeaveClient
+
+async def main():
+    async with SessionWeaveClient() as c:           # default: relay.sessionweave.com
+        sess = await c.create_session(purpose={"kind": "demo"})
+        me = await c.join(sess["session_id"], role="worker", capabilities=["respond"])
+        async with me.events() as stream:           # live WS push
+            async for evt in stream:
+                if evt.name == "command.received":
+                    await me.respond(evt.payload["command_id"], payload={"a": "..."})
+                    break
+        await me.leave(feedback={"summary": "ok", "rating": 5})
+
+asyncio.run(main())
+```
+
+Vendor-neutral examples (Anthropic, OpenAI, plain) live under
+[`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
+For other languages, point any HTTP+WS client at the
+[REST + WebSocket surface](#rest--websocket-surface) above.
+
+### Path B — MCP integration (Claude Code, opencode, etc.)
+
+If your runtime already speaks MCP, register the relay in `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
+      "url": "https://relay.sessionweave.com/mcp"
     }
   }
 }
@@ -258,7 +363,7 @@ Restart the client so the catalog refreshes. The tools appear as
 `claude -p` invocations pass `--mcp-config <file>` and an
 `--allowedTools mcp__sessionweave__...` allowlist.
 
-### 2. Install the participation skill
+### Path B (cont.) — Install the participation skill
 
 The skill lives in the client repo
 [`EnzinoBB/SessionWeave`](https://github.com/EnzinoBB/SessionWeave/tree/main/skills/sessionweave-participant).
@@ -284,7 +389,7 @@ curl -fsSL \
 A symlink against a clone keeps the skill in sync with future client-repo
 updates.
 
-### 3. Install the Python helper + `sessionweave-join` CLI
+### Path B (cont.) — Install the Python helper + `sessionweave-join` CLI
 
 Install the package in a venv. This gives the agent both the importable
 helpers (`sessionweave.invite.parse_link` / `create_link`) and the
@@ -314,10 +419,15 @@ Once these three are in place an agent can:
 Each sub-project gets its own design spec under `docs/superpowers/specs/` and
 its own implementation plan.
 
-1. **MCP core + session relay** — anonymous, transient sessions. *Implemented.*
-   Design: [`docs/superpowers/specs/2026-05-06-mcp-core-session-relay-design.md`][spec].
+1. **MCP core + session relay** — anonymous, transient sessions. *Implemented
+   and deployed at* `relay.sessionweave.com`. Design:
+   [`docs/superpowers/specs/2026-05-06-mcp-core-session-relay-design.md`][spec].
+   The original spec covered MCP only; subsequent additions (REST surface,
+   WebSocket events, exit feedback, heap-driven eviction, disconnect
+   recovery) extended it without breaking backwards compatibility.
 2. **Session persistence** — DB-backed sessions, participants, messages.
-3. **User accounts + auth** — bind sessions to a user; gate premium services.
+3. **User accounts + auth** — bind sessions to a user (replace the
+   bearer-as-`participant_id` shape with a JWT); gate premium services.
 4. **Web dashboard** — read-only over the user's sessions, then management.
 5. **Persistent shared context** — first registered-only service.
 6. **Additional services** — storage, analysis tools, etc., added on demand.
