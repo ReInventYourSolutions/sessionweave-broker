@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.11.0
+version: 0.12.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.11.0** — when reporting your behaviour or filing
+> **Skill version: 0.12.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -313,6 +313,16 @@ Two consumption patterns; pick the one your transport allows:
 - **Pull** — events accumulate in the per-participant buffer; you drain with `POST /v1/sessions/{sid}/participants/me/inbox/drain` (REST) or `session_check_inbox` (MCP). Use if your runtime is request/response only or doesn't surface push notifications to the model. **All HTTP REST clients are pull-mode by definition** — REST has no persistent transport for server-pushed events; pair it with the WS endpoint if you want push.
 
 When joining through MCP, set this explicitly: `delivery_mode: "push"` (the default — uses LoggingMessageNotification) or `delivery_mode: "pull"`. REST joiners are always pull, regardless of body argument.
+
+> **Practical note on MCP `delivery_mode="pull"`** — observed in
+> multi-agent tests with smaller free-tier models: even when the
+> relay correctly buffers events, some models don't reliably parse
+> the JSON-shaped `session_check_inbox` response and fail to call
+> `session_respond`. **Default to `"push"` for MCP-driven workers.**
+> Only flip to `"pull"` if your runtime can't surface
+> `notifications/message` log entries to the model (rare). REST/SDK
+> clients should pair pull with the WS events endpoint when push
+> matters.
 
 In pull mode the receive pattern is: do work → drain → handle events → repeat.
 
@@ -702,7 +712,7 @@ listening" without needing a long-running runtime.
 ## Server mode (offering a capability)
 
 1. **Open or join.** If you're starting fresh: `session_create` then tell the user the returned `session_id`. If they gave you one: skip ahead.
-2. **Advertise.** `session_join {session_id, role: "<service-name>", capabilities: ["<capX>", "<capY>"]}`. Capabilities are the strings clients will filter on.
+2. **Advertise.** `session_join {session_id, role: "<service-name>", capabilities: ["<capX>", "<capY>"]}`. **ALWAYS pass `role` AND `capabilities` explicitly** — they're nominally optional but downstream `dispatch="all" / "any"` filtering relies on them, and observed behaviour with smaller models shows the optional args get dropped silently when not stressed in the prompt. If you have nothing meaningful to advertise, pick a generic role like `"observer"` and capabilities `["respond"]`. Capabilities are the strings clients will filter on.
 3. **Persist your `participant_id`.** You'll need it for `session_resume` on disconnect.
 4. **Listen.** The relay sends `command.received` notifications: `{command_id, sender_id, dispatch_mode, dispatched_to, payload, expires_at}`. See [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for how to keep the listening loop alive on your runtime.
 5. **Respond once per command.** Do the work, then `session_respond {command_id, status: "ok"|"error", payload: <result>}`. Respond before `expires_at` or you'll get `command_not_found`.
@@ -716,9 +726,18 @@ listening" without needing a long-running runtime.
    - Any matching server: `dispatch="any"`, `target.capability="<cap>"`.
    - All matching: `dispatch="all"`, `target.role="<role>"` (fan-out).
    Optionally `timeout_seconds` (clamped to deployment bounds).
+
+   > **Practical note** — when you have a known set of recipients
+   > already in the roster, prefer `dispatch="specific"` with explicit
+   > `participant_ids` over `dispatch="all" + target.capability=…`.
+   > Multi-agent tests showed that smaller models occasionally drop
+   > the `capabilities` arg on join, which would silently exclude
+   > those workers from a capability-filtered broadcast. Pinning the
+   > `participant_ids` makes delivery deterministic.
 4. **Watch notifications.**
    - `result.received` — one per responder, `{command_id, responder_id, status, payload}`.
-   - `command.completed` — terminal: `reason` is `all_responded` or `ttl_expired`. Only at this point are all results in.
+   - `command.cancelled` — sent to recipients that haven't responded by deadline (`reason: ttl_expired`) or whose sender left mid-flight (`reason: sender_gone`). **Server-mode workers must accept this and stop processing the command** — there's no point responding after cancellation.
+   - `command.completed` — terminal, sent to the SENDER: `reason` is `all_responded` or `ttl_expired`. Only at this point are all results in.
 
 ## Exit feedback (mandatory)
 
@@ -907,7 +926,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.11.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.12.0 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
