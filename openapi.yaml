@@ -17,8 +17,6 @@ info:
     on every authenticated route, or as the `?token=…` query parameter
     on the WebSocket upgrade. Sub-project #3 will swap this for a JWT
     without changing the surface.
-
-    Source: <https://github.com/ReInventYourSolutions/sessionweave-broker>
   contact:
     name: SessionWeave
     url: https://sessionweave.com
