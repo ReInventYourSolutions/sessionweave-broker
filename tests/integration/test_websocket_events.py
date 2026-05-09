@@ -262,6 +262,69 @@ async def test_ws_recovers_undelivered_events_to_buffer_on_disconnect() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_ws_subscriber_receives_command_cancelled_on_ttl_expiry() -> None:
+    """When a command's TTL expires, pending recipients must receive
+    ``command.cancelled`` over their live transport (here: WS).
+
+    Regression: prior to the deadline-shortening callback the registry
+    heap kept the original idle-TTL deadline and never woke the
+    session's tick to fire the cancellation.
+    """
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        sender = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+            )
+        ).json()
+        receiver = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants", json={"role": "recv"}
+            )
+        ).json()
+
+        ws_url = (
+            f"{_ws_base(base)}/v1/sessions/{sid}/participants/me/events"
+            f"?token={receiver['participant_token']}"
+        )
+        async with websockets.connect(ws_url) as ws:
+            send = await c.post(
+                f"/v1/sessions/{sid}/commands",
+                headers={"Authorization": f"Bearer {sender['participant_token']}"},
+                json={
+                    "dispatch": "specific",
+                    "target": {"participant_ids": [receiver["participant_id"]]},
+                    "payload": {},
+                    "timeout_seconds": 2,
+                },
+            )
+            assert send.status_code == 201
+            cid = send.json()["command_id"]
+
+            # Drain frames until we either see command.cancelled or the
+            # 6 s budget runs out (covers TTL=2 + tick + transit).
+            saw_cancel = False
+            deadline = asyncio.get_event_loop().time() + 6.0
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=max(0.1, deadline - asyncio.get_event_loop().time())
+                    )
+                except TimeoutError:
+                    break
+                msg = json.loads(raw)
+                if (
+                    msg["name"] == "command.cancelled"
+                    and msg["payload"]["command_id"] == cid
+                    and msg["payload"]["reason"] == "ttl_expired"
+                ):
+                    saw_cancel = True
+                    break
+            assert saw_cancel, "command.cancelled (ttl_expired) never reached the WS subscriber"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_ws_rejects_missing_token() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
         sid = (await c.post("/v1/sessions", json={})).json()["session_id"]

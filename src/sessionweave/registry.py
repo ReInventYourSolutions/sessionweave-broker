@@ -101,6 +101,13 @@ class SessionRegistry:
                 self._connections,
                 metrics=self._metrics,
                 purpose=purpose,
+                # Tell the session how to bump our heap when something
+                # internal (a new inflight tracker, a participant going
+                # offline) shortens its next_deadline. Without this the
+                # heap top sits on the original idle_ttl entry and the
+                # tick that should fire command.cancelled / command.completed
+                # never runs until the session itself idles out.
+                on_deadline_shortened=self._schedule,
             )
             self._sessions[sid] = sess
             self._schedule(sess)

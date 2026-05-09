@@ -48,6 +48,7 @@ class Session:
         "_inflight",
         "_last_activity_at",
         "_metrics",
+        "_on_deadline_shortened",
         "_participants",
         "_picker",
         "_subscribers",
@@ -64,6 +65,7 @@ class Session:
         connections: ConnectionManager,
         metrics: Metrics | None = None,
         purpose: dict[str, Any] | None = None,
+        on_deadline_shortened: Callable[[Session], None] | None = None,
     ) -> None:
         now = _utcnow()
         self.session_id = session_id
@@ -86,6 +88,12 @@ class Session:
         self._connections = connections
         self._metrics = metrics
         self.purpose: dict[str, Any] | None = purpose
+        # Notify the registry whenever an internal event shortens
+        # ``next_deadline`` so its min-heap doesn't sit on a stale,
+        # later deadline. The lazy-invalidation path already absorbs
+        # later-than-stored deadlines (we re-push), but a SHORTER
+        # actual deadline never fires unless the registry sees it.
+        self._on_deadline_shortened = on_deadline_shortened
 
     # --- read-only helpers ---
 
@@ -421,6 +429,13 @@ class Session:
                 deadline=now + timedelta(seconds=ttl),
             )
             self._inflight[command_id] = tracker
+            # The new tracker's deadline is almost certainly sooner
+            # than the session's prior next_deadline (which was
+            # idle_ttl). Tell the registry so its min-heap fires the
+            # cancellation tick on time instead of waiting for idle
+            # TTL.
+            if self._on_deadline_shortened is not None:
+                self._on_deadline_shortened(self)
             self.bump_activity()
             if self._metrics is not None:
                 self._metrics.commands_total.labels(
@@ -572,6 +587,11 @@ class Session:
         if self._metrics is not None:
             self._metrics.participants_active.labels(online="true").dec()
             self._metrics.participants_active.labels(online="false").inc()
+        # Going offline introduces an offline-grace deadline; if grace
+        # is sooner than the existing next_deadline, the registry's
+        # heap entry needs refreshing.
+        if self._on_deadline_shortened is not None:
+            self._on_deadline_shortened(self)
         self._notify_others(
             exclude_pid=pid,
             name="participant.updated",
