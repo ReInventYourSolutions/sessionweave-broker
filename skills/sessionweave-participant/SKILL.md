@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.10.0
+version: 0.11.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.10.0** — when reporting your behaviour or filing
+> **Skill version: 0.11.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -720,6 +720,71 @@ listening" without needing a long-running runtime.
    - `result.received` — one per responder, `{command_id, responder_id, status, payload}`.
    - `command.completed` — terminal: `reason` is `all_responded` or `ttl_expired`. Only at this point are all results in.
 
+## Exit feedback (mandatory)
+
+Before you call `session_leave`, ALWAYS attach a short structured
+exit report so the host (and remaining participants) can see how the
+session went from your side without having to instrument you. From
+v0.10.0 onward `session_leave` accepts an optional `feedback`
+parameter; the relay propagates it on the broadcast `participant.left`
+event so other clients can collect it via their normal event stream
+(`session_check_inbox` / WS / MCP push).
+
+Recommended shape (the relay only enforces a 4 KiB JSON cap):
+
+```json
+{
+  "summary": "echo handled 2 commands cleanly",
+  "rating": 5,
+  "issues": [],
+  "metrics": {
+    "commands_received": 2,
+    "commands_responded": 2,
+    "wall_seconds": 47
+  }
+}
+```
+
+- `summary` — one line of plain English. What did you do? Did it work?
+- `rating` — integer 1..5, your subjective "how was the experience".
+  Use it consistently so the host can spot bad patterns.
+- `issues` — list of short strings, anything weird that shouldn't be
+  ignored: a race you observed, an ambiguous instruction in `purpose`,
+  a tool that didn't behave as documented. Empty list if no issues.
+- `metrics` — optional client-side counters. The host can compare them
+  against its own view (e.g. "I dispatched 3 commands but the worker
+  only saw 2" exposes a delivery bug).
+
+Calls (pick the surface that matches your transport):
+
+```python
+# SDK
+await me.leave(feedback={"summary": "...", "rating": 5, "issues": [], "metrics": {...}})
+```
+
+```bash
+# REST — JSON body on DELETE
+curl -X DELETE "$RELAY/v1/sessions/$SID/participants/me" \
+  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"feedback":{"summary":"…","rating":5,"issues":[],"metrics":{}}}'
+```
+
+```python
+# MCP
+await session_leave(feedback={"summary": "…", "rating": 5, "issues": [], "metrics": {...}})
+```
+
+If you genuinely have nothing to report (single-shot worker, ran clean,
+no anomalies) you may pass a minimal `{"summary": "no issues",
+"rating": 5, "issues": []}` — but DO send something. A worker that
+walks away silently is the hardest case to diagnose later.
+
+The host should drain `participant.left` events after a session and
+either log the feedback or surface it to the operator. Sub-project #2
+(persistence) will additionally archive feedback for post-mortem
+analysis; in #1 it lives only in the in-memory event stream, so the
+host has to capture it before draining is over.
+
 ## Disconnect & resume
 
 If your MCP transport drops, the relay marks you offline (others see `participant.updated`, `online: false`) and **buffers** notifications addressed to you. You have `offline_grace_seconds` (deployment-configured, default 300s) to reconnect:
@@ -842,7 +907,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.10.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.11.0 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
