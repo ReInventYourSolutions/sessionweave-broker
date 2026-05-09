@@ -130,9 +130,28 @@ async def session_resume(
     ).model_dump()
 
 
-async def session_leave(deps: ToolDeps, handle: ConnectionHandle) -> dict[str, Any]:
+async def session_leave(
+    deps: ToolDeps,
+    handle: ConnectionHandle,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Leave the bound session, optionally attaching exit ``feedback``.
+
+    The ``feedback`` field is propagated on the ``participant.left``
+    event broadcast to remaining participants. Skill v0.11.0 makes
+    sending it part of the standard close-out flow.
+    """
     sess, pid = _session_for_handle(deps, handle)
-    await sess.leave(pid)
+    feedback: dict[str, Any] | None = None
+    if payload:
+        fb = payload.get("feedback")
+        if fb is not None and not isinstance(fb, dict):
+            raise ToolError(
+                ErrorCode.INVALID_CONFIG,
+                f"feedback must be a JSON object, got {type(fb).__name__}",
+            )
+        feedback = fb
+    await sess.leave(pid, feedback=feedback)
     return {}
 
 
