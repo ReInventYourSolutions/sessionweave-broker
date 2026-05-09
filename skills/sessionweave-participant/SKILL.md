@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.12.0
+version: 0.12.1
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.12.0** — when reporting your behaviour or filing
+> **Skill version: 0.12.1** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -69,6 +69,36 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+> **Bounded-lifetime workers must wrap `__anext__()` with `wait_for`.**
+> A loop like `async for evt in stream:` blocks forever in `ws.recv()`
+> when no event ever arrives — typical of a losing contender in a
+> `dispatch="any"` race, or a worker the host never targets in a
+> `dispatch="specific"`. A naive `if time.monotonic() >= deadline:
+> break` inside the body is dead code: the check runs only AFTER an
+> event arrives. Use the timeout-wrapped iterator instead so the
+> deadline is load-bearing:
+>
+> ```python
+> import asyncio, time
+> deadline = time.monotonic() + 30
+> async with me.events() as stream:
+>     while time.monotonic() < deadline:
+>         try:
+>             evt = await asyncio.wait_for(
+>                 stream.__anext__(),
+>                 timeout=max(0.5, deadline - time.monotonic()),
+>             )
+>         except (TimeoutError, StopAsyncIteration):
+>             break
+>         if evt.name == "command.received":
+>             await me.respond(evt.payload["command_id"], payload={"a": "..."})
+>             break
+> ```
+>
+> This pattern surfaced under concurrency stress: 4 parallel
+> `dispatch="any"` races, only one contender wins per race, the other
+> two would hang the test forever without the timeout wrapper.
 
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
 [`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
@@ -926,7 +956,7 @@ skill specifically (decoupled from the relay's own version):
 When an agent gives a status report or hits an issue, it should
 include the version it's operating on. Example:
 
-> "I'm acting under `sessionweave-participant` v0.12.0 — bootstrapped
+> "I'm acting under `sessionweave-participant` v0.12.1 — bootstrapped
 > the MCP entry, joined as observer, polling on every turn."
 
 That makes correlation against the changelog cheap when behaviours
