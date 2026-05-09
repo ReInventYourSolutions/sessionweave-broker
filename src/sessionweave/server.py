@@ -138,9 +138,13 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
         )
 
     @mcp.tool(name="session_leave")
-    async def session_leave_tool(ctx: Context | None = None) -> dict[str, Any]:
+    async def session_leave_tool(
+        feedback: dict[str, Any] | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
         assert ctx is not None
-        return await session_leave(deps, _handle_for(ctx))
+        body = {"feedback": feedback} if feedback is not None else None
+        return await session_leave(deps, _handle_for(ctx), body)
 
     @mcp.tool(name="session_update_self")
     async def session_update_self_tool(

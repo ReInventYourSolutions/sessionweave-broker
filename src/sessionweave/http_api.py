@@ -259,13 +259,21 @@ async def patch_self(request: Request) -> JSONResponse:
 
 
 async def delete_self(request: Request) -> Response:
+    """Leave the session.
+
+    Optionally accepts a JSON body with a ``feedback`` field — see
+    ``Session.leave`` and skill v0.11.0 for the convention. RFC 7230
+    permits a body on DELETE; clients without that flexibility can
+    send the feedback on a final ``session_send`` before deleting.
+    """
     sid = request.path_params["sid"]
     deps = _deps(request)
     try:
         token = _require_bearer(request)
+        body = await _read_json_body(request)
         _bind_participant(deps, sid, token)
         try:
-            await session_leave(deps, _HTTP_HANDLE)
+            await session_leave(deps, _HTTP_HANDLE, body if body else None)
         finally:
             _unbind_participant(deps.registry.connections)
     except ToolError as exc:

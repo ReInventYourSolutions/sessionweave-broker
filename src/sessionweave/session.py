@@ -165,7 +165,26 @@ class Session:
             )
             return p
 
-    async def leave(self, participant_id: str) -> None:
+    async def leave(
+        self,
+        participant_id: str,
+        *,
+        feedback: dict[str, Any] | None = None,
+    ) -> None:
+        """Remove a participant from the session.
+
+        ``feedback`` is an optional structured exit report — the
+        skill's recommended convention is ``{"summary": "...",
+        "issues": [...], "rating": 1..5}`` but the relay only enforces
+        a 4 KiB JSON cap. If supplied, it is propagated on the
+        ``participant.left`` event so other participants (and any
+        observers driving the host) see how the session went from this
+        client's perspective. Sub-project #2 (persistence) will
+        additionally archive feedback for post-mortem analysis; in #1
+        it lives only in the in-memory event stream.
+        """
+        if feedback is not None:
+            self._enforce_feedback_size(feedback)
         async with self.lock:
             p = self._participants.pop(participant_id, None)
             if p is None:
@@ -180,10 +199,22 @@ class Session:
                 online_label = "true" if p.online else "false"
                 self._metrics.participants_active.labels(online=online_label).dec()
             self._cancel_inflight_for_sender(participant_id, reason="sender_gone")
+            payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
+            if feedback is not None:
+                payload["feedback"] = feedback
             self._notify_others(
                 exclude_pid=participant_id,
                 name="participant.left",
-                payload={"participant_id": participant_id, "reason": "left"},
+                payload=payload,
+            )
+
+    @staticmethod
+    def _enforce_feedback_size(feedback: dict[str, Any]) -> None:
+        size = len(json.dumps(feedback, separators=(",", ":")).encode("utf-8"))
+        if size > 4 * 1024:
+            raise ToolError(
+                ErrorCode.PAYLOAD_TOO_LARGE,
+                f"feedback {size} bytes exceeds 4 KiB cap",
             )
 
     async def update_self(

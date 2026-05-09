@@ -167,6 +167,74 @@ async def test_leave_returns_204() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_leave_with_feedback_propagates_on_participant_left() -> None:
+    """Skill v0.11.0 makes ``feedback`` part of the standard close-out
+    flow. The relay must accept a JSON body with ``feedback`` on
+    DELETE /participants/me and carry it on the broadcast
+    ``participant.left`` event so other participants can collect it.
+    """
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        observer = await c.post(
+            f"/v1/sessions/{sid}/participants", json={"role": "observer"}
+        )
+        ot = observer.json()["participant_token"]
+        leaver = await c.post(
+            f"/v1/sessions/{sid}/participants", json={"role": "worker"}
+        )
+        lt = leaver.json()["participant_token"]
+        leaver_pid = leaver.json()["participant_id"]
+        # Drain the observer's pending participant.joined first so the
+        # later assertion sees only the leave event we care about.
+        await c.post(
+            f"/v1/sessions/{sid}/participants/me/inbox/drain",
+            headers={"Authorization": f"Bearer {ot}"},
+        )
+        # Leaver leaves with structured feedback.
+        feedback: dict[str, Any] = {
+            "summary": "all good",
+            "rating": 5,
+            "issues": [],
+            "metrics": {"commands_received": 2, "commands_responded": 2},
+        }
+        r = await c.request(
+            "DELETE",
+            f"/v1/sessions/{sid}/participants/me",
+            headers={"Authorization": f"Bearer {lt}"},
+            json={"feedback": feedback},
+        )
+        assert r.status_code == 204
+        drain = await c.post(
+            f"/v1/sessions/{sid}/participants/me/inbox/drain",
+            headers={"Authorization": f"Bearer {ot}"},
+        )
+        msgs = drain.json()["messages"]
+        left = next(m for m in msgs if m["name"] == "participant.left")
+        assert left["payload"]["participant_id"] == leaver_pid
+        assert left["payload"]["reason"] == "left"
+        assert left["payload"]["feedback"] == feedback
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_leave_feedback_too_large_returns_413() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        join = await c.post(f"/v1/sessions/{sid}/participants", json={"role": "p"})
+        token = join.json()["participant_token"]
+        oversize = "x" * 5000  # > 4 KiB cap
+        r = await c.request(
+            "DELETE",
+            f"/v1/sessions/{sid}/participants/me",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"feedback": {"summary": oversize}},
+        )
+        assert r.status_code == 413
+        assert r.json()["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_update_purpose_round_trip() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
         sid = (
