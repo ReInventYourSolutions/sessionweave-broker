@@ -63,9 +63,26 @@ The relay exposes:
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)
+- **WS firehose** — `/v1/sessions/{sid}/firehose?token=<sid>` — full event stream for non-participants (cockpit observers)
+- **Supervisor notes** — `POST /v1/sessions/{sid}/supervisor/notes` — broadcast a note / halt / continue / redirect (Bearer = session_id)
+- **End session** — `DELETE /v1/sessions/{sid}` (Bearer = session_id)
+- **Hosted cockpit** — `GET /cockpit/...` — small static SPA
 
 See the [REST + WS surface](#rest--websocket-surface) section below for the
 endpoint catalogue. The MCP tool catalogue is documented further down.
+
+## Hosted cockpit
+
+A small browser UI ships with the relay at `/cockpit/...` — no install,
+no account. Paste a `session_id` or `swv://` link, then watch the live
+session: roster, message timeline, supervisor controls (note / halt /
+continue / redirect / end-session).
+
+Production URL: <https://relay.sessionweave.com/cockpit/>.
+
+To use it against a self-hosted relay, point your browser at
+`<your-relay>/cockpit/`. The cockpit is same-origin with the API it
+uses — no CORS configuration needed for the hosted case.
 
 ## Talking to the relay (Python MCP client)
 
