@@ -14,6 +14,7 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.config import load_deployment_defaults
+from sessionweave.cors import CORSConfig
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
 from sessionweave.events_ws import routes as events_ws_routes
@@ -261,6 +262,7 @@ def build_app() -> Starlette:
             await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
             yield
 
+    cors_cfg = CORSConfig.from_env(os.environ)
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
@@ -271,6 +273,7 @@ def build_app() -> Starlette:
             *events_ws_routes(),
             Mount("/", app=mcp_app),
         ],
+        middleware=[cors_cfg.as_middleware()],
         lifespan=lifespan,
     )
     app.state.registry = registry
