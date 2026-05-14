@@ -248,6 +248,11 @@ def build_app() -> Starlette:
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
                 "transports": ["mcp", "http", "ws"],
+                "capabilities": {
+                    "firehose": True,
+                    "supervisor_notes": True,
+                    "session_delete": True,
+                },
             }
         )
 
