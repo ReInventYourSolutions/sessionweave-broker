@@ -14,6 +14,7 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.config import load_deployment_defaults
+from sessionweave.cockpit_mount import cockpit_mount
 from sessionweave.cors import CORSConfig
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
@@ -279,6 +280,7 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
+            cockpit_mount(),
             Mount("/", app=mcp_app),
         ],
         middleware=[cors_cfg.as_middleware()],
