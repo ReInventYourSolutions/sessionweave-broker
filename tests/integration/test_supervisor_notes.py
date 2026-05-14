@@ -57,6 +57,24 @@ async def test_post_note_rejects_missing_auth():
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_post_note_unknown_participant_returns_404():
+    async with relay_subprocess() as base:
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()["session_id"]
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {sid}"},
+                json={"kind": "halt", "target": "p-does-not-exist"},
+            )
+        assert r.status_code == 404
+        body = r.json()
+        assert body["error"] == "participant_not_found"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_post_note_rate_limited():
     async with relay_subprocess() as base:
         async with httpx.AsyncClient() as c:

@@ -24,6 +24,7 @@ from starlette.routing import Route
 
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
 from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
@@ -336,11 +337,6 @@ async def post_command_response(request: Request) -> JSONResponse:
 
 
 async def _supervisor_notes_handler(request: Request) -> JSONResponse:
-    from sessionweave.supervisor import (
-        SupervisorRequestError,
-        parse_supervisor_request,
-    )
-
     sid = request.path_params["sid"]
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -375,20 +371,31 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         "ts_ms": note.ts_ms,
     }
 
-    # Fan out to firehose subscribers.
+    # Fan out to firehose subscribers (lock-free by design: firehose is a
+    # separate publish path and never touches participant state).
     firehose = request.app.state.firehose
     await firehose.publish(sid, {"name": "supervisor.note", "payload": payload})
 
-    # Fan out to participants (filtered by target).
-    participant_ids = list(session._participants.keys())
-    targets: list[str] = []
-    if note.target == "all":
-        targets = participant_ids
-    else:
-        if note.target in participant_ids:
+    # Fan out to participants under session.lock — _deliver_or_buffer touches
+    # _participants / _subscribers / _buffers, and the invariant across the
+    # rest of session.py is that those are only accessed while the lock is
+    # held. If target is a participant id that is not in the session, return
+    # 404 instead of a silent success.
+    async with session.lock:
+        if note.target == "all":
+            targets = list(session._participants.keys())
+        elif note.target in session._participants:
             targets = [note.target]
-    for pid in targets:
-        session._deliver_or_buffer(pid, "supervisor.note", payload)
+        else:
+            return JSONResponse(
+                {
+                    "error": "participant_not_found",
+                    "detail": f"target {note.target!r} is not a participant of this session",
+                },
+                status_code=404,
+            )
+        for pid in targets:
+            session._deliver_or_buffer(pid, "supervisor.note", payload)
 
     return JSONResponse(payload, status_code=200)
 
