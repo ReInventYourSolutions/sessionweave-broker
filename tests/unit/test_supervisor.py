@@ -8,8 +8,8 @@ import pytest
 from sessionweave.supervisor import (
     NoteRateLimiter,
     SupervisorNote,
-    parse_supervisor_request,
     SupervisorRequestError,
+    parse_supervisor_request,
 )
 
 

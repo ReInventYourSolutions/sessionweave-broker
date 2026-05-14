@@ -7,8 +7,8 @@ Operators of private deployments who want to restrict can set
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -24,7 +24,7 @@ class CORSConfig:
     allow_credentials: bool = False
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "CORSConfig":
+    def from_env(cls, env: Mapping[str, str]) -> CORSConfig:
         raw = (env.get("SW_CORS_ORIGINS") or "").strip()
         if not raw:
             return cls(allow_origins=list(_DEFAULT_ORIGINS))

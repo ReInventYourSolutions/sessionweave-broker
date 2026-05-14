@@ -43,6 +43,13 @@ async def test_firehose_rejects_wrong_token():
                 await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
             ).json()["session_id"]
         ws_url = f"{base_ws}/v1/sessions/{sid}/firehose?token=wrong"
-        with pytest.raises(Exception):  # InvalidStatus / ConnectionClosed
+        # Wrong token → server closes during handshake. Both modern
+        # (InvalidStatus) and older (InvalidStatusCode) websockets builds
+        # are accepted; ConnectionClosed covers post-handshake close.
+        from websockets.exceptions import (
+            ConnectionClosed,
+            InvalidStatus,
+        )
+        with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
             async with websockets.connect(ws_url):
                 pass

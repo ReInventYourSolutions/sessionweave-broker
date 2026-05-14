@@ -23,7 +23,7 @@ class SupervisorNote:
     ts_ms: int
 
 
-def parse_supervisor_request(body) -> SupervisorNote:
+def parse_supervisor_request(body: object) -> SupervisorNote:
     if not isinstance(body, dict):
         raise SupervisorRequestError("body must be an object")
 

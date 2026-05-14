@@ -47,6 +47,7 @@ class Session:
         "_connections",
         "_created_at",
         "_firehose",
+        "_firehose_tasks",
         "_inflight",
         "_last_activity_at",
         "_metrics",
@@ -98,6 +99,7 @@ class Session:
         # actual deadline never fires unless the registry sees it.
         self._on_deadline_shortened = on_deadline_shortened
         self._firehose = firehose
+        self._firehose_tasks: set[asyncio.Task[None]] = set()
 
     # --- read-only helpers ---
 
@@ -540,11 +542,15 @@ class Session:
         Called once per logical event (not once per recipient). Uses
         ``asyncio.create_task`` so the firehose publish never blocks or
         stalls the participant delivery path even if subscribers are slow.
+        A reference to each task is held in ``_firehose_tasks`` until it
+        finishes, so the task is not garbage-collected mid-flight.
         """
         if self._firehose is not None:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._firehose.publish(self.session_id, {"name": name, "payload": payload})
             )
+            self._firehose_tasks.add(task)
+            task.add_done_callback(self._firehose_tasks.discard)
 
     def _deliver_or_buffer(self, pid: str, name: str, payload: dict[str, Any]) -> None:
         p = self._participants.get(pid)

@@ -13,18 +13,18 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
-from sessionweave.config import load_deployment_defaults
 from sessionweave.cockpit_mount import cockpit_mount
-from sessionweave.cors import CORSConfig
+from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
+from sessionweave.cors import CORSConfig
 from sessionweave.errors import ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
+from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
