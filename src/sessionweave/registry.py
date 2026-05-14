@@ -11,6 +11,7 @@ from typing import Any
 from sessionweave.config import DeploymentDefaults, apply_overrides
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.session import MAX_PURPOSE_BYTES, Session
 
@@ -47,6 +48,7 @@ class SessionRegistry:
     __slots__ = (
         "_connections",
         "_defaults",
+        "_firehose",
         "_heap",
         "_lock",
         "_loop_task",
@@ -60,6 +62,7 @@ class SessionRegistry:
         defaults: DeploymentDefaults,
         connections: ConnectionManager,
         metrics: Metrics | None = None,
+        firehose: FirehoseRegistry | None = None,
     ) -> None:
         self._defaults = defaults
         self._sessions: dict[str, Session] = {}
@@ -67,6 +70,7 @@ class SessionRegistry:
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
         self._metrics = metrics
+        self._firehose = firehose
         # heap entries are (deadline_epoch_seconds, sid). A session may
         # appear multiple times after re-pushes; lazy invalidation drops
         # stale entries on pop.
@@ -108,6 +112,7 @@ class SessionRegistry:
                 # tick that should fire command.cancelled / command.completed
                 # never runs until the session itself idles out.
                 on_deadline_shortened=self._schedule,
+                firehose=self._firehose,
             )
             self._sessions[sid] = sess
             self._schedule(sess)
@@ -216,6 +221,24 @@ class SessionRegistry:
         self._loop_task = asyncio.create_task(
             _runner(), name="sessionweave.registry.tick"
         )
+
+    def get(self, session_id: str) -> Session | None:
+        """Return the session or ``None`` if not found."""
+        return self._sessions.get(session_id)
+
+    async def end_session(self, sid: str, reason: str) -> None:
+        """Explicitly end a session, broadcasting ``session.ended`` to all participants.
+
+        Mirrors the idle-TTL eviction path in ``tick()``.  If the session is
+        not found this is a no-op (idempotent).
+        """
+        async with self._lock:
+            sess = self._sessions.pop(sid, None)
+        if sess is None:
+            return
+        sess.broadcast_session_ended(reason=reason)
+        if self._metrics is not None:
+            self._metrics.sessions_active.dec()
 
     async def shutdown(self, reason: str = "server_shutdown") -> None:
         if self._loop_task is not None:

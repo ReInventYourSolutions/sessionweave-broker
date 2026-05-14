@@ -22,6 +22,7 @@ just joined doesn't need a separate REST drain to seed itself.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -174,6 +175,31 @@ async def events_ws(websocket: WebSocket) -> None:
             await session.requeue_to_buffer(pid, undelivered)
 
 
+async def firehose_ws(websocket: WebSocket) -> None:
+    sid = websocket.path_params["sid"]
+    token = websocket.query_params.get("token", "")
+    if token != sid:
+        await websocket.close(code=_CLOSE_MISSING_TOKEN, reason="invalid token")
+        return
+
+    registry = websocket.app.state.tool_deps.registry
+    firehose = websocket.app.state.firehose
+    if registry.get(sid) is None:
+        await websocket.close(code=_CLOSE_SESSION_NOT_FOUND, reason="session_not_found")
+        return
+
+    await websocket.accept()
+    sub = await firehose.subscribe(sid)
+    try:
+        while True:
+            event = await sub.queue.get()
+            await websocket.send_text(json.dumps(event))
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        await firehose.unsubscribe(sub)
+
+
 def routes() -> list[WebSocketRoute]:
     """Return the list of WebSocket routes to mount on the main app."""
     return [
@@ -181,7 +207,11 @@ def routes() -> list[WebSocketRoute]:
             "/v1/sessions/{sid}/participants/me/events",
             events_ws,
         ),
+        WebSocketRoute(
+            "/v1/sessions/{sid}/firehose",
+            firehose_ws,
+        ),
     ]
 
 
-__all__ = ["events_ws", "routes"]
+__all__ = ["events_ws", "firehose_ws", "routes"]

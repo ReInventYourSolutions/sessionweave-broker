@@ -24,6 +24,7 @@ from starlette.routing import Route
 
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
 from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
@@ -335,6 +336,89 @@ async def post_command_response(request: Request) -> JSONResponse:
     return JSONResponse({}, status_code=201)
 
 
+async def _supervisor_notes_handler(request: Request) -> JSONResponse:
+    sid = request.path_params["sid"]
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if auth[7:].strip() != sid:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    registry = _deps(request).registry
+    session = registry.get(sid)
+    if session is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    limiter = request.app.state.supervisor_rate
+    if not limiter.try_acquire(sid):
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    try:
+        note = parse_supervisor_request(body)
+    except SupervisorRequestError as e:
+        return JSONResponse({"error": "invalid_request", "detail": str(e)}, status_code=400)
+
+    payload = {
+        "note_id": note.note_id,
+        "kind": note.kind,
+        "target": note.target,
+        "message": note.message,
+        "ts_ms": note.ts_ms,
+    }
+
+    # Fan out to firehose subscribers (lock-free by design: firehose is a
+    # separate publish path and never touches participant state).
+    firehose = request.app.state.firehose
+    await firehose.publish(sid, {"name": "supervisor.note", "payload": payload})
+
+    # Fan out to participants under session.lock — _deliver_or_buffer touches
+    # _participants / _subscribers / _buffers, and the invariant across the
+    # rest of session.py is that those are only accessed while the lock is
+    # held. If target is a participant id that is not in the session, return
+    # 404 instead of a silent success.
+    async with session.lock:
+        if note.target == "all":
+            targets = list(session._participants.keys())
+        elif note.target in session._participants:
+            targets = [note.target]
+        else:
+            return JSONResponse(
+                {
+                    "error": "participant_not_found",
+                    "detail": f"target {note.target!r} is not a participant of this session",
+                },
+                status_code=404,
+            )
+        for pid in targets:
+            session._deliver_or_buffer(pid, "supervisor.note", payload)
+
+    return JSONResponse(payload, status_code=200)
+
+
+async def _delete_session_handler(request: Request) -> Response:
+    """End a session. The bearer token must equal the session_id."""
+    sid = request.path_params["sid"]
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    token = auth[7:].strip()
+    if token != sid:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    registry = _deps(request).registry
+    session = registry.get(sid)
+    if session is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    await registry.end_session(sid, reason="deleted_by_cockpit")
+    return Response(status_code=204)
+
+
 # ---------- routing ----------
 
 
@@ -343,6 +427,7 @@ def routes() -> list[Route]:
     return [
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),
+        Route("/v1/sessions/{sid}", _delete_session_handler, methods=["DELETE"]),
         Route(
             "/v1/sessions/{sid}/purpose",
             patch_session_purpose,
@@ -381,6 +466,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/commands/{cid}/responses",
             post_command_response,
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor/notes",
+            _supervisor_notes_handler,
             methods=["POST"],
         ),
     ]

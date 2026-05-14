@@ -1,0 +1,98 @@
+"""Per-session firehose subscriber registry.
+
+A firehose subscriber is NOT a participant — it does not appear in the
+roster, has no participant_id, occupies no participant slot. It is a
+pure observer that receives every event published to its session.
+
+Used by:
+  - The hosted cockpit observatory (one subscription per browser tab).
+  - The local hub's archive subscriber (one per owned session).
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass, field
+from typing import Any
+from uuid import uuid4
+
+_DEFAULT_PER_SESSION_CAP = int(os.environ.get("SW_MAX_FIREHOSE_PER_SESSION", "16"))
+_DEFAULT_QUEUE_CAPACITY = int(os.environ.get("SW_FIREHOSE_QUEUE_CAPACITY", "256"))
+_LAG_EVENT_NAME = "firehose.lagged"
+
+
+@dataclass
+class FirehoseSubscriber:
+    id: str
+    session_id: str
+    queue: asyncio.Queue[dict[str, Any]]
+    _lagged: bool = field(default=False)
+
+
+class FirehoseRegistry:
+    def __init__(
+        self,
+        per_session_cap: int = _DEFAULT_PER_SESSION_CAP,
+        queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
+    ) -> None:
+        self._cap = per_session_cap
+        self._queue_capacity = queue_capacity
+        self._subs: dict[str, list[FirehoseSubscriber]] = {}
+        self._lock = asyncio.Lock()
+
+    async def subscribe(self, session_id: str) -> FirehoseSubscriber:
+        async with self._lock:
+            bucket = self._subs.setdefault(session_id, [])
+            if len(bucket) >= self._cap:
+                raise RuntimeError(f"firehose_cap reached for session {session_id}")
+            sub = FirehoseSubscriber(
+                id=f"fh-{uuid4().hex[:10]}",
+                session_id=session_id,
+                queue=asyncio.Queue(maxsize=self._queue_capacity),
+            )
+            bucket.append(sub)
+            return sub
+
+    async def unsubscribe(self, sub: FirehoseSubscriber) -> None:
+        async with self._lock:
+            bucket = self._subs.get(sub.session_id, [])
+            if sub in bucket:
+                bucket.remove(sub)
+            if not bucket and sub.session_id in self._subs:
+                del self._subs[sub.session_id]
+
+    async def publish(self, session_id: str, event: dict[str, Any]) -> None:
+        """Best-effort fan-out. Subscribers whose queue is full get the
+        oldest entry evicted, then this event pushed, then a synthetic
+        ``firehose.lagged`` marker is ensured at the tail so the client
+        can resync.  The lag marker is sticky: it stays at the tail
+        (potentially displacing older events) for as long as overflow
+        conditions persist.
+        """
+        bucket = list(self._subs.get(session_id, ()))
+        for sub in bucket:
+            try:
+                sub.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Evict oldest, then insert the new event.
+                try:
+                    sub.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    sub.queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
+                # Ensure a ``firehose.lagged`` marker is at the tail.
+                # If the queue is full again we evict one more item to
+                # make room for it, keeping the lag signal visible.
+                sub._lagged = True
+                if sub.queue.full():
+                    try:
+                        sub.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                try:
+                    sub.queue.put_nowait({"name": _LAG_EVENT_NAME, "payload": {}})
+                except asyncio.QueueFull:
+                    pass

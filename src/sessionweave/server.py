@@ -13,14 +13,18 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
+from sessionweave.cockpit_mount import cockpit_mount
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
+from sessionweave.cors import CORSConfig
 from sessionweave.errors import ToolError
 from sessionweave.events_ws import routes as events_ws_routes
+from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
+from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
@@ -220,7 +224,8 @@ def build_app() -> Starlette:
     deps_cfg = load_deployment_defaults(os.environ)
     connections = ConnectionManager()
     metrics = Metrics()
-    registry = SessionRegistry(deps_cfg, connections, metrics=metrics)
+    firehose = FirehoseRegistry()
+    registry = SessionRegistry(deps_cfg, connections, metrics=metrics, firehose=firehose)
     handles = HandleRegistry()
     tool_deps = ToolDeps(registry)
 
@@ -247,6 +252,11 @@ def build_app() -> Starlette:
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
                 "transports": ["mcp", "http", "ws"],
+                "capabilities": {
+                    "firehose": True,
+                    "supervisor_notes": True,
+                    "session_delete": True,
+                },
             }
         )
 
@@ -261,6 +271,7 @@ def build_app() -> Starlette:
             await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
             yield
 
+    cors_cfg = CORSConfig.from_env(os.environ)
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
@@ -269,8 +280,10 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
+            cockpit_mount(),
             Mount("/", app=mcp_app),
         ],
+        middleware=[cors_cfg.as_middleware()],
         lifespan=lifespan,
     )
     app.state.registry = registry
@@ -279,6 +292,8 @@ def build_app() -> Starlette:
     app.state.metrics = metrics
     app.state.tool_deps = tool_deps
     app.state.state = state
+    app.state.firehose = firehose
+    app.state.supervisor_rate = NoteRateLimiter(per_minute=30, per_hour=200)
     return app
 
 

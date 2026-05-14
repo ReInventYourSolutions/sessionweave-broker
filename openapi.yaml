@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.10.1"
+  version: "0.11.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -48,6 +48,12 @@ components:
       description: |
         Bearer token (= `participant_id` in sub-project #1) returned by
         `POST /v1/sessions/{sid}/participants`.
+    BearerSessionId:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token equal to the ``session_id``. Used by cockpit-side
+        endpoints (firehose, supervisor notes, end session).
 
   schemas:
     Purpose:
@@ -195,6 +201,7 @@ components:
             - command.completed
             - session.purpose_updated
             - session.ended
+            - supervisor.note
         payload:
           type: object
           additionalProperties: true
@@ -284,11 +291,21 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.10.1" }
+                  version: { type: string, example: "0.11.0" }
                   subproject: { type: string }
                   transports:
                     type: array
                     items: { type: string, enum: [mcp, http, ws] }
+                  capabilities:
+                    type: object
+                    description: |
+                      Per-feature flags the cockpit and other clients
+                      use to decide which endpoints to call. New flags
+                      may appear in future versions.
+                    properties:
+                      firehose: { type: boolean }
+                      supervisor_notes: { type: boolean }
+                      session_delete: { type: boolean }
 
   /v1/sessions:
     post:
@@ -337,6 +354,20 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [sessions]
+      summary: End a session
+      description: |
+        Ends the session immediately, broadcasts ``session.ended`` to
+        all participants and firehose subscribers, and removes it from
+        the registry.
+      security:
+        - BearerSessionId: []
+      responses:
+        '204': { description: Session ended }
+        '401': { description: Missing bearer }
+        '403': { description: Bearer does not match session_id }
+        '404': { description: Session not found }
 
   /v1/sessions/{sid}/purpose:
     parameters:
@@ -357,6 +388,44 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Session' }
         '401': { description: not_in_session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/sessions/{sid}/supervisor/notes:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [sessions]
+      summary: Post a supervisor note / halt / continue / redirect
+      security:
+        - BearerSessionId: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, target]
+              properties:
+                kind: { type: string, enum: [note, halt, continue, redirect] }
+                target: { type: string, description: "'all' or a participant_id" }
+                message: { type: string, maxLength: 2048 }
+      responses:
+        '200':
+          description: Note delivered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  note_id: { type: string }
+                  kind: { type: string }
+                  target: { type: string }
+                  message: { type: string, nullable: true }
+                  ts_ms: { type: integer }
+        '400': { description: Malformed request }
+        '401': { description: Missing bearer }
+        '403': { description: Bearer does not match session_id }
+        '404': { description: Session not found }
+        '429': { description: Rate-limited }
 
   /v1/sessions/{sid}/participants:
     parameters:
@@ -480,6 +549,26 @@ paths:
       responses:
         '101':
           description: Switching Protocols (WebSocket upgrade)
+
+  /v1/sessions/{sid}/firehose:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - name: token
+        in: query
+        required: true
+        schema: { type: string }
+        description: |
+          Bearer token equal to the ``session_id``. Required here because
+          browsers can't set custom headers on a WebSocket upgrade.
+    get:
+      tags: [sessions]
+      summary: WebSocket — full event stream for the session (non-participant)
+      description: |
+        HTTP/WS upgrade. The ``token`` query parameter must equal the
+        ``session_id``. Frames are JSON ``{name, payload}`` objects,
+        matching the participant inbox shape.
+      responses:
+        '101': { description: Switching Protocols (WebSocket) }
 
   /v1/sessions/{sid}/commands:
     parameters:
