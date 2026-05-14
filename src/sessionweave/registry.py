@@ -217,6 +217,24 @@ class SessionRegistry:
             _runner(), name="sessionweave.registry.tick"
         )
 
+    def get(self, session_id: str) -> Session | None:
+        """Return the session or ``None`` if not found."""
+        return self._sessions.get(session_id)
+
+    async def end_session(self, sid: str, reason: str) -> None:
+        """Explicitly end a session, broadcasting ``session.ended`` to all participants.
+
+        Mirrors the idle-TTL eviction path in ``tick()``.  If the session is
+        not found this is a no-op (idempotent).
+        """
+        async with self._lock:
+            sess = self._sessions.pop(sid, None)
+        if sess is None:
+            return
+        sess.broadcast_session_ended(reason=reason)
+        if self._metrics is not None:
+            self._metrics.sessions_active.dec()
+
     async def shutdown(self, reason: str = "server_shutdown") -> None:
         if self._loop_task is not None:
             self._loop_task.cancel()

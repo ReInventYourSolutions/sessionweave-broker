@@ -335,6 +335,25 @@ async def post_command_response(request: Request) -> JSONResponse:
     return JSONResponse({}, status_code=201)
 
 
+async def _delete_session_handler(request: Request) -> Response:
+    """End a session. The bearer token must equal the session_id."""
+    sid = request.path_params["sid"]
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    token = auth[7:].strip()
+    if token != sid:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    registry = _deps(request).registry
+    session = registry.get(sid)
+    if session is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    await registry.end_session(sid, reason="deleted_by_cockpit")
+    return Response(status_code=204)
+
+
 # ---------- routing ----------
 
 
@@ -343,6 +362,7 @@ def routes() -> list[Route]:
     return [
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),
+        Route("/v1/sessions/{sid}", _delete_session_handler, methods=["DELETE"]),
         Route(
             "/v1/sessions/{sid}/purpose",
             patch_session_purpose,
