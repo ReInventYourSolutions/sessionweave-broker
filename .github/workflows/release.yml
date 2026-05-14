@@ -16,7 +16,7 @@ jobs:
           cache: 'pip'
       - run: pip install -e '.[dev]' build
       - run: playwright install chromium --with-deps
-      - run: ruff check . && mypy . && pytest -q -m "not fuzz"
+      - run: ruff check . && mypy . && pytest -q -m "not fuzz and not e2e"
       - run: pytest tests/e2e -v -m e2e
       - run: python -m build
       - uses: docker/setup-qemu-action@v3
