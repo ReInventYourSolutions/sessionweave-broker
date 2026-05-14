@@ -20,6 +20,7 @@ from sessionweave.errors import ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
+from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.registry import SessionRegistry
@@ -290,6 +291,7 @@ def build_app() -> Starlette:
     app.state.tool_deps = tool_deps
     app.state.state = state
     app.state.firehose = firehose
+    app.state.supervisor_rate = NoteRateLimiter(per_minute=30, per_hour=200)
     return app
 
 

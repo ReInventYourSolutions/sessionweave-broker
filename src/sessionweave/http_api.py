@@ -335,6 +335,64 @@ async def post_command_response(request: Request) -> JSONResponse:
     return JSONResponse({}, status_code=201)
 
 
+async def _supervisor_notes_handler(request: Request) -> JSONResponse:
+    from sessionweave.supervisor import (
+        SupervisorRequestError,
+        parse_supervisor_request,
+    )
+
+    sid = request.path_params["sid"]
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if auth[7:].strip() != sid:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    registry = _deps(request).registry
+    session = registry.get(sid)
+    if session is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    limiter = request.app.state.supervisor_rate
+    if not limiter.try_acquire(sid):
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    try:
+        note = parse_supervisor_request(body)
+    except SupervisorRequestError as e:
+        return JSONResponse({"error": "invalid_request", "detail": str(e)}, status_code=400)
+
+    payload = {
+        "note_id": note.note_id,
+        "kind": note.kind,
+        "target": note.target,
+        "message": note.message,
+        "ts_ms": note.ts_ms,
+    }
+
+    # Fan out to firehose subscribers.
+    firehose = request.app.state.firehose
+    await firehose.publish(sid, {"name": "supervisor.note", "payload": payload})
+
+    # Fan out to participants (filtered by target).
+    participant_ids = list(session._participants.keys())
+    targets: list[str] = []
+    if note.target == "all":
+        targets = participant_ids
+    else:
+        if note.target in participant_ids:
+            targets = [note.target]
+    for pid in targets:
+        session._deliver_or_buffer(pid, "supervisor.note", payload)
+
+    return JSONResponse(payload, status_code=200)
+
+
 async def _delete_session_handler(request: Request) -> Response:
     """End a session. The bearer token must equal the session_id."""
     sid = request.path_params["sid"]
@@ -401,6 +459,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/commands/{cid}/responses",
             post_command_response,
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor/notes",
+            _supervisor_notes_handler,
             methods=["POST"],
         ),
     ]
