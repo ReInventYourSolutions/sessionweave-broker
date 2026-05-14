@@ -18,6 +18,7 @@ from sessionweave.cors import CORSConfig
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ToolError
 from sessionweave.events_ws import routes as events_ws_routes
+from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
@@ -221,7 +222,8 @@ def build_app() -> Starlette:
     deps_cfg = load_deployment_defaults(os.environ)
     connections = ConnectionManager()
     metrics = Metrics()
-    registry = SessionRegistry(deps_cfg, connections, metrics=metrics)
+    firehose = FirehoseRegistry()
+    registry = SessionRegistry(deps_cfg, connections, metrics=metrics, firehose=firehose)
     handles = HandleRegistry()
     tool_deps = ToolDeps(registry)
 
@@ -287,6 +289,7 @@ def build_app() -> Starlette:
     app.state.metrics = metrics
     app.state.tool_deps = tool_deps
     app.state.state = state
+    app.state.firehose = firehose
     return app
 
 

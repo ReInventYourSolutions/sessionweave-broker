@@ -11,6 +11,7 @@ from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
 from sessionweave.dispatcher import RoundRobinPicker, decide_dispatch
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.models import CommandTracker, Participant
 from sessionweave.notifications import BufferOverflow, NotificationBuffer
@@ -45,6 +46,7 @@ class Session:
         "_buffers",
         "_connections",
         "_created_at",
+        "_firehose",
         "_inflight",
         "_last_activity_at",
         "_metrics",
@@ -66,6 +68,7 @@ class Session:
         metrics: Metrics | None = None,
         purpose: dict[str, Any] | None = None,
         on_deadline_shortened: Callable[[Session], None] | None = None,
+        firehose: FirehoseRegistry | None = None,
     ) -> None:
         now = _utcnow()
         self.session_id = session_id
@@ -94,6 +97,7 @@ class Session:
         # later-than-stored deadlines (we re-push), but a SHORTER
         # actual deadline never fires unless the registry sees it.
         self._on_deadline_shortened = on_deadline_shortened
+        self._firehose = firehose
 
     # --- read-only helpers ---
 
@@ -441,31 +445,28 @@ class Session:
                 self._metrics.commands_total.labels(
                     dispatch_mode=dispatch.value
                 ).inc()
+            command_received_payload = {
+                "command_id": command_id,
+                "sender_id": sender_id,
+                "dispatch_mode": dispatch.value,
+                "dispatched_to": list(decision.recipients),
+                "payload": payload,
+                "expires_at": _isoformat(tracker.deadline),
+            }
             for recipient_id in decision.recipients:
-                self._deliver_or_buffer(
-                    recipient_id,
-                    "command.received",
-                    {
-                        "command_id": command_id,
-                        "sender_id": sender_id,
-                        "dispatch_mode": dispatch.value,
-                        "dispatched_to": list(decision.recipients),
-                        "payload": payload,
-                        "expires_at": _isoformat(tracker.deadline),
-                    },
-                )
+                self._deliver_or_buffer(recipient_id, "command.received", command_received_payload)
+            if decision.recipients:
+                self._mirror_firehose("command.received", command_received_payload)
             # If no recipients (e.g., any with no online match), close immediately
             if not decision.recipients:
-                self._deliver_or_buffer(
-                    sender_id,
-                    "command.completed",
-                    {
-                        "command_id": command_id,
-                        "received_count": 0,
-                        "expected_count": 0,
-                        "reason": "all_responded",
-                    },
-                )
+                command_completed_payload = {
+                    "command_id": command_id,
+                    "received_count": 0,
+                    "expected_count": 0,
+                    "reason": "all_responded",
+                }
+                self._deliver_or_buffer(sender_id, "command.completed", command_completed_payload)
+                self._mirror_firehose("command.completed", command_completed_payload)
                 self._inflight.pop(command_id, None)
                 if self._metrics is not None:
                     self._metrics.command_completed_total.labels(
@@ -491,27 +492,23 @@ class Session:
                 raise ToolError(ErrorCode.ALREADY_RESPONDED, "already responded")
             tracker.responses_received.add(responder_id)
             self.bump_activity()
-            self._deliver_or_buffer(
-                tracker.sender_id,
-                "result.received",
-                {
-                    "command_id": command_id,
-                    "responder_id": responder_id,
-                    "status": status,
-                    "payload": payload,
-                },
-            )
+            result_payload = {
+                "command_id": command_id,
+                "responder_id": responder_id,
+                "status": status,
+                "payload": payload,
+            }
+            self._deliver_or_buffer(tracker.sender_id, "result.received", result_payload)
+            self._mirror_firehose("result.received", result_payload)
             if tracker.is_complete():
-                self._deliver_or_buffer(
-                    tracker.sender_id,
-                    "command.completed",
-                    {
-                        "command_id": command_id,
-                        "received_count": tracker.received_count,
-                        "expected_count": tracker.expected_count,
-                        "reason": "all_responded",
-                    },
-                )
+                completed_payload = {
+                    "command_id": command_id,
+                    "received_count": tracker.received_count,
+                    "expected_count": tracker.expected_count,
+                    "reason": "all_responded",
+                }
+                self._deliver_or_buffer(tracker.sender_id, "command.completed", completed_payload)
+                self._mirror_firehose("command.completed", completed_payload)
                 if self._metrics is not None:
                     self._metrics.command_completed_total.labels(
                         reason="all_responded"
@@ -536,6 +533,18 @@ class Session:
         if requested > self.config.max_command_timeout_seconds:
             return self.config.max_command_timeout_seconds
         return requested
+
+    def _mirror_firehose(self, name: str, payload: dict[str, Any]) -> None:
+        """Schedule a non-blocking firehose publish for one logical event.
+
+        Called once per logical event (not once per recipient). Uses
+        ``asyncio.create_task`` so the firehose publish never blocks or
+        stalls the participant delivery path even if subscribers are slow.
+        """
+        if self._firehose is not None:
+            asyncio.create_task(
+                self._firehose.publish(self.session_id, {"name": name, "payload": payload})
+            )
 
     def _deliver_or_buffer(self, pid: str, name: str, payload: dict[str, Any]) -> None:
         p = self._participants.get(pid)
@@ -613,12 +622,10 @@ class Session:
         to_close: list[str] = []
         for cid, t in self._inflight.items():
             if t.sender_id == sender_id:
+                cancelled_payload = {"command_id": cid, "reason": reason}
                 for pending_pid in t.pending_recipients():
-                    self._deliver_or_buffer(
-                        pending_pid,
-                        "command.cancelled",
-                        {"command_id": cid, "reason": reason},
-                    )
+                    self._deliver_or_buffer(pending_pid, "command.cancelled", cancelled_payload)
+                self._mirror_firehose("command.cancelled", cancelled_payload)
                 to_close.append(cid)
         for cid in to_close:
             self._inflight.pop(cid, None)
@@ -679,30 +686,24 @@ class Session:
         expired_cids = [cid for cid, t in self._inflight.items() if t.is_expired(moment)]
         for cid in expired_cids:
             t = self._inflight.pop(cid)
-            self._deliver_or_buffer(
-                t.sender_id,
-                "command.completed",
-                {
-                    "command_id": cid,
-                    "received_count": t.received_count,
-                    "expected_count": t.expected_count,
-                    "reason": "ttl_expired",
-                },
-            )
+            completed_payload = {
+                "command_id": cid,
+                "received_count": t.received_count,
+                "expected_count": t.expected_count,
+                "reason": "ttl_expired",
+            }
+            self._deliver_or_buffer(t.sender_id, "command.completed", completed_payload)
+            self._mirror_firehose("command.completed", completed_payload)
             if self._metrics is not None:
-                self._metrics.command_completed_total.labels(
-                    reason="ttl_expired"
-                ).inc()
-            for pending_pid in t.pending_recipients():
-                self._deliver_or_buffer(
-                    pending_pid,
-                    "command.cancelled",
-                    {"command_id": cid, "reason": "ttl_expired"},
-                )
+                self._metrics.command_completed_total.labels(reason="ttl_expired").inc()
+            pending = t.pending_recipients()
+            cancelled_payload = {"command_id": cid, "reason": "ttl_expired"}
+            for pending_pid in pending:
+                self._deliver_or_buffer(pending_pid, "command.cancelled", cancelled_payload)
                 if self._metrics is not None:
-                    self._metrics.command_cancelled_total.labels(
-                        reason="ttl_expired"
-                    ).inc()
+                    self._metrics.command_cancelled_total.labels(reason="ttl_expired").inc()
+            if pending:
+                self._mirror_firehose("command.cancelled", cancelled_payload)
         # 2. Offline-grace eviction
         evicted: list[str] = []
         for pid, p in self._participants.items():
@@ -730,6 +731,7 @@ class Session:
         self._inflight.clear()
         if self._metrics is not None:
             self._metrics.session_ended_total.labels(reason=reason).inc()
+        self._mirror_firehose("session.ended", {"reason": reason})
 
     def handle_disconnect(self, handle: ConnectionHandle) -> None:
         """Mark a participant offline and notify others.
@@ -806,3 +808,4 @@ class Session:
             if pid == exclude_pid:
                 continue
             self._deliver_or_buffer(pid, name, payload)
+        self._mirror_firehose(name, payload)

@@ -11,6 +11,7 @@ from typing import Any
 from sessionweave.config import DeploymentDefaults, apply_overrides
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.session import MAX_PURPOSE_BYTES, Session
 
@@ -47,6 +48,7 @@ class SessionRegistry:
     __slots__ = (
         "_connections",
         "_defaults",
+        "_firehose",
         "_heap",
         "_lock",
         "_loop_task",
@@ -60,6 +62,7 @@ class SessionRegistry:
         defaults: DeploymentDefaults,
         connections: ConnectionManager,
         metrics: Metrics | None = None,
+        firehose: FirehoseRegistry | None = None,
     ) -> None:
         self._defaults = defaults
         self._sessions: dict[str, Session] = {}
@@ -67,6 +70,7 @@ class SessionRegistry:
         self._lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
         self._metrics = metrics
+        self._firehose = firehose
         # heap entries are (deadline_epoch_seconds, sid). A session may
         # appear multiple times after re-pushes; lazy invalidation drops
         # stale entries on pop.
@@ -108,6 +112,7 @@ class SessionRegistry:
                 # tick that should fire command.cancelled / command.completed
                 # never runs until the session itself idles out.
                 on_deadline_shortened=self._schedule,
+                firehose=self._firehose,
             )
             self._sessions[sid] = sess
             self._schedule(sess)
