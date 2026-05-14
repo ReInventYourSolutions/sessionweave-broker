@@ -76,4 +76,5 @@ markers = [
     "integration: requires spawning a relay subprocess",
     "property: hypothesis-based",
     "fuzz: concurrency stress (nightly)",
+    "e2e: end-to-end tests using a real browser (Playwright)",
 ]
