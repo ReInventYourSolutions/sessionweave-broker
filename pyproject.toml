@@ -16,6 +16,8 @@ dependencies = [
     "websockets>=12.0",
     "pydantic>=2.6",
     "prometheus-client>=0.20",
+    "httpx>=0.27",
+    "sessionweave-client @ git+https://github.com/EnzinoBB/SessionWeave.git#subdirectory=SDK/python",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +36,10 @@ sessionweave = "sessionweave.main:cli"
 sessionweave-join = "sessionweave.launch:main"
 sessionweave-host = "sessionweave.host_cli:main"
 sessionweave-poller = "sessionweave.poller:main"
+sessionweave-agent-runner = "sessionweave.runner.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sessionweave"]
@@ -63,6 +69,11 @@ disallow_incomplete_defs = false
 # bare form here and silence the strict generic-args check for this shim.
 module = "sessionweave.server"
 disallow_any_generics = false
+
+[[tool.mypy.overrides]]
+# sessionweave_client ships no py.typed marker or stubs; ignore missing types.
+module = ["sessionweave_client", "sessionweave_client.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
