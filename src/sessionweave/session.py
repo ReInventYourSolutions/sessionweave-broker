@@ -5,7 +5,10 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from sessionweave.connections import ConnectionHandle
 
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
@@ -328,6 +331,16 @@ class Session:
         ``queue.put_nowait`` on an ``asyncio.Queue``. If the callback
         raises (e.g. queue is full), the event falls through to the
         regular buffer so it isn't silently dropped.
+
+        Side effect on ``online``: a long-lived event subscriber (e.g. the
+        per-participant ``/events`` WebSocket) is by itself enough to
+        consider the participant reachable, even when no traditional
+        transport handle is bound. We flip ``online=True`` here when the
+        participant is currently offline, broadcast
+        ``participant.updated``, and rely on ``detach_subscriber`` to
+        flip back when no subscribers + no alive handle remain. Without
+        this, a WS-only client would be evicted by ``offline_timeout``
+        after ``offline_grace_seconds`` even while actively receiving.
         """
         async with self.lock:
             if participant_id not in self._participants:
@@ -342,7 +355,19 @@ class Session:
                 else []
             )
             self._subscribers.setdefault(participant_id, []).append(callback)
-            return backlog
+            p = self._participants[participant_id]
+            if not p.online:
+                p.online = True
+                p.last_online_at = _utcnow()
+                if self._metrics is not None:
+                    self._metrics.participants_active.labels(online="false").dec()
+                    self._metrics.participants_active.labels(online="true").inc()
+                self._notify_others(
+                    exclude_pid=participant_id,
+                    name="participant.updated",
+                    payload={"participant": p.to_public().model_dump()},
+                )
+        return backlog
 
     async def detach_subscriber(
         self,
@@ -357,6 +382,14 @@ class Session:
         drain whatever queue the callback writes to via
         ``requeue_to_buffer``), or sees it gone and routes to the
         buffer. There is no in-between state where an event can vanish.
+
+        Side effect on ``online``: mirrors ``attach_subscriber``. If
+        removing this callback empties the subscriber list AND no live
+        connection handle remains, the participant transitions back to
+        offline (so the existing eviction loop can sweep them after the
+        offline-grace window). If a regular MCP/REST handle is still
+        bound, ``online`` is left alone — that transport's own lifecycle
+        decides when to flip it.
         """
         async with self.lock:
             subs = self._subscribers.get(participant_id)
@@ -368,6 +401,28 @@ class Session:
                 return
             if not subs:
                 self._subscribers.pop(participant_id, None)
+                p = self._participants.get(participant_id)
+                if p is not None and p.online:
+                    handle = p.connection_ref
+                    # ``connection_ref`` is typed ``object | None`` because
+                    # the dataclass keeps the handle opaque to avoid a
+                    # circular import with connections.py; in practice it is
+                    # always a ConnectionHandle, hence the cast.
+                    handle_alive = bool(
+                        handle is not None
+                        and cast("ConnectionHandle", handle).is_alive()
+                    )
+                    if not handle_alive:
+                        p.online = False
+                        p.last_online_at = _utcnow()
+                        if self._metrics is not None:
+                            self._metrics.participants_active.labels(online="true").dec()
+                            self._metrics.participants_active.labels(online="false").inc()
+                        self._notify_others(
+                            exclude_pid=participant_id,
+                            name="participant.updated",
+                            payload={"participant": p.to_public().model_dump()},
+                        )
 
     async def requeue_to_buffer(
         self,
