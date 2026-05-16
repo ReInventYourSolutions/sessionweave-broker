@@ -33,3 +33,18 @@ def test_separate_instances_have_isolated_registries() -> None:
     b.sessions_active.set(2)
     assert b"7" in a.render()
     assert b"2" in b.render()
+
+
+def test_wait_for_event_metrics_exist() -> None:
+    m = Metrics()
+    # Must not raise
+    m.wait_for_event_total.labels(outcome="event").inc()
+    m.wait_for_event_total.labels(outcome="timeout").inc()
+    m.wait_for_event_duration_seconds.observe(0.5)
+    m.wait_for_event_active.inc()
+    m.wait_for_event_active.dec()
+
+    output = m.render().decode("utf-8")
+    assert "sessionweave_wait_for_event_total" in output
+    assert "sessionweave_wait_for_event_duration_seconds" in output
+    assert "sessionweave_wait_for_event_active" in output

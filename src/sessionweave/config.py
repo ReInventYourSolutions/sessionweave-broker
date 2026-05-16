@@ -16,6 +16,8 @@ class SessionConfig:
     max_command_timeout_seconds: int = 300
     offline_grace_seconds: int = 300
     max_pending_notifications_per_participant: int = 1000
+    max_wait_seconds: int = 600
+    max_concurrent_waits_total: int = 1000
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,6 +35,10 @@ class ConfigBounds:
     offline_grace_seconds_max: int = 3600
     max_pending_notifications_per_participant_min: int = 0
     max_pending_notifications_per_participant_max: int = 100_000
+    max_wait_seconds_min: int = 1
+    max_wait_seconds_max: int = 3600
+    max_concurrent_waits_total_min: int = 0
+    max_concurrent_waits_total_max: int = 100_000
 
     @staticmethod
     def builtin() -> ConfigBounds:
@@ -137,6 +143,18 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
         b.max_pending_notifications_per_participant_min,
         b.max_pending_notifications_per_participant_max,
     )
+    check(
+        "max_wait_seconds",
+        cfg.max_wait_seconds,
+        b.max_wait_seconds_min,
+        b.max_wait_seconds_max,
+    )
+    check(
+        "max_concurrent_waits_total",
+        cfg.max_concurrent_waits_total,
+        b.max_concurrent_waits_total_min,
+        b.max_concurrent_waits_total_max,
+    )
 
 
 def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
@@ -153,6 +171,8 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_pending_notifications_per_participant=env_int(
             "SW_DEFAULT_MAX_PENDING_NOTIFICATIONS", 1000
         ),
+        max_wait_seconds=env_int("SW_DEFAULT_MAX_WAIT_SECONDS", 600),
+        max_concurrent_waits_total=env_int("SW_DEFAULT_MAX_CONCURRENT_WAITS_TOTAL", 1000),
     )
     bounds = ConfigBounds(
         max_participants_min=env_int("SW_MIN_MAX_PARTICIPANTS", 2),
@@ -172,5 +192,9 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_pending_notifications_per_participant_max=env_int(
             "SW_MAX_MAX_PENDING_NOTIFICATIONS", 100_000
         ),
+        max_wait_seconds_min=env_int("SW_MIN_MAX_WAIT_SECONDS", 1),
+        max_wait_seconds_max=env_int("SW_MAX_MAX_WAIT_SECONDS", 3600),
+        max_concurrent_waits_total_min=env_int("SW_MIN_MAX_CONCURRENT_WAITS_TOTAL", 0),
+        max_concurrent_waits_total_max=env_int("SW_MAX_MAX_CONCURRENT_WAITS_TOTAL", 100_000),
     )
     return DeploymentDefaults(defaults=defaults, bounds=bounds)

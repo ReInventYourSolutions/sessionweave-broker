@@ -17,6 +17,10 @@ class ErrorCode(StrEnum):
     ALREADY_RESPONDED = "already_responded"
     PARTICIPANT_NOT_FOUND = "participant_not_found"
     INVALID_CONFIG = "invalid_config"
+    INVALID_DELIVERY_MODE = "invalid_delivery_mode"
+    WAIT_ALREADY_IN_FLIGHT = "wait_already_in_flight"
+    PARTICIPANT_EVICTED = "participant_evicted"
+    TOO_MANY_WAITS = "too_many_waits"
 
 
 @dataclass(slots=True)

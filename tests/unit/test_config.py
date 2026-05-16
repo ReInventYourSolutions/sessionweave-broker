@@ -21,6 +21,8 @@ def test_session_config_default_values() -> None:
     assert cfg.max_command_timeout_seconds == 300
     assert cfg.offline_grace_seconds == 300
     assert cfg.max_pending_notifications_per_participant == 1000
+    assert cfg.max_wait_seconds == 600
+    assert cfg.max_concurrent_waits_total == 1000
 
 
 def test_apply_overrides_returns_new_config_with_changes() -> None:
@@ -77,3 +79,47 @@ def test_load_deployment_defaults_reads_env(monkeypatch: pytest.MonkeyPatch) -> 
     dep: DeploymentDefaults = load_deployment_defaults(os.environ)
     assert dep.defaults.max_participants == 4
     assert dep.bounds.max_participants_max == 8
+
+
+def test_wait_for_event_config_defaults() -> None:
+    cfg = SessionConfig()
+    assert cfg.max_wait_seconds == 600
+    assert cfg.max_concurrent_waits_total == 1000
+
+    b = ConfigBounds.builtin()
+    assert b.max_wait_seconds_min == 1
+    assert b.max_wait_seconds_max == 3600
+    assert b.max_concurrent_waits_total_min == 0
+    assert b.max_concurrent_waits_total_max == 100_000
+
+
+def test_apply_overrides_validates_wait_for_event_bounds() -> None:
+    defaults = SessionConfig()
+    bounds = ConfigBounds.builtin()
+
+    # In-range overrides succeed.
+    out = apply_overrides(
+        defaults, bounds, {"max_wait_seconds": 120, "max_concurrent_waits_total": 50}
+    )
+    assert out.max_wait_seconds == 120
+    assert out.max_concurrent_waits_total == 50
+
+    # Below-min for max_wait_seconds is rejected.
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_wait_seconds": 0})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    # Above-max for max_wait_seconds is rejected.
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_wait_seconds": 10_000})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    # Below-min for max_concurrent_waits_total is rejected.
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_concurrent_waits_total": -1})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    # Above-max for max_concurrent_waits_total is rejected.
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_concurrent_waits_total": 1_000_000})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG

@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,6 +39,14 @@ def _isoformat(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+@dataclass(slots=True)
+class WaitForEventResult:
+    """Return value of Session.wait_for_event."""
+
+    messages: list[dict[str, Any]]
+    timed_out: bool
+
+
 class Session:
     """Single-session state machine. All public methods acquire `self.lock`
     so per-session operations are linearizable.
@@ -46,6 +55,7 @@ class Session:
     """
 
     __slots__ = (
+        "_active_waits",
         "_buffers",
         "_connections",
         "_created_at",
@@ -58,6 +68,7 @@ class Session:
         "_participants",
         "_picker",
         "_subscribers",
+        "_wait_in_flight",
         "config",
         "lock",
         "purpose",
@@ -80,6 +91,8 @@ class Session:
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
+        self._wait_in_flight: set[str] = set()
+        self._active_waits: int = 0
         # Per-participant push subscribers (e.g. WebSocket events handlers).
         # A subscriber is a sync callback ``(name: str, payload: dict) ->
         # None`` invoked from inside ``_deliver_or_buffer`` while ``self.lock``
@@ -216,6 +229,14 @@ class Session:
                 online_label = "true" if p.online else "false"
                 self._metrics.participants_active.labels(online=online_label).dec()
             self._cancel_inflight_for_sender(participant_id, reason="sender_gone")
+            # Wake any wait_for_event coroutine so it can raise PARTICIPANT_EVICTED.
+            subs = self._subscribers.pop(participant_id, None)
+            if subs:
+                for cb in list(subs):
+                    try:
+                        cb("__evicted__", {})
+                    except Exception:
+                        pass
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
             if feedback is not None:
                 payload["feedback"] = feedback
@@ -314,6 +335,175 @@ class Session:
                 {"name": item["_name"], "payload": item["_payload"]}
                 for item in buf.drain()
             ]
+
+    async def wait_for_event(
+        self,
+        participant_id: str,
+        names: list[str] | None,
+        timeout_seconds: float,
+    ) -> WaitForEventResult:
+        """Block until a matching event reaches the caller's inbox.
+
+        Drains the buffer atomically; non-matching events are
+        re-buffered. Pull-mode only; one wait in flight per
+        participant. See spec 2026-05-16-session-wait-for-event.
+        """
+        match_set = frozenset(names) if names else None
+
+        def is_match(evt_name: str) -> bool:
+            return match_set is None or evt_name in match_set
+
+        # Bounded queue between the synchronous subscriber callback
+        # and this coroutine. Overflow falls through to the buffer
+        # via attach_subscriber's existing fallback contract.
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=64)
+
+        def on_event(name: str, payload: dict[str, Any]) -> None:
+            try:
+                queue.put_nowait((name, payload))
+            except asyncio.QueueFull:
+                # Let attach_subscriber's contract route to the buffer.
+                raise
+
+        # Phase 1: validate under lock and snapshot config-derived
+        # values. The lock is released before calling attach/detach
+        # because those acquire it themselves.
+        async with self.lock:
+            p = self._participants.get(participant_id)
+            if p is None:
+                raise ToolError(
+                    ErrorCode.NOT_IN_SESSION, "participant not in session"
+                )
+            if p.delivery_mode != "pull":
+                raise ToolError(
+                    ErrorCode.INVALID_DELIVERY_MODE,
+                    "wait_for_event requires delivery_mode=pull",
+                )
+            if participant_id in self._wait_in_flight:
+                raise ToolError(
+                    ErrorCode.WAIT_ALREADY_IN_FLIGHT,
+                    "another wait_for_event is already in flight",
+                )
+            if self._active_waits >= self.config.max_concurrent_waits_total:
+                raise ToolError(
+                    ErrorCode.TOO_MANY_WAITS,
+                    f"per-session concurrent-wait cap "
+                    f"({self.config.max_concurrent_waits_total}) reached",
+                )
+            self._active_waits += 1
+            self._wait_in_flight.add(participant_id)
+            self.bump_activity()
+            # Effective timeout is bounded by relay config (added in Task 13).
+            effective_timeout = min(
+                float(timeout_seconds), float(self.config.max_wait_seconds)
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + effective_timeout
+
+        if self._metrics is not None:
+            self._metrics.wait_for_event_active.inc()
+        start_time = loop.time()
+        outcome = "error"
+        try:
+            subscriber_attached = False
+            try:
+                # Phase 2: attach subscriber. attach_subscriber atomically
+                # drains the current buffer and registers the callback —
+                # no event arriving between the drain and the registration
+                # can be lost.
+                backlog = await self.attach_subscriber(participant_id, on_event)
+                subscriber_attached = True
+
+                matching: list[dict[str, Any]] = []
+                non_matching: list[dict[str, Any]] = []
+                for entry in backlog:
+                    (matching if is_match(entry["name"]) else non_matching).append(entry)
+
+                # Re-buffer non-matching backlog events so a later
+                # check_inbox / wait_for_event still sees them.
+                # Use requeue_to_buffer (not _deliver_or_buffer) to bypass
+                # the subscriber — calling _deliver_or_buffer here would
+                # route the event back through on_event → queue, causing
+                # an infinite spin loop on non-matching events.
+                if non_matching:
+                    await self.requeue_to_buffer(
+                        participant_id,
+                        [(entry["name"], entry["payload"]) for entry in non_matching],
+                    )
+
+                if matching:
+                    outcome = "event"
+                    return WaitForEventResult(messages=matching, timed_out=False)
+
+                # Phase 3: block until queue delivers an event or budget expires.
+                def check_sentinel(name: str) -> None:
+                    if name == "__evicted__":
+                        raise ToolError(
+                            ErrorCode.PARTICIPANT_EVICTED,
+                            "participant left during wait",
+                        )
+
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        outcome = "timeout"
+                        return WaitForEventResult(messages=[], timed_out=True)
+                    try:
+                        name, payload = await asyncio.wait_for(
+                            queue.get(), timeout=remaining
+                        )
+                    except TimeoutError:
+                        outcome = "timeout"
+                        return WaitForEventResult(messages=[], timed_out=True)
+                    check_sentinel(name)
+
+                    if is_match(name):
+                        matching.append({"name": name, "payload": payload})
+                    else:
+                        await self.requeue_to_buffer(
+                            participant_id, [(name, payload)]
+                        )
+
+                    while True:
+                        try:
+                            name, payload = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        check_sentinel(name)
+                        if is_match(name):
+                            matching.append({"name": name, "payload": payload})
+                        else:
+                            await self.requeue_to_buffer(
+                                participant_id, [(name, payload)]
+                            )
+
+                    if matching:
+                        outcome = "event"
+                        return WaitForEventResult(messages=matching, timed_out=False)
+                    # else: spurious wake on non-matching event(s), keep
+                    # waiting on the same wall-clock budget.
+            except ToolError as exc:
+                if exc.code is ErrorCode.PARTICIPANT_EVICTED:
+                    outcome = "evicted"
+                else:
+                    outcome = "error"
+                raise
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            finally:
+                if subscriber_attached:
+                    await self.detach_subscriber(participant_id, on_event)
+        finally:
+            if self._metrics is not None:
+                duration = loop.time() - start_time
+                self._metrics.wait_for_event_total.labels(outcome=outcome).inc()
+                self._metrics.wait_for_event_duration_seconds.observe(duration)
+                self._metrics.wait_for_event_active.dec()
+            async with self.lock:
+                self._wait_in_flight.discard(participant_id)
+                self._active_waits = max(0, self._active_waits - 1)
 
     async def attach_subscriber(
         self,

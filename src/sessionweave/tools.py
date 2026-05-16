@@ -24,6 +24,8 @@ from sessionweave.schemas import (
     SessionUpdatePurposeOutput,
     SessionUpdateSelfInput,
     SessionUpdateSelfOutput,
+    SessionWaitForEventInput,
+    SessionWaitForEventOutput,
 )
 from sessionweave.session import Session
 
@@ -190,6 +192,23 @@ async def session_check_inbox(
     items = await sess.check_inbox(pid)
     return SessionCheckInboxOutput(
         messages=[InboxMessage(name=i["name"], payload=i["payload"]) for i in items]
+    ).model_dump()
+
+
+async def session_wait_for_event(
+    deps: ToolDeps, handle: ConnectionHandle, payload: dict[str, Any]
+) -> dict[str, Any]:
+    sess, pid = _session_for_handle(deps, handle)
+    inp = SessionWaitForEventInput.model_validate(payload)
+    result = await sess.wait_for_event(
+        pid, names=inp.names, timeout_seconds=inp.timeout_seconds
+    )
+    return SessionWaitForEventOutput(
+        messages=[
+            InboxMessage(name=m["name"], payload=m["payload"])
+            for m in result.messages
+        ],
+        timed_out=result.timed_out,
     ).model_dump()
 
 

@@ -123,6 +123,17 @@ class SessionCheckInboxOutput(_Strict):
     messages: list[InboxMessage]
 
 
+class SessionWaitForEventInput(_Strict):
+    session_id: str
+    names: list[str] | None = None
+    timeout_seconds: float = Field(default=60.0, ge=0.0)
+
+
+class SessionWaitForEventOutput(_Strict):
+    messages: list[InboxMessage]
+    timed_out: bool
+
+
 class SessionSendInput(_Strict):
     dispatch: DispatchMode
     target: Target

@@ -37,6 +37,7 @@ from sessionweave.tools import (
     session_send,
     session_update_purpose,
     session_update_self,
+    session_wait_for_event,
 )
 
 
@@ -74,8 +75,12 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.ALREADY_IN_SESSION: 409,
     ErrorCode.SESSION_FULL: 409,
     ErrorCode.ALREADY_RESPONDED: 409,
+    ErrorCode.INVALID_DELIVERY_MODE: 409,
+    ErrorCode.WAIT_ALREADY_IN_FLIGHT: 409,
+    ErrorCode.PARTICIPANT_EVICTED: 409,
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
+    ErrorCode.TOO_MANY_WAITS: 429,
     ErrorCode.INVALID_DISPATCH_FILTERS: 422,
     ErrorCode.INVALID_TARGETS: 422,
     ErrorCode.INVALID_CONFIG: 422,
@@ -298,6 +303,27 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
     return JSONResponse(out)
 
 
+async def post_inbox_wait(request: Request) -> JSONResponse:
+    sid = request.path_params["sid"]
+    deps = _deps(request)
+    try:
+        token = _require_bearer(request)
+        body = await _read_json_body(request)
+        # session_id is mandatory in the MCP schema but path-derived here;
+        # populate from the path for parity with the other endpoints.
+        body = {**body, "session_id": sid}
+        _bind_participant(deps, sid, token)
+        try:
+            out = await session_wait_for_event(deps, _HTTP_HANDLE, body)
+        finally:
+            _unbind_participant(deps.registry.connections)
+    except ToolError as exc:
+        return _error_response(exc)
+    except ValidationError as exc:
+        return _validation_error(exc)
+    return JSONResponse(out)
+
+
 async def post_commands(request: Request) -> JSONResponse:
     sid = request.path_params["sid"]
     deps = _deps(request)
@@ -456,6 +482,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/participants/me/inbox/drain",
             post_inbox_drain,
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/participants/me/inbox/wait",
+            post_inbox_wait,
             methods=["POST"],
         ),
         Route(

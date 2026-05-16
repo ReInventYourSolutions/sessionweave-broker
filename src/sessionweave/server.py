@@ -38,6 +38,7 @@ from sessionweave.tools import (
     session_send,
     session_update_purpose,
     session_update_self,
+    session_wait_for_event,
 )
 
 _LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1:*", "localhost:*", "[::1]:*")
@@ -183,6 +184,22 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
     ) -> dict[str, Any]:
         assert ctx is not None
         return await session_check_inbox(deps, _handle_for(ctx))
+
+    @mcp.tool(name="session_wait_for_event")
+    async def session_wait_for_event_tool(
+        session_id: str,
+        names: list[str] | None = None,
+        timeout_seconds: float = 60.0,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        assert ctx is not None
+        body: dict[str, Any] = {
+            "session_id": session_id,
+            "timeout_seconds": timeout_seconds,
+        }
+        if names is not None:
+            body["names"] = names
+        return await session_wait_for_event(deps, _handle_for(ctx), body)
 
     @mcp.tool(name="session_send")
     async def session_send_tool(

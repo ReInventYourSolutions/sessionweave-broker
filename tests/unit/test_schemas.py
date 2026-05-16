@@ -3,12 +3,15 @@ from pydantic import ValidationError
 
 from sessionweave.schemas import (
     DispatchMode,
+    InboxMessage,
     ParticipantPublic,
     SessionCreateInput,
     SessionJoinInput,
     SessionRespondInput,
     SessionSendInput,
     SessionUpdateSelfInput,
+    SessionWaitForEventInput,
+    SessionWaitForEventOutput,
     Target,
 )
 
@@ -71,3 +74,37 @@ def test_session_respond_default_status() -> None:
 
 def test_session_update_self_all_optional() -> None:
     SessionUpdateSelfInput()
+
+
+def test_session_wait_for_event_input_defaults() -> None:
+    inp = SessionWaitForEventInput.model_validate({"session_id": "s1"})
+    assert inp.session_id == "s1"
+    assert inp.names is None
+    assert inp.timeout_seconds == 60.0
+
+
+def test_session_wait_for_event_input_with_filter() -> None:
+    inp = SessionWaitForEventInput.model_validate(
+        {"session_id": "s1", "names": ["command.received"], "timeout_seconds": 30}
+    )
+    assert inp.names == ["command.received"]
+    assert inp.timeout_seconds == 30.0
+
+
+def test_session_wait_for_event_input_rejects_negative_timeout() -> None:
+    with pytest.raises(ValidationError):
+        SessionWaitForEventInput.model_validate(
+            {"session_id": "s1", "timeout_seconds": -1}
+        )
+
+
+def test_session_wait_for_event_output_shape() -> None:
+    out = SessionWaitForEventOutput(
+        messages=[InboxMessage(name="x", payload={"y": 1})],
+        timed_out=False,
+    )
+    dumped = out.model_dump()
+    assert dumped == {
+        "messages": [{"name": "x", "payload": {"y": 1}}],
+        "timed_out": False,
+    }

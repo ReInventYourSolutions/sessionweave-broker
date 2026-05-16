@@ -22,6 +22,9 @@ class Metrics:
         "registry",
         "session_ended_total",
         "sessions_active",
+        "wait_for_event_active",
+        "wait_for_event_duration_seconds",
+        "wait_for_event_total",
     )
 
     def __init__(self, registry: CollectorRegistry | None = None) -> None:
@@ -65,6 +68,23 @@ class Metrics:
             "sessionweave_notification_buffer_depth",
             "Per-participant notification buffer depth at observation",
             buckets=(0, 1, 5, 10, 50, 100, 500, 1000, 5000),
+            registry=self.registry,
+        )
+        self.wait_for_event_total = Counter(
+            "sessionweave_wait_for_event_total",
+            "Outcomes of session_wait_for_event calls",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.wait_for_event_duration_seconds = Histogram(
+            "sessionweave_wait_for_event_duration_seconds",
+            "Wall-clock duration of session_wait_for_event calls",
+            buckets=(0.01, 0.1, 1, 5, 30, 60, 300, 600),
+            registry=self.registry,
+        )
+        self.wait_for_event_active = Gauge(
+            "sessionweave_wait_for_event_active",
+            "Currently-blocked session_wait_for_event waiters",
             registry=self.registry,
         )
 
