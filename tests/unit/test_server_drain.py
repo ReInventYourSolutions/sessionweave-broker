@@ -31,3 +31,17 @@ def test_metrics_endpoint_renders_text() -> None:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/plain")
         assert "sessionweave_sessions_active" in resp.text
+
+
+def test_openapi_yaml_route_serves_spec() -> None:
+    app = build_app()
+    with TestClient(app) as client:
+        resp = client.get("/openapi.yaml")
+        assert resp.status_code == 200
+        assert "yaml" in resp.headers["content-type"]
+        text = resp.text
+        # Sanity-check it really is the OpenAPI doc with the current
+        # surface, not a stale or empty file.
+        assert "openapi:" in text
+        assert "/v1/sessions" in text
+        assert "/v1/sessions/{sid}/participants/me/inbox/wait" in text

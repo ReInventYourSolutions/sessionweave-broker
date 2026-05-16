@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
@@ -280,6 +281,17 @@ def build_app() -> Starlette:
     async def metrics_endpoint(request: Request) -> Response:
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 
+    _openapi_path = Path(__file__).parent / "openapi.yaml"
+
+    async def openapi_yaml(request: Request) -> Response:
+        """Canonical OpenAPI spec, shipped alongside the package.
+
+        Served as ``application/yaml``; clients that need JSON can pipe
+        through any YAML→JSON converter. CORS is handled by the
+        global middleware.
+        """
+        return FileResponse(_openapi_path, media_type="application/yaml")
+
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with AsyncExitStack() as stack:
@@ -294,6 +306,7 @@ def build_app() -> Starlette:
             Route("/healthz", healthz),
             Route("/readyz", readyz),
             Route("/v1/info", info),
+            Route("/openapi.yaml", openapi_yaml),
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
