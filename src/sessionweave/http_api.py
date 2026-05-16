@@ -61,8 +61,13 @@ class HTTPParticipantHandle:
         return True
 
 
-# A single shared instance is fine — there is no per-handle state.
-_HTTP_HANDLE = HTTPParticipantHandle()
+# A fresh ``HTTPParticipantHandle()`` is created per HTTP request and
+# bound for the duration of that request only. A module-level singleton
+# would serialise concurrent requests on ``ConnectionManager.bind``
+# (which rejects re-binding a handle to a different participant): two
+# parallel HTTP clients on the same relay process would collide. The
+# handle is stateless (``__slots__ = ()``), so per-request instances
+# are essentially free.
 
 
 # ---------- error mapping ----------
@@ -124,9 +129,11 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 def _bind_participant(
     deps: ToolDeps, session_id: str, participant_id: str
-) -> None:
-    """Validate the Bearer token then bind ``_HTTP_HANDLE`` to that pair
-    for the duration of one tool call.
+) -> HTTPParticipantHandle:
+    """Validate the Bearer token then create + bind a fresh
+    ``HTTPParticipantHandle`` to that pair for the duration of one tool
+    call. The caller MUST pass the returned handle to
+    ``_unbind_participant`` in a ``finally`` block.
 
     Raises ``ToolError(NOT_IN_SESSION)`` if the token doesn't correspond
     to an active participant of the named session — that's how unknown
@@ -137,11 +144,15 @@ def _bind_participant(
         raise ToolError(
             ErrorCode.NOT_IN_SESSION, "unknown or stale participant token"
         )
-    deps.registry.connections.bind(_HTTP_HANDLE, session_id, participant_id)
+    handle = HTTPParticipantHandle()
+    deps.registry.connections.bind(handle, session_id, participant_id)
+    return handle
 
 
-def _unbind_participant(connections: ConnectionManager) -> None:
-    connections.unbind(_HTTP_HANDLE)
+def _unbind_participant(
+    connections: ConnectionManager, handle: HTTPParticipantHandle
+) -> None:
+    connections.unbind(handle)
 
 
 def _bearer(request: Request) -> str | None:
@@ -194,13 +205,13 @@ async def patch_session_purpose(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
             out = await session_update_purpose(
-                deps, _HTTP_HANDLE, {"purpose": body.get("purpose")}
+                deps, handle, {"purpose": body.get("purpose")}
             )
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -213,20 +224,21 @@ async def post_participants(request: Request) -> JSONResponse:
     caller MUST keep that as the Bearer token for subsequent calls."""
     sid = request.path_params["sid"]
     deps = _deps(request)
+    # session_join itself binds the handle to the new participant; we
+    # provide a fresh per-request handle and release it before returning.
+    handle = HTTPParticipantHandle()
     try:
         body = await _read_json_body(request)
         body = {**body, "session_id": sid}
         # Force pull delivery — HTTP has no push transport.
         body["delivery_mode"] = "pull"
-        out = await session_join(deps, _HTTP_HANDLE, body)
+        out = await session_join(deps, handle, body)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
         return _validation_error(exc)
     finally:
-        # session_join binds the handle; release it so the next request
-        # can re-bind via its own Bearer token.
-        _unbind_participant(deps.registry.connections)
+        _unbind_participant(deps.registry.connections, handle)
     response = {**out, "participant_token": out["participant_id"]}
     return JSONResponse(response, status_code=201)
 
@@ -236,11 +248,11 @@ async def get_participants(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         token = _require_bearer(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_list_participants(deps, _HTTP_HANDLE)
+            out = await session_list_participants(deps, handle)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     return JSONResponse(out)
@@ -252,11 +264,11 @@ async def patch_self(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_update_self(deps, _HTTP_HANDLE, body)
+            out = await session_update_self(deps, handle, body)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -277,11 +289,11 @@ async def delete_self(request: Request) -> Response:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            await session_leave(deps, _HTTP_HANDLE, body if body else None)
+            await session_leave(deps, handle, body if body else None)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     # 204 No Content: deliberately empty body per RFC 7230.
@@ -293,11 +305,11 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         token = _require_bearer(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_check_inbox(deps, _HTTP_HANDLE)
+            out = await session_check_inbox(deps, handle)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     return JSONResponse(out)
@@ -312,11 +324,11 @@ async def post_inbox_wait(request: Request) -> JSONResponse:
         # session_id is mandatory in the MCP schema but path-derived here;
         # populate from the path for parity with the other endpoints.
         body = {**body, "session_id": sid}
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_wait_for_event(deps, _HTTP_HANDLE, body)
+            out = await session_wait_for_event(deps, handle, body)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -330,11 +342,11 @@ async def post_commands(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_send(deps, _HTTP_HANDLE, body)
+            out = await session_send(deps, handle, body)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -350,11 +362,11 @@ async def post_command_response(request: Request) -> JSONResponse:
         token = _require_bearer(request)
         body = await _read_json_body(request)
         body = {**body, "command_id": cid}
-        _bind_participant(deps, sid, token)
+        handle = _bind_participant(deps, sid, token)
         try:
-            await session_respond(deps, _HTTP_HANDLE, body)
+            await session_respond(deps, handle, body)
         finally:
-            _unbind_participant(deps.registry.connections)
+            _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
