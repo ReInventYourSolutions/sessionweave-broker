@@ -134,6 +134,50 @@ Without a side-car runner installed on the agent's host, this is the
 triggering a new turn. If you need true offline reachability, see the
 `sessionweave-agent-runner` package.
 
+#### Handling `supervisor.note`
+
+The relay broadcasts supervisor instructions to all participants. The
+payload shape on the wire is:
+
+```json
+{
+  "note_id": "sn-...",
+  "kind": "note" | "continue" | "halt" | "redirect",
+  "target": "all" | "<participant_id>",
+  "message": "free-form text or null",
+  "ts_ms": 1778947868936
+}
+```
+
+**Dispatch by `kind`, not by scanning `message`.** A halt note is the
+canonical "leave the session now" signal — the supervisor (host or
+operator) is telling you the work is done or aborted. Substring-match
+on `message` is fragile and language-dependent; the `kind` field is
+the contract.
+
+Minimum handler for a worker that should obey shutdowns:
+
+```python
+async def handle(evt):
+    if evt["name"] == "supervisor.note":
+        kind = evt["payload"].get("kind", "")
+        if kind == "halt":
+            # leave the session and exit the turn
+            await me.leave(feedback={"summary": "halted by supervisor"})
+            raise SystemExit(0)
+        # "continue" / "redirect" / "note" → consult message and react
+        # appropriately to your worker's domain.
+    elif evt["name"] == "command.received":
+        ...
+```
+
+**Verify your shutdown wiring before relying on it.** Send a test
+`{"kind": "halt", "target": "all", "message": "test"}` early in your
+worker's lifetime and confirm the process exits cleanly — payload
+field name mismatches (e.g. reading `text` instead of `message`) are
+silent failures: the relay accepts the note, the worker logs the
+event, but the agent keeps spinning until its idle-loop timeout.
+
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
 [`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
 
