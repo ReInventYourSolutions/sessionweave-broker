@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.11.1"
+  version: "0.13.2"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -214,6 +214,45 @@ components:
           items:
             $ref: '#/components/schemas/InboxEvent'
 
+    InboxWaitRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        names:
+          type: array
+          items: { type: string }
+          nullable: true
+          description: |
+            Optional event-name filter. `null` or `[]` means "wake on
+            any event". Otherwise, only events whose `name` matches
+            one of the listed strings wake the call; other events
+            are silently re-buffered.
+        timeout_seconds:
+          type: number
+          format: float
+          minimum: 0
+          default: 60
+          description: |
+            Caller-chosen wall-clock budget. The relay clamps this to
+            `min(max_wait_seconds, session_remaining_ttl)`. A value
+            of 0 means "drain matching events right now, do not wait"
+            — useful as a filtered version of `inbox/drain`.
+
+    InboxWaitResponse:
+      type: object
+      required: [messages, timed_out]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxEvent'
+        timed_out:
+          type: boolean
+          description: |
+            True iff the call returned because the `timeout_seconds`
+            deadline elapsed without any matching event. When False,
+            at least one matching event was delivered.
+
     LeaveRequest:
       type: object
       description: Optional body on DELETE /participants/me.
@@ -274,6 +313,10 @@ components:
                 - invalid_targets
                 - invalid_config
                 - validation_error
+                - invalid_delivery_mode
+                - wait_already_in_flight
+                - participant_evicted
+                - too_many_waits
             message:
               type: string
 
@@ -291,7 +334,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.11.1" }
+                  version: { type: string, example: "0.13.2" }
                   subproject: { type: string }
                   transports:
                     type: array
@@ -520,6 +563,48 @@ paths:
               schema: { $ref: '#/components/schemas/InboxDrainResponse' }
         '401':
           description: not_in_session
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/sessions/{sid}/participants/me/inbox/wait:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [participants]
+      summary: Blocking long-poll for events on the participant's inbox
+      description: |
+        Pull-mode only. Block until ≥1 buffered event matches the
+        optional `names` filter (or `timeout_seconds` elapses), then
+        return all matching events and re-buffer the rest. The
+        response shape mirrors `inbox/drain` plus a `timed_out`
+        flag distinguishing a real event delivery from a clean
+        timeout.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InboxWaitRequest' }
+      responses:
+        '200':
+          description: Events or timeout (both success)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxWaitResponse' }
+        '400':
+          description: invalid_payload
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: bearer does not match participant
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: session_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: too_many_waits — relay concurrent-wait cap exceeded
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /v1/sessions/{sid}/participants/me/events:

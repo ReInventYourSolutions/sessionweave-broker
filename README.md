@@ -177,6 +177,7 @@ The contract is one-for-one with the MCP tools.
 | `PATCH` | `/v1/sessions/{sid}/participants/me` | Update self (role / capabilities / metadata) |
 | `DELETE` | `/v1/sessions/{sid}/participants/me` | Leave; optional JSON body with `feedback` |
 | `POST` | `/v1/sessions/{sid}/participants/me/inbox/drain` | Pop buffered events |
+| `POST` | `/v1/sessions/{sid}/participants/me/inbox/wait` | Long-poll: block until ≥1 matching event arrives or timeout |
 | `POST` | `/v1/sessions/{sid}/commands` | Dispatch a command (`specific` / `all` / `any`) |
 | `POST` | `/v1/sessions/{sid}/commands/{cid}/responses` | Respond to a command |
 | `WS` | `/v1/sessions/{sid}/participants/me/events?token=…` | Live event stream |
@@ -187,7 +188,11 @@ authenticated route, or as `?token=…` on the WS upgrade. Sub-project #3
 will swap this for a JWT without changing the surface.
 
 REST joiners are pull-mode by definition; pair with the WS endpoint for
-push delivery, or poll `inbox/drain`. Each WS frame is a single JSON
+push delivery, or poll `inbox/drain`. For turn-based agents that can't
+keep a WebSocket open, `POST .../inbox/wait` offers a long-poll
+alternative: it blocks until a matching event arrives (or
+`timeout_seconds` elapses) and returns the same `{messages}` shape —
+no polling loop needed. Pull-mode only. Each WS frame is a single JSON
 object `{"name": "<event>", "payload": {...}}` matching the
 `inbox/drain` schema.
 
@@ -240,6 +245,7 @@ themselves. Recommended shape (per skill v0.11.0+):
 | `session_update_self` | Replace fields on the caller's participant; broadcast. |
 | `session_list_participants` | Snapshot of the roster. |
 | `session_check_inbox` | Drain pending events for the caller. Required when joined with `delivery_mode="pull"`. |
+| `session_wait_for_event` | Blocking long-poll: drain pending events that match the optional `names` filter, or block until one arrives (or `timeout_seconds` elapses). Pull-mode only. Same `{messages, timed_out}` shape as REST. |
 | `session_send` | Dispatch a command (`all` / `any` / `specific`) to others. |
 | `session_respond` | Respond to a previously received command. |
 
@@ -285,6 +291,8 @@ Configurable parameters:
 - `default_command_timeout_seconds`, `max_command_timeout_seconds`
 - `offline_grace_seconds`
 - `max_pending_notifications_per_participant`
+- `max_wait_seconds` (default 600) — clamps the `timeout_seconds` a caller may pass to `inbox/wait`
+- `max_concurrent_waits_total` (default 1000) — relay-wide cap on simultaneous long-poll waits
 
 Process binding: `SW_HOST` (default `0.0.0.0`), `SW_PORT` (default `8765`).
 
