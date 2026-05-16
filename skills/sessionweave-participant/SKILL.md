@@ -100,6 +100,40 @@ asyncio.run(main())
 > `dispatch="any"` races, only one contender wins per race, the other
 > two would hang the test forever without the timeout wrapper.
 
+### Staying reachable inside a turn
+
+Turn-based agents (Claude Code, Codex, opencode) need to hold a turn
+open while waiting for counterparty events. The right pattern is a
+bounded long-poll loop, not busy-polling `session_check_inbox`:
+
+```python
+# MCP client (works for any runtime that surfaces MCP tools)
+while True:
+    out = await session.call_tool("session_wait_for_event", {
+        "session_id": sid,
+        "names": ["command.received", "supervisor.note"],
+        "timeout_seconds": 60,
+    })
+    msgs = out["messages"]
+    if msgs:
+        for evt in msgs:
+            await handle(evt)        # respond, dispatch, etc.
+    elif out["timed_out"]:
+        # nothing relevant arrived in this window
+        if should_exit():
+            break
+```
+
+Token cost: while `wait_for_event` is blocking server-side, the
+model performs **zero inferences**. Token cost is paid only when an
+event returns and the next inference begins. A 60-second idle wait
+costs nothing in tokens.
+
+Without a side-car runner installed on the agent's host, this is the
+**only** way an agent can be reachable without the user manually
+triggering a new turn. If you need true offline reachability, see the
+`sessionweave-agent-runner` package.
+
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
 [`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
 
@@ -335,12 +369,41 @@ SessionWeave is a transport-agnostic relay that lets multiple agents exchange co
 
 **Invariant:** one connection participates in **at most one** session at a time. The `session_id` and your `participant_token` (which equals your `participant_id` in sub-project #1) are the only credentials — keep both until the session ends.
 
+## Lifecycle & reachability
+
+A SessionWeave participant is reachable only while *something* is
+listening on its behalf. The relay buffers events for any joined
+participant forever (until the session expires), but the agent
+itself sees those events only when it actively asks for them.
+
+```
+relay buffer  ─────► alive forever (until session TTL)
+agent process ─────► alive only during a turn
+```
+
+There are exactly three ways to bridge that gap:
+
+| Pattern | Listener lives in | When |
+|---|---|---|
+| **Long-poll inside a turn** (`session_wait_for_event`) | The agent's own MCP/REST call | Default for turn-based runtimes (Claude Code, Codex, opencode CLI) |
+| **Side-car runner** (`sessionweave-agent-runner`) | A daemon next to the agent host | Orchestrators, persistent workers |
+| **External orchestrator** (cron, CI, scripted relauncher) | Outside the agent entirely | When you can't run a daemon next to the agent |
+
+If you are an agent reading this skill: assume pattern #1 unless told
+otherwise. Pattern #1 means your turn stays alive by re-issuing
+`session_wait_for_event` in a loop until you have something to
+report or the user instructs you to stop.
+
 ## Delivery modes
 
 Two consumption patterns; pick the one your transport allows:
 
 - **Push** — events arrive in real time. Available via the WebSocket events endpoint (`wss://.../events?token=…`) over HTTP, or as MCP `notifications/message` (LoggingMessageNotification, `logger="sessionweave"`) when you've joined through MCP. Use if your client can surface live frames or server-side log notifications to the model.
-- **Pull** — events accumulate in the per-participant buffer; you drain with `POST /v1/sessions/{sid}/participants/me/inbox/drain` (REST) or `session_check_inbox` (MCP). Use if your runtime is request/response only or doesn't surface push notifications to the model. **All HTTP REST clients are pull-mode by definition** — REST has no persistent transport for server-pushed events; pair it with the WS endpoint if you want push.
+- **Pull** — events accumulate in the per-participant buffer. Two ways to consume:
+  - **Active drain** (one-shot): `session_check_inbox` (MCP) / `POST .../inbox/drain` (REST). Returns whatever is in the buffer right now, even if empty. Use when you want to peek.
+  - **Blocking wait** (long-poll): `session_wait_for_event` (MCP) / `POST .../inbox/wait` (REST). Blocks until at least one matching event arrives (or `timeout_seconds` elapses) and returns all matching events. **Recommended pattern** for keeping a turn alive without busy-polling.
+
+  Use if your runtime is request/response only or doesn't surface push notifications to the model. **All HTTP REST clients are pull-mode by definition** — REST has no persistent transport for server-pushed events; pair it with the WS endpoint if you want push.
 
 When joining through MCP, set this explicitly: `delivery_mode: "push"` (the default — uses LoggingMessageNotification) or `delivery_mode: "pull"`. REST joiners are always pull, regardless of body argument.
 
@@ -471,6 +534,7 @@ print(link)  # hand THIS string to the user; nothing else needed
 | `session_update_self {role?, objective?, capabilities?, metadata?}` | Replace fields (no merge). Omitted = unchanged. |
 | `session_list_participants {}` | Snapshot of the roster. |
 | `session_check_inbox {}` | Drain pending notifications for the caller. Returns `{messages: [{name, payload}, ...]}`. Required when joined with `delivery_mode="pull"`. |
+| `session_wait_for_event {session_id, names?, timeout_seconds?}` | Pull-mode long-poll. Blocks until ≥1 buffered event matches the optional `names` filter, then returns `{messages, timed_out}`. Drain shape identical to `session_check_inbox`. Required tool when joined with `delivery_mode="pull"` and you need to wait for events without busy-polling. |
 | `session_send {dispatch, target, payload, timeout_seconds?}` | Dispatch a command. |
 | `session_respond {command_id, status?, payload}` | Respond to a command you received. `status` defaults to `"ok"`. |
 
@@ -497,7 +561,7 @@ don't join.
 | Mode | Required tool bundle |
 |---|---|
 | Read-only inspection of an invite link | `session_describe` |
-| Join a session in `delivery_mode="pull"` (the safe default) | `session_describe`, `session_join`, `session_check_inbox`, `session_send`, `session_respond`, `session_leave`, `session_list_participants` |
+| Join a session in `delivery_mode="pull"` (the safe default) | `session_describe`, `session_join`, `session_check_inbox`, `session_wait_for_event`, `session_send`, `session_respond`, `session_leave`, `session_list_participants` |
 | Join in `delivery_mode="push"` (only if the runtime surfaces MCP logs to the model) | same as above minus `session_check_inbox` |
 | Host a new session | the join bundle plus `session_create` (and `session_update_purpose` if the brief evolves) |
 
@@ -505,9 +569,10 @@ Phrase the ask concretely. Example for the join-pull bundle:
 
 > "To participate as `<role>` in this session I'll need:
 > `session_describe`, `session_join`, `session_check_inbox`,
-> `session_send`, `session_respond`, `session_leave`,
-> `session_list_participants`. Without `session_check_inbox` I can
-> drive but not read replies. OK to allow all seven?"
+> `session_wait_for_event`, `session_send`, `session_respond`,
+> `session_leave`, `session_list_participants`. Without
+> `session_check_inbox` I can drive but not read replies. OK to
+> allow all eight?"
 
 If your runtime supports wildcard allow-rules (`mcp__sessionweave__*`,
 or "trust this MCP server"), suggest that to the user — it solves the
