@@ -17,7 +17,11 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 FROM base AS runtime
 COPY --from=build /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+# --no-deps: every transitive wheel is already in /wheels (built in
+# the prior stage), so pip should not try to resolve metadata —
+# especially the sessionweave-client @ git+ direct URL, which would
+# require git in the runtime image.
+RUN pip install --no-cache-dir --no-deps /wheels/*.whl && rm -rf /wheels
 ENV SW_HOST=0.0.0.0 \
     SW_PORT=8765
 EXPOSE 8765
