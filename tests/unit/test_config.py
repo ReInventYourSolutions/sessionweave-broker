@@ -176,3 +176,38 @@ def test_apply_overrides_rejects_max_wait_seconds_mcp_above_max_wait_seconds() -
     )
     assert out.max_wait_seconds_mcp == 30
     assert out.max_wait_seconds == 300
+
+
+def test_load_deployment_defaults_rejects_non_integer_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed env var must raise a clear ToolError(INVALID_CONFIG),
+    not a raw ValueError, so the operator sees what to fix."""
+    monkeypatch.setenv("SW_DEFAULT_MAX_PARTICIPANTS", "abc")
+    with pytest.raises(ToolError) as exc:
+        load_deployment_defaults(os.environ)
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+    # Error must mention the offending env var name.
+    assert "SW_DEFAULT_MAX_PARTICIPANTS" in exc.value.message
+
+
+def test_load_deployment_defaults_rejects_defaults_outside_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the operator picks SW_DEFAULT_* outside SW_MIN_*/SW_MAX_*,
+    fail at startup, not silently when a session is created."""
+    monkeypatch.setenv("SW_DEFAULT_MAX_PARTICIPANTS", "300")
+    monkeypatch.setenv("SW_MAX_MAX_PARTICIPANTS", "256")
+    with pytest.raises(ToolError) as exc:
+        load_deployment_defaults(os.environ)
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+
+def test_load_deployment_defaults_accepts_consistent_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SW_DEFAULT_MAX_PARTICIPANTS", "10")
+    monkeypatch.setenv("SW_MAX_MAX_PARTICIPANTS", "32")
+    dep = load_deployment_defaults(os.environ)
+    assert dep.defaults.max_participants == 10
+    assert dep.bounds.max_participants_max == 32

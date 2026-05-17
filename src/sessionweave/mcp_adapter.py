@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from mcp.types import (
@@ -13,6 +14,9 @@ from mcp.types import (
 if TYPE_CHECKING:  # pragma: no cover
     from mcp.server.session import ServerSession
 
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.registry import SessionRegistry
+
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,11 @@ logger = logging.getLogger(__name__)
 # notifications get dropped at the client's ServerNotification validator.
 # Recipients extract ``data._name`` and ``data._payload``.
 _LOGGER_NAME = "sessionweave"
+
+# Type alias for the optional failure-recovery callback injected at construction.
+# The callback receives (event_name, payload) and is responsible for requeuing
+# the event to the appropriate participant buffer.
+_RequeueCB = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 class MCPConnectionHandle:
@@ -34,14 +43,27 @@ class MCPConnectionHandle:
     running event loop. The Session/Registry callers are synchronous and
     typically hold a per-session lock; deferring the actual write avoids
     blocking those critical sections.
+
+    The optional *requeue_callback* closes the delivery-race window: when
+    ``_dispatch`` successfully schedules a send but the transport dies before
+    the coroutine runs, ``send_notification`` raises and the event would be
+    silently dropped (``is_alive()`` returned True at decision time, so the
+    buffer path was skipped).  If a *requeue_callback* is provided, ``_dispatch``
+    calls it on any send failure so the event lands back in the participant's
+    buffer and can be recovered by a later ``inbox/drain`` or ``wait_for_event``.
     """
 
-    __slots__ = ("_alive", "_pending", "_session")
+    __slots__ = ("_alive", "_pending", "_requeue_callback", "_session")
 
-    def __init__(self, session: ServerSession) -> None:
+    def __init__(
+        self,
+        session: ServerSession,
+        requeue_callback: _RequeueCB | None = None,
+    ) -> None:
         self._session = session
         self._alive = True
         self._pending: set[asyncio.Task[None]] = set()
+        self._requeue_callback = requeue_callback
 
     @property
     def server_session(self) -> ServerSession:
@@ -85,9 +107,59 @@ class MCPConnectionHandle:
         )
         try:
             await self._session.send_notification(notif)
-        except Exception as exc:  # pragma: no cover - transport failure paths
+        except Exception as exc:
             logger.debug("dropping notification %s: %s", name, exc)
             self._alive = False
+            # Requeue the event back to the participant's buffer so it can be
+            # recovered via inbox/drain or wait_for_event.  This closes the
+            # delivery-race window where is_alive() returned True at dispatch
+            # time but the transport closed before send_notification ran.
+            if self._requeue_callback is not None:
+                try:
+                    await self._requeue_callback(name, payload)
+                except Exception as requeue_exc:  # pragma: no cover
+                    logger.debug(
+                        "requeue also failed for %s: %s", name, requeue_exc
+                    )
+
+
+class _RequeueBridge:
+    """Thin helper that lets ``HandleRegistry`` wire a requeue callback before
+    the ``MCPConnectionHandle`` is exposed to callers.
+
+    The bridge holds a reference to the handle (set immediately after
+    construction), the ``ConnectionManager``, and the ``SessionRegistry``.
+    When called, it looks up the current (sid, pid) binding from the
+    ``ConnectionManager`` — using the late-bound lookup so the callback
+    works even if the handle is re-bound between construction and the first
+    failed send.
+    """
+
+    __slots__ = ("_connections", "_handle", "_registry")
+
+    def __init__(
+        self,
+        connections: ConnectionManager,
+        registry: SessionRegistry,
+    ) -> None:
+        self._connections = connections
+        self._registry = registry
+        self._handle: MCPConnectionHandle | None = None
+
+    def set_handle(self, handle: MCPConnectionHandle) -> None:
+        self._handle = handle
+
+    async def __call__(self, name: str, payload: dict[str, Any]) -> None:
+        if self._handle is None:
+            return
+        binding = self._connections.session_for(self._handle)
+        if binding is None:
+            return
+        sid, pid = binding
+        sess = self._registry.get(sid)
+        if sess is None:
+            return
+        await sess.requeue_to_buffer(pid, [(name, payload)])
 
 
 class HandleRegistry:
@@ -98,11 +170,30 @@ class HandleRegistry:
     def __init__(self) -> None:
         self._handles: dict[int, MCPConnectionHandle] = {}
 
-    def for_session(self, session: ServerSession) -> MCPConnectionHandle:
+    def for_session(
+        self,
+        session: ServerSession,
+        *,
+        connections: ConnectionManager | None = None,
+        registry: SessionRegistry | None = None,
+    ) -> MCPConnectionHandle:
+        """Return (or create) the stable handle for *session*.
+
+        When both *connections* and *registry* are supplied the returned handle
+        is wired with a requeue callback: if the MCP transport dies after
+        ``is_alive()`` returned True but before ``send_notification`` completes,
+        the event is pushed back to the participant's buffer instead of being
+        silently dropped (audit fix T1.2).
+        """
         key = id(session)
         h = self._handles.get(key)
         if h is None:
-            h = MCPConnectionHandle(session)
+            if connections is not None and registry is not None:
+                bridge = _RequeueBridge(connections, registry)
+                h = MCPConnectionHandle(session, requeue_callback=bridge)
+                bridge.set_handle(h)
+            else:
+                h = MCPConnectionHandle(session)
             self._handles[key] = h
         return h
 

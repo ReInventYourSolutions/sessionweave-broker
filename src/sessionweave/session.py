@@ -737,6 +737,7 @@ class Session:
                 raise ToolError(ErrorCode.NOT_A_RECIPIENT, "not a recipient of this command")
             if responder_id in tracker.responses_received:
                 raise ToolError(ErrorCode.ALREADY_RESPONDED, "already responded")
+            self._enforce_payload_size(payload)
             tracker.responses_received.add(responder_id)
             self.bump_activity()
             result_payload = {
@@ -966,6 +967,17 @@ class Session:
             self._evict(pid, reason="offline_timeout")
 
     def broadcast_session_ended(self, *, reason: str) -> None:
+        # Wake any wait_for_event coroutines so they raise PARTICIPANT_EVICTED
+        # rather than silently timing out on their full budget while the session
+        # disappears under them. Must fire BEFORE _participants is cleared so the
+        # sentinel handler's membership check sees the right state.
+        for _pid, subs in list(self._subscribers.items()):
+            for cb in list(subs):
+                try:
+                    cb("__evicted__", {})
+                except Exception:
+                    pass
+        self._subscribers.clear()
         for pid, p in list(self._participants.items()):
             if p.online:
                 self._connections.send(

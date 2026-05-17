@@ -67,7 +67,12 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
-def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
+def _build_fastmcp(
+    deps: ToolDeps,
+    handles: HandleRegistry,
+    connections: ConnectionManager | None = None,
+    registry: SessionRegistry | None = None,
+) -> FastMCP:
     mcp = FastMCP(
         "sessionweave",
         transport_security=TransportSecuritySettings(
@@ -77,7 +82,11 @@ def _build_fastmcp(deps: ToolDeps, handles: HandleRegistry) -> FastMCP:
     )
 
     def _handle_for(ctx: Context) -> Any:
-        return handles.for_session(ctx.session)
+        return handles.for_session(
+            ctx.session,
+            connections=connections,
+            registry=registry,
+        )
 
     @mcp.tool(name="session_create")
     async def session_create_tool(
@@ -247,7 +256,7 @@ def build_app() -> Starlette:
     handles = HandleRegistry()
     tool_deps = ToolDeps(registry)
 
-    mcp = _build_fastmcp(tool_deps, handles)
+    mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
     mcp_app = mcp.streamable_http_app()
 
     state: dict[str, bool] = {"draining": False}

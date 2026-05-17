@@ -98,6 +98,31 @@ async def test_respond_not_a_recipient_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_respond_rejects_payload_too_large() -> None:
+    s = Session("s", SessionConfig(max_payload_bytes=256), ConnectionManager())
+    h_a, h_b = FakeHandle(), FakeHandle()
+    a = await s.join(h_a, role=None, capabilities=[])
+    b = await s.join(h_b, role="r", capabilities=[])
+    out = await s.send(
+        sender_id=a.participant_id,
+        dispatch=DispatchMode.SPECIFIC,
+        target=Target(participant_ids=[b.participant_id]),
+        payload={},
+    )
+    cmd_id = out.command_id
+    # Build a payload that JSON-serialises larger than 256 bytes.
+    big = {"data": "x" * 1024}
+    with pytest.raises(ToolError) as exc:
+        await s.respond(
+            responder_id=b.participant_id,
+            command_id=cmd_id,
+            status="ok",
+            payload=big,
+        )
+    assert exc.value.code is ErrorCode.PAYLOAD_TOO_LARGE
+
+
+@pytest.mark.asyncio
 async def test_double_respond_raises_already_responded() -> None:
     s = Session("s", SessionConfig(), ConnectionManager())
     h_a, h_b = FakeHandle(), FakeHandle()

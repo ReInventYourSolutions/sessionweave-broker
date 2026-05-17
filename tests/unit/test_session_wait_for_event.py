@@ -282,3 +282,27 @@ async def test_wait_for_event_increments_metrics() -> None:
     assert result.timed_out is False
     rendered = m.render().decode("utf-8")
     assert 'sessionweave_wait_for_event_total{outcome="event"}' in rendered
+
+
+@pytest.mark.asyncio
+async def test_wait_raises_evicted_when_session_ended_mid_wait() -> None:
+    """If the session is ended (by supervisor or TTL eviction) while a
+    wait_for_event coroutine is in flight, that coroutine must wake with
+    PARTICIPANT_EVICTED rather than silently timing out on the full
+    budget. Mirrors the leave-mid-wait test but exercises the
+    broadcast_session_ended path instead.
+    """
+    s = Session("s", SessionConfig(), ConnectionManager())
+    h = FakeHandle()
+    p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
+
+    waiter = asyncio.create_task(
+        s.wait_for_event(p.participant_id, names=None, timeout_seconds=5.0)
+    )
+    await asyncio.sleep(0.02)
+    # Simulate supervisor-triggered session end.
+    s.broadcast_session_ended(reason="deleted_by_test")
+
+    with pytest.raises(ToolError) as excinfo:
+        await waiter
+    assert excinfo.value.code is ErrorCode.PARTICIPANT_EVICTED

@@ -183,7 +183,14 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
 
 def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
     def env_int(name: str, default: int) -> int:
-        return int(env.get(name, default))
+        raw = env.get(name, str(default))
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as e:
+            raise ToolError(
+                ErrorCode.INVALID_CONFIG,
+                f"{name}={raw!r} is not an integer: {e}",
+            ) from e
 
     defaults = SessionConfig(
         max_participants=env_int("SW_DEFAULT_MAX_PARTICIPANTS", 16),
@@ -224,4 +231,10 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_wait_seconds_mcp_min=env_int("SW_MIN_MAX_WAIT_SECONDS_MCP", 1),
         max_wait_seconds_mcp_max=env_int("SW_MAX_MAX_WAIT_SECONDS_MCP", 60),
     )
+    # Operator misconfiguration: defaults must fit inside bounds at startup
+    # so sessions created without client config overrides don't silently use
+    # out-of-range values. _validate with overridden=None range-checks all
+    # fields against the bounds.
+    _validate(defaults, bounds, overridden=None)
+
     return DeploymentDefaults(defaults=defaults, bounds=bounds)
