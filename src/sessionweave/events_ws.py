@@ -154,16 +154,20 @@ async def events_ws(websocket: WebSocket) -> None:
                     continue
                 if isinstance(body, dict) and isinstance(body.get("ack"), int):
                     n = body["ack"]
-                    # Trim unacked of everything up to and including N
-                    # and advance the high-water mark. The relay-side
-                    # buffer is not touched: events are removed from
-                    # ``unacked`` only after the client confirms it has
-                    # consumed them in memory.
+                    # Trim per-connection ``unacked`` of everything up to
+                    # and including N and advance the local high-water
+                    # mark. Also report the ACK to the session so the
+                    # participant's authoritative ``last_acked_seq`` is
+                    # advanced and the per-participant buffer is
+                    # eagerly trimmed — this keeps a parallel REST
+                    # drain from re-surfacing events the WS client has
+                    # already consumed.
                     if n > highest_acked_seq:
                         highest_acked_seq = n
                     for seq_key in list(unacked.keys()):
                         if seq_key <= n:
                             unacked.pop(seq_key, None)
+                    await session.record_ack(pid, n)
         except WebSocketDisconnect:
             return
 

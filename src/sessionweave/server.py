@@ -143,13 +143,18 @@ def _build_fastmcp(
     async def session_resume_tool(
         session_id: str,
         participant_id: str,
+        last_acked_seq: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         assert ctx is not None
         return await session_resume(
             deps,
             _handle_for(ctx),
-            {"session_id": session_id, "participant_id": participant_id},
+            {
+                "session_id": session_id,
+                "participant_id": participant_id,
+                "last_acked_seq": last_acked_seq,
+            },
         )
 
     @mcp.tool(name="session_leave")

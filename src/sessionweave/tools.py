@@ -123,7 +123,9 @@ async def session_resume(
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = deps.registry.get_or_raise(inp.session_id)
-    await sess.resume(handle, inp.participant_id)
+    await sess.resume(
+        handle, inp.participant_id, last_acked_seq=inp.last_acked_seq
+    )
     return SessionResumeOutput(
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),

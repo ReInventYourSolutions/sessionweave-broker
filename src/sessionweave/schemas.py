@@ -67,6 +67,13 @@ class SessionJoinOutput(_Strict):
 class SessionResumeInput(_Strict):
     session_id: str
     participant_id: str
+    # Highest seq the caller has already consumed in memory over some
+    # prior channel (typically a WS that died mid-stream). When set,
+    # the push-mode buffer replay on resume filters out events with
+    # ``seq <= last_acked_seq``. Equivalent to the WS attach's
+    # ``?last_acked_seq=N`` query param — closes the parity gap between
+    # the two reconnect paths.
+    last_acked_seq: int | None = None
 
 
 class SessionResumeOutput(_Strict):

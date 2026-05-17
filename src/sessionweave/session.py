@@ -39,6 +39,21 @@ def _isoformat(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _passes_ack_filter(item_seq: int, ack_watermark: int) -> bool:
+    """True if a buffered item with ``item_seq`` should be delivered
+    given the participant's effective ``ack_watermark``.
+
+    Items with ``seq == 0`` are legacy / unsequenced (e.g. handed back
+    via ``requeue_to_buffer`` from a pre-seq transport adapter) and
+    always pass through — they predate the dedup protocol and a client
+    has no way to acknowledge them. Sequenced items are delivered iff
+    ``item_seq > ack_watermark``.
+    """
+    if item_seq <= 0:
+        return True
+    return item_seq > ack_watermark
+
+
 @dataclass(slots=True)
 class WaitForEventResult:
     """Return value of Session.wait_for_event."""
@@ -330,15 +345,18 @@ class Session:
         ``{"name": <event>, "payload": {...}, "seq": <int>}``.
 
         ``last_acked_seq`` (optional): if provided, only buffered events
-        with ``seq > last_acked_seq`` are returned. Lets a client that
-        consumed events in memory before a flaky disconnect resume
-        without seeing duplicates.
+        with ``seq > last_acked_seq`` are returned. Merged with the
+        participant's authoritative ``last_acked_seq`` watermark via
+        ``max(...)`` so a prior ACK on the WS channel is not regressed
+        by a weaker caller-supplied value, and clients that ACK
+        promptly can omit the parameter entirely.
         """
         async with self.lock:
             p = self._participants.get(participant_id)
             if p is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             self.bump_activity()
+            effective_ack = max(last_acked_seq or 0, p.last_acked_seq)
             buf = self._buffers.pop(participant_id, None)
             if buf is None:
                 return []
@@ -349,7 +367,7 @@ class Session:
                     "seq": item.get("_seq", 0),
                 }
                 for item in self._filter_stale_buffer_items(buf.drain())
-                if last_acked_seq is None or item.get("_seq", 0) > last_acked_seq
+                if _passes_ack_filter(item.get("_seq", 0), effective_ack)
             ]
 
     async def wait_for_event(
@@ -585,6 +603,8 @@ class Session:
         async with self.lock:
             if participant_id not in self._participants:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            p_for_ack = self._participants[participant_id]
+            effective_ack = max(last_acked_seq or 0, p_for_ack.last_acked_seq)
             buf = self._buffers.pop(participant_id, None)
             backlog: list[dict[str, Any]] = (
                 [
@@ -594,8 +614,7 @@ class Session:
                         "seq": item.get("_seq", 0),
                     }
                     for item in self._filter_stale_buffer_items(buf.drain())
-                    if last_acked_seq is None
-                    or item.get("_seq", 0) > last_acked_seq
+                    if _passes_ack_filter(item.get("_seq", 0), effective_ack)
                 ]
                 if buf is not None
                 else []
@@ -863,6 +882,29 @@ class Session:
                     continue
             out.append(item)
         return out
+
+    async def record_ack(self, participant_id: str, seq: int) -> None:
+        """Advance the participant's authoritative ``last_acked_seq``
+        and eagerly trim the per-participant buffer of events with
+        ``_seq <= seq``.
+
+        Idempotent and monotonic: callers can pass a non-increasing
+        ``seq`` (e.g. an old WS connection retrying an ACK) and the
+        watermark will not regress. No-op if the participant is gone.
+        """
+        if seq <= 0:
+            return
+        async with self.lock:
+            p = self._participants.get(participant_id)
+            if p is None:
+                return
+            if seq <= p.last_acked_seq:
+                # Already at or past this watermark; nothing to do.
+                return
+            p.last_acked_seq = seq
+            buf = self._buffers.get(participant_id)
+            if buf is not None:
+                buf.drop_where(lambda item: item.get("_seq", 0) <= seq)
 
     def _enforce_payload_size(self, payload: dict[str, Any]) -> None:
         size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -1182,7 +1224,24 @@ class Session:
             payload={"participant": p.to_public().model_dump()},
         )
 
-    async def resume(self, handle: ConnectionHandle, participant_id: str) -> None:
+    async def resume(
+        self,
+        handle: ConnectionHandle,
+        participant_id: str,
+        *,
+        last_acked_seq: int | None = None,
+    ) -> None:
+        """Re-attach a participant after a disconnect.
+
+        ``last_acked_seq`` (optional): highest seq the caller has
+        already consumed in memory before its prior transport died.
+        On push-mode replay the buffer is filtered so events with
+        ``seq <= effective_last_acked_seq`` are skipped. The effective
+        value is ``max(last_acked_seq or 0,
+        participant.last_acked_seq)`` — a stronger watermark from a
+        prior ACK is never regressed by a weaker caller-supplied
+        value.
+        """
         async with self.lock:
             p = self._participants.get(participant_id)
             if p is None:
@@ -1196,6 +1255,17 @@ class Session:
             if was_offline and self._metrics is not None:
                 self._metrics.participants_active.labels(online="false").dec()
                 self._metrics.participants_active.labels(online="true").inc()
+            # Resolve the effective ACK watermark. Caller-supplied value
+            # is merged with the participant's prior watermark; the
+            # latter is also advanced so subsequent drains see the same
+            # state.
+            effective_ack: int = 0
+            if last_acked_seq is not None and last_acked_seq > effective_ack:
+                effective_ack = last_acked_seq
+            if p.last_acked_seq > effective_ack:
+                effective_ack = p.last_acked_seq
+            if effective_ack > p.last_acked_seq:
+                p.last_acked_seq = effective_ack
             # Pull-mode participants drain their own buffer via
             # session_check_inbox; flushing here would push events through
             # the transport and lose them (their model only sees synchronous
@@ -1204,6 +1274,10 @@ class Session:
                 buf = self._buffers.pop(participant_id, None)
                 if buf is not None:
                     for item in self._filter_stale_buffer_items(buf.drain()):
+                        if not _passes_ack_filter(
+                            item.get("_seq", 0), effective_ack
+                        ):
+                            continue
                         self._connections.send(
                             self.session_id,
                             participant_id,

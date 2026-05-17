@@ -41,6 +41,15 @@ class Participant:
     # ``last_acked_seq=N`` to skip events it has already consumed in memory
     # before its socket died. Starts at 0; the first event carries ``seq=1``.
     next_seq: int = 0
+    # Authoritative server-side high-water mark of acknowledged seq.
+    # Advanced when the relay receives an upstream ``{"ack": N}`` frame
+    # on the participant's WS, or when a client passes a stronger
+    # ``last_acked_seq`` on resume / drain. Used to (a) eagerly trim the
+    # per-participant buffer of events the client has confirmed it
+    # consumed, and (b) seed buffer-replay filters when the caller
+    # didn't pass an explicit ``last_acked_seq`` (so clients that ACK
+    # promptly don't need to track a watermark themselves).
+    last_acked_seq: int = 0
 
     @staticmethod
     def create(
