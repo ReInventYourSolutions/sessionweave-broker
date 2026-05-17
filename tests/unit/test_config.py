@@ -123,3 +123,56 @@ def test_apply_overrides_validates_wait_for_event_bounds() -> None:
     with pytest.raises(ToolError) as exc:
         apply_overrides(defaults, bounds, {"max_concurrent_waits_total": 1_000_000})
     assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+
+def test_max_wait_seconds_mcp_default_and_bounds() -> None:
+    cfg = SessionConfig()
+    assert cfg.max_wait_seconds_mcp == 20
+
+    b = ConfigBounds.builtin()
+    assert b.max_wait_seconds_mcp_min == 1
+    assert b.max_wait_seconds_mcp_max == 60
+
+
+def test_apply_overrides_validates_max_wait_seconds_mcp() -> None:
+    defaults = SessionConfig()
+    bounds = ConfigBounds.builtin()
+
+    out = apply_overrides(defaults, bounds, {"max_wait_seconds_mcp": 10})
+    assert out.max_wait_seconds_mcp == 10
+
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_wait_seconds_mcp": 0})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(defaults, bounds, {"max_wait_seconds_mcp": 999})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+
+def test_apply_overrides_rejects_max_wait_seconds_mcp_above_max_wait_seconds() -> None:
+    """The MCP cap must never exceed the REST cap, otherwise the tool layer
+    would report an effective_timeout_seconds larger than what
+    Session.wait_for_event actually waits for."""
+    defaults = SessionConfig()
+    bounds = ConfigBounds.builtin()
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(
+            defaults,
+            bounds,
+            {"max_wait_seconds_mcp": 50, "max_wait_seconds": 30},
+        )
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    # And when only max_wait_seconds is lowered below the existing MCP cap:
+    base = SessionConfig(max_wait_seconds_mcp=40, max_wait_seconds=600)
+    with pytest.raises(ToolError) as exc:
+        apply_overrides(base, bounds, {"max_wait_seconds": 30})
+    assert exc.value.code is ErrorCode.INVALID_CONFIG
+
+    # In-range combinations still accepted.
+    out = apply_overrides(
+        defaults, bounds, {"max_wait_seconds_mcp": 30, "max_wait_seconds": 300}
+    )
+    assert out.max_wait_seconds_mcp == 30
+    assert out.max_wait_seconds == 300

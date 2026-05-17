@@ -102,9 +102,32 @@ def test_session_wait_for_event_output_shape() -> None:
     out = SessionWaitForEventOutput(
         messages=[InboxMessage(name="x", payload={"y": 1})],
         timed_out=False,
+        effective_timeout_seconds=60.0,
     )
     dumped = out.model_dump()
     assert dumped == {
         "messages": [{"name": "x", "payload": {"y": 1}}],
         "timed_out": False,
+        "effective_timeout_seconds": 60.0,
     }
+
+
+def test_session_wait_for_event_output_includes_effective_timeout() -> None:
+    out = SessionWaitForEventOutput(
+        messages=[InboxMessage(name="x", payload={"y": 1})],
+        timed_out=False,
+        effective_timeout_seconds=20.0,
+    )
+    dumped = out.model_dump()
+    assert dumped == {
+        "messages": [{"name": "x", "payload": {"y": 1}}],
+        "timed_out": False,
+        "effective_timeout_seconds": 20.0,
+    }
+
+
+def test_session_wait_for_event_output_requires_effective_timeout() -> None:
+    # Use model_validate with a partial dict so the missing field is
+    # caught at runtime by Pydantic, not at type-check time by mypy.
+    with pytest.raises(ValidationError):
+        SessionWaitForEventOutput.model_validate({"messages": [], "timed_out": True})

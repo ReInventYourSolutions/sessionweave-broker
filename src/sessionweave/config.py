@@ -18,6 +18,7 @@ class SessionConfig:
     max_pending_notifications_per_participant: int = 1000
     max_wait_seconds: int = 600
     max_concurrent_waits_total: int = 1000
+    max_wait_seconds_mcp: int = 20
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +40,8 @@ class ConfigBounds:
     max_wait_seconds_max: int = 3600
     max_concurrent_waits_total_min: int = 0
     max_concurrent_waits_total_max: int = 100_000
+    max_wait_seconds_mcp_min: int = 1
+    max_wait_seconds_mcp_max: int = 60
 
     @staticmethod
     def builtin() -> ConfigBounds:
@@ -131,6 +134,21 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
                 f"default_command_timeout_seconds={cfg.default_command_timeout_seconds} "
                 f"exceeds max_command_timeout_seconds={cfg.max_command_timeout_seconds}",
             )
+    # Cross-field invariant: max_wait_seconds_mcp must never exceed
+    # max_wait_seconds. Otherwise the tools.py clamp would report
+    # effective_timeout_seconds=max_wait_seconds_mcp while
+    # Session.wait_for_event silently re-clamps to the smaller REST cap.
+    if (
+        overridden is None
+        or "max_wait_seconds_mcp" in overridden
+        or "max_wait_seconds" in overridden
+    ):
+        if cfg.max_wait_seconds_mcp > cfg.max_wait_seconds:
+            raise ToolError(
+                ErrorCode.INVALID_CONFIG,
+                f"max_wait_seconds_mcp={cfg.max_wait_seconds_mcp} "
+                f"exceeds max_wait_seconds={cfg.max_wait_seconds}",
+            )
     check(
         "offline_grace_seconds",
         cfg.offline_grace_seconds,
@@ -155,6 +173,12 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
         b.max_concurrent_waits_total_min,
         b.max_concurrent_waits_total_max,
     )
+    check(
+        "max_wait_seconds_mcp",
+        cfg.max_wait_seconds_mcp,
+        b.max_wait_seconds_mcp_min,
+        b.max_wait_seconds_mcp_max,
+    )
 
 
 def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
@@ -173,6 +197,7 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         ),
         max_wait_seconds=env_int("SW_DEFAULT_MAX_WAIT_SECONDS", 600),
         max_concurrent_waits_total=env_int("SW_DEFAULT_MAX_CONCURRENT_WAITS_TOTAL", 1000),
+        max_wait_seconds_mcp=env_int("SW_DEFAULT_MAX_WAIT_SECONDS_MCP", 20),
     )
     bounds = ConfigBounds(
         max_participants_min=env_int("SW_MIN_MAX_PARTICIPANTS", 2),
@@ -196,5 +221,7 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_wait_seconds_max=env_int("SW_MAX_MAX_WAIT_SECONDS", 3600),
         max_concurrent_waits_total_min=env_int("SW_MIN_MAX_CONCURRENT_WAITS_TOTAL", 0),
         max_concurrent_waits_total_max=env_int("SW_MAX_MAX_CONCURRENT_WAITS_TOTAL", 100_000),
+        max_wait_seconds_mcp_min=env_int("SW_MIN_MAX_WAIT_SECONDS_MCP", 1),
+        max_wait_seconds_mcp_max=env_int("SW_MAX_MAX_WAIT_SECONDS_MCP", 60),
     )
     return DeploymentDefaults(defaults=defaults, bounds=bounds)

@@ -198,10 +198,30 @@ async def session_check_inbox(
 async def session_wait_for_event(
     deps: ToolDeps, handle: ConnectionHandle, payload: dict[str, Any]
 ) -> dict[str, Any]:
+    # Inline the MCPConnectionHandle import to avoid a potential
+    # top-level import cycle with sessionweave.mcp_adapter.
+    from sessionweave.mcp_adapter import MCPConnectionHandle
+
     sess, pid = _session_for_handle(deps, handle)
     inp = SessionWaitForEventInput.model_validate(payload)
+
+    if isinstance(handle, MCPConnectionHandle):
+        cap = sess.config.max_wait_seconds_mcp
+        transport_label = "mcp"
+    else:
+        cap = sess.config.max_wait_seconds
+        transport_label = "http"
+
+    requested = float(inp.timeout_seconds)
+    effective = min(requested, float(cap))
+
+    if effective < requested and sess._metrics is not None:
+        sess._metrics.wait_for_event_clamped_total.labels(
+            transport=transport_label
+        ).inc()
+
     result = await sess.wait_for_event(
-        pid, names=inp.names, timeout_seconds=inp.timeout_seconds
+        pid, names=inp.names, timeout_seconds=effective
     )
     return SessionWaitForEventOutput(
         messages=[
@@ -209,6 +229,7 @@ async def session_wait_for_event(
             for m in result.messages
         ],
         timed_out=result.timed_out,
+        effective_timeout_seconds=effective,
     ).model_dump()
 
 

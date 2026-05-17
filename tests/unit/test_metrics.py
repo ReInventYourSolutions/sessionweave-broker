@@ -48,3 +48,14 @@ def test_wait_for_event_metrics_exist() -> None:
     assert "sessionweave_wait_for_event_total" in output
     assert "sessionweave_wait_for_event_duration_seconds" in output
     assert "sessionweave_wait_for_event_active" in output
+
+
+def test_wait_for_event_clamped_metric_exists() -> None:
+    m = Metrics()
+    m.wait_for_event_clamped_total.labels(transport="mcp").inc()
+    m.wait_for_event_clamped_total.labels(transport="http").inc()
+
+    output = m.render().decode("utf-8")
+    assert "sessionweave_wait_for_event_clamped_total" in output
+    assert 'transport="mcp"' in output
+    assert 'transport="http"' in output

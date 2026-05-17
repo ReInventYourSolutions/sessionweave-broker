@@ -109,3 +109,32 @@ async def test_wait_for_event_mcp_rejects_push_mode() -> None:
                     "session_wait_for_event",
                     {"session_id": sid, "timeout_seconds": 1},
                 )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_wait_for_event_mcp_clamps_above_cap() -> None:
+    """MCP callers requesting timeout_seconds > max_wait_seconds_mcp should
+    receive a response within ~max_wait_seconds_mcp and an
+    effective_timeout_seconds reflecting the clamp.
+    """
+    import time
+
+    async with relay_subprocess() as base:
+        async with sw_client(base) as client:
+            sid = (await client.call_tool("session_create", {}))["session_id"]
+            await client.call_tool(
+                "session_join",
+                {"session_id": sid, "role": "lone", "delivery_mode": "pull"},
+            )
+
+            start = time.monotonic()
+            out = await client.call_tool(
+                "session_wait_for_event",
+                {"session_id": sid, "timeout_seconds": 100.0},
+            )
+            elapsed = time.monotonic() - start
+
+            assert out["effective_timeout_seconds"] == 20.0
+            assert elapsed < 25.0, f"clamp should have fired ~20s, got {elapsed}s"
+            assert out["timed_out"] is True

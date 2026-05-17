@@ -132,6 +132,7 @@ class SessionWaitForEventInput(_Strict):
 class SessionWaitForEventOutput(_Strict):
     messages: list[InboxMessage]
     timed_out: bool
+    effective_timeout_seconds: float
 
 
 class SessionSendInput(_Strict):

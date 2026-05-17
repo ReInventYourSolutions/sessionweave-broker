@@ -23,6 +23,7 @@ class Metrics:
         "session_ended_total",
         "sessions_active",
         "wait_for_event_active",
+        "wait_for_event_clamped_total",
         "wait_for_event_duration_seconds",
         "wait_for_event_total",
     )
@@ -85,6 +86,13 @@ class Metrics:
         self.wait_for_event_active = Gauge(
             "sessionweave_wait_for_event_active",
             "Currently-blocked session_wait_for_event waiters",
+            registry=self.registry,
+        )
+        self.wait_for_event_clamped_total = Counter(
+            "sessionweave_wait_for_event_clamped_total",
+            "session_wait_for_event calls where the requested timeout was "
+            "clamped by the transport-specific cap (MCP) or the global cap (HTTP)",
+            ["transport"],
             registry=self.registry,
         )
 
