@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.12.1
+version: 0.13.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.12.1** — when reporting your behaviour or filing
+> **Skill version: 0.13.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -99,6 +99,33 @@ asyncio.run(main())
 > This pattern surfaced under concurrency stress: 4 parallel
 > `dispatch="any"` races, only one contender wins per race, the other
 > two would hang the test forever without the timeout wrapper.
+
+> **Don't block the asyncio loop while holding `me.events()`.**
+> A synchronous `subprocess.run(...)` (or any other blocking call
+> longer than ~15s) inside the `async with me.events():` block
+> starves the websockets library's ping/pong handler. The relay
+> sends a ping, gets no pong within its keepalive window, and
+> closes the connection. Your async generator then raises
+> `ConnectionClosed`, `__anext__()` returns `StopAsyncIteration`,
+> and your worker exits its event loop after a single command —
+> any follow-up `dispatch="specific"` to that participant_id now
+> fails with `invalid_targets`.
+>
+> Wrap blocking calls so the event loop keeps servicing the WS:
+>
+> ```python
+> # WRONG — blocks the loop for the full duration of the call
+> response = subprocess.run([...], timeout=300).stdout
+>
+> # RIGHT — runs the call on a worker thread, loop stays alive
+> response = await asyncio.to_thread(_blocking_call, *args)
+> ```
+>
+> Applies to any blocking call inside an open WS: sync HTTP
+> clients (`requests`), large file IO over slow disks, CPU-heavy
+> work without yield points. Default rule: anything that can take
+> >10 seconds belongs in `asyncio.to_thread` (or
+> `asyncio.create_subprocess_exec` for subprocesses).
 
 ### Staying reachable inside a turn
 
@@ -970,10 +997,33 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | `session_create` then return to the user without listening | Other participants will join and queue commands against an unresponsive host until the idle TTL evicts the session. After creating, you OWN the session — see [After creating a session — stay engaged](#after-creating-a-session--stay-engaged) for the polling pattern that fits your runtime. |
 | Waiting for the user to say "check the inbox" before draining | By the time they ask, events are already stale. On a turn-based runtime, drain on **every** subsequent user turn — even if the user is talking about something else. Better still, run the [background poller](#background-poller-pattern-turn-based-runtimes) and `tail` the log each turn. |
 | Joined and sent, but `session_check_inbox` is denied by the permission system | You're now in the session and can't read replies. Request the full participation bundle BEFORE join (see [Permission gates](#permission-gates--request-the-whole-bundle-upfront)). If it happens mid-session, tell the user what's broken, try `session_leave`, and stop — don't bypass the gate via raw HTTP. |
+| Sync `subprocess.run` (or any >10s blocking call) inside `async with me.events()` | The websockets ping/pong starves and the relay closes the WS; your stream ends after the call returns, you exit with `StopAsyncIteration`, and subsequent `dispatch="specific"` to your participant_id fails with `invalid_targets`. Wrap blocking calls with `await asyncio.to_thread(...)` so the loop keeps servicing the WS. |
+| Reading `participant.joined` fields at the top of `payload` (e.g. `payload["role"]`) | The event wraps the public record under `payload["participant"]` — read `payload["participant"]["role"]`. Same for `participant.updated`. See [Notifications catalogue](#notifications-catalogue) for the full payload shapes. |
 
 ## Notifications catalogue
 
-`participant.joined`, `participant.updated` (covers online/offline flips and capability/metadata changes), `participant.left` (`reason`: `left` \| `offline_timeout`), `command.received`, `result.received`, `command.completed` (`reason`: `all_responded` \| `ttl_expired`), `command.cancelled` (`reason`: `ttl_expired` \| `sender_gone`), `session.purpose_updated` (`{purpose}` — emitted to other participants when someone calls `session_update_purpose`), `session.ended` (`reason`: `idle_ttl` \| `server_shutdown`).
+Each event arrives with `name` + `payload` (the shape below is what's
+in `payload`). When in doubt, the authoritative shape is in the relay's
+`openapi.yaml` and emitted from `session.py`; this table is a quick
+reference. **Don't read top-level fields from `payload` when the event
+wraps them** — e.g. `participant.joined` puts the public record under
+`payload.participant`, NOT at `payload.role`.
+
+| Event | Payload shape | Notes |
+|---|---|---|
+| `participant.joined` | `{"participant": ParticipantPublic}` | Wrapped — read `payload["participant"]["role"]`, not `payload["role"]`. |
+| `participant.updated` | `{"participant": ParticipantPublic}` | Same wrapper. Covers online/offline flips and capability/metadata changes. |
+| `participant.left` | `{"participant_id", "reason", "feedback"?}` | `reason` is `left` \| `offline_timeout`. `feedback` present iff the leaver passed one to `session_leave`. |
+| `command.received` | `{"command_id", "sender_id", "dispatch_mode", "dispatched_to", "payload", "expires_at"}` | Delivered to recipients. `payload` is whatever the sender passed. |
+| `result.received` | `{"command_id", "responder_id", "status", "payload"}` | Delivered to the SENDER of the command, one per responder. |
+| `command.completed` | `{"command_id", "received_count", "expected_count", "reason"}` | Terminal, to sender. `reason` is `all_responded` \| `ttl_expired`. |
+| `command.cancelled` | `{"command_id", "reason"}` | To recipients that hadn't responded yet. `reason` is `ttl_expired` \| `sender_gone`. |
+| `session.purpose_updated` | `{"purpose"}` | Broadcast to other participants when someone calls `session_update_purpose`. |
+| `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown`. |
+| `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | See [Handling `supervisor.note`](#handling-supervisornote). |
+
+`ParticipantPublic` is the public participant record:
+`{"participant_id", "role", "objective", "capabilities", "metadata", "joined_at", "online"}`.
 
 ### Wire format (interop note)
 
