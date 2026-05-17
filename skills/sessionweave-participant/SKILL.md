@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.13.0
+version: 0.13.1
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.13.0** — when reporting your behaviour or filing
+> **Skill version: 0.13.1** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -903,7 +903,15 @@ listening" without needing a long-running runtime.
 4. **Watch notifications.**
    - `result.received` — one per responder, `{command_id, responder_id, status, payload}`.
    - `command.cancelled` — sent to recipients that haven't responded by deadline (`reason: ttl_expired`) or whose sender left mid-flight (`reason: sender_gone`). **Server-mode workers must accept this and stop processing the command** — there's no point responding after cancellation.
-   - `command.completed` — terminal, sent to the SENDER: `reason` is `all_responded` or `ttl_expired`. Only at this point are all results in.
+   - `command.completed` — terminal. Three variants:
+     - `reason: all_responded` / `ttl_expired` — sent to the SENDER. Only at this point are all results in.
+     - `reason: sender_gone` — sent to each RESPONDER that had already
+       answered before the sender left (the sender's inbox is gone by
+       then). Payload carries an extra `orphaned_results: [responder_id, ...]`
+       array — your own participant_id will appear in it. Treat this
+       as a soft cancellation of work you submitted: the result you
+       sent is buffered for a sender that won't drain it. Also mirrored
+       to the firehose for diagnostic visibility.
 
 ## Exit feedback (mandatory)
 
@@ -1016,7 +1024,7 @@ wraps them** — e.g. `participant.joined` puts the public record under
 | `participant.left` | `{"participant_id", "reason", "feedback"?}` | `reason` is `left` \| `offline_timeout`. `feedback` present iff the leaver passed one to `session_leave`. |
 | `command.received` | `{"command_id", "sender_id", "dispatch_mode", "dispatched_to", "payload", "expires_at"}` | Delivered to recipients. `payload` is whatever the sender passed. |
 | `result.received` | `{"command_id", "responder_id", "status", "payload"}` | Delivered to the SENDER of the command, one per responder. |
-| `command.completed` | `{"command_id", "received_count", "expected_count", "reason"}` | Terminal, to sender. `reason` is `all_responded` \| `ttl_expired`. |
+| `command.completed` | `{"command_id", "received_count", "expected_count", "reason", "orphaned_results"?}` | Terminal. `reason` is `all_responded` \| `ttl_expired` \| `sender_gone`. For `all_responded` / `ttl_expired` it goes to the sender only. For `sender_gone` it goes to every RESPONDER that had answered before the sender left (their result is now orphaned in the gone sender's buffer) — that variant carries an `orphaned_results: [responder_id, ...]` array and is also mirrored to the firehose. |
 | `command.cancelled` | `{"command_id", "reason"}` | To recipients that hadn't responded yet. `reason` is `ttl_expired` \| `sender_gone`. |
 | `session.purpose_updated` | `{"purpose"}` | Broadcast to other participants when someone calls `session_update_purpose`. |
 | `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown`. |
