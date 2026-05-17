@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
@@ -334,7 +334,7 @@ class Session:
                 return []
             return [
                 {"name": item["_name"], "payload": item["_payload"]}
-                for item in buf.drain()
+                for item in self._filter_stale_buffer_items(buf.drain())
             ]
 
     async def wait_for_event(
@@ -567,7 +567,7 @@ class Session:
             backlog: list[dict[str, Any]] = (
                 [
                     {"name": item["_name"], "payload": item["_payload"]}
-                    for item in buf.drain()
+                    for item in self._filter_stale_buffer_items(buf.drain())
                 ]
                 if buf is not None
                 else []
@@ -793,6 +793,42 @@ class Session:
                 # duplicate respond raises ALREADY_RESPONDED rather than
                 # COMMAND_NOT_FOUND.  TTL-based eviction is handled in Task 13.
 
+    def _is_command_stale(self, command_id: str | None) -> bool:
+        """A buffered ``command.received`` is stale if its command is no
+        longer dispatchable from the relay's perspective — either evicted
+        from ``_inflight`` (responded fully / cancelled / cleaned up) or
+        still present but already past its TTL deadline.
+
+        Used to filter buffered events at drain time so a participant
+        that resumes after a long offline window doesn't get handed a
+        ``command.received`` it can't respond to anyway.
+        """
+        if command_id is None:
+            return False
+        tracker = self._inflight.get(command_id)
+        if tracker is None:
+            return True
+        return tracker.is_expired()
+
+    def _filter_stale_buffer_items(
+        self, items: Iterable[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop buffer entries representing ``command.received`` for an
+        already-expired or gone command. Other event types pass through.
+
+        Operates on raw buffer items (``{"_name": ..., "_payload": ...}``)
+        so it can be plugged in at any drain site before the caller
+        re-shapes the entries for transport.
+        """
+        out: list[dict[str, Any]] = []
+        for item in items:
+            if item.get("_name") == "command.received":
+                payload = item.get("_payload") or {}
+                if self._is_command_stale(payload.get("command_id")):
+                    continue
+            out.append(item)
+        return out
+
     def _enforce_payload_size(self, payload: dict[str, Any]) -> None:
         size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         if size > self.config.max_payload_bytes:
@@ -919,6 +955,31 @@ class Session:
                 for pending_pid in t.pending_recipients():
                     self._deliver_or_buffer(pending_pid, "command.cancelled", cancelled_payload)
                 self._mirror_firehose("command.cancelled", cancelled_payload)
+                # When the sender leaves with pre-existing responses, the
+                # corresponding ``result.received`` events were buffered for
+                # a participant that is now gone — they would be lost
+                # silently when the buffer is evicted. Emit a parallel
+                # ``command.completed`` on the firehose with the list of
+                # responders whose results have been orphaned, so observers
+                # (cockpits, tests, diagnostic tooling) can detect the
+                # data-loss scenario instead of seeing silent drops.
+                #
+                # The completed event is intentionally only mirrored to the
+                # firehose, NOT to the (now-evicted) sender's buffer — that
+                # buffer is about to be torn down by ``_evict``.
+                if reason == "sender_gone":
+                    completed_payload = {
+                        "command_id": cid,
+                        "received_count": t.received_count,
+                        "expected_count": t.expected_count,
+                        "reason": "sender_gone",
+                        "orphaned_results": sorted(t.responses_received),
+                    }
+                    self._mirror_firehose("command.completed", completed_payload)
+                    if self._metrics is not None:
+                        self._metrics.command_completed_total.labels(
+                            reason="sender_gone"
+                        ).inc()
                 to_close.append(cid)
         for cid in to_close:
             self._inflight.pop(cid, None)
@@ -1087,7 +1148,7 @@ class Session:
             if p.delivery_mode != "pull":
                 buf = self._buffers.pop(participant_id, None)
                 if buf is not None:
-                    for item in buf.drain():
+                    for item in self._filter_stale_buffer_items(buf.drain()):
                         self._connections.send(
                             self.session_id,
                             participant_id,
