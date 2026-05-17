@@ -22,6 +22,7 @@ class Metrics:
         "registry",
         "session_ended_total",
         "sessions_active",
+        "subscriber_dispatch_failed_total",
         "wait_for_event_active",
         "wait_for_event_clamped_total",
         "wait_for_event_duration_seconds",
@@ -93,6 +94,14 @@ class Metrics:
             "session_wait_for_event calls where the requested timeout was "
             "clamped by the transport-specific cap (MCP) or the global cap (HTTP)",
             ["transport"],
+            registry=self.registry,
+        )
+        self.subscriber_dispatch_failed_total = Counter(
+            "sessionweave_subscriber_dispatch_failed_total",
+            "Subscriber callbacks that raised during _deliver_or_buffer. "
+            "Indicates a slow/broken WS consumer that lost an event; the "
+            "event still reached at least one healthy subscriber, otherwise "
+            "the buffer fallback path would have run.",
             registry=self.registry,
         )
 

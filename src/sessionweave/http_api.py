@@ -388,7 +388,10 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         return JSONResponse({"error": "not_found"}, status_code=404)
 
     limiter = request.app.state.supervisor_rate
-    if not limiter.try_acquire(sid):
+    source_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if not source_ip and request.client is not None:
+        source_ip = request.client.host or ""
+    if not limiter.try_acquire(sid, source_ip):
         return JSONResponse({"error": "rate_limited"}, status_code=429)
 
     try:

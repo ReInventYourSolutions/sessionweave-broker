@@ -223,13 +223,16 @@ async def session_wait_for_event(
     result = await sess.wait_for_event(
         pid, names=inp.names, timeout_seconds=effective
     )
+    # session.wait_for_event applies a third clamp term (remaining session
+    # TTL), so the authoritative effective_timeout_seconds comes from the
+    # session result, not the locally-computed transport cap.
     return SessionWaitForEventOutput(
         messages=[
             InboxMessage(name=m["name"], payload=m["payload"])
             for m in result.messages
         ],
         timed_out=result.timed_out,
-        effective_timeout_seconds=effective,
+        effective_timeout_seconds=result.effective_timeout_seconds,
     ).model_dump()
 
 
