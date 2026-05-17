@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -347,6 +348,20 @@ def build_app() -> Starlette:
     app.state.tool_deps = tool_deps
     app.state.state = state
     app.state.firehose = firehose
+    # Optional relay-wide admin token gating the firehose endpoint.
+    # When set, the firehose WS upgrade requires ``?token=<this value>``
+    # — knowing the session_id is no longer sufficient. When unset, the
+    # legacy ``token == session_id`` check remains active so existing
+    # dev / cockpit setups keep working (with a startup warning).
+    # Operators in multi-tenant production should set this.
+    app.state.firehose_admin_token = os.environ.get("SW_FIREHOSE_ADMIN_TOKEN", "") or None
+    if app.state.firehose_admin_token is None:
+        logging.getLogger(__name__).warning(
+            "SW_FIREHOSE_ADMIN_TOKEN not set; firehose authenticates with "
+            "token==session_id (LEGACY mode). Any session participant can "
+            "subscribe and observe the full event stream. Set the env var "
+            "in production deployments."
+        )
     app.state.supervisor_rate = NoteRateLimiter(
         per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
         per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),

@@ -53,3 +53,47 @@ async def test_firehose_rejects_wrong_token():
         with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
             async with websockets.connect(ws_url):
                 pass
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_firehose_admin_token_mode_rejects_session_id() -> None:
+    """When ``SW_FIREHOSE_ADMIN_TOKEN`` is set, a token equal to the
+    session_id must be rejected — only the admin token is accepted.
+    Closes the info-leak gap from #54: a session participant who
+    knows its own ``session_id`` can no longer subscribe to the
+    firehose without the admin secret.
+    """
+    admin = "test-admin-secret-d3b07384"
+    async with relay_subprocess(
+        env_overrides={"SW_FIREHOSE_ADMIN_TOKEN": admin}
+    ) as base:
+        base_ws = base.replace("http://", "ws://")
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()["session_id"]
+
+        from websockets.exceptions import (
+            ConnectionClosed,
+            InvalidStatus,
+        )
+
+        # Token == session_id must FAIL in admin-token mode.
+        url_legacy = f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
+        with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
+            async with websockets.connect(url_legacy):
+                pass
+
+        # Token == admin_token must succeed.
+        url_admin = f"{base_ws}/v1/sessions/{sid}/firehose?token={admin}"
+        async with websockets.connect(url_admin) as ws:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(
+                    f"{base}/v1/sessions/{sid}/participants",
+                    json={"role": "worker"},
+                )
+            assert r.status_code in (200, 201)
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            frame = json.loads(raw)
+            assert frame["name"] == "participant.joined"

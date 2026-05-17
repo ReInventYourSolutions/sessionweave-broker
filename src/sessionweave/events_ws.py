@@ -263,9 +263,29 @@ async def events_ws(websocket: WebSocket) -> None:
 async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
-    if token != sid:
-        await websocket.close(code=_CLOSE_MISSING_TOKEN, reason="invalid token")
-        return
+    admin_token = getattr(websocket.app.state, "firehose_admin_token", None)
+    # Two authentication modes for the firehose endpoint:
+    #   - admin-token mode (``SW_FIREHOSE_ADMIN_TOKEN`` set at startup):
+    #     subscription requires ``?token=<admin_token>``. Knowing the
+    #     session_id is NOT sufficient — closes the info-leak gap where
+    #     any session participant could observe the full event stream
+    #     (issue #54).
+    #   - legacy mode (env var unset): accept ``?token=<sid>``. Matches
+    #     historical behaviour for local dev / cockpit setups. The
+    #     startup logger emits a one-shot warning advising operators
+    #     to set the env var in multi-tenant deployments.
+    if admin_token is not None:
+        if token != admin_token:
+            await websocket.close(
+                code=_CLOSE_MISSING_TOKEN, reason="invalid firehose token"
+            )
+            return
+    else:
+        if token != sid:
+            await websocket.close(
+                code=_CLOSE_MISSING_TOKEN, reason="invalid token"
+            )
+            return
 
     registry = websocket.app.state.tool_deps.registry
     firehose = websocket.app.state.firehose

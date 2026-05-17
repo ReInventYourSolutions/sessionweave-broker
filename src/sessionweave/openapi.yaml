@@ -706,8 +706,22 @@ paths:
         required: true
         schema: { type: string }
         description: |
-          Bearer token equal to the ``session_id``. Required here because
+          Authentication token, required as a query param because
           browsers can't set custom headers on a WebSocket upgrade.
+
+          Two modes:
+
+          - **Admin-token mode** (recommended for multi-tenant
+            deployments): when the relay is started with
+            ``SW_FIREHOSE_ADMIN_TOKEN=<value>``, this query param
+            must equal that value. Knowing the ``session_id`` is
+            NOT sufficient.
+          - **Legacy mode** (default when the env var is unset):
+            the token must equal the ``session_id``. Any session
+            participant can subscribe and observe the full event
+            stream. Suitable for local dev / single-tenant cockpit
+            deployments only; the relay logs a warning at startup
+            advising operators to switch to admin-token mode.
     get:
       tags: [sessions]
       summary: WebSocket — full event stream for the session (non-participant)
