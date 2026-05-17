@@ -76,3 +76,27 @@ def test_rate_limiter_window_slides(monkeypatch):
     assert limiter.try_acquire("sid-1") is False
     t[0] += 61
     assert limiter.try_acquire("sid-1") is True
+
+
+def test_rate_limiter_per_ip_buckets_are_independent(monkeypatch):
+    """Distinct source IPs against the same session must NOT share a bucket."""
+    t = [1_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    limiter = NoteRateLimiter(per_minute=2, per_hour=200)
+    # IP A burns its quota.
+    assert limiter.try_acquire("sid-1", "10.0.0.1") is True
+    assert limiter.try_acquire("sid-1", "10.0.0.1") is True
+    assert limiter.try_acquire("sid-1", "10.0.0.1") is False
+    # IP B is unaffected.
+    assert limiter.try_acquire("sid-1", "10.0.0.2") is True
+    assert limiter.try_acquire("sid-1", "10.0.0.2") is True
+    assert limiter.try_acquire("sid-1", "10.0.0.2") is False
+
+
+def test_rate_limiter_default_ip_is_empty_string():
+    """Calls without a source_ip share a single ('sid', '') bucket — legacy compat."""
+    limiter = NoteRateLimiter(per_minute=1, per_hour=200)
+    assert limiter.try_acquire("sid-1") is True
+    assert limiter.try_acquire("sid-1") is False
+    # The empty-string bucket isn't shared with an explicit IP:
+    assert limiter.try_acquire("sid-1", "10.0.0.1") is True

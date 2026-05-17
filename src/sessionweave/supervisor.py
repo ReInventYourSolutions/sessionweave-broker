@@ -54,21 +54,24 @@ def parse_supervisor_request(body: object) -> SupervisorNote:
 
 
 class NoteRateLimiter:
-    """Sliding-window rate limiter keyed by session_id.
+    """Sliding-window rate limiter keyed by (session_id, source_ip).
 
+    Distinct source IPs against the same session get distinct quotas, so a
+    single misbehaving client cannot exhaust the bucket for a whole team.
     Tracks a per-minute and a per-hour cap. ``try_acquire`` is O(k) where
     k is the count of stamps older than the per-hour cutoff (those get
-    dropped). Memory is bounded by per_hour.
+    dropped). Memory is bounded by per_hour per (sid, ip) bucket.
     """
 
     def __init__(self, per_minute: int, per_hour: int) -> None:
         self._per_minute = per_minute
         self._per_hour = per_hour
-        self._stamps: dict[str, deque[float]] = {}
+        self._stamps: dict[tuple[str, str], deque[float]] = {}
 
-    def try_acquire(self, sid: str) -> bool:
+    def try_acquire(self, sid: str, source_ip: str = "") -> bool:
         now = time.monotonic()
-        bucket = self._stamps.setdefault(sid, deque())
+        key = (sid, source_ip)
+        bucket = self._stamps.setdefault(key, deque())
         cutoff_hour = now - 3600
         cutoff_minute = now - 60
         while bucket and bucket[0] < cutoff_hour:

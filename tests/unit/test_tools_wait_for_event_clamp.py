@@ -91,7 +91,11 @@ async def test_mcp_handle_clamps_to_max_wait_seconds_mcp(
             # Called as unbound (class-level patch): first arg is self (Session instance),
             # second is participant_id positional, then keyword args.
             captured["timeout_seconds"] = timeout_seconds
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 
@@ -122,7 +126,11 @@ async def test_http_handle_uses_max_wait_seconds_cap(
             timeout_seconds: float = 0.0,
         ) -> WaitForEventResult:
             captured["timeout_seconds"] = timeout_seconds
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 
@@ -151,7 +159,11 @@ async def test_http_handle_clamps_to_global_cap_when_above_max_wait_seconds(
             timeout_seconds: float = 0.0,
         ) -> WaitForEventResult:
             captured["timeout_seconds"] = timeout_seconds
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 
@@ -180,7 +192,11 @@ async def test_below_cap_passes_through_unchanged_on_mcp(
             timeout_seconds: float = 0.0,
         ) -> WaitForEventResult:
             captured["timeout_seconds"] = timeout_seconds
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 
@@ -207,7 +223,11 @@ async def test_zero_timeout_not_clamped(monkeypatch: pytest.MonkeyPatch) -> None
             timeout_seconds: float = 0.0,
         ) -> WaitForEventResult:
             captured["timeout_seconds"] = timeout_seconds
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 
@@ -237,7 +257,11 @@ async def test_clamped_metric_increments_on_mcp_clamp(
             names: list[str] | None = None,
             timeout_seconds: float = 0.0,
         ) -> WaitForEventResult:
-            return WaitForEventResult(messages=[], timed_out=True)
+            return WaitForEventResult(
+                messages=[],
+                timed_out=True,
+                effective_timeout_seconds=timeout_seconds,
+            )
 
         monkeypatch.setattr(Session, "wait_for_event", fake_wait)
 

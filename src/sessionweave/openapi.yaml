@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.13.8"
+  version: "0.13.9"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -75,6 +75,30 @@ components:
         max_command_timeout_seconds: { type: integer, example: 300 }
         offline_grace_seconds: { type: integer, example: 300 }
         max_pending_notifications_per_participant: { type: integer, example: 1000 }
+        max_wait_seconds:
+          type: integer
+          example: 600
+          description: |
+            Hard cap (seconds) applied to `session_wait_for_event` over HTTP
+            and WebSocket transports. The effective timeout is the minimum of
+            the caller-requested value, this cap, and the remaining session
+            TTL.
+        max_concurrent_waits_total:
+          type: integer
+          example: 1000
+          description: |
+            Cap on the number of `session_wait_for_event` callers blocked at
+            any moment across all sessions. Requests above this cap return
+            ERR_TOO_MANY_WAITERS.
+        max_wait_seconds_mcp:
+          type: integer
+          example: 20
+          description: |
+            Transport-specific cap applied to `session_wait_for_event` invoked
+            over MCP. Tighter than `max_wait_seconds` because many MCP clients
+            abort long-running tool calls around the 30-second mark; keeping
+            the relay side under that threshold avoids spurious aborts.
+            Cross-field invariant: `max_wait_seconds_mcp <= max_wait_seconds`.
 
     ParticipantPublic:
       type: object

@@ -306,3 +306,28 @@ async def test_wait_raises_evicted_when_session_ended_mid_wait() -> None:
     with pytest.raises(ToolError) as excinfo:
         await waiter
     assert excinfo.value.code is ErrorCode.PARTICIPANT_EVICTED
+
+
+@pytest.mark.asyncio
+async def test_wait_effective_timeout_clamped_by_session_ttl() -> None:
+    """The wait must never block past the moment the session would idle-expire.
+    Configure a 2-second idle TTL and request a 60-second wait; the relay
+    must clamp to ~2 seconds (rounding for clock skew) and report it in
+    WaitForEventResult.effective_timeout_seconds.
+    """
+    s = Session(
+        "s",
+        SessionConfig(idle_ttl_seconds=2, max_wait_seconds=600),
+        ConnectionManager(),
+    )
+    h = FakeHandle()
+    p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
+
+    result = await s.wait_for_event(
+        p.participant_id, names=None, timeout_seconds=60.0
+    )
+    assert result.timed_out is True
+    # The wait should NOT have blocked the full 60s; it was clamped by TTL.
+    # bump_activity inside join+wait resets the TTL clock to now, so the
+    # effective timeout should be ~idle_ttl_seconds (small slop allowed).
+    assert 0.5 < result.effective_timeout_seconds <= 2.5

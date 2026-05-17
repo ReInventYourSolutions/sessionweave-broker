@@ -45,6 +45,7 @@ class WaitForEventResult:
 
     messages: list[dict[str, Any]]
     timed_out: bool
+    effective_timeout_seconds: float = 0.0
 
 
 class Session:
@@ -393,9 +394,20 @@ class Session:
             self._active_waits += 1
             self._wait_in_flight.add(participant_id)
             self.bump_activity()
-            # Effective timeout is bounded by relay config (added in Task 13).
+            # Effective timeout is the minimum of three terms:
+            #  1. caller-requested value
+            #  2. max_wait_seconds (relay config cap)
+            #  3. remaining session TTL — never block past the moment the
+            #     session would idle-expire, since the wait itself doesn't
+            #     count as session activity beyond the bump_activity above
+            #     and stale wait_for_event calls would just race the eviction.
+            remaining_ttl = max(
+                0.0, (self.expires_at() - _utcnow()).total_seconds()
+            )
             effective_timeout = min(
-                float(timeout_seconds), float(self.config.max_wait_seconds)
+                float(timeout_seconds),
+                float(self.config.max_wait_seconds),
+                remaining_ttl,
             )
 
         loop = asyncio.get_running_loop()
@@ -434,7 +446,11 @@ class Session:
 
                 if matching:
                     outcome = "event"
-                    return WaitForEventResult(messages=matching, timed_out=False)
+                    return WaitForEventResult(
+                        messages=matching,
+                        timed_out=False,
+                        effective_timeout_seconds=effective_timeout,
+                    )
 
                 # Phase 3: block until queue delivers an event or budget expires.
                 def check_sentinel(name: str) -> None:
@@ -448,14 +464,22 @@ class Session:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         outcome = "timeout"
-                        return WaitForEventResult(messages=[], timed_out=True)
+                        return WaitForEventResult(
+                            messages=[],
+                            timed_out=True,
+                            effective_timeout_seconds=effective_timeout,
+                        )
                     try:
                         name, payload = await asyncio.wait_for(
                             queue.get(), timeout=remaining
                         )
                     except TimeoutError:
                         outcome = "timeout"
-                        return WaitForEventResult(messages=[], timed_out=True)
+                        return WaitForEventResult(
+                            messages=[],
+                            timed_out=True,
+                            effective_timeout_seconds=effective_timeout,
+                        )
                     check_sentinel(name)
 
                     if is_match(name):
@@ -480,7 +504,11 @@ class Session:
 
                     if matching:
                         outcome = "event"
-                        return WaitForEventResult(messages=matching, timed_out=False)
+                        return WaitForEventResult(
+                        messages=matching,
+                        timed_out=False,
+                        effective_timeout_seconds=effective_timeout,
+                    )
                     # else: spurious wake on non-matching event(s), keep
                     # waiting on the same wall-clock budget.
             except ToolError as exc:
@@ -790,6 +818,13 @@ class Session:
         stalls the participant delivery path even if subscribers are slow.
         A reference to each task is held in ``_firehose_tasks`` until it
         finishes, so the task is not garbage-collected mid-flight.
+
+        Ordering invariant: every caller MUST run ``_deliver_or_buffer`` for
+        all recipients BEFORE invoking ``_mirror_firehose``. Receiver inboxes
+        are populated synchronously inside the session lock, so by the time
+        the firehose task is scheduled the inbox state already reflects the
+        event. Firehose subscribers (cockpits, dashboards) therefore never
+        observe an event before the receiver could have observed it.
         """
         if self._firehose is not None:
             task = asyncio.create_task(
@@ -816,18 +851,24 @@ class Session:
         # WebSocket-style subscribers replace the buffer when present so we
         # don't double-deliver. attach_subscriber drains the buffer atomically
         # at attach-time, and detach_subscriber resumes buffering for events
-        # that arrive after disconnect. Subscriber failures fall through to
-        # the buffer so a slow consumer doesn't drop events silently.
+        # that arrive after disconnect. Every subscriber attached at delivery
+        # time receives a delivery attempt — a slow/broken consumer that
+        # raises does NOT starve healthy peers because we iterate the full
+        # tuple snapshot. The buffer is only used when ALL subscribers failed,
+        # so an event reaches at least one consumer (live or buffered).
         subs = self._subscribers.get(pid)
         if subs:
             delivered = False
+            failures = 0
             for cb in tuple(subs):
                 try:
                     cb(name, payload)
                     delivered = True
                 except Exception:
-                    pass
+                    failures += 1
             if delivered:
+                if failures and self._metrics is not None:
+                    self._metrics.subscriber_dispatch_failed_total.inc(failures)
                 return
         try:
             buf = self._buffer_for(pid)

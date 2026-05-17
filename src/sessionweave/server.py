@@ -18,7 +18,7 @@ from sessionweave.cockpit_mount import cockpit_mount
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.cors import CORSConfig
-from sessionweave.errors import ToolError
+from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
@@ -287,7 +287,17 @@ def build_app() -> Starlette:
             }
         )
 
+    metrics_token = os.environ.get("SW_METRICS_TOKEN", "").strip() or None
+
     async def metrics_endpoint(request: Request) -> Response:
+        # When SW_METRICS_TOKEN is set, require a matching bearer token.
+        # Unset → endpoint is open (backwards-compatible default).
+        if metrics_token is not None:
+            auth = request.headers.get("authorization", "")
+            if not auth.lower().startswith("bearer "):
+                return Response("unauthorized", status_code=401)
+            if auth[7:].strip() != metrics_token:
+                return Response("forbidden", status_code=403)
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 
     _openapi_path = Path(__file__).parent / "openapi.yaml"
@@ -332,8 +342,30 @@ def build_app() -> Starlette:
     app.state.tool_deps = tool_deps
     app.state.state = state
     app.state.firehose = firehose
-    app.state.supervisor_rate = NoteRateLimiter(per_minute=30, per_hour=200)
+    app.state.supervisor_rate = NoteRateLimiter(
+        per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
+        per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),
+    )
     return app
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            f"{name}={raw!r} is not an integer: {e}",
+        ) from e
+    if value < lo or value > hi:
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            f"{name}={value} outside bounds [{lo}, {hi}]",
+        )
+    return value
 
 
 async def _drain_registry(registry: SessionRegistry, state: dict[str, bool]) -> None:

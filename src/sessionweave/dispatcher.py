@@ -60,7 +60,9 @@ def _specific(
             ErrorCode.INVALID_TARGETS,
             f"unknown participant_id(s): {','.join(unknown)}",
         )
-    return DispatchDecision(list(pids))
+    # Dedup while preserving first-occurrence order so callers that submit
+    # ["pid-1","pid-1","pid-2"] don't trigger double delivery.
+    return DispatchDecision(list(dict.fromkeys(pids)))
 
 
 def _filter_role_capability(

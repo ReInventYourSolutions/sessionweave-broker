@@ -139,3 +139,20 @@ def test_round_robin_distributes_over_time() -> None:
     assert picks.count("a") == 2
     assert picks.count("b") == 2
     assert picks.count("c") == 2
+
+
+def test_specific_dedups_duplicate_participant_ids() -> None:
+    """Duplicate pids in target list must collapse to a single delivery."""
+    roster = {
+        "a": _p("a", "x", ["c1"], online=True),
+        "b": _p("b", "x", ["c1"], online=True),
+    }
+    decision = decide_dispatch(
+        roster=roster,
+        sender_id="x",
+        dispatch=DispatchMode.SPECIFIC,
+        target=Target(participant_ids=["a", "a", "b", "a"]),
+        picker=RoundRobinPicker(),
+    )
+    # Order-preserving dedup: first occurrence wins.
+    assert decision.recipients == ["a", "b"]
