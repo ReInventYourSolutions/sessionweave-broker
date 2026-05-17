@@ -5,11 +5,21 @@ from sessionweave.connections import ConnectionHandle, ConnectionManager
 
 class FakeHandle(ConnectionHandle):
     def __init__(self) -> None:
-        self.sent: list[tuple[str, dict[str, object]]] = []
+        self.sent: list[tuple[str, dict[str, object], int | None]] = []
         self.closed = False
 
-    def send(self, name: str, payload: dict[str, object]) -> None:
-        self.sent.append((name, payload))
+    def send(
+        self,
+        name: str,
+        payload: dict[str, object],
+        *,
+        seq: int | None = None,
+    ) -> None:
+        # This local FakeHandle stores 3-tuples so the test below can
+        # assert on the seq directly; other tests use the shared
+        # ``tests/unit/fakes.py`` FakeHandle which keeps 2-tuples for
+        # backwards-compat.
+        self.sent.append((name, payload, seq))
 
     def is_alive(self) -> bool:
         return not self.closed
@@ -53,9 +63,9 @@ def test_send_notification_via_handle() -> None:
     mgr = ConnectionManager()
     h = FakeHandle()
     mgr.bind(h, "s1", "p1")
-    sent = mgr.send("s1", "p1", "participant.joined", {"x": 1})
+    sent = mgr.send("s1", "p1", "participant.joined", {"x": 1}, seq=5)
     assert sent is True
-    assert h.sent == [("participant.joined", {"x": 1})]
+    assert h.sent == [("participant.joined", {"x": 1}, 5)]
 
 
 def test_send_returns_false_when_no_handle() -> None:

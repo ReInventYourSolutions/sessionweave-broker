@@ -5,7 +5,9 @@ from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class ConnectionHandle(Protocol):
-    def send(self, name: str, payload: dict[str, Any]) -> None: ...
+    def send(
+        self, name: str, payload: dict[str, Any], *, seq: int | None = None
+    ) -> None: ...
     def is_alive(self) -> bool: ...
 
 
@@ -62,9 +64,11 @@ class ConnectionManager:
         participant_id: str,
         name: str,
         payload: dict[str, Any],
+        *,
+        seq: int | None = None,
     ) -> bool:
         handle = self._by_key.get((session_id, participant_id))
         if handle is None or not handle.is_alive():
             return False
-        handle.send(name, payload)
+        handle.send(name, payload, seq=seq)
         return True

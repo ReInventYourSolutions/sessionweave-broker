@@ -32,6 +32,11 @@ async def sw_client(base_url: str) -> AsyncIterator[Client]:
             data = getattr(params, "data", None)
             if not isinstance(data, dict):
                 return
+            # Tests that need to inspect the raw envelope (e.g. to
+            # assert ``_seq`` is present on MCP push) hook this side
+            # channel; it fires once per LoggingMessageNotification
+            # before the (name, payload) unwrap is dispatched.
+            await client._dispatch_raw_logging_message(data)
             name = data.get("_name")
             payload = data.get("_payload") or {}
             if not isinstance(name, str):
@@ -55,11 +60,12 @@ NotificationCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 class Client:
     """Thin wrapper over MCP ClientSession returning tool results as dicts."""
 
-    __slots__ = ("_callbacks", "_session")
+    __slots__ = ("_callbacks", "_raw_callbacks", "_session")
 
     def __init__(self, session: ClientSession) -> None:
         self._session = session
         self._callbacks: list[NotificationCallback] = []
+        self._raw_callbacks: list[Callable[[dict[str, Any]], Any]] = []
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         result = await self._session.call_tool(name=name, arguments=args)
@@ -82,11 +88,29 @@ class Client:
     def on_notification(self, callback: NotificationCallback) -> None:
         self._callbacks.append(callback)
 
+    def on_raw_logging_message(
+        self, callback: Callable[[dict[str, Any]], Any]
+    ) -> None:
+        """Subscribe to the raw ``LoggingMessageNotification.params.data``
+        dict before the ``_name`` / ``_payload`` unwrap. Use this when a
+        test needs to inspect envelope fields like ``_seq`` that the
+        higher-level ``on_notification`` hook discards.
+        """
+        self._raw_callbacks.append(callback)
+
     async def _dispatch_notification(
         self, method: str, params: dict[str, Any]
     ) -> None:
         for cb in list(self._callbacks):
             res = cb(method, params)
+            if hasattr(res, "__await__"):
+                await res  # type: ignore[misc]
+
+    async def _dispatch_raw_logging_message(
+        self, data: dict[str, Any]
+    ) -> None:
+        for cb in list(self._raw_callbacks):
+            res = cb(data)
             if hasattr(res, "__await__"):
                 await res  # type: ignore[misc]
 

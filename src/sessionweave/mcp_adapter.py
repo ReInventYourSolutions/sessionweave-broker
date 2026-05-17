@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 _LOGGER_NAME = "sessionweave"
 
 # Type alias for the optional failure-recovery callback injected at construction.
-# The callback receives (event_name, payload) and is responsible for requeuing
-# the event to the appropriate participant buffer.
-_RequeueCB = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
+# The callback receives (event_name, payload, seq) and is responsible for
+# requeuing the event to the appropriate participant buffer with its
+# original sequence number preserved (so a reconnecting client's
+# ``last_acked_seq`` filter still applies).
+_RequeueCB = Callable[[str, dict[str, Any], int], Coroutine[Any, Any, None]]
 
 
 class MCPConnectionHandle:
@@ -69,14 +71,20 @@ class MCPConnectionHandle:
     def server_session(self) -> ServerSession:
         return self._session
 
-    def send(self, name: str, payload: dict[str, Any]) -> None:
+    def send(
+        self,
+        name: str,
+        payload: dict[str, Any],
+        *,
+        seq: int | None = None,
+    ) -> None:
         if not self._alive:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - no running loop
             return
-        task = loop.create_task(self._dispatch(name, payload))
+        task = loop.create_task(self._dispatch(name, payload, seq))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
 
@@ -95,13 +103,24 @@ class MCPConnectionHandle:
     def mark_dead(self) -> None:
         self._alive = False
 
-    async def _dispatch(self, name: str, payload: dict[str, Any]) -> None:
+    async def _dispatch(
+        self, name: str, payload: dict[str, Any], seq: int | None
+    ) -> None:
+        # Per-event ``_seq`` is tunnelled in the LoggingMessageNotification
+        # ``data`` envelope so MCP clients that care about dedup can read
+        # it the same way they read ``_name`` and ``_payload``. Pre-seq
+        # callers (legacy paths, REST handles) pass ``seq=None``; the
+        # envelope field is omitted in that case so older clients don't
+        # see a confusing zero.
+        data: dict[str, Any] = {"_name": name, "_payload": payload}
+        if seq is not None and seq > 0:
+            data["_seq"] = seq
         notif = ServerNotification(
             LoggingMessageNotification(
                 params=LoggingMessageNotificationParams(
                     level="info",
                     logger=_LOGGER_NAME,
-                    data={"_name": name, "_payload": payload},
+                    data=data,
                 ),
             ),
         )
@@ -116,7 +135,7 @@ class MCPConnectionHandle:
             # time but the transport closed before send_notification ran.
             if self._requeue_callback is not None:
                 try:
-                    await self._requeue_callback(name, payload)
+                    await self._requeue_callback(name, payload, seq or 0)
                 except Exception as requeue_exc:  # pragma: no cover
                     logger.debug(
                         "requeue also failed for %s: %s", name, requeue_exc
@@ -149,7 +168,9 @@ class _RequeueBridge:
     def set_handle(self, handle: MCPConnectionHandle) -> None:
         self._handle = handle
 
-    async def __call__(self, name: str, payload: dict[str, Any]) -> None:
+    async def __call__(
+        self, name: str, payload: dict[str, Any], seq: int
+    ) -> None:
         if self._handle is None:
             return
         binding = self._connections.session_for(self._handle)
@@ -159,7 +180,7 @@ class _RequeueBridge:
         sess = self._registry.get(sid)
         if sess is None:
             return
-        await sess.requeue_to_buffer(pid, [(name, payload)])
+        await sess.requeue_to_buffer(pid, [(name, payload, seq)])
 
 
 class HandleRegistry:

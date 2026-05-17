@@ -69,18 +69,21 @@ async def test_dispatch_failure_does_not_raise() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_calls_requeue_callback() -> None:
-    """When _dispatch raises, the requeue_callback receives (name, payload)."""
-    requeued: list[tuple[str, dict[str, Any]]] = []
+    """When _dispatch raises, the requeue_callback receives
+    ``(name, payload, seq)`` so the event can be re-buffered with
+    its original sequence number preserved.
+    """
+    requeued: list[tuple[str, dict[str, Any], int]] = []
 
-    async def _cb(name: str, payload: dict[str, Any]) -> None:
-        requeued.append((name, payload))
+    async def _cb(name: str, payload: dict[str, Any], seq: int) -> None:
+        requeued.append((name, payload, seq))
 
     handle = _make_failing_mcp_handle(requeue_callback=_cb)
-    handle.send("test.event", {"x": 1})
+    handle.send("test.event", {"x": 1}, seq=7)
     for task in list(handle._pending):
         await task
 
-    assert requeued == [("test.event", {"x": 1})]
+    assert requeued == [("test.event", {"x": 1}, 7)]
     assert not handle.is_alive()
 
 
@@ -94,24 +97,21 @@ async def test_dispatch_failure_requeues_event_to_session_buffer() -> None:
     sess, pid, cm = await _build_session_with_participant(delivery_mode="push")
 
     # Wire up the requeue callback the way HandleRegistry.for_session will.
-    async def _requeue(name: str, payload: dict[str, Any]) -> None:
-        # The MCP handle path predates per-event seq, so emit seq=0 here.
-        # Pre-seq buffer entries surface as seq=0 / None on drain — fine
-        # for backwards-compat with older transport adapters.
-        await sess.requeue_to_buffer(pid, [(name, payload, 0)])
+    async def _requeue(name: str, payload: dict[str, Any], seq: int) -> None:
+        await sess.requeue_to_buffer(pid, [(name, payload, seq)])
 
     handle = _make_failing_mcp_handle(requeue_callback=_requeue)
     cm.bind(handle, sess.session_id, pid)
 
     try:
-        handle.send("test.event", {"x": 99})
+        handle.send("test.event", {"x": 99}, seq=42)
         # Drain all pending tasks
         for task in list(handle._pending):
             await task
 
         inbox = await sess.check_inbox(pid)
         assert inbox == [
-            {"name": "test.event", "payload": {"x": 99}, "seq": 0}
+            {"name": "test.event", "payload": {"x": 99}, "seq": 42}
         ], f"Expected event in buffer after failed send, got: {inbox!r}"
     finally:
         cm.unbind(handle)

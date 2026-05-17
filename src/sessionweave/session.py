@@ -963,10 +963,11 @@ class Session:
         if p.online and p.delivery_mode == "push":
             handle = self._connections.handle_for(self.session_id, pid)
             if handle is not None and handle.is_alive():
-                # MCP-style transports use the legacy (name, payload) interface
-                # and don't surface seq to the model. Seq is still incremented
-                # so the buffer remains internally consistent.
-                self._connections.send(self.session_id, pid, name, payload)
+                # ``seq`` rides along on the wire envelope so MCP clients
+                # can dedup on reconnect the same way WS clients do.
+                self._connections.send(
+                    self.session_id, pid, name, payload, seq=seq
+                )
                 return
             # Handle vanished or transport is dead: transition to offline
             # before falling through to the buffer/subscribers path.
@@ -1278,11 +1279,13 @@ class Session:
                             item.get("_seq", 0), effective_ack
                         ):
                             continue
+                        item_seq = item.get("_seq", 0)
                         self._connections.send(
                             self.session_id,
                             participant_id,
                             item["_name"],
                             item["_payload"],
+                            seq=item_seq if item_seq > 0 else None,
                         )
             if was_offline:
                 self._notify_others(

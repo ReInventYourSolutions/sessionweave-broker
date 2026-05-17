@@ -54,7 +54,13 @@ class HTTPParticipantHandle:
 
     __slots__ = ()
 
-    def send(self, name: str, payload: dict[str, Any]) -> None:
+    def send(
+        self, name: str, payload: dict[str, Any], *, seq: int | None = None
+    ) -> None:
+        # No-op: REST clients are pull-mode by definition (they drain
+        # via ``inbox/drain`` or upgrade to the WS events endpoint).
+        # The ``seq`` parameter is accepted to satisfy the
+        # ``ConnectionHandle`` protocol but ignored.
         return None
 
     def is_alive(self) -> bool:
