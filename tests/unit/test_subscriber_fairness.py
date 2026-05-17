@@ -24,12 +24,12 @@ async def test_failing_subscriber_does_not_starve_healthy_peer() -> None:
     p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
     pid = p.participant_id
 
-    delivered_to_healthy: list[tuple[str, dict[str, object]]] = []
+    delivered_to_healthy: list[tuple[str, dict[str, object], int]] = []
 
-    def healthy(name: str, payload: dict[str, object]) -> None:
-        delivered_to_healthy.append((name, payload))
+    def healthy(name: str, payload: dict[str, object], seq: int) -> None:
+        delivered_to_healthy.append((name, payload, seq))
 
-    def broken(name: str, payload: dict[str, object]) -> None:
+    def broken(name: str, payload: dict[str, object], seq: int) -> None:
         raise RuntimeError("queue full")
 
     # Both attached for the same pid. Order matters: broken first so we
@@ -38,7 +38,8 @@ async def test_failing_subscriber_does_not_starve_healthy_peer() -> None:
 
     s._deliver_or_buffer(pid, "command.received", {"x": 1})
 
-    assert delivered_to_healthy == [("command.received", {"x": 1})]
+    # seq=1 because this is the first event delivered to this participant.
+    assert delivered_to_healthy == [("command.received", {"x": 1}, 1)]
     rendered = m.render().decode("utf-8")
     assert "sessionweave_subscriber_dispatch_failed_total 1.0" in rendered
 
@@ -53,13 +54,14 @@ async def test_all_subscribers_failing_falls_through_to_buffer() -> None:
     p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
     pid = p.participant_id
 
-    def broken(name: str, payload: dict[str, object]) -> None:
+    def broken(name: str, payload: dict[str, object], seq: int) -> None:
         raise RuntimeError("queue full")
 
     s._subscribers.setdefault(pid, []).append(broken)
 
     s._deliver_or_buffer(pid, "result.received", {"y": 2})
 
-    # check_inbox is the buffer drain.
+    # check_inbox is the buffer drain. The first event delivered to this
+    # participant carries seq=1.
     inbox = await s.check_inbox(pid)
-    assert inbox == [{"name": "result.received", "payload": {"y": 2}}]
+    assert inbox == [{"name": "result.received", "payload": {"y": 2}, "seq": 1}]

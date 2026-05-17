@@ -106,7 +106,7 @@ def test_session_wait_for_event_output_shape() -> None:
     )
     dumped = out.model_dump()
     assert dumped == {
-        "messages": [{"name": "x", "payload": {"y": 1}}],
+        "messages": [{"name": "x", "payload": {"y": 1}, "seq": None}],
         "timed_out": False,
         "effective_timeout_seconds": 60.0,
     }
@@ -120,7 +120,7 @@ def test_session_wait_for_event_output_includes_effective_timeout() -> None:
     )
     dumped = out.model_dump()
     assert dumped == {
-        "messages": [{"name": "x", "payload": {"y": 1}}],
+        "messages": [{"name": "x", "payload": {"y": 1}, "seq": None}],
         "timed_out": False,
         "effective_timeout_seconds": 20.0,
     }

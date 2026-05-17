@@ -14,10 +14,16 @@ header on a WebSocket upgrade, so the token is accepted as the
 this same query param will carry the JWT.
 
 Wire format: each frame is a single JSON object
-``{"name": "<event>", "payload": {...}}`` matching the REST inbox-drain
-schema. The handler also forwards any pending buffered events at
-connect-time before streaming subsequent live events, so a client that
-just joined doesn't need a separate REST drain to seed itself.
+``{"name": "<event>", "payload": {...}, "seq": <int>}`` matching the
+REST inbox-drain schema. ``seq`` is a per-participant monotonically
+increasing sequence number; a client can echo it back as ``{"ack":
+N}`` upstream so the relay knows the client has consumed events up to
+``N``, and on reconnect pass ``?last_acked_seq=N`` so the relay skips
+those events on the buffer replay.
+
+The handler also forwards any pending buffered events at connect-time
+before streaming subsequent live events, so a client that just joined
+doesn't need a separate REST drain to seed itself.
 """
 from __future__ import annotations
 
@@ -75,25 +81,50 @@ async def events_ws(websocket: WebSocket) -> None:
         return
 
     pid = token
+
+    # Parse optional ``?last_acked_seq=N`` so a reconnecting client can
+    # tell the relay it has already consumed events up to N. The relay
+    # will skip those events on the buffer replay. Invalid integers
+    # are treated as if the param were absent (full replay).
+    raw_acked = websocket.query_params.get("last_acked_seq")
+    last_acked_seq: int | None
+    if raw_acked is None:
+        last_acked_seq = None
+    else:
+        try:
+            last_acked_seq = int(raw_acked)
+        except ValueError:
+            last_acked_seq = None
+
     await websocket.accept()
 
-    queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
+    queue: asyncio.Queue[tuple[str, dict[str, Any], int]] = asyncio.Queue(
         maxsize=_QUEUE_MAX
     )
 
-    def callback(name: str, payload: dict[str, Any]) -> None:
+    def callback(name: str, payload: dict[str, Any], seq: int) -> None:
         # Invoked from inside Session._deliver_or_buffer while the
         # session lock is held. put_nowait is sync and safe on the same
         # event loop. If the queue is full we raise: Session catches and
         # falls back to the buffer.
-        queue.put_nowait((name, payload))
+        queue.put_nowait((name, payload, seq))
 
     # Items the callback handed us but the socket failed to deliver
     # before disconnect. detach_subscriber pushes them back onto the
     # per-participant buffer so a REST drain (or a fresh WS attach) can
     # recover them — otherwise _deliver_or_buffer saw the callback
     # succeed and never wrote the event anywhere durable.
-    undelivered: list[tuple[str, dict[str, Any]]] = []
+    undelivered: list[tuple[str, dict[str, Any], int]] = []
+
+    # Events successfully sent over the wire but not yet acknowledged by
+    # the client (via an upstream ``{"ack": <seq>}`` frame). Keyed by
+    # seq. If the socket dies before an ACK arrives, ``finally`` will
+    # push these back onto the per-participant buffer so the next WS
+    # attach (or REST drain) can recover them — this is the wire-level
+    # guarantee that lets ``?last_acked_seq=N`` deduplicate after a
+    # flaky disconnect (issue #43).
+    unacked: dict[int, tuple[str, dict[str, Any]]] = {}
+    highest_acked_seq: int = last_acked_seq or 0
 
     # We must concurrently await ``websocket.receive()`` so a peer-side
     # close is observed even when our send loop is blocked in
@@ -102,28 +133,63 @@ async def events_ws(websocket: WebSocket) -> None:
     # perspective until the next ``send_json`` actually fails — by
     # which time we've already handed the event to (an effectively
     # dead) ``send_json`` and counted it delivered.
+    #
+    # We also handle upstream ``{"ack": N}`` frames so a client can
+    # advertise the highest seq it has consumed. For now the relay
+    # accepts and ignores these (the seq-on-replay path is the
+    # critical guarantee); a future revision can trim the buffer
+    # eagerly. Non-ACK frames are tolerated to avoid breaking any
+    # client that sends ping/pong text frames on the same channel.
     async def _watch_close() -> None:
+        nonlocal highest_acked_seq
         try:
             while True:
-                await websocket.receive()
+                msg = await websocket.receive()
+                text = msg.get("text") if isinstance(msg, dict) else None
+                if not text:
+                    continue
+                try:
+                    body = json.loads(text)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(body, dict) and isinstance(body.get("ack"), int):
+                    n = body["ack"]
+                    # Trim unacked of everything up to and including N
+                    # and advance the high-water mark. The relay-side
+                    # buffer is not touched: events are removed from
+                    # ``unacked`` only after the client confirms it has
+                    # consumed them in memory.
+                    if n > highest_acked_seq:
+                        highest_acked_seq = n
+                    for seq_key in list(unacked.keys()):
+                        if seq_key <= n:
+                            unacked.pop(seq_key, None)
         except WebSocketDisconnect:
             return
 
-    backlog = await session.attach_subscriber(pid, callback)
+    backlog = await session.attach_subscriber(
+        pid, callback, last_acked_seq=last_acked_seq
+    )
     closer: asyncio.Task[None] | None = None
     try:
         for item in backlog:
             name = item["name"]
             payload = item["payload"]
+            seq = item.get("seq", 0)
             try:
-                await websocket.send_json({"name": name, "payload": payload})
+                await websocket.send_json(
+                    {"name": name, "payload": payload, "seq": seq}
+                )
             except WebSocketDisconnect:
-                undelivered.append((name, payload))
+                undelivered.append((name, payload, seq))
                 raise
+            else:
+                if seq > highest_acked_seq:
+                    unacked[seq] = (name, payload)
 
         closer = asyncio.create_task(_watch_close())
         while True:
-            getter: asyncio.Task[tuple[str, dict[str, Any]]] = asyncio.create_task(
+            getter: asyncio.Task[tuple[str, dict[str, Any], int]] = asyncio.create_task(
                 queue.get()
             )
             done, _pending = await asyncio.wait(
@@ -136,15 +202,20 @@ async def events_ws(websocket: WebSocket) -> None:
                 # finally-block drain will catch it.
                 getter.cancel()
                 break
-            name, payload = getter.result()
+            name, payload, seq = getter.result()
             if closer.done():
-                undelivered.append((name, payload))
+                undelivered.append((name, payload, seq))
                 break
             try:
-                await websocket.send_json({"name": name, "payload": payload})
+                await websocket.send_json(
+                    {"name": name, "payload": payload, "seq": seq}
+                )
             except WebSocketDisconnect:
-                undelivered.append((name, payload))
+                undelivered.append((name, payload, seq))
                 raise
+            else:
+                if seq > highest_acked_seq:
+                    unacked[seq] = (name, payload)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -171,6 +242,16 @@ async def events_ws(websocket: WebSocket) -> None:
                 undelivered.append(queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
+        # Anything we send_json'd but never received an ACK for is, from
+        # the client's point of view, potentially unread (its socket may
+        # have died mid-frame, or the WS layer drained the TCP buffer
+        # past the application). Push those back too so a reconnecting
+        # client with ``last_acked_seq=N`` can recover them. Earlier
+        # un-ACKed seq goes first so buffer order matches delivery order.
+        if unacked:
+            for seq in sorted(unacked):
+                name, payload = unacked[seq]
+                undelivered.append((name, payload, seq))
         if undelivered:
             await session.requeue_to_buffer(pid, undelivered)
 

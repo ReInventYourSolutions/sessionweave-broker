@@ -186,12 +186,18 @@ async def session_list_participants(
 
 
 async def session_check_inbox(
-    deps: ToolDeps, handle: ConnectionHandle
+    deps: ToolDeps,
+    handle: ConnectionHandle,
+    *,
+    last_acked_seq: int | None = None,
 ) -> dict[str, Any]:
     sess, pid = _session_for_handle(deps, handle)
-    items = await sess.check_inbox(pid)
+    items = await sess.check_inbox(pid, last_acked_seq=last_acked_seq)
     return SessionCheckInboxOutput(
-        messages=[InboxMessage(name=i["name"], payload=i["payload"]) for i in items]
+        messages=[
+            InboxMessage(name=i["name"], payload=i["payload"], seq=i.get("seq"))
+            for i in items
+        ]
     ).model_dump()
 
 

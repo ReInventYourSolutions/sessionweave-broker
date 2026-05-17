@@ -24,7 +24,7 @@ async def test_wait_returns_immediately_when_matching_event_already_buffered() -
     )
 
     assert result.timed_out is False
-    assert result.messages == [{"name": "command.received", "payload": {"x": 1}}]
+    assert result.messages == [{"name": "command.received", "payload": {"x": 1}, "seq": 1}]
 
 
 @pytest.mark.asyncio
@@ -46,7 +46,7 @@ async def test_wait_wakes_on_event_arrival() -> None:
     await producer
 
     assert result.timed_out is False
-    assert result.messages == [{"name": "command.received", "payload": {"k": "v"}}]
+    assert result.messages == [{"name": "command.received", "payload": {"k": "v"}, "seq": 1}]
 
 
 @pytest.mark.asyncio
@@ -79,7 +79,7 @@ async def test_wait_times_out_when_only_non_matching_events_arrive() -> None:
     assert result.messages == []
     # The non-matching event must have been re-buffered into _buffers.
     leftover = await s.check_inbox(p.participant_id)
-    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}}]
+    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}, "seq": 1}]
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,7 @@ async def test_wait_ignores_non_matching_buffered_event_and_rebuffers_it() -> No
     assert result.messages == []
     # The non-matching event must still be in the buffer.
     leftover = await s.check_inbox(p.participant_id)
-    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}}]
+    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}, "seq": 1}]
 
 
 @pytest.mark.asyncio
@@ -139,10 +139,10 @@ async def test_wait_returns_only_matching_when_mixed_burst_arrives() -> None:
     await producer
 
     assert result.timed_out is False
-    assert result.messages == [{"name": "command.received", "payload": {"b": 2}}]
+    assert result.messages == [{"name": "command.received", "payload": {"b": 2}, "seq": 2}]
     # The non-matching event must still be in the buffer.
     leftover = await s.check_inbox(p.participant_id)
-    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}}]
+    assert leftover == [{"name": "participant.updated", "payload": {"a": 1}, "seq": 1}]
 
 
 @pytest.mark.asyncio

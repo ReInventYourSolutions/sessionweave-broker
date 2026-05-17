@@ -95,7 +95,10 @@ async def test_dispatch_failure_requeues_event_to_session_buffer() -> None:
 
     # Wire up the requeue callback the way HandleRegistry.for_session will.
     async def _requeue(name: str, payload: dict[str, Any]) -> None:
-        await sess.requeue_to_buffer(pid, [(name, payload)])
+        # The MCP handle path predates per-event seq, so emit seq=0 here.
+        # Pre-seq buffer entries surface as seq=0 / None on drain — fine
+        # for backwards-compat with older transport adapters.
+        await sess.requeue_to_buffer(pid, [(name, payload, 0)])
 
     handle = _make_failing_mcp_handle(requeue_callback=_requeue)
     cm.bind(handle, sess.session_id, pid)
@@ -107,9 +110,9 @@ async def test_dispatch_failure_requeues_event_to_session_buffer() -> None:
             await task
 
         inbox = await sess.check_inbox(pid)
-        assert inbox == [{"name": "test.event", "payload": {"x": 99}}], (
-            f"Expected event in buffer after failed send, got: {inbox!r}"
-        )
+        assert inbox == [
+            {"name": "test.event", "payload": {"x": 99}, "seq": 0}
+        ], f"Expected event in buffer after failed send, got: {inbox!r}"
     finally:
         cm.unbind(handle)
 

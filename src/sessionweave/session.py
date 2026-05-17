@@ -100,7 +100,7 @@ class Session:
         # is held — callbacks must not block on the lock or do heavy work.
         # Typical implementation: ``queue.put_nowait`` on an asyncio queue.
         self._subscribers: dict[
-            str, list[Callable[[str, dict[str, Any]], None]]
+            str, list[Callable[[str, dict[str, Any], int], None]]
         ] = {}
         self._picker = RoundRobinPicker()
         self._last_activity_at: datetime = now
@@ -235,7 +235,7 @@ class Session:
             if subs:
                 for cb in list(subs):
                     try:
-                        cb("__evicted__", {})
+                        cb("__evicted__", {}, 0)
                     except Exception:
                         pass
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
@@ -317,12 +317,22 @@ class Session:
             )
             return new_purpose
 
-    async def check_inbox(self, participant_id: str) -> list[dict[str, Any]]:
+    async def check_inbox(
+        self,
+        participant_id: str,
+        *,
+        last_acked_seq: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Drain and return any buffered notifications for ``participant_id``.
 
         Used by ``delivery_mode=pull`` clients (and any client that wants to
         flush the offline buffer mid-session). Returns each entry as
-        ``{"name": <event>, "payload": {...}}``.
+        ``{"name": <event>, "payload": {...}, "seq": <int>}``.
+
+        ``last_acked_seq`` (optional): if provided, only buffered events
+        with ``seq > last_acked_seq`` are returned. Lets a client that
+        consumed events in memory before a flaky disconnect resume
+        without seeing duplicates.
         """
         async with self.lock:
             p = self._participants.get(participant_id)
@@ -333,8 +343,13 @@ class Session:
             if buf is None:
                 return []
             return [
-                {"name": item["_name"], "payload": item["_payload"]}
+                {
+                    "name": item["_name"],
+                    "payload": item["_payload"],
+                    "seq": item.get("_seq", 0),
+                }
                 for item in self._filter_stale_buffer_items(buf.drain())
+                if last_acked_seq is None or item.get("_seq", 0) > last_acked_seq
             ]
 
     async def wait_for_event(
@@ -357,11 +372,13 @@ class Session:
         # Bounded queue between the synchronous subscriber callback
         # and this coroutine. Overflow falls through to the buffer
         # via attach_subscriber's existing fallback contract.
-        queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=64)
+        queue: asyncio.Queue[tuple[str, dict[str, Any], int]] = asyncio.Queue(
+            maxsize=64
+        )
 
-        def on_event(name: str, payload: dict[str, Any]) -> None:
+        def on_event(name: str, payload: dict[str, Any], seq: int) -> None:
             try:
-                queue.put_nowait((name, payload))
+                queue.put_nowait((name, payload, seq))
             except asyncio.QueueFull:
                 # Let attach_subscriber's contract route to the buffer.
                 raise
@@ -441,7 +458,10 @@ class Session:
                 if non_matching:
                     await self.requeue_to_buffer(
                         participant_id,
-                        [(entry["name"], entry["payload"]) for entry in non_matching],
+                        [
+                            (entry["name"], entry["payload"], entry.get("seq", 0))
+                            for entry in non_matching
+                        ],
                     )
 
                 if matching:
@@ -470,7 +490,7 @@ class Session:
                             effective_timeout_seconds=effective_timeout,
                         )
                     try:
-                        name, payload = await asyncio.wait_for(
+                        name, payload, seq = await asyncio.wait_for(
                             queue.get(), timeout=remaining
                         )
                     except TimeoutError:
@@ -483,23 +503,23 @@ class Session:
                     check_sentinel(name)
 
                     if is_match(name):
-                        matching.append({"name": name, "payload": payload})
+                        matching.append({"name": name, "payload": payload, "seq": seq})
                     else:
                         await self.requeue_to_buffer(
-                            participant_id, [(name, payload)]
+                            participant_id, [(name, payload, seq)]
                         )
 
                     while True:
                         try:
-                            name, payload = queue.get_nowait()
+                            name, payload, seq = queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
                         check_sentinel(name)
                         if is_match(name):
-                            matching.append({"name": name, "payload": payload})
+                            matching.append({"name": name, "payload": payload, "seq": seq})
                         else:
                             await self.requeue_to_buffer(
-                                participant_id, [(name, payload)]
+                                participant_id, [(name, payload, seq)]
                             )
 
                     if matching:
@@ -536,7 +556,9 @@ class Session:
     async def attach_subscriber(
         self,
         participant_id: str,
-        callback: Callable[[str, dict[str, Any]], None],
+        callback: Callable[[str, dict[str, Any], int], None],
+        *,
+        last_acked_seq: int | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically drain pending buffered notifications and register a
         live event callback. Returns the drained backlog as a list of
@@ -566,8 +588,14 @@ class Session:
             buf = self._buffers.pop(participant_id, None)
             backlog: list[dict[str, Any]] = (
                 [
-                    {"name": item["_name"], "payload": item["_payload"]}
+                    {
+                        "name": item["_name"],
+                        "payload": item["_payload"],
+                        "seq": item.get("_seq", 0),
+                    }
                     for item in self._filter_stale_buffer_items(buf.drain())
+                    if last_acked_seq is None
+                    or item.get("_seq", 0) > last_acked_seq
                 ]
                 if buf is not None
                 else []
@@ -590,7 +618,7 @@ class Session:
     async def detach_subscriber(
         self,
         participant_id: str,
-        callback: Callable[[str, dict[str, Any]], None],
+        callback: Callable[[str, dict[str, Any], int], None],
     ) -> None:
         """Remove a previously-attached subscriber. Idempotent.
 
@@ -645,12 +673,19 @@ class Session:
     async def requeue_to_buffer(
         self,
         participant_id: str,
-        items: list[tuple[str, dict[str, Any]]],
+        items: list[tuple[str, dict[str, Any], int]],
     ) -> None:
         """Push events that a subscriber had popped (or had handed to
         it) but couldn't actually deliver back onto the per-participant
         buffer, so a REST ``inbox/drain`` (or a fresh subscriber) can
         still recover them.
+
+        Each item is ``(name, payload, seq)`` — the seq is the per-
+        participant monotonic sequence number that was assigned when
+        the event was originally fanned out from
+        ``_deliver_or_buffer``. Preserving it here means a reconnecting
+        client that has ACKed up to N can still skip duplicates after a
+        flaky disconnect.
 
         Typical caller: a WebSocket handler that detached because the
         peer closed; anything left in its asyncio.Queue at that point
@@ -664,9 +699,9 @@ class Session:
             if participant_id not in self._participants:
                 return
             buf = self._buffer_for(participant_id)
-            for name, payload in items:
+            for name, payload, seq in items:
                 try:
-                    buf.enqueue({"_name": name, "_payload": payload})
+                    buf.enqueue({"_name": name, "_payload": payload, "_seq": seq})
                 except BufferOverflow:
                     # Buffer cap exceeded — the participant is clearly
                     # past their grace; let the regular eviction path
@@ -873,12 +908,22 @@ class Session:
         p = self._participants.get(pid)
         if p is None:
             return
+        # Tag this event with a per-participant monotonic seq BEFORE choosing
+        # a delivery path so that the buffer, the live WS subscriber, and any
+        # future delivery path observe the same ordering. The seq lets a
+        # reconnecting client tell the relay "I already consumed up to N" via
+        # ``last_acked_seq`` and skip duplicates on replay.
+        p.next_seq += 1
+        seq = p.next_seq
         # ``pull`` clients always go to the buffer regardless of online status —
         # they drain it via session_check_inbox. We skip the push path entirely
         # so the same notification isn't delivered twice.
         if p.online and p.delivery_mode == "push":
             handle = self._connections.handle_for(self.session_id, pid)
             if handle is not None and handle.is_alive():
+                # MCP-style transports use the legacy (name, payload) interface
+                # and don't surface seq to the model. Seq is still incremented
+                # so the buffer remains internally consistent.
                 self._connections.send(self.session_id, pid, name, payload)
                 return
             # Handle vanished or transport is dead: transition to offline
@@ -898,7 +943,7 @@ class Session:
             failures = 0
             for cb in tuple(subs):
                 try:
-                    cb(name, payload)
+                    cb(name, payload, seq)
                     delivered = True
                 except Exception:
                     failures += 1
@@ -908,7 +953,7 @@ class Session:
                 return
         try:
             buf = self._buffer_for(pid)
-            buf.enqueue({"_name": name, "_payload": payload})
+            buf.enqueue({"_name": name, "_payload": payload, "_seq": seq})
         except BufferOverflow:
             # Cap exceeded — escalate to eviction. Implemented in Task 13.
             self._enqueue_eviction(pid, reason="offline_timeout")
@@ -1076,7 +1121,7 @@ class Session:
         for _pid, subs in list(self._subscribers.items()):
             for cb in list(subs):
                 try:
-                    cb("__evicted__", {})
+                    cb("__evicted__", {}, 0)
                 except Exception:
                     pass
         self._subscribers.clear()

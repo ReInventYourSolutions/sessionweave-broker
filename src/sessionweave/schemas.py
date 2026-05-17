@@ -117,6 +117,10 @@ class SessionDescribeOutput(_Strict):
 class InboxMessage(_Strict):
     name: str
     payload: dict[str, Any]
+    # Per-participant monotonic sequence number assigned by the relay.
+    # Optional for backwards-compat: pre-seq events buffered by older
+    # builds (or items handed in via legacy paths) may not carry one.
+    seq: int | None = None
 
 
 class SessionCheckInboxOutput(_Strict):

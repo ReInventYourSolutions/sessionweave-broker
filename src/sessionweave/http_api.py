@@ -303,11 +303,27 @@ async def delete_self(request: Request) -> Response:
 async def post_inbox_drain(request: Request) -> JSONResponse:
     sid = request.path_params["sid"]
     deps = _deps(request)
+    # Optional ``?last_acked_seq=N`` lets a reconnecting client tell the
+    # relay it already consumed events up to N (typically via an earlier
+    # WS session whose socket died). Invalid integers are silently
+    # ignored to keep the endpoint forgiving — a missing param falls back
+    # to the original full-drain behaviour.
+    raw_acked = request.query_params.get("last_acked_seq")
+    last_acked_seq: int | None
+    if raw_acked is None:
+        last_acked_seq = None
+    else:
+        try:
+            last_acked_seq = int(raw_acked)
+        except ValueError:
+            last_acked_seq = None
     try:
         token = _require_bearer(request)
         handle = _bind_participant(deps, sid, token)
         try:
-            out = await session_check_inbox(deps, handle)
+            out = await session_check_inbox(
+                deps, handle, last_acked_seq=last_acked_seq
+            )
         finally:
             _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:

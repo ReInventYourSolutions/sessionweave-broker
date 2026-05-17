@@ -34,6 +34,13 @@ class Participant:
     # buffer, drained via session_check_inbox. Use for clients that don't
     # surface server notifications to their model.
     delivery_mode: str = "push"
+    # Monotonically increasing per-participant sequence number. Incremented
+    # by ``Session._deliver_or_buffer`` before every event is delivered (live
+    # OR buffered) so each event carries a unique ``seq`` the client can
+    # acknowledge. A reconnecting WS / drain client can pass
+    # ``last_acked_seq=N`` to skip events it has already consumed in memory
+    # before its socket died. Starts at 0; the first event carries ``seq=1``.
+    next_seq: int = 0
 
     @staticmethod
     def create(

@@ -229,6 +229,17 @@ components:
         payload:
           type: object
           additionalProperties: true
+        seq:
+          type: integer
+          minimum: 1
+          description: |
+            Per-participant monotonically increasing sequence number
+            assigned by the relay when the event was fanned out. A
+            reconnecting client can ack consumed events with
+            `{"ack": N}` on the WS upstream or pass `?last_acked_seq=N`
+            on the next inbox-drain / WS attach to skip duplicates.
+            Optional for backwards-compat: events buffered by older
+            builds may be absent.
 
     InboxDrainResponse:
       type: object
@@ -587,8 +598,26 @@ paths:
     post:
       tags: [participants]
       summary: Drain pending events for the calling participant
+      description: |
+        Drain (and remove from the per-participant buffer) every
+        notification queued for the calling participant. Each returned
+        message carries an integer `seq` field (per-participant
+        monotonically increasing). A client that has already consumed
+        events up to ``seq=N`` over some other channel (typically a
+        WebSocket that died mid-stream) can pass `?last_acked_seq=N`
+        to skip those events on this drain.
       security:
         - bearerAuth: []
+      parameters:
+        - name: last_acked_seq
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+          description: |
+            Highest `seq` the caller has already consumed in memory.
+            Buffered events with `seq <= last_acked_seq` are filtered
+            out of the drained set. Invalid integers are ignored
+            (full-drain fallback).
       responses:
         '200':
           description: Events
