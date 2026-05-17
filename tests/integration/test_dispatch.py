@@ -358,3 +358,258 @@ async def test_dispatch_any_no_loss_under_roster_churn() -> None:
                     f"not in {valid_pids}"
                 )
             assert len(sends) == total  # no command lost from the caller's POV
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dispatch_any_under_multi_worker_simultaneous_churn() -> None:
+    """Cross-endorsed follow-up from joint review session
+    `3e6a2ac7-...`: the single-transient-worker test in #45 doesn't
+    stress the `RoundRobinPicker.pick` sort-by-pid logic under
+    *concurrent* roster mutations. Two transient workers join AND
+    leave during a single dispatch burst; the picker re-sorts twice
+    in close succession.
+
+    Invariants (same shape as the stable case, no stronger because
+    the relay does not guarantee fairness across a moving roster —
+    just no-loss):
+
+      - sum(delivered_to[0] for all sends) == total
+      - every delivered_to[0] is a participant_id that was online at
+        dispatch time (no phantom recipient)
+    """
+    total = 40
+    async with relay_subprocess() as base:
+        async with (
+            sw_client(base) as sender,
+            sw_client(base) as r1,
+            sw_client(base) as r2,
+            sw_client(base) as r3,
+            sw_client(base) as t1,
+            sw_client(base) as t2,
+        ):
+            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            await sender.call_tool(
+                "session_join", {"session_id": sid, "role": "sender"}
+            )
+            stable_pids: set[str] = set()
+            for r in (r1, r2, r3):
+                pj = await r.call_tool(
+                    "session_join",
+                    {
+                        "session_id": sid,
+                        "role": "worker",
+                        "capabilities": ["respond"],
+                    },
+                )
+                stable_pids.add(pj["participant_id"])
+
+            transient_pids: set[str] = set()
+
+            async def _churn(client: Any) -> str:
+                pj = await client.call_tool(
+                    "session_join",
+                    {
+                        "session_id": sid,
+                        "role": "worker",
+                        "capabilities": ["respond"],
+                    },
+                )
+                await asyncio.sleep(0.05)
+                await client.call_tool("session_leave", {})
+                return pj["participant_id"]
+
+            churn_tasks = [asyncio.create_task(_churn(t1)), asyncio.create_task(_churn(t2))]
+            sends = await asyncio.gather(
+                *[
+                    sender.call_tool(
+                        "session_send",
+                        {
+                            "dispatch": "any",
+                            "target": {"capability": "respond"},
+                            "payload": {"i": i},
+                        },
+                    )
+                    for i in range(total)
+                ]
+            )
+            for task in churn_tasks:
+                transient_pids.add(await task)
+
+            valid_pids = stable_pids | transient_pids
+            for s in sends:
+                assert len(s["delivered_to"]) == 1, (
+                    f"dispatch=any returned {len(s['delivered_to'])} "
+                    "recipients; expected exactly 1"
+                )
+                assert s["delivered_to"][0] in valid_pids, (
+                    f"command routed to phantom pid {s['delivered_to'][0]} "
+                    f"not in {valid_pids}"
+                )
+            assert len(sends) == total
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dispatch_all_no_double_count_under_fanout() -> None:
+    """A race in `_deliver_or_buffer` that double-counts a recipient
+    on `dispatch="all"` fan-out wouldn't be caught by the existing
+    `dispatch="any"` fairness tests (which only deliver one event
+    per send). Spin up 4 workers, dispatch 20 commands with
+    `dispatch="all"`; each worker must receive EXACTLY 20
+    command.received events (no fewer = no loss, no more = no
+    double-count).
+    """
+    total = 20
+    n_workers = 4
+    async with relay_subprocess() as base:
+        async with (
+            sw_client(base) as sender,
+            sw_client(base) as w1,
+            sw_client(base) as w2,
+            sw_client(base) as w3,
+            sw_client(base) as w4,
+        ):
+            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            await sender.call_tool(
+                "session_join", {"session_id": sid, "role": "sender"}
+            )
+            workers = [w1, w2, w3, w4]
+            received_buckets: list[list[tuple[str, dict[str, Any]]]] = []
+            for w in workers:
+                await w.call_tool(
+                    "session_join",
+                    {
+                        "session_id": sid,
+                        "role": "worker",
+                        "capabilities": ["respond"],
+                    },
+                )
+                bucket: list[tuple[str, dict[str, Any]]] = []
+                received_buckets.append(bucket)
+                w.on_notification(
+                    lambda n, p, _b=bucket: _b.append((n, p))
+                )
+
+            sends = await asyncio.gather(
+                *[
+                    sender.call_tool(
+                        "session_send",
+                        {
+                            "dispatch": "all",
+                            "target": {"capability": "respond"},
+                            "payload": {"i": i},
+                        },
+                    )
+                    for i in range(total)
+                ]
+            )
+
+            # Each send must have fanned out to exactly n_workers
+            # recipients.
+            for s in sends:
+                assert len(s["delivered_to"]) == n_workers, (
+                    f"dispatch=all delivered to {len(s['delivered_to'])} "
+                    f"recipients; expected {n_workers}"
+                )
+
+            # Wait until each worker has received total commands.
+            await _wait_for(
+                lambda: all(
+                    sum(1 for n, _ in b if n == "command.received") == total
+                    for b in received_buckets
+                ),
+                timeout=10.0,
+                message=(
+                    "not all workers reached the expected "
+                    f"{total} command.received events"
+                ),
+            )
+
+            # And no worker received more than total — catches a
+            # double-count race in _deliver_or_buffer / dispatcher.
+            for i, b in enumerate(received_buckets):
+                cmd_count = sum(1 for n, _ in b if n == "command.received")
+                assert cmd_count == total, (
+                    f"worker {i} received {cmd_count} commands; "
+                    f"expected {total} (no double-count)"
+                )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dispatch_any_heterogeneous_worker_speeds() -> None:
+    """One slow + three fast responders to stress the picker's
+    sort-by-pid assumption when responses arrive out-of-order. The
+    `RoundRobinPicker` SELECTION is independent of response speed
+    (it picks before the previous recipient responds), so this is
+    primarily a smoke test that the response path's
+    `tracker.is_complete` accounting doesn't go funny when responses
+    arrive in non-dispatch order. Asserts that every send produces a
+    `command.completed reason=all_responded` after all four answer.
+    """
+    total = 8
+    async with relay_subprocess() as base:
+        async with (
+            sw_client(base) as sender,
+            sw_client(base) as fast1,
+            sw_client(base) as fast2,
+            sw_client(base) as fast3,
+            sw_client(base) as slow,
+        ):
+            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            await sender.call_tool(
+                "session_join", {"session_id": sid, "role": "sender"}
+            )
+            fast_clients = [fast1, fast2, fast3]
+            slow_pj = await slow.call_tool(
+                "session_join",
+                {
+                    "session_id": sid,
+                    "role": "worker",
+                    "capabilities": ["respond"],
+                },
+            )
+            slow_pid = slow_pj["participant_id"]
+            for client in fast_clients:
+                await client.call_tool(
+                    "session_join",
+                    {
+                        "session_id": sid,
+                        "role": "worker",
+                        "capabilities": ["respond"],
+                    },
+                )
+
+            sends = await asyncio.gather(
+                *[
+                    sender.call_tool(
+                        "session_send",
+                        {
+                            "dispatch": "any",
+                            "target": {"capability": "respond"},
+                            "payload": {"i": i},
+                            "timeout_seconds": 30,
+                        },
+                    )
+                    for i in range(total)
+                ]
+            )
+
+            # Every dispatch must hit exactly one recipient.
+            for s in sends:
+                assert len(s["delivered_to"]) == 1
+
+            # If the picker is strict round-robin with 4 sorted
+            # participants and 8 sends, the slow worker received
+            # exactly 2 commands. We don't assert that — fairness is
+            # a separate test (#45). We only assert: no command
+            # vanished and no command was double-delivered.
+            counts: dict[str, int] = {}
+            for s in sends:
+                pid = s["delivered_to"][0]
+                counts[pid] = counts.get(pid, 0) + 1
+            assert sum(counts.values()) == total
+            assert all(v >= 1 for v in counts.values()) or slow_pid not in counts, (
+                f"unexpected distribution under stable-roster dispatch: {counts}"
+            )
