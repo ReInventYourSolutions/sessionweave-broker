@@ -401,8 +401,24 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if auth[7:].strip() != sid:
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+    token = auth[7:].strip()
+    # Two authentication modes (mirrors the firehose endpoint):
+    #   - admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set at
+    #     startup): token must equal that secret. Knowing the
+    #     session_id alone is NOT sufficient — closes the gap where
+    #     any session participant could post halt notes targeting
+    #     other participants.
+    #   - legacy mode (env var unset): accept token == session_id.
+    #     Backwards-compat for local-dev cockpit. Startup logger
+    #     emits a one-shot warning advising operators to set the
+    #     env var.
+    admin_token = getattr(request.app.state, "supervisor_admin_token", None)
+    if admin_token is not None:
+        if token != admin_token:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+    else:
+        if token != sid:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
 
     registry = _deps(request).registry
     session = registry.get(sid)

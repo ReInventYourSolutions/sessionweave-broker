@@ -362,6 +362,24 @@ def build_app() -> Starlette:
             "subscribe and observe the full event stream. Set the env var "
             "in production deployments."
         )
+    # Optional relay-wide admin token gating the supervisor-notes
+    # endpoint. Mirrors the firehose-admin-token pattern: when set, the
+    # supervisor /notes POST requires this token instead of accepting
+    # ``token == session_id``. Knowing the session_id alone is no longer
+    # enough to halt or redirect participants, so an XSS on a session
+    # roster page cannot escalate to "kill all agents".
+    app.state.supervisor_admin_token = (
+        os.environ.get("SW_SUPERVISOR_ADMIN_TOKEN", "") or None
+    )
+    if app.state.supervisor_admin_token is None:
+        logging.getLogger(__name__).warning(
+            "SW_SUPERVISOR_ADMIN_TOKEN not set; supervisor /notes endpoint "
+            "authenticates with token==session_id (LEGACY mode). Any holder "
+            "of the session_id (every session participant inherently) can "
+            "POST supervisor notes targeting any participant, including "
+            "kind=halt. Set the env var in multi-tenant production "
+            "deployments."
+        )
     app.state.supervisor_rate = NoteRateLimiter(
         per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
         per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),

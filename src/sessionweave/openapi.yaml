@@ -483,6 +483,28 @@ paths:
     post:
       tags: [sessions]
       summary: Post a supervisor note / halt / continue / redirect
+      description: |
+        Authentication has two modes (parallels the firehose
+        endpoint):
+
+        - **Admin-token mode** (recommended in multi-tenant
+          deployments): the relay is started with
+          ``SW_SUPERVISOR_ADMIN_TOKEN=<value>``; the bearer header
+          must equal that value. Knowing the session_id alone is
+          NOT sufficient — closes the gap where any participant
+          could post halt notes targeting other participants.
+        - **Legacy mode** (default when the env var is unset):
+          bearer must equal the ``session_id``. Suitable for
+          local-dev cockpits; the relay logs a warning at startup
+          advising operators to switch.
+
+        Server-side invariants (both modes):
+          - ``kind`` is restricted to the documented enum
+            (``note`` / ``halt`` / ``continue`` / ``redirect``).
+            Unknown kinds return 400.
+          - ``target`` must equal ``"all"`` or a participant_id
+            currently in the session roster.
+          - Per-(session, source-ip) rate limit applies.
       security:
         - BearerSessionId: []
       requestBody:

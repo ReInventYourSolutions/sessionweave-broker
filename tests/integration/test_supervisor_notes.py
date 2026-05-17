@@ -90,3 +90,65 @@ async def test_post_note_rate_limited():
                 )
                 statuses.append(r.status_code)
         assert 429 in statuses
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_note_admin_token_mode_rejects_session_id() -> None:
+    """When ``SW_SUPERVISOR_ADMIN_TOKEN`` is set, a bearer equal to
+    the session_id must be rejected — only the admin token is
+    accepted. Closes the authz gap from #55: a session participant
+    who knows its own ``session_id`` cannot post supervisor notes
+    (including ``kind=halt``) without the admin secret.
+    """
+    admin = "test-supervisor-secret-cafebabe"
+    async with relay_subprocess(
+        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+    ) as base:
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()["session_id"]
+
+            # Bearer == session_id must FAIL in admin-token mode.
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {sid}"},
+                json={"kind": "halt", "target": "all", "message": "denied"},
+            )
+            assert r.status_code == 403
+
+            # Bearer == admin_token must succeed.
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {admin}"},
+                json={"kind": "note", "target": "all", "message": "ok"},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["kind"] == "note"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_note_unknown_kind_rejected() -> None:
+    """The server-side kind allowlist (``note`` / ``halt`` /
+    ``continue`` / ``redirect``) rejects unknown kinds with 400.
+    Stops a compromised cockpit from injecting custom kinds the
+    skill doesn't document, which client-side custom handlers
+    might act on.
+    """
+    async with relay_subprocess() as base:
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()["session_id"]
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {sid}"},
+                json={"kind": "poison-pill", "target": "all", "message": "x"},
+            )
+            assert r.status_code == 400
+            body = r.json()
+            assert body["error"] == "invalid_request"
+            assert "kind" in body["detail"].lower()
