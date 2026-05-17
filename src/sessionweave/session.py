@@ -1004,14 +1004,20 @@ class Session:
                 # corresponding ``result.received`` events were buffered for
                 # a participant that is now gone — they would be lost
                 # silently when the buffer is evicted. Emit a parallel
-                # ``command.completed`` on the firehose with the list of
-                # responders whose results have been orphaned, so observers
-                # (cockpits, tests, diagnostic tooling) can detect the
-                # data-loss scenario instead of seeing silent drops.
+                # ``command.completed`` carrying the list of responders
+                # whose results have been orphaned. Delivery semantics:
                 #
-                # The completed event is intentionally only mirrored to the
-                # firehose, NOT to the (now-evicted) sender's buffer — that
-                # buffer is about to be torn down by ``_evict``.
+                # 1. Firehose (for observers / cockpits / diagnostic tools)
+                # 2. Each responder's own inbox — closes the observability
+                #    gap surfaced by the 2026-05-17 joint-review session:
+                #    a responder that already answered can correlate the
+                #    eventual cancellation with the fact that its result
+                #    was orphaned, without having to subscribe to the
+                #    firehose. Pending recipients already get
+                #    ``command.cancelled`` above; they don't need a second
+                #    event.
+                # 3. NOT delivered to the sender — its inbox is about to
+                #    be torn down by ``_evict``.
                 if reason == "sender_gone":
                     completed_payload = {
                         "command_id": cid,
@@ -1020,6 +1026,10 @@ class Session:
                         "reason": "sender_gone",
                         "orphaned_results": sorted(t.responses_received),
                     }
+                    for responder_id in t.responses_received:
+                        self._deliver_or_buffer(
+                            responder_id, "command.completed", completed_payload
+                        )
                     self._mirror_firehose("command.completed", completed_payload)
                     if self._metrics is not None:
                         self._metrics.command_completed_total.labels(

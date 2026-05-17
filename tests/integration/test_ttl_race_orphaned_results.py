@@ -247,3 +247,98 @@ async def test_sender_gone_emits_orphaned_results_on_firehose() -> None:
 
             # Silence the lint about pa being unused in narrative tests.
             assert pa["participant_id"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sender_gone_delivers_completed_to_responders() -> None:
+    """Follow-up from issue #49 / #48 item 4: when a sender leaves
+    with at least one ``result.received`` already recorded, the
+    relay must deliver ``command.completed reason=sender_gone`` to
+    each responder's own inbox — not only to the firehose.
+
+    The pending recipients already get ``command.cancelled``; this
+    test asserts the *responders* get the new completed event so
+    they can correlate their submitted result with the eventual
+    orphaning, without having to subscribe to the firehose.
+    """
+    async with relay_subprocess() as base:
+        async with sw_client(base) as a, sw_client(base) as b, sw_client(base) as c:
+            sid = (await a.call_tool("session_create", {}))["session_id"]
+            await a.call_tool(
+                "session_join", {"session_id": sid, "role": "sender"}
+            )
+            pb = await b.call_tool(
+                "session_join",
+                {
+                    "session_id": sid,
+                    "role": "worker",
+                    "capabilities": ["respond"],
+                },
+            )
+            await c.call_tool(
+                "session_join",
+                {
+                    "session_id": sid,
+                    "role": "worker",
+                    "capabilities": ["respond"],
+                },
+            )
+            received_b: list[tuple[str, dict[str, Any]]] = []
+            b.on_notification(lambda n, p: received_b.append((n, p)))
+
+            send = await a.call_tool(
+                "session_send",
+                {
+                    "dispatch": "all",
+                    "target": {"role": "worker"},
+                    "payload": {"q": "ping"},
+                    "timeout_seconds": 30,
+                },
+            )
+            cmd_id = send["command_id"]
+
+            # B responds, C remains pending.
+            await _wait_for(
+                lambda: any(
+                    n == "command.received" and p["command_id"] == cmd_id
+                    for n, p in received_b
+                )
+            )
+            await b.call_tool(
+                "session_respond",
+                {
+                    "command_id": cmd_id,
+                    "status": "ok",
+                    "payload": {"ack": True},
+                },
+            )
+
+            # A leaves. The relay fires _cancel_inflight_for_sender,
+            # which must deliver command.completed reason=sender_gone
+            # to B (the responder), in addition to the firehose
+            # mirror and the command.cancelled to C.
+            await a.call_tool("session_leave", {})
+
+            await _wait_for(
+                lambda: any(
+                    n == "command.completed"
+                    and p.get("reason") == "sender_gone"
+                    and p["command_id"] == cmd_id
+                    for n, p in received_b
+                ),
+                message=(
+                    "B (responder) did not receive command.completed "
+                    "reason=sender_gone in its inbox"
+                ),
+            )
+            completed = next(
+                p
+                for n, p in received_b
+                if n == "command.completed"
+                and p.get("reason") == "sender_gone"
+                and p["command_id"] == cmd_id
+            )
+            assert completed["orphaned_results"] == [pb["participant_id"]]
+            assert completed["received_count"] == 1
+            assert completed["expected_count"] == 2

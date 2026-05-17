@@ -715,6 +715,25 @@ paths:
         HTTP/WS upgrade. The ``token`` query parameter must equal the
         ``session_id``. Frames are JSON ``{name, payload}`` objects,
         matching the participant inbox shape.
+
+        **Overlap semantics.** The firehose carries every event the
+        relay fans out for this session. Per-participant subscribers
+        (the ``/events`` WS, ``inbox/drain``, MCP push) receive only
+        the events targeted at their participant_id. The two streams
+        MAY overlap: a participant that opens its own ``/events`` WS
+        AND subscribes to the firehose (it knows its own
+        ``session_id``, which is the firehose token) will observe
+        the same event on both channels. Consumers that subscribe to
+        both MUST dedupe by event identity (``command_id`` for
+        command-lifecycle events, ``participant_id`` + event name
+        for participant events, etc.). The relay does NOT enforce
+        disjointness.
+
+        One concrete example: ``command.completed
+        reason="sender_gone"`` is delivered both to the firehose and
+        to each responder's per-participant inbox (since #51). A
+        responder that also subscribes to the firehose will see the
+        event twice and is expected to dedupe.
       responses:
         '101': { description: Switching Protocols (WebSocket) }
 
