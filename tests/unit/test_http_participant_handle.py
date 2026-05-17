@@ -15,8 +15,11 @@ def test_http_handle_send_is_noop() -> None:
     """HTTP handle.send is a no-op — events go to the per-participant
     buffer for inbox drain, not to a live push transport."""
     h = HTTPParticipantHandle()
-    # No exception, no state.
-    assert h.send("evt", {"x": 1}) is None
+    # No exception, no state. ``send`` returns ``None`` (no-op);
+    # we call it inside ``assertNotImplemented`` shape via the
+    # do-nothing call below — mypy refuses an ``== None`` assertion
+    # on a typed-``-> None`` function, so we just call it.
+    h.send("evt", {"x": 1})
 
 
 def test_http_handle_is_alive_always_true() -> None:

@@ -103,10 +103,12 @@ async def test_mcp_push_envelope_carries_seq() -> None:
                 for env in raw_envelopes
                 if env.get("_name") == "command.received"
             ]
-            seqs = [env.get("_seq") for env in command_envelopes]
-            assert all(isinstance(s, int) and s > 0 for s in seqs), (
-                f"_seq missing or non-positive on MCP push envelope: {seqs}"
+            raw_seqs = [env.get("_seq") for env in command_envelopes]
+            assert all(isinstance(s, int) and s > 0 for s in raw_seqs), (
+                f"_seq missing or non-positive on MCP push envelope: {raw_seqs}"
             )
+            # Narrow to list[int] for sorted/set ops below.
+            seqs: list[int] = [int(s) for s in raw_seqs if s is not None]
             assert seqs == sorted(seqs), (
                 f"seqs not monotonic in delivery order: {seqs}"
             )

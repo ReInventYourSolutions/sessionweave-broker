@@ -230,9 +230,15 @@ async def test_dispatch_any_fairness_max_minus_min_le_one() -> None:
                 inbox_counts[pid] = 0
                 bucket: list[tuple[str, dict[str, Any]]] = []
                 received_buckets.append(bucket)
-                r.on_notification(
-                    lambda n, p, _bucket=bucket: _bucket.append((n, p))
-                )
+
+                def _on_event(
+                    n: str,
+                    p: dict[str, Any],
+                    _bucket: list[tuple[str, dict[str, Any]]] = bucket,
+                ) -> None:
+                    _bucket.append((n, p))
+
+                r.on_notification(_on_event)
 
             sends = await asyncio.gather(
                 *[
@@ -329,7 +335,7 @@ async def test_dispatch_any_no_loss_under_roster_churn() -> None:
                 )
                 await asyncio.sleep(0.05)
                 await transient.call_tool("session_leave", {})
-                return pj["participant_id"]
+                return str(pj["participant_id"])
 
             churn_task = asyncio.create_task(_churn())
             sends = await asyncio.gather(
@@ -417,7 +423,7 @@ async def test_dispatch_any_under_multi_worker_simultaneous_churn() -> None:
                 )
                 await asyncio.sleep(0.05)
                 await client.call_tool("session_leave", {})
-                return pj["participant_id"]
+                return str(pj["participant_id"])
 
             churn_tasks = [asyncio.create_task(_churn(t1)), asyncio.create_task(_churn(t2))]
             sends = await asyncio.gather(
@@ -487,9 +493,15 @@ async def test_dispatch_all_no_double_count_under_fanout() -> None:
                 )
                 bucket: list[tuple[str, dict[str, Any]]] = []
                 received_buckets.append(bucket)
-                w.on_notification(
-                    lambda n, p, _b=bucket: _b.append((n, p))
-                )
+
+                def _on_event(
+                    n: str,
+                    p: dict[str, Any],
+                    _bucket: list[tuple[str, dict[str, Any]]] = bucket,
+                ) -> None:
+                    _bucket.append((n, p))
+
+                w.on_notification(_on_event)
 
             sends = await asyncio.gather(
                 *[

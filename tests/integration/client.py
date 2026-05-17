@@ -112,7 +112,7 @@ class Client:
         for cb in list(self._raw_callbacks):
             res = cb(data)
             if hasattr(res, "__await__"):
-                await res  # type: ignore[misc]
+                await res
 
 
 def _extract_text(result: Any) -> dict[str, Any]:
