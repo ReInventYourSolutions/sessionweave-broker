@@ -99,6 +99,19 @@ components:
             abort long-running tool calls around the 30-second mark; keeping
             the relay side under that threshold avoids spurious aborts.
             Cross-field invariant: `max_wait_seconds_mcp <= max_wait_seconds`.
+        max_buffer_bytes_per_session:
+          type: integer
+          example: 52428800
+          description: |
+            Aggregate byte budget across all buffered notifications for
+            all participants in this session (default 50 MiB). When
+            exceeded, the relay evicts the OLDEST buffered events
+            across the session until the budget is met, and emits a
+            single `buffer_evicted` event on the firehose with the
+            eviction batch summary. Prevents the OOM vector where a
+            compromised participant fills its 1000-message count cap
+            with max-size payloads on every participant (16 * 1000 *
+            256 KiB ~= 4 GiB worst-case absent this guard).
 
     ParticipantPublic:
       type: object

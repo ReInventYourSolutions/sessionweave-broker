@@ -19,6 +19,14 @@ class SessionConfig:
     max_wait_seconds: int = 600
     max_concurrent_waits_total: int = 1000
     max_wait_seconds_mcp: int = 20
+    # Aggregate byte budget for all buffered notifications across all
+    # participants in this session. Defeats the OOM vector where a
+    # compromised participant pushes ``count_cap x payload_cap`` bytes
+    # of slow-to-drain notifications. When exceeded, oldest events
+    # across the session are dropped until the budget is met, and a
+    # ``buffer_evicted reason=session_byte_cap`` event is emitted on
+    # the firehose so observers see the back-pressure.
+    max_buffer_bytes_per_session: int = 50 * 1024 * 1024  # 50 MiB
 
 
 @dataclass(slots=True, frozen=True)
@@ -42,6 +50,11 @@ class ConfigBounds:
     max_concurrent_waits_total_max: int = 100_000
     max_wait_seconds_mcp_min: int = 1
     max_wait_seconds_mcp_max: int = 60
+    # Bytes; lower bound forces operators to plan at least 1 MiB
+    # headroom, upper bound caps a single session at 4 GiB before the
+    # operator has to think about cgroup memory pressure.
+    max_buffer_bytes_per_session_min: int = 1 * 1024 * 1024  # 1 MiB
+    max_buffer_bytes_per_session_max: int = 4 * 1024 * 1024 * 1024  # 4 GiB
 
     @staticmethod
     def builtin() -> ConfigBounds:
@@ -179,6 +192,12 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
         b.max_wait_seconds_mcp_min,
         b.max_wait_seconds_mcp_max,
     )
+    check(
+        "max_buffer_bytes_per_session",
+        cfg.max_buffer_bytes_per_session,
+        b.max_buffer_bytes_per_session_min,
+        b.max_buffer_bytes_per_session_max,
+    )
 
 
 def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
@@ -205,6 +224,9 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_wait_seconds=env_int("SW_DEFAULT_MAX_WAIT_SECONDS", 600),
         max_concurrent_waits_total=env_int("SW_DEFAULT_MAX_CONCURRENT_WAITS_TOTAL", 1000),
         max_wait_seconds_mcp=env_int("SW_DEFAULT_MAX_WAIT_SECONDS_MCP", 20),
+        max_buffer_bytes_per_session=env_int(
+            "SW_DEFAULT_MAX_BUFFER_BYTES_PER_SESSION", 50 * 1024 * 1024
+        ),
     )
     bounds = ConfigBounds(
         max_participants_min=env_int("SW_MIN_MAX_PARTICIPANTS", 2),
@@ -230,6 +252,12 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_concurrent_waits_total_max=env_int("SW_MAX_MAX_CONCURRENT_WAITS_TOTAL", 100_000),
         max_wait_seconds_mcp_min=env_int("SW_MIN_MAX_WAIT_SECONDS_MCP", 1),
         max_wait_seconds_mcp_max=env_int("SW_MAX_MAX_WAIT_SECONDS_MCP", 60),
+        max_buffer_bytes_per_session_min=env_int(
+            "SW_MIN_MAX_BUFFER_BYTES_PER_SESSION", 1 * 1024 * 1024
+        ),
+        max_buffer_bytes_per_session_max=env_int(
+            "SW_MAX_MAX_BUFFER_BYTES_PER_SESSION", 4 * 1024 * 1024 * 1024
+        ),
     )
     # Operator misconfiguration: defaults must fit inside bounds at startup
     # so sessions created without client config overrides don't silently use

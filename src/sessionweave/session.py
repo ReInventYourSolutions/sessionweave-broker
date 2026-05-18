@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -39,6 +40,16 @@ def _isoformat(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _payload_size_bytes(payload: dict[str, Any]) -> int:
+    """Byte size of a buffer item's ``payload`` field — same metric
+    used by ``Session._enforce_payload_size`` at ingress. Keeping
+    ingress and bookkeeping consistent means a payload that fits
+    ``max_payload_bytes`` contributes exactly that many bytes to
+    ``Session._buffered_bytes``.
+    """
+    return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+
 def _passes_ack_filter(item_seq: int, ack_watermark: int) -> bool:
     """True if a buffered item with ``item_seq`` should be delivered
     given the participant's effective ``ack_watermark``.
@@ -72,6 +83,7 @@ class Session:
 
     __slots__ = (
         "_active_waits",
+        "_buffered_bytes",
         "_buffers",
         "_connections",
         "_created_at",
@@ -107,6 +119,13 @@ class Session:
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
+        # Running total of buffered notification bytes across ALL
+        # participants in this session. Used to enforce
+        # ``config.max_buffer_bytes_per_session``. We size each buffered
+        # event by its JSON-encoded ``payload`` byte length (the same
+        # measure ``_enforce_payload_size`` checks at ingress, so the
+        # accounting is consistent end-to-end).
+        self._buffered_bytes: int = 0
         self._wait_in_flight: set[str] = set()
         self._active_waits: int = 0
         # Per-participant push subscribers (e.g. WebSocket events handlers).
@@ -239,7 +258,7 @@ class Session:
             if handle is not None:
                 # handle is a ConnectionHandle (set by join/resume)
                 self._connections.unbind(handle)  # type: ignore[arg-type]
-            self._buffers.pop(participant_id, None)
+            self._discard_buffer(self._buffers.pop(participant_id, None))
             self.bump_activity()
             if self._metrics is not None:
                 online_label = "true" if p.online else "false"
@@ -360,13 +379,16 @@ class Session:
             buf = self._buffers.pop(participant_id, None)
             if buf is None:
                 return []
+            drained = self._account_drained(
+                self._filter_stale_buffer_items(buf.drain())
+            )
             return [
                 {
                     "name": item["_name"],
                     "payload": item["_payload"],
                     "seq": item.get("_seq", 0),
                 }
-                for item in self._filter_stale_buffer_items(buf.drain())
+                for item in drained
                 if _passes_ack_filter(item.get("_seq", 0), effective_ack)
             ]
 
@@ -606,19 +628,21 @@ class Session:
             p_for_ack = self._participants[participant_id]
             effective_ack = max(last_acked_seq or 0, p_for_ack.last_acked_seq)
             buf = self._buffers.pop(participant_id, None)
-            backlog: list[dict[str, Any]] = (
-                [
-                    {
-                        "name": item["_name"],
-                        "payload": item["_payload"],
-                        "seq": item.get("_seq", 0),
-                    }
-                    for item in self._filter_stale_buffer_items(buf.drain())
-                    if _passes_ack_filter(item.get("_seq", 0), effective_ack)
-                ]
-                if buf is not None
-                else []
-            )
+            if buf is not None:
+                drained = self._account_drained(
+                    self._filter_stale_buffer_items(buf.drain())
+                )
+            else:
+                drained = []
+            backlog: list[dict[str, Any]] = [
+                {
+                    "name": item["_name"],
+                    "payload": item["_payload"],
+                    "seq": item.get("_seq", 0),
+                }
+                for item in drained
+                if _passes_ack_filter(item.get("_seq", 0), effective_ack)
+            ]
             self._subscribers.setdefault(participant_id, []).append(callback)
             p = self._participants[participant_id]
             if not p.online:
@@ -719,14 +743,26 @@ class Session:
                 return
             buf = self._buffer_for(participant_id)
             for name, payload, seq in items:
+                size = _payload_size_bytes(payload)
                 try:
-                    buf.enqueue({"_name": name, "_payload": payload, "_seq": seq})
+                    buf.enqueue(
+                        {
+                            "_name": name,
+                            "_payload": payload,
+                            "_seq": seq,
+                            "_size": size,
+                            "_ts": time.monotonic_ns(),
+                        }
+                    )
                 except BufferOverflow:
                     # Buffer cap exceeded — the participant is clearly
                     # past their grace; let the regular eviction path
                     # catch them on the next tick.
                     self._enqueue_eviction(participant_id, reason="offline_timeout")
                     break
+                else:
+                    self._buffered_bytes += size
+            self._enforce_session_byte_budget()
 
     # --- command lifecycle ---
 
@@ -904,7 +940,13 @@ class Session:
             p.last_acked_seq = seq
             buf = self._buffers.get(participant_id)
             if buf is not None:
-                buf.drop_where(lambda item: item.get("_seq", 0) <= seq)
+                removed = buf.pop_where(
+                    lambda item: item.get("_seq", 0) <= seq
+                )
+                for item in removed:
+                    self._buffered_bytes -= item.get("_size", 0)
+                if self._buffered_bytes < 0:
+                    self._buffered_bytes = 0
 
     def _enforce_payload_size(self, payload: dict[str, Any]) -> None:
         size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -996,10 +1038,30 @@ class Session:
                 return
         try:
             buf = self._buffer_for(pid)
-            buf.enqueue({"_name": name, "_payload": payload, "_seq": seq})
+            size = _payload_size_bytes(payload)
+            buf.enqueue(
+                {
+                    "_name": name,
+                    "_payload": payload,
+                    "_seq": seq,
+                    "_size": size,
+                    "_ts": time.monotonic_ns(),
+                }
+            )
         except BufferOverflow:
-            # Cap exceeded — escalate to eviction. Implemented in Task 13.
+            # Per-participant count cap exceeded — escalate to per-
+            # participant eviction (existing semantics: drop the offender
+            # from the session). Distinct from the session-wide byte
+            # budget enforced below.
             self._enqueue_eviction(pid, reason="offline_timeout")
+            return
+        else:
+            self._buffered_bytes += size
+        # Session-wide byte budget — evicts oldest items across all
+        # participants until ``_buffered_bytes`` is under the cap and
+        # emits a single ``buffer_evicted`` firehose event so observers
+        # see the back-pressure.
+        self._enforce_session_byte_budget()
 
     def _mark_offline(self, pid: str) -> None:
         p = self._participants.get(pid)
@@ -1023,6 +1085,89 @@ class Session:
             name="participant.updated",
             payload={"participant": p.to_public().model_dump()},
         )
+
+    def _account_drained(self, items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Materialise an iterable of buffer items and subtract their
+        ``_size`` from ``self._buffered_bytes``. Returns the same list
+        so the caller can iterate it once more for its own purposes.
+
+        Use this at every site that ``drain()``s a per-participant
+        buffer; without it the session-wide byte accounting drifts.
+        """
+        out = list(items)
+        for item in out:
+            self._buffered_bytes -= item.get("_size", 0)
+        # Floor at zero — accounting drift would otherwise compound
+        # and falsely trip ``_enforce_session_byte_budget``.
+        if self._buffered_bytes < 0:
+            self._buffered_bytes = 0
+        return out
+
+    def _discard_buffer(self, buf: NotificationBuffer | None) -> None:
+        """Throw away a buffer's contents while keeping
+        ``_buffered_bytes`` in sync. Used by participant eviction
+        paths where the buffer's owner is gone and the items have no
+        consumer.
+        """
+        if buf is None:
+            return
+        for item in buf.drain():
+            self._buffered_bytes -= item.get("_size", 0)
+        if self._buffered_bytes < 0:
+            self._buffered_bytes = 0
+
+    def _enforce_session_byte_budget(self) -> None:
+        """Drop the oldest buffered items across the session until
+        ``_buffered_bytes <= config.max_buffer_bytes_per_session``.
+        Emits a single ``buffer_evicted`` event on the firehose with the
+        eviction batch summary so observers can detect back-pressure.
+
+        Item age is the ``_ts`` field set at enqueue time
+        (``time.monotonic_ns()``). For each eviction pass, the buffer
+        with the oldest head item gives up its head; we repeat until
+        the budget is met or every buffer is empty.
+
+        Runs under ``self.lock`` (every caller is already inside the
+        session lock).
+        """
+        cap = self.config.max_buffer_bytes_per_session
+        if self._buffered_bytes <= cap:
+            return
+        evicted_count = 0
+        freed_bytes = 0
+        while self._buffered_bytes > cap:
+            # Find the buffer with the oldest head item.
+            oldest_pid: str | None = None
+            oldest_ts: int = 0
+            for pid, buf in self._buffers.items():
+                head = buf.head()
+                if head is None:
+                    continue
+                ts = head.get("_ts", 0)
+                if oldest_pid is None or ts < oldest_ts:
+                    oldest_pid = pid
+                    oldest_ts = ts
+            if oldest_pid is None:
+                # All buffers empty yet ``_buffered_bytes > cap`` — that's
+                # an accounting bug; clamp and bail rather than spin.
+                self._buffered_bytes = 0
+                break
+            head = self._buffers[oldest_pid].popleft()
+            size = head.get("_size", 0)
+            self._buffered_bytes -= size
+            freed_bytes += size
+            evicted_count += 1
+        if evicted_count > 0:
+            self._mirror_firehose(
+                "buffer_evicted",
+                {
+                    "reason": "session_byte_cap",
+                    "evicted_count": evicted_count,
+                    "freed_bytes": freed_bytes,
+                    "buffered_bytes": self._buffered_bytes,
+                    "buffer_byte_cap": cap,
+                },
+            )
 
     def _buffer_for(self, pid: str) -> NotificationBuffer:
         buf = self._buffers.get(pid)
@@ -1088,7 +1233,7 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return
-        self._buffers.pop(pid, None)
+        self._discard_buffer(self._buffers.pop(pid, None))
         if self._metrics is not None:
             online_label = "true" if p.online else "false"
             self._metrics.participants_active.labels(online=online_label).dec()
@@ -1189,7 +1334,7 @@ class Session:
             if self._metrics is not None:
                 online_label = "true" if p.online else "false"
                 self._metrics.participants_active.labels(online=online_label).dec()
-            self._buffers.pop(pid, None)
+            self._discard_buffer(self._buffers.pop(pid, None))
         self._participants.clear()
         self._inflight.clear()
         if self._metrics is not None:
@@ -1274,7 +1419,9 @@ class Session:
             if p.delivery_mode != "pull":
                 buf = self._buffers.pop(participant_id, None)
                 if buf is not None:
-                    for item in self._filter_stale_buffer_items(buf.drain()):
+                    for item in self._account_drained(
+                        self._filter_stale_buffer_items(buf.drain())
+                    ):
                         if not _passes_ack_filter(
                             item.get("_seq", 0), effective_ack
                         ):
