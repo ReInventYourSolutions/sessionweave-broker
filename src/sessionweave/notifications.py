@@ -17,6 +17,22 @@ class NotificationBuffer:
 
     `drop_where` removes items matching a predicate (used to garbage-collect
     stale notifications such as command.received for an expired command).
+
+    **Concurrency invariant (issue #64):** this class has NO internal
+    synchronisation. All mutations (``enqueue`` / ``drain`` /
+    ``drop_where`` / ``pop_where`` / ``popleft``) are expected to be
+    serialised by the **caller** via ``Session.lock``. Every code path
+    in ``session.py`` that touches a ``NotificationBuffer`` either
+    acquires ``Session.lock`` directly or runs from a path that does
+    (eviction, ACK trim, byte-budget enforcement, drain at
+    ``check_inbox`` / ``attach_subscriber`` / ``resume``). The
+    integration-level stress test in
+    ``tests/integration/test_buffer_race.py`` exercises the invariant
+    under concurrent dispatch + drain.
+
+    A future maintainer who introduces a buffer-local lock should
+    re-evaluate every ``Session.lock`` site to avoid double-locking
+    or invariant duplication. See #64 for the design rationale.
     """
 
     __slots__ = ("_cap", "_q")
