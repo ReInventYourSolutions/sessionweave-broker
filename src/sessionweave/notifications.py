@@ -96,3 +96,22 @@ class NotificationBuffer:
                 kept.append(item)
         self._q = kept
         return removed
+
+    def popleft_while(self, predicate: Callable[[Any], bool]) -> list[Any]:
+        """Pop items from the HEAD while ``predicate(head)`` is true,
+        then stop. Returns the removed items in pop order.
+
+        This is the right primitive for monotonic-cursor evictions —
+        e.g. ``Session.record_ack`` trimming items with ``_seq <=
+        ack_watermark``. Since ``_seq`` is monotonically increasing
+        per participant AND the buffer is in arrival order, the first
+        item that fails the predicate guarantees every later item
+        also fails — no need to scan the rest. Amortized O(1) per
+        ACK (vs O(n) for ``drop_where`` / ``pop_where``).
+
+        See #66.
+        """
+        removed: list[Any] = []
+        while self._q and predicate(self._q[0]):
+            removed.append(self._q.popleft())
+        return removed

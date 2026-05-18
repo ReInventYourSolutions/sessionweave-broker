@@ -940,7 +940,14 @@ class Session:
             p.last_acked_seq = seq
             buf = self._buffers.get(participant_id)
             if buf is not None:
-                removed = buf.pop_where(
+                # ``popleft_while`` is amortized O(1) per ACK because
+                # ``_seq`` is monotonic and buffer items are in arrival
+                # order — once we see an item with seq > ack we know
+                # every later item also has seq > ack, so we stop.
+                # ``pop_where`` did a full O(n) scan per ACK; under
+                # reconnect bursts (1000s of ACK frames) that was
+                # O(n^2) total and could stall the event loop. See #66.
+                removed = buf.popleft_while(
                     lambda item: item.get("_seq", 0) <= seq
                 )
                 for item in removed:
