@@ -315,6 +315,53 @@ The HTTP surface (Starlette) and tool wiring (FastMCP) live in `server.py` and
 State is in-memory only; restart loses all sessions. Persistence is
 sub-project #2.
 
+## Threat model (sub-project #1)
+
+The current deployment is the **anonymous, transient, in-memory** slice.
+That means a few specific things are NOT in the threat model and operators
+should know about them before exposing the relay to multi-tenant traffic.
+``GET /v1/info`` advertises the model via the
+``"auth_model": "shared-bearer-sub-project-1"`` field so SDK clients can
+warn.
+
+What the bearer-token model actually is:
+
+- ``participant_token == participant_id``. There is no separation between
+  identity and credential, no expiry, no rotation, no per-action scope.
+- Anyone who learns a participant_id can call any endpoint as that
+  participant until the session ends (idle TTL, supervisor end, server
+  shutdown).
+- ``ConnectionManager.bind`` is intentionally **last-resume-wins**: a
+  second client presenting the same ``participant_id`` displaces the
+  first without notification. This is a useful reconnect primitive when
+  the holder is the original client, and a session-hijack primitive
+  when someone else has stolen the token.
+
+Concrete leak channels operators must defend against:
+
+| Channel | Mitigation |
+|---|---|
+| HTTP access logs that record bearer headers | Strip ``Authorization`` at the reverse proxy (Caddy) or the relay's log formatter. |
+| WebSocket URLs that include ``?token=<participant_id>`` in the Network tab of any browser | Don't share screenshots / videos of DevTools; use a private-mode browser for cockpit demos. |
+| TLS-terminating proxies that log query strings (CDN, WAF) | Caddy doesn't by default; verify any front-of-relay proxy. |
+| Prometheus labels in a previous build had per-participant cardinality | Locked down: see #58 (structural test guard). |
+| ``supervisor.note`` posted by anyone with the session_id | Set ``SW_SUPERVISOR_ADMIN_TOKEN`` (#59) to require a separate admin secret. |
+| ``firehose`` open to any session participant | Set ``SW_FIREHOSE_ADMIN_TOKEN`` (#57) to require an admin secret. |
+
+What is **explicitly NOT in scope** for sub-project #1:
+
+- Token rotation, expiry, or revocation.
+- Per-action scope (e.g. "can send commands but not subscribe to
+  firehose").
+- Concurrent-bind protection beyond the existing
+  ``last-resume-wins``.
+- Single-use invite tokens (the ``swv://`` link is itself a bearer:
+  anyone with the link can ``POST /v1/sessions/{sid}/participants``
+  and get a fresh participant slot).
+
+These belong to **sub-project #3 (auth)** which will replace the
+shared-bearer model with scoped JWTs. Tracking: #62.
+
 ## Development
 
 ```bash

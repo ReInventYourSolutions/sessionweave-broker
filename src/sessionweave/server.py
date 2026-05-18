@@ -279,11 +279,19 @@ def build_app() -> Starlette:
         return JSONResponse({"status": "ready", "version": __version__})
 
     async def info(request: Request) -> JSONResponse:
+        # ``auth_model`` lets SDK clients detect they're talking to the
+        # sub-project #1 deployment (bearer == participant_id, no
+        # rotation / expiry / scope). New SDK versions can surface a
+        # one-shot warning when this value is "shared-bearer-sub-project-1"
+        # so users don't unwittingly assume production-grade auth.
+        # Sub-project #3 (JWT scoped tokens) will return a different
+        # string here.
         return JSONResponse(
             {
                 "name": "sessionweave",
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
+                "auth_model": "shared-bearer-sub-project-1",
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {
                     "firehose": True,

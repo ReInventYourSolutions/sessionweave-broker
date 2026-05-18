@@ -379,8 +379,19 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.13.2" }
+                  version: { type: string, example: "0.14.0" }
                   subproject: { type: string }
+                  auth_model:
+                    type: string
+                    description: |
+                      Identifier for the relay's authentication shape so
+                      SDK clients can detect which security guarantees
+                      apply. ``shared-bearer-sub-project-1`` means
+                      bearer-token equals ``participant_id`` with no
+                      rotation, expiry, or scope (see Threat Model in
+                      README). Sub-project #3 will return a different
+                      string (TBD) when JWT-scoped tokens land.
+                    enum: [shared-bearer-sub-project-1]
                   transports:
                     type: array
                     items: { type: string, enum: [mcp, http, ws] }
