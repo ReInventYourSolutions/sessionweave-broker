@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.14.0
+version: 0.15.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.14.0** — when reporting your behaviour or filing
+> **Skill version: 0.15.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -614,23 +614,105 @@ print(link)  # hand THIS string to the user; nothing else needed
 
 | Tool | When |
 |---|---|
-| `session_create {config?, purpose?}` | Open a new session. Returns `session_id` (and `purpose` echo). |
-| `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster}` without allocating a participant. Use as pre-flight before deciding to join. |
+| `session_create {config?, purpose?, persistence?}` | Open a new session. Returns `session_id`, `purpose` echo, **`creator_token`** (one-time, save it), and `persistence` state. `persistence` is opt-in: omit it for **Zero Data Retention** (RAM-only); pass `{mode:"ttl",ttl_seconds:N}` or `{mode:"until_deleted"}` to persist (relay 0.16.0+). |
+| `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster, persistence?}` without allocating a participant. Use as pre-flight before deciding to join. |
 | `session_update_purpose {purpose?}` | Replace the session's purpose mid-flight (or `null` to clear). Broadcasts `session.purpose_updated` to others. Caller must be in the session. |
-| `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`, `roster`, `config`, `purpose`, and `relay_epoch`. `delivery_mode` is `"push"` (default) or `"pull"`. |
-| `session_resume {session_id, participant_id, last_acked_seq?}` | Re-attach after a disconnect. Returns `roster`, `config`, `purpose`, `relay_epoch`. Compare `relay_epoch` against the value you captured at join time — see [Disconnect & resume](#disconnect--resume). |
+| `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`, `roster`, `config`, `purpose`, `relay_epoch`, and `persistence` (if any). `delivery_mode` is `"push"` (default) or `"pull"`. |
+| `session_resume {session_id, participant_id, last_acked_seq?}` | Re-attach after a disconnect. Returns `roster`, `config`, `purpose`, `relay_epoch`. For persisted sessions resume survives across a relay restart (new `relay_epoch`). See [Disconnect & resume](#disconnect--resume). |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |
 | `session_update_self {role?, objective?, capabilities?, metadata?}` | Replace fields (no merge). Omitted = unchanged. |
 | `session_list_participants {}` | Snapshot of the roster. |
 | `session_check_inbox {}` | Drain pending notifications for the caller. Returns `{messages: [{name, payload}, ...]}`. Required when joined with `delivery_mode="pull"`. |
 | `session_wait_for_event {session_id, names?, timeout_seconds?}` | Pull-mode long-poll. Blocks until ≥1 buffered event matches the optional `names` filter, then returns `{messages, timed_out}`. Drain shape identical to `session_check_inbox`. Required tool when joined with `delivery_mode="pull"` and you need to wait for events without busy-polling. |
-| `session_send {dispatch, target, payload, timeout_seconds?}` | Dispatch a command. |
+| `session_send {dispatch, target, payload, timeout_seconds?, command_id?}` | Dispatch a command. Pass a caller-generated stable `command_id` (e.g. `uuid.uuid4().hex`) to make retries idempotent — a second `send` with the same id returns the original response without creating a duplicate. Relay 0.16.0+. |
 | `session_respond {command_id, status?, payload}` | Respond to a command you received. `status` defaults to `"ok"`. |
+| `session_delete {session_id, creator_token}` | Terminate the session. Requires the per-session `creator_token` returned at `session_create`. The HTTP variant `DELETE /v1/sessions/{id}` ALSO accepts the relay-wide `SW_SUPERVISOR_ADMIN_TOKEN` as Bearer for a supervisor override (recorded as `ended_reason=admin_deleted`). Relay 0.16.0+. |
+| `session_get_events {session_id, after_seq?, before_seq?, kind?, participant_id?, limit?, order?}` | Browse the timeline of a **persisted** session without bringing it back into RAM. Returns paginated `events` + `session_state` (`hot`/`cold`/`ended`). Returns `no_history` on an ephemeral session. Relay 0.16.0+. |
 
 **Dispatch modes:**
 - `specific` — requires `target.participant_ids`. Targets exact recipients.
 - `all` — requires `target.role` or `target.capability`. Fans out to every match online.
 - `any` — requires `target.role` or `target.capability`. Picks one (round-robin).
+
+## Persistence & Zero Data Retention
+
+A session is **ephemeral by default**. The relay holds it only in RAM
+and discards everything (roster, command timeline, buffered events,
+inflight trackers) once `idle_ttl_seconds` elapses. Nothing is written
+to disk. This is the **Zero Data Retention** mode and it is **the
+caller's choice**: omit the `persistence` field on `session_create` and
+the contents of your collaboration will never touch the relay's storage
+layer.
+
+You opt INTO persistence by passing a `persistence` block at create:
+
+```json
+{ "persistence": { "mode": "ttl", "ttl_seconds": 86400 } }
+```
+
+or
+
+```json
+{ "persistence": { "mode": "until_deleted" } }
+```
+
+What changes when persistence is on (relay 0.16.0+):
+
+- The session's full state (purpose, config, roster, every observable
+  event, inflight commands, per-participant buffers) is persisted to the
+  relay's storage on **every event** before delivery — durability
+  invariant: "observed ⇒ committed".
+- The session goes **cold** (evicted from RAM) when `idle_ttl_seconds`
+  elapses, but stays recoverable. The next `session_join`,
+  `session_resume`, or `session_describe` **hydrates** it back
+  transparently — the client is unaware of the round-trip.
+- Cross-restart resume works: even after a relay process `kill -9`, the
+  session and its events come back on first access.
+- `session_get_events` lets observers (a cockpit, a late-joiner, an
+  auditor) read the entire timeline of a hot, cold, or ended session
+  **without bringing it into RAM** — useful for scroll-back UX and for
+  any pattern where one party joins late and needs context.
+
+What you get back at create:
+
+```json
+{
+  "session_id": "…",
+  "creator_token": "…",   // one-time, save it
+  "persistence": { "mode": "ttl", "expires_at": "2026-…" }
+}
+```
+
+**`creator_token`** is the **only** way to terminate a session (via
+`session_delete`) unless the relay operator has configured a
+relay-wide `SW_SUPERVISOR_ADMIN_TOKEN` for supervisor overrides.
+
+### When to use persistence
+
+- **Zero Data Retention** (omit `persistence`): privacy-first agents,
+  one-shot tasks, scratch sessions, anything you want truly gone the
+  moment the conversation ends. **Default.**
+- **`ttl`**: project work, long-running tasks, conversations that
+  should survive a network blip or a relay restart but eventually
+  expire (default min 1 h, max 90 d; operator can tune).
+- **`until_deleted`**: stateful workspaces that should live until the
+  host explicitly tears them down. Subject to a relay-wide safety cap
+  (default 90 d of inactivity) to prevent accidental forever-storage.
+
+### Custodying the `creator_token`
+
+The token is returned exactly once. Treat it like an API key:
+
+- Agents / SDK callers: keep it in process memory; if the process dies,
+  the token dies with it (delete becomes impossible without an admin
+  override).
+- Cockpit / human supervisor: write it down or store in a vault. The
+  hosted cockpit prompts for it at click time and never persists it to
+  `localStorage`.
+
+The relay stores only `sha256(creator_token)` server-side; the
+plaintext never appears again in `describe`, `join`, `events`, or any
+other response.
 
 ## Permission gates — request the whole bundle upfront
 
@@ -1110,7 +1192,8 @@ wraps them** — e.g. `participant.joined` puts the public record under
 | `command.completed` | `{"command_id", "received_count", "expected_count", "reason", "orphaned_results"?}` | Terminal. `reason` is `all_responded` \| `ttl_expired` \| `sender_gone`. For `all_responded` / `ttl_expired` it goes to the sender only. For `sender_gone` it goes to every RESPONDER that had answered before the sender left (their result is now orphaned in the gone sender's buffer) — that variant carries an `orphaned_results: [responder_id, ...]` array and is also mirrored to the firehose. |
 | `command.cancelled` | `{"command_id", "reason"}` | To recipients that hadn't responded yet. `reason` is `ttl_expired` \| `sender_gone`. |
 | `session.purpose_updated` | `{"purpose"}` | Broadcast to other participants when someone calls `session_update_purpose`. |
-| `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown`. |
+| `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown` \| `host_deleted` \| `admin_deleted` \| `persistence_expired`. The last three appear only with persisted sessions (relay 0.16.0+). |
+| `session.cold` *(persisted only)* | `{}` | Sent only to LIVE push subscribers (WebSocket or MCP SSE) when a persisted session hits idle TTL. The session is being evicted from RAM but its state stays on disk; a subsequent `session_join` / `session_resume` / `session_describe` rehydrates it. **Different from `session.ended`** — the session is not over, just paged out. Relay 0.16.0+. |
 | `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | See [Handling `supervisor.note`](#handling-supervisornote). |
 | `buffer_evicted` *(firehose only)* | `{"reason", "evicted_count", "freed_bytes", "buffered_bytes", "buffer_byte_cap"}` | Emitted when `_enforce_session_byte_budget` drops the oldest events to bring the per-session aggregate under `max_buffer_bytes_per_session`. **Not delivered to individual participants** — only firehose subscribers see it. Treat as a back-pressure indicator; recipients of evicted events get no notification. |
 
@@ -1215,13 +1298,24 @@ diverge between two agents.
 
 ### Sub-project alignment
 
-This skill matches **SessionWeave sub-project #1** (anonymous,
-transient, in-memory sessions). The relay self-identifies this on
-`GET /v1/info` via `"auth_model": "shared-bearer-sub-project-1"` —
-clients that care about auth posture should branch off that field
-rather than the relay's semver.
+This skill (v0.15.0) covers **SessionWeave sub-projects #1 and #2**:
 
-When persistence (#2) or accounts/auth (#3) land, the `auth_model`
-string will change, durable session ids and scoped tokens will appear
-in the surface, and this skill must be updated with at least a minor
-version bump.
+- **#1** — anonymous transient sessions, shared bearer = participant_id,
+  WebSocket events, supervisor notes. Default behaviour.
+- **#2** — opt-in persistence: hot/cold lifecycle, cross-restart
+  resume, the events-history endpoint, the `creator_token` returned at
+  create, the `session_delete` tool, the in-session participant_token
+  path on `/supervisor/notes`. See the
+  [Persistence & Zero Data Retention](#persistence--zero-data-retention)
+  section.
+
+The relay self-identifies on `GET /v1/info`:
+- `"auth_model": "shared-bearer-sub-project-1"` — token == participant_id
+- `"capabilities": {…, "session_delete": true, …}` — feature flags
+
+Clients that care about auth posture should branch on `auth_model`
+rather than the relay's semver. Clients that conditionally call
+`session_delete` / `session_get_events` should check `capabilities`.
+
+When accounts/auth (#3) lands, the `auth_model` string will change to
+something JWT-shaped, and this skill will get at least a minor bump.
