@@ -62,6 +62,9 @@ class SessionJoinOutput(_Strict):
     roster: list[ParticipantPublic]
     config: dict[str, int]
     purpose: dict[str, Any] | None = None
+    # Per-relay-process startup epoch — clients store this at join
+    # time and compare on resume to detect relay restart. See #65.
+    relay_epoch: int = 0
 
 
 class SessionResumeInput(_Strict):
@@ -81,6 +84,11 @@ class SessionResumeOutput(_Strict):
     roster: list[ParticipantPublic]
     config: dict[str, int]
     purpose: dict[str, Any] | None = None
+    # Per-relay-process monotonic startup epoch (UNIX seconds at boot).
+    # Clients should remember this at join time and compare on resume;
+    # if it changes the relay has restarted and the client's local seq
+    # cursor refers to a now-empty buffer in a fresh process. Issue #65.
+    relay_epoch: int = 0
 
 
 class SessionUpdateSelfInput(_Strict):

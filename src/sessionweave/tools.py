@@ -33,10 +33,16 @@ from sessionweave.session import Session
 class ToolDeps:
     """Bag of dependencies passed to each tool handler."""
 
-    __slots__ = ("registry",)
+    __slots__ = ("registry", "relay_epoch")
 
-    def __init__(self, registry: SessionRegistry) -> None:
+    def __init__(
+        self, registry: SessionRegistry, relay_epoch: int = 0
+    ) -> None:
         self.registry = registry
+        # Per-process startup epoch (UNIX seconds at server build_app).
+        # Surfaced on session_join / session_resume outputs and on
+        # /v1/info so clients can detect relay restart. See #65.
+        self.relay_epoch = relay_epoch
 
 
 def _session_for_handle(
@@ -111,6 +117,7 @@ async def session_join(
         roster=sess.roster_snapshot(),
         config=asdict(sess.config),
         purpose=sess.purpose,
+        relay_epoch=deps.relay_epoch,
     ).model_dump()
 
 
@@ -131,6 +138,7 @@ async def session_resume(
         roster=sess.roster_snapshot(),
         config=asdict(sess.config),
         purpose=sess.purpose,
+        relay_epoch=deps.relay_epoch,
     ).model_dump()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -260,7 +261,11 @@ def build_app() -> Starlette:
     firehose = FirehoseRegistry()
     registry = SessionRegistry(deps_cfg, connections, metrics=metrics, firehose=firehose)
     handles = HandleRegistry()
-    tool_deps = ToolDeps(registry)
+    # Per-process startup epoch. Surfaced on /v1/info, session_join,
+    # and session_resume so SDK clients can detect relay restart and
+    # invalidate their local seq cursor. See #65.
+    relay_epoch = int(time.time())
+    tool_deps = ToolDeps(registry, relay_epoch=relay_epoch)
 
     mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
     mcp_app = mcp.streamable_http_app()
@@ -286,12 +291,18 @@ def build_app() -> Starlette:
         # so users don't unwittingly assume production-grade auth.
         # Sub-project #3 (JWT scoped tokens) will return a different
         # string here.
+        #
+        # ``relay_epoch`` is the UNIX-seconds startup time. External
+        # monitors and SDK clients can poll this; a change means the
+        # relay has restarted and any in-memory state they remember
+        # (seq cursors, participant_ids) is gone. See #65.
         return JSONResponse(
             {
                 "name": "sessionweave",
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
                 "auth_model": "shared-bearer-sub-project-1",
+                "relay_epoch": relay_epoch,
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {
                     "firehose": True,

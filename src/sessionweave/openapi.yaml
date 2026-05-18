@@ -405,6 +405,15 @@ paths:
                       README). Sub-project #3 will return a different
                       string (TBD) when JWT-scoped tokens land.
                     enum: [shared-bearer-sub-project-1]
+                  relay_epoch:
+                    type: integer
+                    description: |
+                      Per-process startup time (UNIX seconds at
+                      ``build_app``). A change between two polls signals
+                      that the relay has restarted — any in-memory state
+                      a client remembers (seq cursors, participant_ids,
+                      session_ids) is gone. The SDK uses this to invalidate
+                      ``last_acked_seq`` on resume after a relay restart.
                   transports:
                     type: array
                     items: { type: string, enum: [mcp, http, ws] }
