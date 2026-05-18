@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.13.1
+version: 0.14.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.13.1** — when reporting your behaviour or filing
+> **Skill version: 0.14.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -264,7 +264,7 @@ Endpoint catalogue:
 
 | Verb | Path | Purpose |
 |------|------|---------|
-| GET  | `/v1/info` | Relay name, version, transports list |
+| GET  | `/v1/info` | Relay name, version, transports list, `auth_model`, `relay_epoch`, `capabilities` |
 | POST | `/v1/sessions` | Create a session (`purpose`, `config`) |
 | GET  | `/v1/sessions/{sid}` | Describe a session (read-only) |
 | PATCH | `/v1/sessions/{sid}/purpose` | Update the purpose (auth required) |
@@ -276,6 +276,24 @@ Endpoint catalogue:
 | POST | `/v1/sessions/{sid}/commands` | Dispatch a command (`specific` / `all` / `any`) |
 | POST | `/v1/sessions/{sid}/commands/{cid}/responses` | Respond to a command |
 | WS   | `/v1/sessions/{sid}/participants/me/events?token=…` | Live event stream |
+
+`GET /v1/info` is your pre-flight probe. It is unauthenticated and
+includes:
+
+- `auth_model` — one of `shared-bearer-sub-project-1` (current — bearer
+  token equals `participant_id`, no rotation/expiry/scope) or a future
+  value when sub-project #3 (JWT scoped tokens) lands. If your client
+  caches credentials across restarts, switch its behaviour off this
+  string rather than the relay's semver.
+- `relay_epoch` — UNIX-seconds startup time of the relay process. A
+  change between two polls means the relay has restarted: all
+  in-memory state (sessions, participant_ids, buffered events, seq
+  cursors) is gone. Use it as the canonical signal for "should I
+  resume or rebuild from scratch?" — see
+  [Disconnect & resume](#disconnect--resume).
+- `capabilities` — feature flags (`firehose`, `supervisor_notes`,
+  `session_delete`, …) that clients use to decide which endpoints
+  to call. New flags may appear without a major bump.
 
 ## Auto-trigger on `swv://` / `swvs://`
 
@@ -599,8 +617,8 @@ print(link)  # hand THIS string to the user; nothing else needed
 | `session_create {config?, purpose?}` | Open a new session. Returns `session_id` (and `purpose` echo). |
 | `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster}` without allocating a participant. Use as pre-flight before deciding to join. |
 | `session_update_purpose {purpose?}` | Replace the session's purpose mid-flight (or `null` to clear). Broadcasts `session.purpose_updated` to others. Caller must be in the session. |
-| `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`. `delivery_mode` is `"push"` (default) or `"pull"`. |
-| `session_resume {session_id, participant_id}` | Re-attach after a disconnect. |
+| `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`, `roster`, `config`, `purpose`, and `relay_epoch`. `delivery_mode` is `"push"` (default) or `"pull"`. |
+| `session_resume {session_id, participant_id, last_acked_seq?}` | Re-attach after a disconnect. Returns `roster`, `config`, `purpose`, `relay_epoch`. Compare `relay_epoch` against the value you captured at join time — see [Disconnect & resume](#disconnect--resume). |
 | `session_leave {}` | Detach explicitly. Broadcasts `participant.left` (reason `left`). |
 | `session_update_self {role?, objective?, capabilities?, metadata?}` | Replace fields (no merge). Omitted = unchanged. |
 | `session_list_participants {}` | Snapshot of the roster. |
@@ -980,15 +998,78 @@ host has to capture it before draining is over.
 
 ## Disconnect & resume
 
-If your MCP transport drops, the relay marks you offline (others see `participant.updated`, `online: false`) and **buffers** notifications addressed to you. You have `offline_grace_seconds` (deployment-configured, default 300s) to reconnect:
+If your transport drops, the relay marks you offline (others see
+`participant.updated`, `online: false`) and **buffers** notifications
+addressed to you. You have `offline_grace_seconds` (deployment-configured,
+default 300s) to reconnect:
 
 ```
-session_resume {session_id, participant_id}
+session_resume {session_id, participant_id, last_acked_seq?}
 ```
 
-The buffered notifications flush in order on the new transport. Past the grace window the relay evicts you with `participant.left` (`reason: "offline_timeout"`).
+The buffered notifications flush in order on the new transport. Past the
+grace window the relay evicts you with `participant.left`
+(`reason: "offline_timeout"`).
 
-**Resume requires the original `participant_id`** — never throw it away mid-session.
+**Resume requires the original `participant_id`** — never throw it away
+mid-session.
+
+### Did the relay restart? Check `relay_epoch`.
+
+`session_join` and `session_resume` both return a `relay_epoch` integer
+— the UNIX-seconds startup time of the relay process. Capture it at
+join, compare on resume:
+
+```python
+joined = await me.client.join(sid, role="worker")
+join_epoch = joined["relay_epoch"]     # remember this
+# ... time passes, transport drops, you reconnect ...
+resumed = await me.client.resume(sid, participant_id, last_acked_seq=last_seq)
+if resumed["relay_epoch"] != join_epoch:
+    # Relay has restarted. The session_id, your participant_id, and
+    # every buffered event are gone — `resume` returned a NEW slot in
+    # a fresh process. Treat as a cold start: discard your local seq
+    # cursor, re-derive `session_id` from the invite link if you need
+    # the same session (it likely no longer exists), and proceed via
+    # describe → join from scratch.
+    ...
+```
+
+The SDK's `Participant.relay_epoch` attribute exposes this for you
+(populated from the join response; defaults to `0` when talking to a
+pre-0.15.0 relay so `if me.relay_epoch == 0` is a safe "unknown" check).
+
+### Seq cursors and `last_acked_seq`
+
+Every push notification carries a monotonic per-participant `seq`
+field. The WebSocket attach accepts `?last_acked_seq=N` and
+`session_resume` accepts an optional `last_acked_seq` body field; the
+relay then suppresses replay of buffered events with `seq <= N`. This
+closes the WS-reconnect duplicate-frame gap and keeps the MCP/REST
+resume path in parity.
+
+If you don't track `seq` (most agents don't need to), just omit the
+field — the relay will replay everything in the buffer. The deduping
+matters mainly when you've already acted on events received over a
+previous channel that died mid-stream.
+
+### The buffer is bounded — don't assume free storage during grace
+
+The per-session buffer is capped by an aggregate byte budget
+(`max_buffer_bytes_per_session`, default 50 MiB) **plus** a
+per-participant message count cap (`max_pending_notifications_per_participant`,
+default 1000). When the aggregate cap is exceeded the relay evicts the
+oldest buffered events across every participant — including events
+addressed to *you* if you're the offline one and others are still
+generating traffic. A `buffer_evicted` event is mirrored to the
+firehose (only) so observers can see back-pressure, but you, the
+recipient, get no direct signal.
+
+Practical consequence: a long disconnect during a noisy session can
+return you to a partial event history even within `offline_grace_seconds`.
+Workers that must not miss anything should keep their WS attached (or
+poll aggressively in pull mode), not rely on the buffer as durable
+storage.
 
 ## Common mistakes
 
@@ -1007,6 +1088,8 @@ The buffered notifications flush in order on the new transport. Past the grace w
 | Joined and sent, but `session_check_inbox` is denied by the permission system | You're now in the session and can't read replies. Request the full participation bundle BEFORE join (see [Permission gates](#permission-gates--request-the-whole-bundle-upfront)). If it happens mid-session, tell the user what's broken, try `session_leave`, and stop — don't bypass the gate via raw HTTP. |
 | Sync `subprocess.run` (or any >10s blocking call) inside `async with me.events()` | The websockets ping/pong starves and the relay closes the WS; your stream ends after the call returns, you exit with `StopAsyncIteration`, and subsequent `dispatch="specific"` to your participant_id fails with `invalid_targets`. Wrap blocking calls with `await asyncio.to_thread(...)` so the loop keeps servicing the WS. |
 | Reading `participant.joined` fields at the top of `payload` (e.g. `payload["role"]`) | The event wraps the public record under `payload["participant"]` — read `payload["participant"]["role"]`. Same for `participant.updated`. See [Notifications catalogue](#notifications-catalogue) for the full payload shapes. |
+| Treating `offline_grace_seconds` as a free durable buffer | The aggregate byte budget (`max_buffer_bytes_per_session`, default 50 MiB) evicts the oldest events across the session — your events too, if others are noisy while you're offline. No direct signal to the recipient; `buffer_evicted` shows up only on the firehose. Keep your transport attached for at-least-once delivery during long disconnects. |
+| Calling `session_resume` after a relay restart and trusting the result | The `participant_id` you held is gone with the previous process. Compare `relay_epoch` on resume against the value you captured at join — if it changed, the "resume" silently created a fresh slot in a new process. See [Disconnect & resume](#disconnect--resume). |
 
 ## Notifications catalogue
 
@@ -1029,6 +1112,7 @@ wraps them** — e.g. `participant.joined` puts the public record under
 | `session.purpose_updated` | `{"purpose"}` | Broadcast to other participants when someone calls `session_update_purpose`. |
 | `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown`. |
 | `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | See [Handling `supervisor.note`](#handling-supervisornote). |
+| `buffer_evicted` *(firehose only)* | `{"reason", "evicted_count", "freed_bytes", "buffered_bytes", "buffer_byte_cap"}` | Emitted when `_enforce_session_byte_budget` drops the oldest events to bring the per-session aggregate under `max_buffer_bytes_per_session`. **Not delivered to individual participants** — only firehose subscribers see it. Treat as a back-pressure indicator; recipients of evicted events get no notification. |
 
 `ParticipantPublic` is the public participant record:
 `{"participant_id", "role", "objective", "capabilities", "metadata", "joined_at", "online"}`.
@@ -1132,7 +1216,12 @@ diverge between two agents.
 ### Sub-project alignment
 
 This skill matches **SessionWeave sub-project #1** (anonymous,
-transient, in-memory sessions). When persistence (#2) or accounts/auth
-(#3) land, this skill must be updated to cover durable session ids,
-auth tokens, and any new tool surface, with at least a minor version
-bump.
+transient, in-memory sessions). The relay self-identifies this on
+`GET /v1/info` via `"auth_model": "shared-bearer-sub-project-1"` —
+clients that care about auth posture should branch off that field
+rather than the relay's semver.
+
+When persistence (#2) or accounts/auth (#3) land, the `auth_model`
+string will change, durable session ids and scoped tokens will appear
+in the surface, and this skill must be updated with at least a minor
+version bump.
