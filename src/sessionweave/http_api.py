@@ -30,6 +30,7 @@ from sessionweave.tools import (
     session_check_inbox,
     session_create,
     session_describe,
+    session_get_events,
     session_join,
     session_leave,
     session_list_participants,
@@ -95,6 +96,10 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.INVALID_DISPATCH_FILTERS: 422,
     ErrorCode.INVALID_TARGETS: 422,
     ErrorCode.INVALID_CONFIG: 422,
+    ErrorCode.PERMISSION_DENIED: 403,
+    ErrorCode.NO_HISTORY: 409,
+    ErrorCode.PERSISTENCE_FAILED: 503,
+    ErrorCode.PERSISTENCE_CORRUPTED: 500,
 }
 
 
@@ -133,7 +138,7 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
     return body
 
 
-def _bind_participant(
+async def _bind_participant(
     deps: ToolDeps, session_id: str, participant_id: str
 ) -> HTTPParticipantHandle:
     """Validate the Bearer token then create + bind a fresh
@@ -145,7 +150,7 @@ def _bind_participant(
     to an active participant of the named session — that's how unknown
     or stale Bearer tokens get rejected uniformly.
     """
-    sess = deps.registry.get_or_raise(session_id)
+    sess = await deps.registry.get_or_raise(session_id)
     if participant_id not in sess._participants:
         raise ToolError(
             ErrorCode.NOT_IN_SESSION, "unknown or stale participant token"
@@ -211,7 +216,7 @@ async def patch_session_purpose(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_update_purpose(
                 deps, handle, {"purpose": body.get("purpose")}
@@ -254,7 +259,7 @@ async def get_participants(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         token = _require_bearer(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_list_participants(deps, handle)
         finally:
@@ -270,7 +275,7 @@ async def patch_self(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_update_self(deps, handle, body)
         finally:
@@ -295,7 +300,7 @@ async def delete_self(request: Request) -> Response:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             await session_leave(deps, handle, body if body else None)
         finally:
@@ -325,7 +330,7 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
             last_acked_seq = None
     try:
         token = _require_bearer(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_check_inbox(
                 deps, handle, last_acked_seq=last_acked_seq
@@ -346,7 +351,7 @@ async def post_inbox_wait(request: Request) -> JSONResponse:
         # session_id is mandatory in the MCP schema but path-derived here;
         # populate from the path for parity with the other endpoints.
         body = {**body, "session_id": sid}
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_wait_for_event(deps, handle, body)
         finally:
@@ -364,7 +369,7 @@ async def post_commands(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             out = await session_send(deps, handle, body)
         finally:
@@ -384,7 +389,7 @@ async def post_command_response(request: Request) -> JSONResponse:
         token = _require_bearer(request)
         body = await _read_json_body(request)
         body = {**body, "command_id": cid}
-        handle = _bind_participant(deps, sid, token)
+        handle = await _bind_participant(deps, sid, token)
         try:
             await session_respond(deps, handle, body)
         finally:
@@ -402,28 +407,39 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
-    # Two authentication modes (mirrors the firehose endpoint):
-    #   - admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set at
-    #     startup): token must equal that secret. Knowing the
-    #     session_id alone is NOT sufficient — closes the gap where
-    #     any session participant could post halt notes targeting
-    #     other participants.
-    #   - legacy mode (env var unset): accept token == session_id.
-    #     Backwards-compat for local-dev cockpit. Startup logger
-    #     emits a one-shot warning advising operators to set the
-    #     env var.
-    admin_token = getattr(request.app.state, "supervisor_admin_token", None)
-    if admin_token is not None:
-        if token != admin_token:
-            return JSONResponse({"error": "forbidden"}, status_code=403)
-    else:
-        if token != sid:
-            return JSONResponse({"error": "forbidden"}, status_code=403)
-
+    # Three authentication modes (priority order):
+    #   1. admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set): token ==
+    #      admin_token → relay-wide override.
+    #   2. in-session participant: token matches the participant_id of an
+    #      active participant in THIS session → accept. Lets an SDK caller
+    #      broadcast supervisor notes (e.g. kind=note target=all "session
+    #      summary") without requiring the admin token. An orchestrator/
+    #      supervisor role can also issue kind=halt targeting peers — that's
+    #      the intended power-of-an-in-session-role model.
+    #   3. legacy: admin token unset AND token == sid. Local-dev cockpit
+    #      backwards-compat (startup logger warns operators to set the env
+    #      var in prod).
     registry = _deps(request).registry
     session = registry.get(sid)
     if session is None:
         return JSONResponse({"error": "not_found"}, status_code=404)
+
+    import hmac as _hmac
+    admin_token = getattr(request.app.state, "supervisor_admin_token", None)
+    accepted = False
+    # Constant-time comparison on the admin_token path; falling back to
+    # plain `==` would let a local attacker recover the admin token via
+    # timing side-channel on this hot endpoint.
+    if admin_token is not None and _hmac.compare_digest(token, admin_token):
+        accepted = True
+    elif token in session._participants:
+        # participant_id is a uuid4 lookup — dict membership is O(1) and
+        # already constant-time for any fixed key size.
+        accepted = True
+    elif admin_token is None and _hmac.compare_digest(token, sid):
+        accepted = True
+    if not accepted:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
 
     limiter = request.app.state.supervisor_rate
     source_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
@@ -479,23 +495,103 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     return JSONResponse(payload, status_code=200)
 
 
+async def _get_session_events_handler(request: Request) -> Response:
+    """Browse the timeline of a persisted session without hydrating."""
+    sid = request.path_params["sid"]
+    qp = request.query_params
+
+    def _opt_int(name: str) -> int | None:
+        v = qp.get(name)
+        return int(v) if v is not None and v != "" else None
+
+    try:
+        limit = int(qp.get("limit") or 200)
+    except ValueError:
+        limit = 200
+    payload = {
+        "session_id": sid,
+        "after_seq": _opt_int("after_seq"),
+        "before_seq": _opt_int("before_seq"),
+        "kind": qp.get("kind") or None,
+        "participant_id": qp.get("participant_id") or None,
+        "limit": limit,
+        "order": qp.get("order") or "asc",
+    }
+    deps = _deps(request)
+    try:
+        result = await session_get_events(deps, payload)
+    except ToolError as e:
+        return JSONResponse(
+            {"error": e.code.value, "message": e.message},
+            status_code=_STATUS_BY_CODE.get(e.code, 500),
+        )
+    return JSONResponse(result, status_code=200)
+
+
 async def _delete_session_handler(request: Request) -> Response:
-    """End a session. The bearer token must equal the session_id."""
+    """End a session. Accepts the per-session creator_token or the
+    relay-wide SW_SUPERVISOR_ADMIN_TOKEN as Bearer."""
+    import asyncio as _asyncio
+    import hmac as _hmac
+
+    from sessionweave.errors import ErrorCode, ToolError
+    from sessionweave.persistence_token import verify_creator_token
+
     sid = request.path_params["sid"]
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
-    if token != sid:
-        return JSONResponse({"error": "forbidden"}, status_code=403)
 
-    registry = _deps(request).registry
-    session = registry.get(sid)
-    if session is None:
-        return JSONResponse({"error": "not_found"}, status_code=404)
+    state = request.app.state
+    deps = _deps(request)
+    rl = deps.delete_rate_limiter
+    if rl is not None and rl.is_banned(sid):
+        await _asyncio.sleep(0.5)
+        if deps.metrics is not None:
+            try:
+                deps.metrics.session_delete_failed_total.labels(
+                    reason="rate_limited").inc()
+            except Exception:
+                pass
+        return JSONResponse({"error": "permission_denied"}, status_code=403)
 
-    await registry.end_session(sid, reason="deleted_by_cockpit")
-    return Response(status_code=204)
+    try:
+        sess = await deps.registry.get_or_raise(sid)
+    except ToolError as e:
+        if e.code is ErrorCode.SESSION_NOT_FOUND:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        raise
+
+    reason: str | None = None
+    if sess.creator_token_hash is not None and verify_creator_token(
+        token, sess.creator_token_hash
+    ):
+        reason = "host_deleted"
+    else:
+        admin = getattr(state, "supervisor_admin_token", None)
+        if admin is not None and _hmac.compare_digest(token, admin):
+            reason = "admin_deleted"
+
+    if reason is None:
+        if rl is not None:
+            rl.record_failure(sid)
+        if deps.metrics is not None:
+            try:
+                deps.metrics.session_delete_failed_total.labels(
+                    reason="invalid_token").inc()
+            except Exception:
+                pass
+        # Uniform 0.5 s tax matches the rate-limited path so callers
+        # can't distinguish "rate-limited" from "invalid token" via
+        # response latency. See session_delete in tools.py for rationale.
+        await _asyncio.sleep(0.5)
+        return JSONResponse({"error": "permission_denied"}, status_code=403)
+
+    deleted_at = await deps.registry.delete(sid, reason=reason)
+    if rl is not None:
+        rl.reset(sid)
+    return JSONResponse({"deleted_at": deleted_at}, status_code=200)
 
 
 # ---------- routing ----------
@@ -507,6 +603,7 @@ def routes() -> list[Route]:
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),
         Route("/v1/sessions/{sid}", _delete_session_handler, methods=["DELETE"]),
+        Route("/v1/sessions/{sid}/events", _get_session_events_handler, methods=["GET"]),
         Route(
             "/v1/sessions/{sid}/purpose",
             patch_session_purpose,

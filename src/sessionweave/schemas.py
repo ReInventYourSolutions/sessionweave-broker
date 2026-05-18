@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DispatchMode(StrEnum):
@@ -32,12 +32,33 @@ class Target(_Strict):
     participant_ids: list[str] | None = None
 
 
+class PersistenceConfig(_Strict):
+    """How long a session's contents persist on disk."""
+    mode: Literal["ttl", "until_deleted"]
+    ttl_seconds: int | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if self.mode == "ttl" and self.ttl_seconds is None:
+            raise ValueError("ttl_seconds is required when mode='ttl'")
+        if self.mode == "until_deleted" and self.ttl_seconds is not None:
+            raise ValueError("ttl_seconds must be omitted when mode='until_deleted'")
+        return self
+
+
+class PersistenceStatePublic(_Strict):
+    """Server-side view of a session's persistence state, exposed to clients."""
+    mode: Literal["ttl", "until_deleted"]
+    expires_at: str | None = None
+
+
 class SessionCreateInput(_Strict):
     config: dict[str, Any] | None = None
     # Free-form description of WHY this session exists. Persisted on the
     # Session and echoed back to every joiner so a recipient of an invite
     # link can act without an out-of-band briefing. Capped at 16 KiB JSON.
     purpose: dict[str, Any] | None = None
+    persistence: PersistenceConfig | None = None
 
 
 class SessionCreateOutput(_Strict):
@@ -45,6 +66,8 @@ class SessionCreateOutput(_Strict):
     expires_at: str
     config: dict[str, int]
     purpose: dict[str, Any] | None = None
+    persistence: PersistenceStatePublic | None = None
+    creator_token: str = ""
 
 
 class SessionJoinInput(_Strict):
@@ -65,6 +88,7 @@ class SessionJoinOutput(_Strict):
     # Per-relay-process startup epoch — clients store this at join
     # time and compare on resume to detect relay restart. See #65.
     relay_epoch: int = 0
+    persistence: PersistenceStatePublic | None = None
 
 
 class SessionResumeInput(_Strict):
@@ -127,6 +151,7 @@ class SessionDescribeOutput(_Strict):
     config: dict[str, int]
     purpose: dict[str, Any] | None = None
     roster: list[ParticipantPublic]
+    persistence: PersistenceStatePublic | None = None
 
 
 class InboxMessage(_Strict):
@@ -159,6 +184,12 @@ class SessionSendInput(_Strict):
     target: Target
     payload: dict[str, Any]
     timeout_seconds: int | None = None
+    # Optional caller-supplied command_id. When present, a retry of
+    # session_send with the same command_id returns the ORIGINAL
+    # dispatch's response (no duplicate event, no new tracker). Required
+    # for retry-safe semantics on persisted sessions; otherwise the relay
+    # generates a fresh uuid4 server-side.
+    command_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_target(self) -> SessionSendInput:
@@ -228,4 +259,53 @@ class CommandCancelledNotification(_Strict):
 
 
 class SessionEndedNotification(_Strict):
-    reason: Literal["idle_ttl", "server_shutdown"]
+    # NOTE: this class is documentation-only — the relay broadcasts the
+    # `session.ended` event payload as a plain dict (see
+    # `Session.broadcast_session_ended`) and never instantiates this
+    # model at runtime. Kept here so SDK consumers and the OpenAPI export
+    # see the full set of reasons.
+    reason: Literal[
+        "idle_ttl",
+        "server_shutdown",
+        "host_deleted",          # session_delete via creator_token
+        "admin_deleted",         # session_delete via admin_token (HTTP)
+        "persistence_expired",   # ttl / until_deleted safety sweep
+    ]
+
+
+# ---- Persistence tool I/O ----
+
+class SessionDeleteInput(_Strict):
+    session_id: str
+    creator_token: str
+
+
+class SessionDeleteOutput(_Strict):
+    deleted_at: str
+
+
+class SessionGetEventsInput(_Strict):
+    session_id: str
+    after_seq: int | None = None
+    before_seq: int | None = None
+    kind: list[str] | None = None
+    participant_id: list[str] | None = None
+    limit: int = Field(default=200, ge=1, le=1000)
+    order: Literal["asc", "desc"] = "asc"
+
+    @field_validator("kind", "participant_id", mode="before")
+    @classmethod
+    def _csv_split(cls, v: Any) -> Any:
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [s for s in (part.strip() for part in v.split(",")) if s]
+        return v
+
+
+class SessionGetEventsOutput(_Strict):
+    session_id: str
+    events: list[dict[str, Any]]
+    next_cursor: int | None
+    has_more: bool
+    session_state: Literal["hot", "cold", "ended"]

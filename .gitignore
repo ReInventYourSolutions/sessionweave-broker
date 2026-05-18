@@ -16,3 +16,5 @@ SessionWeave-handoff*.zip
 *.handoff.zip
 .claude/
 report-test.md
+.playwright-mcp/
+cockpit-empty.png

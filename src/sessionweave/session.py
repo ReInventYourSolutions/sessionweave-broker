@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from sessionweave.connections import ConnectionHandle
+    from sessionweave.persistence import PersistenceStore, SessionSnapshot
 
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
@@ -87,6 +88,7 @@ class Session:
         "_buffers",
         "_connections",
         "_created_at",
+        "_event_seq",
         "_firehose",
         "_firehose_tasks",
         "_inflight",
@@ -94,10 +96,13 @@ class Session:
         "_metrics",
         "_on_deadline_shortened",
         "_participants",
+        "_persistence_mode",
         "_picker",
+        "_store",
         "_subscribers",
         "_wait_in_flight",
         "config",
+        "creator_token_hash",
         "lock",
         "purpose",
         "session_id",
@@ -112,6 +117,8 @@ class Session:
         purpose: dict[str, Any] | None = None,
         on_deadline_shortened: Callable[[Session], None] | None = None,
         firehose: FirehoseRegistry | None = None,
+        store: PersistenceStore | None = None,
+        persistence_mode: str | None = None,
     ) -> None:
         now = _utcnow()
         self.session_id = session_id
@@ -151,6 +158,95 @@ class Session:
         self._on_deadline_shortened = on_deadline_shortened
         self._firehose = firehose
         self._firehose_tasks: set[asyncio.Task[None]] = set()
+        self._store = store
+        self._persistence_mode = persistence_mode
+        self._event_seq: int = 0
+        self.creator_token_hash: bytes | None = None
+
+    # --- hydration ---
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snap: SessionSnapshot,
+        *,
+        config: SessionConfig,
+        connections: ConnectionManager,
+        store: PersistenceStore | None,
+        metrics: Metrics | None,
+        firehose: FirehoseRegistry | None,
+        on_deadline_shortened: Callable[[Session], None] | None,
+    ) -> Session:
+        import json as _json
+        from datetime import UTC, datetime
+
+        from sessionweave.models import CommandTracker, Participant
+        from sessionweave.notifications import NotificationBuffer
+
+        purpose = _json.loads(snap.purpose_json) if snap.purpose_json else None
+        sess = cls(
+            session_id=snap.session_id,
+            config=config,
+            connections=connections,
+            metrics=metrics,
+            purpose=purpose,
+            on_deadline_shortened=on_deadline_shortened,
+            firehose=firehose,
+            store=store,
+            persistence_mode=snap.persistence_mode,
+        )
+        sess.creator_token_hash = snap.creator_token_hash
+        # Participants (only active — left_at NULL)
+        for p in snap.participants:
+            s = p["snapshot"]
+            joined_at = datetime.fromtimestamp(p["joined_at"] / 1000, tz=UTC)
+            sess._participants[p["participant_id"]] = Participant(
+                participant_id=p["participant_id"],
+                role=s.get("role"),
+                objective=s.get("objective"),
+                capabilities=list(s.get("capabilities", ())),
+                metadata=dict(s.get("metadata", {})),
+                joined_at=joined_at,
+                online=False,
+                delivery_mode=s.get("delivery_mode", "push"),
+                next_seq=p.get("last_seen_seq", 0),
+                last_acked_seq=p.get("last_seen_seq", 0),
+            )
+        # Inflight
+        for cid, tracker_d in snap.inflight.items():
+            sess._inflight[cid] = CommandTracker.from_snapshot(tracker_d)
+        # Buffers + byte accounting
+        cap = sess.config.max_pending_notifications_per_participant
+        for entry in snap.buffered:
+            pid = entry["participant_id"]
+            buf = sess._buffers.setdefault(pid, NotificationBuffer(cap=cap))
+            payload_bytes = len(
+                _json.dumps(entry["payload"], separators=(",", ":")).encode()
+            )
+            buf.enqueue({
+                "_name": entry["kind"],
+                "_payload": entry["payload"],
+                "_seq": entry["seq"],
+                "_size": payload_bytes,
+                "_ts": 0,
+            })
+            sess._buffered_bytes += payload_bytes
+        # Restore last_activity_at and per-session event seq
+        sess._last_activity_at = datetime.fromtimestamp(
+            snap.last_activity_at / 1000, tz=UTC)
+        # Resume ``_event_seq`` so the next dispatched event picks up
+        # right after the highest seq already on disk. ``snap.max_event_seq``
+        # is sourced from MAX(seq) on the `events` table and is correct
+        # even when ``snap.buffered`` is empty — which is the common case
+        # for push-only sessions whose subscribers all stayed caught up
+        # before going cold. Falling back to ``max(buffered.seq)`` would
+        # leave ``_event_seq`` at 0 here and cause the next dispatch to
+        # collide with an existing (session_id, seq) PK on `events`.
+        sess._event_seq = max(
+            snap.max_event_seq,
+            max((entry["seq"] for entry in snap.buffered), default=0),
+        )
+        return sess
 
     # --- read-only helpers ---
 
@@ -223,11 +319,28 @@ class Session:
             self.bump_activity()
             if self._metrics is not None:
                 self._metrics.participants_active.labels(online="true").inc()
-            self._notify_others(
-                exclude_pid=p.participant_id,
-                name="participant.joined",
-                payload={"participant": p.to_public().model_dump()},
+            if self._store is not None:
+                snapshot = {
+                    "role": p.role,
+                    "objective": p.objective,
+                    "capabilities": list(p.capabilities),
+                    "metadata": dict(p.metadata),
+                    "delivery_mode": p.delivery_mode,
+                    "online": p.online,
+                }
+                joined_at_ms = int(p.joined_at.timestamp() * 1000)
+                await self._store.upsert_participant(
+                    self.session_id, p.participant_id, snapshot,
+                    last_seen_seq=0, joined_at=joined_at_ms,
+                )
+            joined_payload = {"participant": p.to_public().model_dump()}
+            others = [pid for pid in self._participants if pid != p.participant_id]
+            await self._dispatch_event(
+                kind="participant.joined",
+                payload=joined_payload,
+                recipients=others,
             )
+            self._mirror_firehose("participant.joined", joined_payload)
             return p
 
     async def leave(
@@ -275,11 +388,18 @@ class Session:
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
             if feedback is not None:
                 payload["feedback"] = feedback
-            self._notify_others(
-                exclude_pid=participant_id,
-                name="participant.left",
+            if self._store is not None:
+                left_at_ms = int(_utcnow().timestamp() * 1000)
+                await self._store.soft_delete_participant(
+                    self.session_id, participant_id, left_at=left_at_ms
+                )
+            others = list(self._participants.keys())
+            await self._dispatch_event(
+                kind="participant.left",
                 payload=payload,
+                recipients=others,
             )
+            self._mirror_firehose("participant.left", payload)
 
     @staticmethod
     def _enforce_feedback_size(feedback: dict[str, Any]) -> None:
@@ -312,11 +432,28 @@ class Session:
             if metadata is not None:
                 p.metadata = dict(metadata)
             self.bump_activity()
-            self._notify_others(
-                exclude_pid=participant_id,
-                name="participant.updated",
-                payload={"participant": p.to_public().model_dump()},
+            if self._store is not None:
+                snapshot = {
+                    "role": p.role,
+                    "objective": p.objective,
+                    "capabilities": list(p.capabilities),
+                    "metadata": dict(p.metadata),
+                    "delivery_mode": p.delivery_mode,
+                    "online": p.online,
+                }
+                joined_at_ms = int(p.joined_at.timestamp() * 1000)
+                await self._store.upsert_participant(
+                    self.session_id, participant_id, snapshot,
+                    last_seen_seq=p.last_acked_seq, joined_at=joined_at_ms,
+                )
+            updated_payload = {"participant": p.to_public().model_dump()}
+            others = [pid for pid in self._participants if pid != participant_id]
+            await self._dispatch_event(
+                kind="participant.updated",
+                payload=updated_payload,
+                recipients=others,
             )
+            self._mirror_firehose("participant.updated", updated_payload)
             return p.to_public()
 
     async def update_purpose(
@@ -344,11 +481,17 @@ class Session:
                     )
             self.purpose = new_purpose
             self.bump_activity()
-            self._notify_others(
-                exclude_pid=requester_id,
-                name="session.purpose_updated",
-                payload={"purpose": new_purpose},
+            if self._store is not None:
+                purpose_json = json.dumps(new_purpose) if new_purpose is not None else None
+                await self._store.update_session_purpose(self.session_id, purpose_json)
+            purpose_payload = {"purpose": new_purpose}
+            others = [pid for pid in self._participants if pid != requester_id]
+            await self._dispatch_event(
+                kind="session.purpose_updated",
+                payload=purpose_payload,
+                recipients=others,
             )
+            self._mirror_firehose("session.purpose_updated", purpose_payload)
             return new_purpose
 
     async def check_inbox(
@@ -774,10 +917,21 @@ class Session:
         target: Target,
         payload: dict[str, Any],
         timeout_seconds: int | None = None,
+        command_id: str | None = None,
     ) -> SessionSendOutput:
         async with self.lock:
             if sender_id not in self._participants:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "sender not in session")
+            # Idempotent retry: a caller-supplied command_id that already
+            # exists in this session's inflight set returns the original
+            # dispatch's response (same delivered_to). No new event, no
+            # new tracker. Closes the SDK retry-loop gap.
+            if command_id is not None and command_id in self._inflight:
+                existing = self._inflight[command_id]
+                return SessionSendOutput(
+                    command_id=command_id,
+                    delivered_to=list(existing.dispatched_to),
+                )
             self._enforce_payload_size(payload)
             decision = decide_dispatch(
                 roster=self._participants,
@@ -788,7 +942,8 @@ class Session:
             )
             ttl = self._clamp_timeout(timeout_seconds)
             now = _utcnow()
-            command_id = str(uuid.uuid4())
+            if command_id is None:
+                command_id = str(uuid.uuid4())
             tracker = CommandTracker(
                 command_id=command_id,
                 sender_id=sender_id,
@@ -797,12 +952,14 @@ class Session:
                 created_at=now,
                 deadline=now + timedelta(seconds=ttl),
             )
+            # Register inflight FIRST so the registry's next_deadline
+            # calculation (triggered by _on_deadline_shortened) reflects
+            # the new tracker's TTL. If persist fails below, we roll back.
             self._inflight[command_id] = tracker
             # The new tracker's deadline is almost certainly sooner
             # than the session's prior next_deadline (which was
             # idle_ttl). Tell the registry so its min-heap fires the
-            # cancellation tick on time instead of waiting for idle
-            # TTL.
+            # cancellation tick on time instead of waiting for idle TTL.
             if self._on_deadline_shortened is not None:
                 self._on_deadline_shortened(self)
             self.bump_activity()
@@ -818,9 +975,19 @@ class Session:
                 "payload": payload,
                 "expires_at": _isoformat(tracker.deadline),
             }
-            for recipient_id in decision.recipients:
-                self._deliver_or_buffer(recipient_id, "command.received", command_received_payload)
             if decision.recipients:
+                try:
+                    await self._dispatch_event(
+                        kind="command.received",
+                        payload=command_received_payload,
+                        recipients=list(decision.recipients),
+                        inflight_upsert=(command_id, tracker.to_snapshot()),
+                    )
+                except Exception:
+                    # Persist failure → rollback inflight; observers won't
+                    # see the event (DB ordering invariant), so no orphan.
+                    self._inflight.pop(command_id, None)
+                    raise
                 self._mirror_firehose("command.received", command_received_payload)
             # If no recipients (e.g., any with no online match), close immediately
             if not decision.recipients:
@@ -864,16 +1031,26 @@ class Session:
                 "status": status,
                 "payload": payload,
             }
-            self._deliver_or_buffer(tracker.sender_id, "result.received", result_payload)
+            is_complete = tracker.is_complete()
+            await self._dispatch_event(
+                kind="result.received",
+                payload=result_payload,
+                recipients=[tracker.sender_id],
+                inflight_complete=command_id if is_complete else None,
+            )
             self._mirror_firehose("result.received", result_payload)
-            if tracker.is_complete():
+            if is_complete:
                 completed_payload = {
                     "command_id": command_id,
                     "received_count": tracker.received_count,
                     "expected_count": tracker.expected_count,
                     "reason": "all_responded",
                 }
-                self._deliver_or_buffer(tracker.sender_id, "command.completed", completed_payload)
+                await self._dispatch_event(
+                    kind="command.completed",
+                    payload=completed_payload,
+                    recipients=[tracker.sender_id],
+                )
                 self._mirror_firehose("command.completed", completed_payload)
                 if self._metrics is not None:
                     self._metrics.command_completed_total.labels(
@@ -994,6 +1171,51 @@ class Session:
             )
             self._firehose_tasks.add(task)
             task.add_done_callback(self._firehose_tasks.discard)
+
+    async def _dispatch_event(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        recipients: list[str],
+        inflight_upsert: tuple[str, dict[str, Any]] | None = None,
+        inflight_complete: str | None = None,
+    ) -> None:
+        """Single durability + delivery primitive used by mutators with a store.
+
+        Caller must hold ``self.lock``. If a store is attached we persist
+        the event (and any inflight/buffered metadata) BEFORE applying
+        in-RAM effects, so an observer of the event implies durability.
+        """
+        if self._store is not None:
+            buffered_pids: list[str] = []
+            for pid in recipients:
+                p = self._participants.get(pid)
+                if p is None:
+                    continue
+                if p.delivery_mode == "pull":
+                    buffered_pids.append(pid)
+                    continue
+                if self._subscribers.get(pid):
+                    continue  # live subscriber
+                if p.online:
+                    handle = self._connections.handle_for(self.session_id, pid)
+                    if handle is not None and handle.is_alive():
+                        continue  # live push delivery
+                buffered_pids.append(pid)
+
+            self._event_seq += 1
+            ts_ms = int(time.time() * 1000)
+            await self._store.persist_event_atomic(
+                sid=self.session_id, seq=self._event_seq,
+                kind=kind, payload=payload, ts=ts_ms,
+                inflight_upsert=inflight_upsert,
+                inflight_complete=inflight_complete,
+                buffered_pids=tuple(buffered_pids),
+            )
+
+        for pid in recipients:
+            self._deliver_or_buffer(pid, kind, payload)
 
     def _deliver_or_buffer(self, pid: str, name: str, payload: dict[str, Any]) -> None:
         p = self._participants.get(pid)
@@ -1279,6 +1501,15 @@ class Session:
         when this session's heap deadline fires. Synchronous; assumes
         single-threaded scheduling. Must NOT be called while a tool call
         holds ``self.lock`` mid-await.
+
+        # Task 9 note: tick() is sync; persistence is best-effort via
+        # background task (asyncio.create_task). Timeout-emitted events
+        # are observable from RAM immediately; the store write is
+        # eventual. Acceptable edge-case: if the relay crashes within
+        # milliseconds of the timeout the cancellation event may be
+        # absent from the cold snapshot — the timeline will still show
+        # the command as inflight (it was removed from RAM here) so the
+        # resuming relay will treat it as timed-out anyway.
         """
         moment = now or _utcnow()
         # 0. Detect handles that closed without an explicit leave/disconnect.
@@ -1286,10 +1517,23 @@ class Session:
         #    this is mostly a belt-and-braces check for callers (and tests)
         #    that invoke ``tick`` directly.
         self.detect_disconnects()
-        # 1. Expired trackers
+        # 1. Expired trackers. Two sub-cases:
+        #    (a) tracker incomplete (waiting on responses) → emit
+        #        command.completed reason=ttl_expired + command.cancelled
+        #        for each pending recipient
+        #    (b) tracker already complete (all_responded, but kept in
+        #        _inflight as ALREADY_RESPONDED guard) → silent eviction,
+        #        no observable event. A second command.completed at TTL
+        #        is a UX bug: the sender already received
+        #        reason=all_responded earlier; emitting another one with
+        #        reason=ttl_expired confuses cockpits and SDK retry loops.
         expired_cids = [cid for cid, t in self._inflight.items() if t.is_expired(moment)]
         for cid in expired_cids:
             t = self._inflight.pop(cid)
+            if t.is_complete():
+                # Silent cleanup; the original all_responded was already
+                # broadcast in respond().
+                continue
             completed_payload = {
                 "command_id": cid,
                 "received_count": t.received_count,
@@ -1308,6 +1552,35 @@ class Session:
                     self._metrics.command_cancelled_total.labels(reason="ttl_expired").inc()
             if pending:
                 self._mirror_firehose("command.cancelled", cancelled_payload)
+            # Best-effort persistence for tick()-emitted events (store write is
+            # eventual since tick() is sync; see Task 9 note above).
+            if self._store is not None:
+                ts_ms = int(time.time() * 1000)
+                self._event_seq += 1
+                seq_completed = self._event_seq
+                task_completed = asyncio.create_task(
+                    self._store.persist_event_atomic(
+                        sid=self.session_id, seq=seq_completed,
+                        kind="command.completed", payload=completed_payload,
+                        ts=ts_ms, inflight_complete=cid,
+                        buffered_pids=(),
+                    )
+                )
+                self._firehose_tasks.add(task_completed)
+                task_completed.add_done_callback(self._firehose_tasks.discard)
+                if pending:
+                    self._event_seq += 1
+                    seq_cancelled = self._event_seq
+                    task_cancelled = asyncio.create_task(
+                        self._store.persist_event_atomic(
+                            sid=self.session_id, seq=seq_cancelled,
+                            kind="command.cancelled", payload=cancelled_payload,
+                            ts=ts_ms,
+                            buffered_pids=tuple(pending),
+                        )
+                    )
+                    self._firehose_tasks.add(task_cancelled)
+                    task_cancelled.add_done_callback(self._firehose_tasks.discard)
         # 2. Offline-grace eviction
         evicted: list[str] = []
         for pid, p in self._participants.items():
@@ -1317,6 +1590,35 @@ class Session:
                 evicted.append(pid)
         for pid in evicted:
             self._evict(pid, reason="offline_timeout")
+
+    def broadcast_to_subscribers(self, name: str, payload: dict[str, Any]) -> None:
+        """Best-effort fan-out to ALL active subscribers. Used for control-plane
+        notifications like ``session.cold`` that should NOT be buffered.
+        """
+        for pid, subs in self._subscribers.items():
+            p = self._participants.get(pid)
+            if p is None:
+                continue
+            # Use a synthetic seq (0) — this is a control event, not part
+            # of the per-participant resume seq stream.
+            for cb in tuple(subs):
+                try:
+                    cb(name, payload, 0)
+                except Exception:
+                    pass
+
+    def close_all_subscribers(self) -> None:
+        """Drop all subscriber callbacks. WS handlers should observe their
+        socket close shortly after; new attaches will work normally.
+        """
+        self._subscribers.clear()
+
+    def cancel_all_wait_for_event(self) -> None:
+        """Best-effort: clear any pending wait_for_event state so callers
+        return promptly with timed_out=True or similar. Called during
+        explicit session deletion."""
+        self._wait_in_flight.clear()
+        self._active_waits = 0
 
     def broadcast_session_ended(self, *, reason: str) -> None:
         # Wake any wait_for_event coroutines so they raise PARTICIPANT_EVICTED

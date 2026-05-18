@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.15.0"
+  version: "0.16.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -112,6 +112,34 @@ components:
             compromised participant fills its 1000-message count cap
             with max-size payloads on every participant (16 * 1000 *
             256 KiB ~= 4 GiB worst-case absent this guard).
+        persistence_db_path: { type: string, example: "data/sessionweave.db" }
+        persistence_db_pool_size: { type: integer, example: 4 }
+        persistence_sweep_interval_seconds: { type: integer, example: 60 }
+        persistence_until_deleted_safety_seconds: { type: integer, example: 7776000 }
+
+    PersistenceConfig:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [ttl, until_deleted]
+        ttl_seconds:
+          type: integer
+          minimum: 3600
+          maximum: 7776000
+
+    PersistenceStatePublic:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [ttl, until_deleted]
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
 
     ParticipantPublic:
       type: object
@@ -172,6 +200,9 @@ components:
             Equal to `participant_id` in sub-project #1.
         role: { type: string, nullable: true }
         session_id: { type: string, format: uuid }
+        persistence:
+          $ref: '#/components/schemas/PersistenceStatePublic'
+          nullable: true
 
     Target:
       type: object
@@ -392,7 +423,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.15.0" }
+                  version: { type: string, example: "0.16.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -442,13 +473,27 @@ paths:
                   $ref: '#/components/schemas/Purpose'
                 config:
                   $ref: '#/components/schemas/SessionConfig'
+                persistence:
+                  $ref: '#/components/schemas/PersistenceConfig'
       responses:
         '201':
           description: Created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Session'
+                type: object
+                allOf:
+                  - $ref: '#/components/schemas/Session'
+                properties:
+                  persistence:
+                    $ref: '#/components/schemas/PersistenceStatePublic'
+                    nullable: true
+                  creator_token:
+                    type: string
+                    description: |
+                      Opaque token that authorises the creator to delete this
+                      session via DELETE /v1/sessions/{sid}. Store securely;
+                      not re-issuable.
         '400':
           description: validation_error
           content:
@@ -469,7 +514,14 @@ paths:
           description: Snapshot
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Session' }
+              schema:
+                type: object
+                allOf:
+                  - $ref: '#/components/schemas/Session'
+                properties:
+                  persistence:
+                    $ref: '#/components/schemas/PersistenceStatePublic'
+                    nullable: true
         '404':
           description: session_not_found
           content:
@@ -479,9 +531,10 @@ paths:
       tags: [sessions]
       summary: End a session
       description: |
-        Ends the session immediately, broadcasts ``session.ended`` to
-        all participants and firehose subscribers, and removes it from
-        the registry.
+        Delete a session. Authorization: Bearer accepts either the
+        per-session creator_token (returned at session_create) OR the
+        relay-wide SW_SUPERVISOR_ADMIN_TOKEN. Distinct ended_reason
+        values: host_deleted (creator_token) vs admin_deleted (admin).
       security:
         - BearerSessionId: []
       responses:
@@ -489,6 +542,61 @@ paths:
         '401': { description: Missing bearer }
         '403': { description: Bearer does not match session_id }
         '404': { description: Session not found }
+
+  /v1/sessions/{sid}/events:
+    parameters:
+      - name: sid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [sessions]
+      summary: "Browse the timeline of a persisted session"
+      parameters:
+        - in: query
+          name: after_seq
+          schema: { type: integer, minimum: 0 }
+        - in: query
+          name: before_seq
+          schema: { type: integer, minimum: 0 }
+        - in: query
+          name: kind
+          schema: { type: string }
+          description: "Comma-separated list of event kinds"
+        - in: query
+          name: participant_id
+          schema: { type: string }
+          description: "Comma-separated list of participant_ids"
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        - in: query
+          name: order
+          schema: { type: string, enum: [asc, desc], default: asc }
+      responses:
+        "200":
+          description: "Page of events"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, events, has_more, session_state]
+                properties:
+                  session_id: { type: string }
+                  events:
+                    type: array
+                    items: { type: object }
+                  next_cursor:
+                    type: integer
+                    nullable: true
+                  has_more: { type: boolean }
+                  session_state:
+                    type: string
+                    enum: [hot, cold, ended]
+        "404":
+          description: "Unknown session"
+        "409":
+          description: "Session is not persisted (no history)"
 
   /v1/sessions/{sid}/purpose:
     parameters:

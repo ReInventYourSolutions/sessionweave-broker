@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -26,13 +27,17 @@ from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
 from sessionweave.mcp_adapter import HandleRegistry
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
+from sessionweave.persistence import PersistenceStore
+from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
     session_check_inbox,
     session_create,
+    session_delete,
     session_describe,
+    session_get_events,
     session_join,
     session_leave,
     session_list_participants,
@@ -94,10 +99,11 @@ def _build_fastmcp(
     async def session_create_tool(
         config: dict[str, Any] | None = None,
         purpose: dict[str, Any] | None = None,
+        persistence: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         return await session_create(
-            deps, {"config": config, "purpose": purpose}
+            deps, {"config": config, "purpose": purpose, "persistence": persistence}
         )
 
     @mcp.tool(name="session_describe")
@@ -250,6 +256,40 @@ def _build_fastmcp(
             {"command_id": command_id, "payload": payload, "status": status},
         )
 
+    @mcp.tool(name="session_delete")
+    async def session_delete_tool(
+        session_id: str,
+        creator_token: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete a session. Requires the creator_token returned at create."""
+        return await session_delete(
+            deps, {"session_id": session_id, "creator_token": creator_token}
+        )
+
+    @mcp.tool(name="session_get_events")
+    async def session_get_events_tool(
+        session_id: str,
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        kind: str | None = None,
+        participant_id: str | None = None,
+        limit: int = 200,
+        order: str = "asc",
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Browse the timeline of a persisted session without hydrating it."""
+        payload = {
+            "session_id": session_id,
+            "after_seq": after_seq,
+            "before_seq": before_seq,
+            "kind": kind,
+            "participant_id": participant_id,
+            "limit": limit,
+            "order": order,
+        }
+        return await session_get_events(deps, payload)
+
     return mcp
 
 
@@ -265,7 +305,14 @@ def build_app() -> Starlette:
     # and session_resume so SDK clients can detect relay restart and
     # invalidate their local seq cursor. See #65.
     relay_epoch = int(time.time())
-    tool_deps = ToolDeps(registry, relay_epoch=relay_epoch)
+    delete_rate_limiter = DeleteRateLimiter()
+    tool_deps = ToolDeps(
+        registry,
+        relay_epoch=relay_epoch,
+        bounds=deps_cfg.bounds,
+        metrics=metrics,
+        delete_rate_limiter=delete_rate_limiter,
+    )
 
     mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
     mcp_app = mcp.streamable_http_app()
@@ -338,11 +385,57 @@ def build_app() -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        _log = logging.getLogger(__name__)
+        db_path = deps_cfg.defaults.persistence_db_path
+        store: PersistenceStore | None = None
+        sweep_task: asyncio.Task | None = None
+        if db_path:
+            store = PersistenceStore(db_path)
+            await store.init(pool_size=deps_cfg.defaults.persistence_db_pool_size)
+            # Integrity check
+            assert store._write_conn is not None
+            async with store._write_conn.execute("PRAGMA integrity_check") as cur:
+                row = await cur.fetchone()
+            val = row[0] if row else "unknown"
+            if val != "ok":
+                _log.critical("persistence integrity check failed: %r", val)
+                raise SystemExit(2)
+            # Stranded recovery
+            stranded = await store.find_stranded(
+                now_ms=int(time.time() * 1000),
+                idle_threshold_hours=24,
+            )
+            for sid in stranded:
+                await store.mark_session_ended(
+                    sid, "startup_stranded", int(time.time() * 1000)
+                )
+                if metrics is not None:
+                    metrics.session_stranded_recovered_total.inc()
+            # Hand store to registry
+            registry._store = store
+            # Sweep loop
+            sweep_task = asyncio.create_task(
+                registry.sweep_expired_loop(
+                    interval_seconds=deps_cfg.defaults.persistence_sweep_interval_seconds,
+                    safety_seconds=deps_cfg.defaults.persistence_until_deleted_safety_seconds,
+                )
+            )
+        app.state.persistence_store = store
         async with AsyncExitStack() as stack:
             await registry.start()
             stack.push_async_callback(_drain_registry, registry, state)
             await stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
-            yield
+            try:
+                yield
+            finally:
+                if sweep_task is not None:
+                    sweep_task.cancel()
+                    try:
+                        await sweep_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if store is not None:
+                    await store.close()
 
     cors_cfg = CORSConfig.from_env(os.environ)
     app = Starlette(
@@ -365,6 +458,7 @@ def build_app() -> Starlette:
     app.state.handles = handles
     app.state.metrics = metrics
     app.state.tool_deps = tool_deps
+    app.state.delete_rate_limiter = delete_rate_limiter
     app.state.state = state
     app.state.firehose = firehose
     # Optional relay-wide admin token gating the firehose endpoint.

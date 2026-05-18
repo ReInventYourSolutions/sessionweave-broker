@@ -65,7 +65,7 @@ class SessionRegistryStub:
     def get(self, sid: str) -> Session | None:
         return self._sess if sid == self._sess.session_id else None
 
-    def get_or_raise(self, sid: str) -> Session:
+    async def get_or_raise(self, sid: str) -> Session:
         s = self.get(sid)
         if s is None:
             from sessionweave.errors import ErrorCode, ToolError

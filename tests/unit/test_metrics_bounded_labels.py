@@ -53,6 +53,18 @@ ALLOWED_LABELS: dict[str, set[str]] = {
     "sessionweave_wait_for_event_active": set(),
     "sessionweave_wait_for_event_clamped_total": {"transport"},
     "sessionweave_subscriber_dispatch_failed_total": set(),
+    "sessionweave_session_persisted_total": {"persistence_mode"},
+    "sessionweave_session_cold_total": set(),
+    "sessionweave_session_hydrate_total": set(),
+    "sessionweave_session_hydrate_seconds": set(),
+    "sessionweave_session_purge_total": {"reason"},
+    "sessionweave_session_delete_failed_total": {"reason"},
+    "sessionweave_session_stranded_recovered_total": set(),
+    "sessionweave_persistence_write_seconds": set(),
+    "sessionweave_persistence_failures_total": {"op"},
+    "sessionweave_events_browse_total": {"session_state"},
+    "sessionweave_events_browse_returned_total": set(),
+    "sessionweave_events_browse_seconds": set(),
 }
 
 # Hard-banned label NAMES. If any metric tries to use one of these the

@@ -64,7 +64,7 @@ async def events_ws(websocket: WebSocket) -> None:
         return
 
     try:
-        session = deps.registry.get_or_raise(sid)
+        session = await deps.registry.get_or_raise(sid)
     except ToolError as exc:
         code = (
             _CLOSE_SESSION_NOT_FOUND

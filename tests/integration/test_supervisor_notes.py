@@ -152,3 +152,59 @@ async def test_post_note_unknown_kind_rejected() -> None:
             body = r.json()
             assert body["error"] == "invalid_request"
             assert "kind" in body["detail"].lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_in_session_participant_can_post_supervisor_note_with_admin_token_set() -> None:
+    """An in-session participant's participant_token is accepted by
+    /supervisor/notes even when SW_SUPERVISOR_ADMIN_TOKEN is set.
+    This enables broadcast-as-self patterns (e.g. a director posting a
+    session_summary kind=note target=all) without exposing the relay-wide
+    admin token to in-session callers."""
+    admin = "deadbeefcafebabe-admin-secret"
+    async with relay_subprocess(
+        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+    ) as base:
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"x": 1}})
+            ).json()["session_id"]
+            joined = (
+                await c.post(
+                    f"{base}/v1/sessions/{sid}/participants",
+                    json={"role": "orchestrator", "capabilities": ["coord"]},
+                )
+            ).json()
+            p_token = joined["participant_token"]
+            # Bearer == participant_token must succeed even with admin set.
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {p_token}"},
+                json={"kind": "note", "target": "all",
+                      "message": "session-summary from orchestrator"},
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["kind"] == "note"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_non_participant_token_rejected_when_admin_set() -> None:
+    """A token that is neither admin_token, nor sid, nor an in-session
+    participant_token must be rejected with 403 (regression guard)."""
+    admin = "deadbeefcafebabe-admin-secret-2"
+    async with relay_subprocess(
+        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+    ) as base:
+        async with httpx.AsyncClient() as c:
+            sid = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"x": 1}})
+            ).json()["session_id"]
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": "Bearer some-random-string"},
+                json={"kind": "note", "target": "all", "message": "denied"},
+            )
+            assert r.status_code == 403

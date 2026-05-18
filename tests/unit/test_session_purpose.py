@@ -27,18 +27,18 @@ def _defaults() -> DeploymentDefaults:
 async def test_create_persists_purpose_and_returns_it() -> None:
     reg = SessionRegistry(_defaults(), ConnectionManager())
     purpose = {"kind": "tic-tac-toe-v1", "your_role": "O"}
-    sid, _expires, _cfg, returned = await reg.create({}, purpose=purpose)
+    sid, _expires, _cfg, returned, _persistence = await reg.create({}, purpose=purpose)
     assert returned == purpose
-    sess = reg.get_or_raise(sid)
+    sess = await reg.get_or_raise(sid)
     assert sess.purpose == purpose
 
 
 @pytest.mark.asyncio
 async def test_create_without_purpose_keeps_none() -> None:
     reg = SessionRegistry(_defaults(), ConnectionManager())
-    sid, _expires, _cfg, returned = await reg.create({})
+    sid, _expires, _cfg, returned, _persistence = await reg.create({})
     assert returned is None
-    assert reg.get_or_raise(sid).purpose is None
+    assert (await reg.get_or_raise(sid)).purpose is None
 
 
 @pytest.mark.asyncio

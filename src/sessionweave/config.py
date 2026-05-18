@@ -27,6 +27,12 @@ class SessionConfig:
     # ``buffer_evicted reason=session_byte_cap`` event is emitted on
     # the firehose so observers see the back-pressure.
     max_buffer_bytes_per_session: int = 50 * 1024 * 1024  # 50 MiB
+    # Persistence (sub-project #2). Default is empty = persistence disabled;
+    # operator opts in by setting SW_PERSISTENCE_DB_PATH at deploy time.
+    persistence_db_path: str = ""
+    persistence_db_pool_size: int = 4
+    persistence_sweep_interval_seconds: int = 60
+    persistence_until_deleted_safety_seconds: int = 7_776_000  # 90 days
 
 
 @dataclass(slots=True, frozen=True)
@@ -55,6 +61,16 @@ class ConfigBounds:
     # operator has to think about cgroup memory pressure.
     max_buffer_bytes_per_session_min: int = 1 * 1024 * 1024  # 1 MiB
     max_buffer_bytes_per_session_max: int = 4 * 1024 * 1024 * 1024  # 4 GiB
+    # `persistence_ttl_seconds_{min,max}` bound `PersistenceConfig.ttl_seconds`
+    # (input to session_create when persistence={"mode": "ttl", ...}), validated
+    # at the tool layer (Task 13). They have no counterpart field on
+    # `SessionConfig` — persistence is per-create-call, not a deployment knob.
+    persistence_ttl_seconds_min: int = 3600          # 1 hour
+    persistence_ttl_seconds_max: int = 7_776_000     # 90 days
+    persistence_db_pool_size_min: int = 1
+    persistence_db_pool_size_max: int = 32
+    persistence_sweep_interval_seconds_min: int = 10
+    persistence_sweep_interval_seconds_max: int = 3600
 
     @staticmethod
     def builtin() -> ConfigBounds:
@@ -198,6 +214,18 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
         b.max_buffer_bytes_per_session_min,
         b.max_buffer_bytes_per_session_max,
     )
+    check(
+        "persistence_db_pool_size",
+        cfg.persistence_db_pool_size,
+        b.persistence_db_pool_size_min,
+        b.persistence_db_pool_size_max,
+    )
+    check(
+        "persistence_sweep_interval_seconds",
+        cfg.persistence_sweep_interval_seconds,
+        b.persistence_sweep_interval_seconds_min,
+        b.persistence_sweep_interval_seconds_max,
+    )
 
 
 def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
@@ -226,6 +254,12 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_wait_seconds_mcp=env_int("SW_DEFAULT_MAX_WAIT_SECONDS_MCP", 20),
         max_buffer_bytes_per_session=env_int(
             "SW_DEFAULT_MAX_BUFFER_BYTES_PER_SESSION", 50 * 1024 * 1024
+        ),
+        persistence_db_path=env.get("SW_PERSISTENCE_DB_PATH", ""),
+        persistence_db_pool_size=env_int("SW_PERSISTENCE_DB_POOL_SIZE", 4),
+        persistence_sweep_interval_seconds=env_int("SW_PERSISTENCE_SWEEP_INTERVAL_SECONDS", 60),
+        persistence_until_deleted_safety_seconds=env_int(
+            "SW_PERSISTENCE_UNTIL_DELETED_SAFETY_SECONDS", 7_776_000
         ),
     )
     bounds = ConfigBounds(
@@ -257,6 +291,16 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         ),
         max_buffer_bytes_per_session_max=env_int(
             "SW_MAX_MAX_BUFFER_BYTES_PER_SESSION", 4 * 1024 * 1024 * 1024
+        ),
+        persistence_ttl_seconds_min=env_int("SW_MIN_PERSISTENCE_TTL_SECONDS", 3600),
+        persistence_ttl_seconds_max=env_int("SW_MAX_PERSISTENCE_TTL_SECONDS", 7_776_000),
+        persistence_db_pool_size_min=env_int("SW_MIN_PERSISTENCE_DB_POOL_SIZE", 1),
+        persistence_db_pool_size_max=env_int("SW_MAX_PERSISTENCE_DB_POOL_SIZE", 32),
+        persistence_sweep_interval_seconds_min=env_int(
+            "SW_MIN_PERSISTENCE_SWEEP_INTERVAL_SECONDS", 10
+        ),
+        persistence_sweep_interval_seconds_max=env_int(
+            "SW_MAX_PERSISTENCE_SWEEP_INTERVAL_SECONDS", 3600
         ),
     )
     # Operator misconfiguration: defaults must fit inside bounds at startup

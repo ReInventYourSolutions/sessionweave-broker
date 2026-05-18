@@ -21,6 +21,10 @@ class ErrorCode(StrEnum):
     WAIT_ALREADY_IN_FLIGHT = "wait_already_in_flight"
     PARTICIPANT_EVICTED = "participant_evicted"
     TOO_MANY_WAITS = "too_many_waits"
+    PERMISSION_DENIED = "permission_denied"
+    NO_HISTORY = "no_history"
+    PERSISTENCE_FAILED = "persistence_failed"
+    PERSISTENCE_CORRUPTED = "persistence_corrupted"
 
 
 @dataclass(slots=True)

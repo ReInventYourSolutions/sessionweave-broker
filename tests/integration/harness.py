@@ -20,10 +20,13 @@ def _free_port() -> int:
 @contextlib.asynccontextmanager
 async def relay_subprocess(
     env_overrides: dict[str, str] | None = None,
+    persistence_db_path: str | None = None,
 ) -> AsyncIterator[str]:
     """Spawn the relay as a subprocess on a free port and yield its base URL."""
     port = _free_port()
     env = {**os.environ, "SW_PORT": str(port), "SW_HOST": "127.0.0.1"}
+    if persistence_db_path is not None:
+        env["SW_PERSISTENCE_DB_PATH"] = persistence_db_path
     if env_overrides:
         env.update(env_overrides)
     proc = subprocess.Popen(

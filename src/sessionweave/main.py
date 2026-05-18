@@ -22,7 +22,18 @@ def cli() -> None:
             "reverse proxy / TLS terminator. Default: 127.0.0.1."
         ),
     )
+    parser.add_argument(
+        "--persistence-db-path",
+        default=None,
+        help=(
+            "Override SW_PERSISTENCE_DB_PATH. Use an empty string to disable "
+            "persistence. When unset, falls back to the env var (default: "
+            "data/sessionweave.db)."
+        ),
+    )
     args = parser.parse_args()
+    if args.persistence_db_path is not None:
+        os.environ["SW_PERSISTENCE_DB_PATH"] = args.persistence_db_path
     uvicorn.run(
         build_app(),
         host=args.host,

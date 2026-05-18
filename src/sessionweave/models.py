@@ -115,3 +115,31 @@ class CommandTracker:
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return (now or _utcnow()) >= self.deadline
+
+    def to_snapshot(self) -> dict[str, object]:
+        """JSON-safe snapshot used by PersistenceStore."""
+        return {
+            "command_id": self.command_id,
+            "sender_id": self.sender_id,
+            "dispatch_mode": self.dispatch_mode.value,
+            "dispatched_to": list(self.dispatched_to),
+            "deadline_ms": int(self.deadline.timestamp() * 1000),
+            "received_count": self.received_count,
+            "expected_count": self.expected_count,
+            "responses_received": list(self.responses_received),
+            "created_at_ms": int(self.created_at.timestamp() * 1000),
+        }
+
+    @classmethod
+    def from_snapshot(cls, d: dict[str, Any]) -> CommandTracker:
+        from datetime import UTC, datetime
+        return cls(
+            command_id=d["command_id"],
+            sender_id=d["sender_id"],
+            dispatch_mode=DispatchMode(d["dispatch_mode"]),
+            dispatched_to=list(d.get("dispatched_to", [])),
+            created_at=datetime.fromtimestamp(
+                d.get("created_at_ms", 0) / 1000, tz=UTC),
+            deadline=datetime.fromtimestamp(d["deadline_ms"] / 1000, tz=UTC),
+            responses_received=set(d.get("responses_received", [])),
+        )

@@ -142,3 +142,53 @@ async def test_double_respond_raises_already_responded() -> None:
             responder_id=b.participant_id, command_id=res.command_id, status="ok", payload={}
         )
     assert exc.value.code is ErrorCode.ALREADY_RESPONDED
+
+
+@pytest.mark.asyncio
+async def test_send_idempotent_with_caller_supplied_command_id() -> None:
+    """A retry of session_send with the SAME caller-supplied command_id
+    must return the original dispatch's response — no second tracker
+    in _inflight, no duplicate command.received event observed by the
+    recipient."""
+    from sessionweave.config import SessionConfig
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.schemas import DispatchMode, Target
+    from sessionweave.session import Session
+    from tests.unit.fakes import FakeHandle
+
+    s = Session("s", SessionConfig(), ConnectionManager())
+    h_a, h_b = FakeHandle(), FakeHandle()
+    a = await s.join(h_a, role=None, capabilities=[])
+    b = await s.join(h_b, role="r", capabilities=[])
+
+    stable_cid = "caller-supplied-cmd-1"
+    out1 = await s.send(
+        sender_id=a.participant_id,
+        dispatch=DispatchMode.SPECIFIC,
+        target=Target(participant_ids=[b.participant_id]),
+        payload={"q": "hello"},
+        command_id=stable_cid,
+    )
+    assert out1.command_id == stable_cid
+    assert b.participant_id in out1.delivered_to
+    # snapshot delivered-events to b
+    seen_before = [n for n, _ in h_b.sent if n == "command.received"]
+
+    # Retry with SAME command_id — must be idempotent.
+    out2 = await s.send(
+        sender_id=a.participant_id,
+        dispatch=DispatchMode.SPECIFIC,
+        target=Target(participant_ids=[b.participant_id]),
+        payload={"q": "hello"},
+        command_id=stable_cid,
+    )
+    assert out2.command_id == stable_cid
+    assert out2.delivered_to == out1.delivered_to
+
+    # No second command.received emitted to b
+    seen_after = [n for n, _ in h_b.sent if n == "command.received"]
+    assert seen_after == seen_before, (
+        f"expected no extra command.received on retry, got {seen_after}"
+    )
+    # Single tracker in _inflight
+    assert sum(1 for cid in s._inflight if cid == stable_cid) == 1
