@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.16.0"
+  version: "0.17.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -475,6 +475,18 @@ paths:
                   $ref: '#/components/schemas/SessionConfig'
                 persistence:
                   $ref: '#/components/schemas/PersistenceConfig'
+                creator_id:
+                  type: string
+                  nullable: true
+                  description: |
+                    Optional opaque handle identifying the creator (e.g. a
+                    cockpit user_id, or any future authenticated user
+                    identity on the relay side). If absent, the relay mints
+                    a uuid4 and returns it in the response. Not persisted
+                    on the relay in v0.17.0 — clients echo it locally for
+                    display; relay-side enforcement (creator-only ops
+                    bound to a user identity) is a future change once
+                    relay auth lands.
       responses:
         '201':
           description: Created
@@ -491,9 +503,21 @@ paths:
                   creator_token:
                     type: string
                     description: |
-                      Opaque token that authorises the creator to delete this
-                      session via DELETE /v1/sessions/{sid}. Store securely;
-                      not re-issuable.
+                      Opaque token that authorises the creator as the
+                      supervisor of this session: accepted on
+                      DELETE /v1/sessions/{sid} (end session), on
+                      POST /v1/sessions/{sid}/supervisor/notes, AND on
+                      the /v1/sessions/{sid}/firehose WebSocket (see
+                      that endpoint's `token` description). Store
+                      securely; not re-issuable.
+                  creator_id:
+                    type: string
+                    description: |
+                      Stable handle for the creator. Either the
+                      `creator_id` passed in the request, or a uuid4
+                      minted by the relay if none was provided. Echo
+                      this back to participants / UIs to show "created
+                      by X" without exposing the creator_token.
         '400':
           description: validation_error
           content:
@@ -872,26 +896,38 @@ paths:
           Authentication token, required as a query param because
           browsers can't set custom headers on a WebSocket upgrade.
 
-          Two modes:
+          Three modes (any one match accepts the connection):
 
           - **Admin-token mode** (recommended for multi-tenant
             deployments): when the relay is started with
             ``SW_FIREHOSE_ADMIN_TOKEN=<value>``, this query param
-            must equal that value. Knowing the ``session_id`` is
-            NOT sufficient.
-          - **Legacy mode** (default when the env var is unset):
-            the token must equal the ``session_id``. Any session
-            participant can subscribe and observe the full event
-            stream. Suitable for local dev / single-tenant cockpit
-            deployments only; the relay logs a warning at startup
-            advising operators to switch to admin-token mode.
+            may equal that value. Relay-wide operator credential —
+            list/manage every session on the relay.
+          - **Creator-token mode** (added in v0.17.0): the
+            ``creator_token`` returned by ``session_create`` for
+            *this* session is accepted as a session-scoped
+            supervisor channel. The user who created the session
+            has the right to observe every event in it (chat
+            between other participants included) without holding
+            the relay-wide admin token. Verified with a
+            constant-time SHA-256 compare against the session's
+            stored ``creator_token_hash``.
+          - **Legacy SID mode** (default when the admin env var is
+            unset): the token may equal the ``session_id``. Any
+            session participant can subscribe and observe the full
+            event stream. Suitable for local dev / single-tenant
+            cockpit deployments only; the relay logs a warning at
+            startup advising operators to switch to admin-token
+            mode for multi-tenant production.
     get:
       tags: [sessions]
       summary: WebSocket — full event stream for the session (non-participant)
       description: |
-        HTTP/WS upgrade. The ``token`` query parameter must equal the
-        ``session_id``. Frames are JSON ``{name, payload}`` objects,
-        matching the participant inbox shape.
+        HTTP/WS upgrade. Authentication via the ``token`` query
+        parameter — see the parameter description for the three
+        accepted modes (admin / creator / legacy). Frames are JSON
+        ``{name, payload}`` objects, matching the participant inbox
+        shape.
 
         **Overlap semantics.** The firehose carries every event the
         relay fans out for this session. Per-participant subscribers
