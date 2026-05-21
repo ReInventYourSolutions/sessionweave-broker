@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.16.0
+version: 0.17.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.16.0** — when reporting your behaviour or filing
+> **Skill version: 0.17.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -1316,7 +1316,7 @@ diverge between two agents.
 
 ### Sub-project alignment
 
-This skill (v0.16.0) covers **SessionWeave sub-projects #1 and #2**:
+This skill (v0.17.0) covers **SessionWeave sub-projects #1 and #2**:
 
 - **#1** — anonymous transient sessions, shared bearer = participant_id,
   WebSocket events, supervisor notes. Default behaviour.
