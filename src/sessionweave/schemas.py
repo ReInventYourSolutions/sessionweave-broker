@@ -59,6 +59,13 @@ class SessionCreateInput(_Strict):
     # link can act without an out-of-band briefing. Capped at 16 KiB JSON.
     purpose: dict[str, Any] | None = None
     persistence: PersistenceConfig | None = None
+    # Optional opaque handle identifying the creator (the cockpit user_id,
+    # or any future authenticated user identity on the relay side). If the
+    # client doesn't pass one, the relay mints a uuid4 so the output field
+    # is always populated. Not persisted in v0.16 — the cockpit echoes it
+    # locally for display; relay-side enforcement (creator-only ops bound
+    # to a user identity) is a future change once relay auth lands.
+    creator_id: str | None = None
 
 
 class SessionCreateOutput(_Strict):
@@ -68,6 +75,7 @@ class SessionCreateOutput(_Strict):
     purpose: dict[str, Any] | None = None
     persistence: PersistenceStatePublic | None = None
     creator_token: str = ""
+    creator_id: str = ""
 
 
 class SessionJoinInput(_Strict):

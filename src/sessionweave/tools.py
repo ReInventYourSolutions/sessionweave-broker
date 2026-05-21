@@ -142,6 +142,13 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
         persistence=inp.persistence,
         creator_token_hash=token_hash,
     )
+    # Echo back a creator_id so the caller has a stable handle for display.
+    # If the client passed one (e.g. a cockpit user_id), we use it verbatim;
+    # otherwise we mint a uuid4. Not persisted on the relay yet — that
+    # requires relay-side auth (sub-project #3), so right now this is a
+    # forward-compat shim the cockpit (and future identities) can populate.
+    from uuid import uuid4
+    creator_id = inp.creator_id if inp.creator_id else str(uuid4())
     return SessionCreateOutput(
         session_id=sid,
         expires_at=expires_at,
@@ -149,6 +156,7 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
         purpose=purpose,
         persistence=persistence_state,
         creator_token=token,
+        creator_id=creator_id,
     ).model_dump()
 
 

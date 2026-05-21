@@ -264,33 +264,46 @@ async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
     admin_token = getattr(websocket.app.state, "firehose_admin_token", None)
-    # Two authentication modes for the firehose endpoint:
-    #   - admin-token mode (``SW_FIREHOSE_ADMIN_TOKEN`` set at startup):
-    #     subscription requires ``?token=<admin_token>``. Knowing the
-    #     session_id is NOT sufficient — closes the info-leak gap where
-    #     any session participant could observe the full event stream
-    #     (issue #54).
-    #   - legacy mode (env var unset): accept ``?token=<sid>``. Matches
-    #     historical behaviour for local dev / cockpit setups. The
-    #     startup logger emits a one-shot warning advising operators
-    #     to set the env var in multi-tenant deployments.
-    if admin_token is not None:
-        if token != admin_token:
-            await websocket.close(
-                code=_CLOSE_MISSING_TOKEN, reason="invalid firehose token"
-            )
-            return
-    else:
-        if token != sid:
-            await websocket.close(
-                code=_CLOSE_MISSING_TOKEN, reason="invalid token"
-            )
-            return
-
     registry = websocket.app.state.tool_deps.registry
     firehose = websocket.app.state.firehose
-    if registry.get(sid) is None:
+    session = registry.get(sid)
+    if session is None:
         await websocket.close(code=_CLOSE_SESSION_NOT_FOUND, reason="session_not_found")
+        return
+
+    # Three authentication modes for the firehose endpoint:
+    #
+    #   1. admin-token mode (``SW_FIREHOSE_ADMIN_TOKEN`` set at startup):
+    #      subscription requires ``?token=<admin_token>``. Relay-wide
+    #      operator (list/manage all sessions).
+    #
+    #   2. creator_token of *this* session: accepted as a session-scoped
+    #      supervisor channel. The user who created the session has the
+    #      right to observe every event in it (supervisor / orchestrator
+    #      view), distinct from the relay-wide operator. Verified via
+    #      ``verify_creator_token`` against the session's stored hash.
+    #
+    #   3. legacy mode (admin env var unset): accept ``?token=<sid>``.
+    #      Historical behaviour for local dev / cockpit setups. The
+    #      startup logger emits a one-shot warning advising operators
+    #      to set the env var in multi-tenant deployments.
+    from sessionweave.persistence_token import verify_creator_token
+
+    accepted = False
+    if admin_token is not None and token == admin_token:
+        accepted = True
+    elif session.creator_token_hash is not None and verify_creator_token(
+        token, session.creator_token_hash
+    ):
+        accepted = True
+    elif admin_token is None and token == sid:
+        accepted = True
+
+    if not accepted:
+        await websocket.close(
+            code=_CLOSE_MISSING_TOKEN,
+            reason="invalid firehose token" if admin_token is not None else "invalid token",
+        )
         return
 
     await websocket.accept()
