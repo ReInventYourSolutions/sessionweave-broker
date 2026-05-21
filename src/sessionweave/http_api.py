@@ -407,7 +407,7 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
-    # Three authentication modes (priority order):
+    # Four authentication modes (priority order):
     #   1. admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set): token ==
     #      admin_token → relay-wide override.
     #   2. in-session participant: token matches the participant_id of an
@@ -416,7 +416,12 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     #      summary") without requiring the admin token. An orchestrator/
     #      supervisor role can also issue kind=halt targeting peers — that's
     #      the intended power-of-an-in-session-role model.
-    #   3. legacy: admin token unset AND token == sid. Local-dev cockpit
+    #   3. per-session creator: token matches the session's creator_token
+    #      (when persistence + creator_token are set at create). Symmetric
+    #      with the firehose WS auth (events_ws.py) so the cockpit's
+    #      creator-role surface has matching supervisor power on both
+    #      transports.
+    #   4. legacy: admin token unset AND token == sid. Local-dev cockpit
     #      backwards-compat (startup logger warns operators to set the env
     #      var in prod).
     registry = _deps(request).registry
@@ -425,6 +430,9 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         return JSONResponse({"error": "not_found"}, status_code=404)
 
     import hmac as _hmac
+
+    from sessionweave.persistence_token import verify_creator_token
+
     admin_token = getattr(request.app.state, "supervisor_admin_token", None)
     accepted = False
     # Constant-time comparison on the admin_token path; falling back to
@@ -435,6 +443,10 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     elif token in session._participants:
         # participant_id is a uuid4 lookup — dict membership is O(1) and
         # already constant-time for any fixed key size.
+        accepted = True
+    elif session.creator_token_hash is not None and verify_creator_token(
+        token, session.creator_token_hash
+    ):
         accepted = True
     elif admin_token is None and _hmac.compare_digest(token, sid):
         accepted = True

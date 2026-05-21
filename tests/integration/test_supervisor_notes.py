@@ -208,3 +208,52 @@ async def test_non_participant_token_rejected_when_admin_set() -> None:
                 json={"kind": "note", "target": "all", "message": "denied"},
             )
             assert r.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_note_accepts_creator_token(tmp_path) -> None:
+    """A session's creator_token is accepted on /supervisor/notes —
+    symmetric with the firehose WS auth. Lets the cockpit's creator-role
+    surface post supervisor notes without needing a relay-wide admin
+    token. Stays accepted even when SW_SUPERVISOR_ADMIN_TOKEN is set."""
+    admin = "creator-token-test-admin-secret"
+    db_path = str(tmp_path / "creator_token_notes.db")
+    async with relay_subprocess(
+        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin},
+        persistence_db_path=db_path,
+    ) as base:
+        async with httpx.AsyncClient() as c:
+            # Persistence must be set for the relay to mint a creator_token.
+            created = (
+                await c.post(
+                    f"{base}/v1/sessions",
+                    json={
+                        "purpose": {"kind": "ct-supervisor-notes"},
+                        "persistence": {"mode": "ttl", "ttl_seconds": 3600},
+                    },
+                )
+            ).json()
+            sid = created["session_id"]
+            creator_token = created["creator_token"]
+            assert creator_token, "relay must return creator_token when persistence set"
+
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {creator_token}"},
+                json={"kind": "note", "target": "all",
+                      "message": "note via creator_token"},
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["kind"] == "note"
+            assert body["message"] == "note via creator_token"
+
+            # A garbled creator_token must still 403 (no false-positive
+            # from accidental prefix matching, etc.).
+            r = await c.post(
+                f"{base}/v1/sessions/{sid}/supervisor/notes",
+                headers={"authorization": f"Bearer {creator_token[:-4]}xxxx"},
+                json={"kind": "note", "target": "all", "message": "denied"},
+            )
+            assert r.status_code == 403

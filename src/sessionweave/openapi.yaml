@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.17.0"
+  version: "0.17.1"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -649,21 +649,29 @@ paths:
       tags: [sessions]
       summary: Post a supervisor note / halt / continue / redirect
       description: |
-        Authentication has two modes (parallels the firehose
-        endpoint):
+        Authentication has four modes (mirrors the firehose
+        endpoint's auth lattice):
 
         - **Admin-token mode** (recommended in multi-tenant
           deployments): the relay is started with
           ``SW_SUPERVISOR_ADMIN_TOKEN=<value>``; the bearer header
-          must equal that value. Knowing the session_id alone is
-          NOT sufficient — closes the gap where any participant
-          could post halt notes targeting other participants.
-        - **Legacy mode** (default when the env var is unset):
-          bearer must equal the ``session_id``. Suitable for
-          local-dev cockpits; the relay logs a warning at startup
-          advising operators to switch.
+          must equal that value. Relay-wide operator authority.
+        - **In-session participant**: bearer matches the
+          ``participant_id`` of an active participant in this
+          session. Lets an SDK orchestrator/supervisor role issue
+          notes (kind=note/halt/continue/redirect) from inside the
+          session.
+        - **Per-session creator**: bearer matches the session's
+          ``creator_token`` (when persistence + creator_token were
+          set at create). Symmetric with the firehose WS auth so
+          the cockpit's creator-role has supervisor power on both
+          transports.
+        - **Legacy mode** (default when the admin-token env var is
+          unset): bearer must equal the ``session_id``. Suitable
+          for local-dev cockpits; the relay logs a warning at
+          startup advising operators to switch.
 
-        Server-side invariants (both modes):
+        Server-side invariants (all modes):
           - ``kind`` is restricted to the documented enum
             (``note`` / ``halt`` / ``continue`` / ``redirect``).
             Unknown kinds return 400.
