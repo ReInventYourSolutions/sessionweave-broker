@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.15.0
+version: 0.16.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.15.0** — when reporting your behaviour or filing
+> **Skill version: 0.16.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -614,7 +614,7 @@ print(link)  # hand THIS string to the user; nothing else needed
 
 | Tool | When |
 |---|---|
-| `session_create {config?, purpose?, persistence?}` | Open a new session. Returns `session_id`, `purpose` echo, **`creator_token`** (one-time, save it), and `persistence` state. `persistence` is opt-in: omit it for **Zero Data Retention** (RAM-only); pass `{mode:"ttl",ttl_seconds:N}` or `{mode:"until_deleted"}` to persist (relay 0.16.0+). |
+| `session_create {config?, purpose?, persistence?, creator_id?}` | Open a new session. Returns `session_id`, `purpose` echo, **`creator_token`** (one-time, save it), `creator_id` (echoed from input or uuid4 if omitted — relay 0.17.0+), and `persistence` state. `persistence` is opt-in: omit it for **Zero Data Retention** (RAM-only); pass `{mode:"ttl",ttl_seconds:N}` or `{mode:"until_deleted"}` to persist (relay 0.16.0+). |
 | `session_describe {session_id}` | Read-only snapshot: returns `{config, purpose, roster, persistence?}` without allocating a participant. Use as pre-flight before deciding to join. |
 | `session_update_purpose {purpose?}` | Replace the session's purpose mid-flight (or `null` to clear). Broadcasts `session.purpose_updated` to others. Caller must be in the session. |
 | `session_join {session_id, role?, capabilities?, objective?, metadata?, delivery_mode?}` | Bind this connection as a new participant. Returns `participant_id`, `roster`, `config`, `purpose`, `relay_epoch`, and `persistence` (if any). `delivery_mode` is `"push"` (default) or `"pull"`. |
@@ -679,13 +679,31 @@ What you get back at create:
 {
   "session_id": "…",
   "creator_token": "…",   // one-time, save it
+  "creator_id": "…",      // relay 0.17.0+ — echoed from input or uuid4
   "persistence": { "mode": "ttl", "expires_at": "2026-…" }
 }
 ```
 
-**`creator_token`** is the **only** way to terminate a session (via
-`session_delete`) unless the relay operator has configured a
-relay-wide `SW_SUPERVISOR_ADMIN_TOKEN` for supervisor overrides.
+**`creator_token`** is the proof of ownership for the session:
+- It's the only way to terminate via `session_delete` (unless the
+  relay operator has configured a relay-wide
+  `SW_SUPERVISOR_ADMIN_TOKEN` for supervisor overrides).
+- Relay 0.17.0+: it's also the bearer for the per-session firehose
+  at `GET /v1/sessions/{sid}/firehose?token=<creator_token>` — the
+  supervisor stream that delivers every event in the session
+  (chat between other participants included), authenticated via a
+  constant-time SHA-256 compare against the session's stored
+  `creator_token_hash`. A non-creator participant cannot subscribe
+  to that stream without either the relay-wide admin token or the
+  creator_token.
+
+**`creator_id`** is an opaque display handle the relay echoes back.
+Pass your own to bind a stable identity to the session
+(`{"creator_id": "alice@team"}` etc.); omit it and the relay mints a
+uuid4 so the field is always populated in the response. Not persisted
+on the relay in v0.17.0 — it's a client-side display aid for
+"created by X" surfaces. Relay-side enforcement (creator-only ops
+bound to a user identity) is a future change once relay auth lands.
 
 ### When to use persistence
 
@@ -1119,7 +1137,7 @@ if resumed["relay_epoch"] != join_epoch:
 
 The SDK's `Participant.relay_epoch` attribute exposes this for you
 (populated from the join response; defaults to `0` when talking to a
-pre-0.15.0 relay so `if me.relay_epoch == 0` is a safe "unknown" check).
+pre-0.16.0 relay so `if me.relay_epoch == 0` is a safe "unknown" check).
 
 ### Seq cursors and `last_acked_seq`
 
@@ -1298,7 +1316,7 @@ diverge between two agents.
 
 ### Sub-project alignment
 
-This skill (v0.15.0) covers **SessionWeave sub-projects #1 and #2**:
+This skill (v0.16.0) covers **SessionWeave sub-projects #1 and #2**:
 
 - **#1** — anonymous transient sessions, shared bearer = participant_id,
   WebSocket events, supervisor notes. Default behaviour.
