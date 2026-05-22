@@ -309,6 +309,88 @@ async def test_wait_raises_evicted_when_session_ended_mid_wait() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_releases_in_flight_when_metrics_inc_raises() -> None:
+    """Regression: a Prometheus error in wait_for_event_active.inc() must
+    NOT leak the participant into _wait_in_flight. Reported from the
+    cockpit-side Opus's fan-out repro (2026-05-22): the FIRST
+    wait_for_event raised with an empty exception string and every
+    subsequent call returned HTTP 409 wait_already_in_flight. Root cause:
+    the metrics inc lived between lock-release and the outer try/finally,
+    so any raise there bypassed the cleanup forever.
+
+    Simulate the failure by handing the session a metrics stub whose
+    wait_for_event_active.inc() blows up. The first call must propagate
+    a useful exception AND clean up. The second call must proceed
+    normally (no 409).
+    """
+    from sessionweave.metrics import Metrics
+
+    real = Metrics()
+    boom_count = {"n": 0}
+
+    class ExplodingInc:
+        def inc(self) -> None:
+            boom_count["n"] += 1
+            raise RuntimeError("simulated prometheus failure")
+
+        def dec(self) -> None:
+            real.wait_for_event_active.dec()
+
+    real.wait_for_event_active = ExplodingInc()  # type: ignore[assignment]
+    s = Session("s", SessionConfig(), ConnectionManager(), metrics=real)
+    h = FakeHandle()
+    p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
+    await s.check_inbox(p.participant_id)
+
+    # Even with metrics inc raising, the wait itself must complete cleanly
+    # (the inc failure is logged, not propagated).
+    result = await s.wait_for_event(
+        p.participant_id, names=None, timeout_seconds=0.05
+    )
+    assert result.timed_out is True
+    assert boom_count["n"] == 1
+    # Cleanup must have run.
+    assert p.participant_id not in s._wait_in_flight
+    assert s._active_waits == 0
+
+    # A second wait_for_event must NOT be blocked by stale in-flight state.
+    result2 = await s.wait_for_event(
+        p.participant_id, names=None, timeout_seconds=0.05
+    )
+    assert result2.timed_out is True
+    assert p.participant_id not in s._wait_in_flight
+
+
+@pytest.mark.asyncio
+async def test_wait_releases_in_flight_when_metrics_finally_raises() -> None:
+    """Belt-and-suspenders companion to the inc() test: a raise from the
+    metrics block inside the OUTER finally (labels().inc() / observe() /
+    dec()) must not skip the lock+discard that clears _wait_in_flight.
+    """
+    from sessionweave.metrics import Metrics
+
+    real = Metrics()
+
+    class ExplodingLabels:
+        def labels(self, **_kwargs: object) -> None:
+            raise RuntimeError("simulated label failure")
+
+    real.wait_for_event_total = ExplodingLabels()  # type: ignore[assignment]
+    s = Session("s", SessionConfig(), ConnectionManager(), metrics=real)
+    h = FakeHandle()
+    p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
+    await s.check_inbox(p.participant_id)
+
+    result = await s.wait_for_event(
+        p.participant_id, names=None, timeout_seconds=0.05
+    )
+    assert result.timed_out is True
+    # Cleanup must still have run despite the metrics failure.
+    assert p.participant_id not in s._wait_in_flight
+    assert s._active_waits == 0
+
+
+@pytest.mark.asyncio
 async def test_wait_effective_timeout_clamped_by_session_ttl() -> None:
     """The wait must never block past the moment the session would idle-expire.
     Configure a 2-second idle TTL and request a 60-second wait; the relay

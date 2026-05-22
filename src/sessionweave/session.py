@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -27,6 +28,8 @@ from sessionweave.schemas import (
     SessionSendOutput,
     Target,
 )
+
+logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
 MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
@@ -610,14 +613,35 @@ class Session:
                 remaining_ttl,
             )
 
+        # Once we exited the lock above, _wait_in_flight already contains
+        # participant_id and _active_waits has been incremented. From this
+        # point on, the cleanup in the outer finally MUST run on every
+        # exit path — otherwise the participant stays "in flight" forever
+        # and every future wait_for_event for that pid returns 409.
+        #
+        # The previous structure left a leak window between lock-release
+        # and the try below: a Prometheus error in
+        # _metrics.wait_for_event_active.inc() (or any other unexpected
+        # exception in the setup lines) escaped without ever triggering
+        # the cleanup. Move all post-lock setup INSIDE the try, defensively
+        # wrap metrics ops, and log any failure so the silent path
+        # observed from the cockpit fan-out surfaces in the relay logs.
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + effective_timeout
-
-        if self._metrics is not None:
-            self._metrics.wait_for_event_active.inc()
         start_time = loop.time()
         outcome = "error"
         try:
+            deadline = loop.time() + effective_timeout
+            if self._metrics is not None:
+                try:
+                    self._metrics.wait_for_event_active.inc()
+                except Exception:
+                    logger.exception(
+                        "wait_for_event: metrics inc failed "
+                        "(sid=%s pid=%s)",
+                        self.session_id,
+                        participant_id,
+                    )
+
             subscriber_attached = False
             try:
                 # Phase 2: attach subscriber. attach_subscriber atomically
@@ -723,15 +747,43 @@ class Session:
             except asyncio.CancelledError:
                 outcome = "cancelled"
                 raise
+            except Exception:
+                # Surface unexpected exceptions so the cockpit-side
+                # "empty str(e)" failure mode (where the relay raises
+                # something without a JSON envelope) is visible in the
+                # logs. The outer finally still runs.
+                logger.exception(
+                    "wait_for_event: unexpected error in wait body "
+                    "(sid=%s pid=%s)",
+                    self.session_id,
+                    participant_id,
+                )
+                raise
             finally:
                 if subscriber_attached:
                     await self.detach_subscriber(participant_id, on_event)
         finally:
+            # Metrics cleanup MUST NOT block the state cleanup below: a
+            # raise from Prometheus here would skip the lock+discard and
+            # re-introduce the leak this block is meant to prevent.
             if self._metrics is not None:
-                duration = loop.time() - start_time
-                self._metrics.wait_for_event_total.labels(outcome=outcome).inc()
-                self._metrics.wait_for_event_duration_seconds.observe(duration)
-                self._metrics.wait_for_event_active.dec()
+                try:
+                    duration = loop.time() - start_time
+                    self._metrics.wait_for_event_total.labels(
+                        outcome=outcome
+                    ).inc()
+                    self._metrics.wait_for_event_duration_seconds.observe(
+                        duration
+                    )
+                    self._metrics.wait_for_event_active.dec()
+                except Exception:
+                    logger.exception(
+                        "wait_for_event: metrics cleanup failed "
+                        "(sid=%s pid=%s outcome=%s)",
+                        self.session_id,
+                        participant_id,
+                        outcome,
+                    )
             async with self.lock:
                 self._wait_in_flight.discard(participant_id)
                 self._active_waits = max(0, self._active_waits - 1)
