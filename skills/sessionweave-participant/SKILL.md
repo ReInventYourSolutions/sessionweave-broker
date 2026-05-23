@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.17.0
+version: 0.18.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.17.0** — when reporting your behaviour or filing
+> **Skill version: 0.18.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -160,6 +160,20 @@ Without a side-car runner installed on the agent's host, this is the
 **only** way an agent can be reachable without the user manually
 triggering a new turn. If you need true offline reachability, see the
 `sessionweave-agent-runner` package.
+
+> **HTTP timeout: the client read timeout must outlive the
+> server-side budget.** The relay long-poll really blocks for
+> `timeout_seconds` (clamped to the deployment cap). Most HTTP
+> clients default to a much shorter read timeout: `httpx` is 5 s
+> out of the box, the SessionWeave SDK was 30 s before 0.7.0,
+> browsers vary. If your read timeout fires first the relay
+> observes the disconnect, cancels the wait, and returns
+> HTTP `499 client_disconnect` (relay 0.17.3+) — the participant's
+> in-flight flag is cleared and the next call proceeds cleanly,
+> but every aborted call still surfaces as a `ReadTimeout` on
+> your side. Set the read timeout to at least
+> `timeout_seconds + a few seconds of slack`. The Python SDK
+> handles this automatically from version 0.7.0 onwards.
 
 #### Handling `supervisor.note`
 
@@ -1226,6 +1240,25 @@ To stay compatible with every MCP client, the relay tunnels application events t
 
 `not_in_session`, `already_in_session`, `session_not_found`, `session_full`, `payload_too_large`, `invalid_dispatch_filters`, `invalid_targets`, `command_not_found`, `not_a_recipient`, `already_responded`, `participant_not_found`, `invalid_config`. All carry a human-readable `message`.
 
+**Long-poll error codes** (`wait_for_event` / `POST .../inbox/wait`):
+`invalid_delivery_mode` and `wait_already_in_flight` (HTTP 409),
+`participant_evicted` (HTTP 409), `too_many_waits` (HTTP 429), and
+`client_disconnect` (HTTP 499 — relay 0.17.3+, see below).
+
+> **`client_disconnect` (HTTP 499, relay 0.17.3+).** The relay
+> watches the ASGI receive channel for `http.disconnect` while the
+> wait blocks. When the HTTP client closes the TCP socket before
+> the wait finishes (typical when the client's read timeout is
+> shorter than the requested `timeout_seconds`), the relay cancels
+> the wait, clears the participant's in-flight flag, and returns
+> 499. The client never sees the body, but the cleanup is what
+> matters: the **next** `wait_for_event` from the same participant
+> proceeds normally instead of cascading with
+> `wait_already_in_flight` until the original deadline expires on
+> its own. To avoid generating these in the first place, make sure
+> your HTTP client's read timeout is at least
+> `timeout_seconds + a few seconds of slack`.
+
 ## Agent configuration
 
 To make this skill useful, the agent needs to (a) reach the relay and
@@ -1316,7 +1349,7 @@ diverge between two agents.
 
 ### Sub-project alignment
 
-This skill (v0.17.0) covers **SessionWeave sub-projects #1 and #2**:
+This skill (v0.18.0) covers **SessionWeave sub-projects #1 and #2**:
 
 - **#1** — anonymous transient sessions, shared bearer = participant_id,
   WebSocket events, supervisor notes. Default behaviour.
