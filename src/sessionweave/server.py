@@ -17,7 +17,6 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
-from sessionweave.cockpit_mount import cockpit_mount
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.cors import CORSConfig
@@ -447,7 +446,6 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
-            cockpit_mount(),
             Mount("/", app=mcp_app),
         ],
         middleware=[cors_cfg.as_middleware()],
@@ -465,7 +463,7 @@ def build_app() -> Starlette:
     # When set, the firehose WS upgrade requires ``?token=<this value>``
     # — knowing the session_id is no longer sufficient. When unset, the
     # legacy ``token == session_id`` check remains active so existing
-    # dev / cockpit setups keep working (with a startup warning).
+    # dev clients keep working (with a startup warning).
     # Operators in multi-tenant production should set this.
     app.state.firehose_admin_token = os.environ.get("SW_FIREHOSE_ADMIN_TOKEN", "") or None
     if app.state.firehose_admin_token is None:
