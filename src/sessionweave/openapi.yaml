@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.17.3"
+  version: "0.17.4"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -406,6 +406,7 @@ components:
                 - wait_already_in_flight
                 - participant_evicted
                 - too_many_waits
+                - client_disconnect
             message:
               type: string
 
@@ -836,6 +837,21 @@ paths:
         response shape mirrors `inbox/drain` plus a `timed_out`
         flag distinguishing a real event delivery from a clean
         timeout.
+
+        **Client-disconnect handling (relay 0.17.3+).** The relay
+        polls the ASGI receive channel for `http.disconnect` events
+        while the wait blocks. If the client closes the TCP
+        connection before the server-side budget elapses (e.g. an
+        HTTP client whose read timeout is shorter than
+        `timeout_seconds`), the wait is cancelled, the participant's
+        in-flight flag is cleared, and the relay returns
+        HTTP `499 client_disconnect` — the client never sees the
+        body, but the status code makes the log line unambiguous and
+        a subsequent `inbox/wait` from the same participant proceeds
+        normally instead of cascading with `409 wait_already_in_flight`.
+        Set your HTTP client's read timeout to at least
+        `timeout_seconds + a few seconds of slack` to avoid this
+        signal turning into per-call churn.
       security:
         - bearerAuth: []
       requestBody:
@@ -863,6 +879,13 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: too_many_waits — relay concurrent-wait cap exceeded
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '499':
+          description: |
+            client_disconnect — the relay observed the client close the
+            TCP connection before the wait completed and cancelled the
+            wait so subsequent calls don't see `wait_already_in_flight`.
+            The client never reads this body in practice.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /v1/sessions/{sid}/participants/me/events:

@@ -7,6 +7,7 @@ during writes. Schema migrations are plain SQL files in
 
 from __future__ import annotations
 
+import asyncio
 import importlib.resources as ir
 import time
 from dataclasses import dataclass
@@ -64,6 +65,19 @@ class PersistenceStore:
         self._path = path
         self._write_conn: aiosqlite.Connection | None = None
         self._read_pool: list[aiosqlite.Connection] = []
+        # SQLite refuses nested transactions on a single connection: a
+        # second BEGIN while the first transaction is still open raises
+        # ``sqlite3.OperationalError: cannot start a transaction within
+        # a transaction``. Because every relay write goes through the
+        # one ``_write_conn``, two coroutines that call
+        # ``persist_event_atomic`` (or one ``persist_event_atomic``
+        # racing ``delete_session``) at the same time trigger exactly
+        # that error. This lock serialises the BEGIN/COMMIT/ROLLBACK
+        # sequences; non-transactional single-statement writes
+        # (autocommit because we opened the connection with
+        # ``isolation_level=None``) don't take the lock and run in
+        # whatever interleaving aiosqlite's worker thread allows.
+        self._write_tx_lock: asyncio.Lock = asyncio.Lock()
 
     async def init(self, pool_size: int = 4) -> None:
         self._write_conn = await aiosqlite.connect(self._path, isolation_level=None)
@@ -158,22 +172,23 @@ class PersistenceStore:
 
     async def delete_session(self, sid: str) -> None:
         assert self._write_conn is not None
-        await self._write_conn.execute("BEGIN")
-        try:
-            await self._write_conn.execute(
-                "DELETE FROM buffered_notifications WHERE session_id = ?", (sid,))
-            await self._write_conn.execute(
-                "DELETE FROM inflight_commands WHERE session_id = ?", (sid,))
-            await self._write_conn.execute(
-                "DELETE FROM participants WHERE session_id = ?", (sid,))
-            await self._write_conn.execute(
-                "DELETE FROM events WHERE session_id = ?", (sid,))
-            await self._write_conn.execute(
-                "DELETE FROM sessions WHERE session_id = ?", (sid,))
-            await self._write_conn.execute("COMMIT")
-        except Exception:
-            await self._write_conn.execute("ROLLBACK")
-            raise
+        async with self._write_tx_lock:
+            await self._write_conn.execute("BEGIN")
+            try:
+                await self._write_conn.execute(
+                    "DELETE FROM buffered_notifications WHERE session_id = ?", (sid,))
+                await self._write_conn.execute(
+                    "DELETE FROM inflight_commands WHERE session_id = ?", (sid,))
+                await self._write_conn.execute(
+                    "DELETE FROM participants WHERE session_id = ?", (sid,))
+                await self._write_conn.execute(
+                    "DELETE FROM events WHERE session_id = ?", (sid,))
+                await self._write_conn.execute(
+                    "DELETE FROM sessions WHERE session_id = ?", (sid,))
+                await self._write_conn.execute("COMMIT")
+            except Exception:
+                await self._write_conn.execute("ROLLBACK")
+                raise
 
     async def update_last_activity(self, sid: str, last_activity_at: int) -> None:
         assert self._write_conn is not None
@@ -192,42 +207,43 @@ class PersistenceStore:
     ) -> None:
         import json as _json
         assert self._write_conn is not None
-        await self._write_conn.execute("BEGIN")
-        try:
-            await self._write_conn.execute(
-                "INSERT INTO events (session_id, seq, kind, payload_json, ts)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (sid, seq, kind, _json.dumps(payload, separators=(",", ":")), ts),
-            )
-            if inflight_upsert is not None:
-                cid, tracker = inflight_upsert
+        async with self._write_tx_lock:
+            await self._write_conn.execute("BEGIN")
+            try:
                 await self._write_conn.execute(
-                    "INSERT INTO inflight_commands"
-                    " (session_id, command_id, tracker_json, created_at)"
-                    " VALUES (?, ?, ?, ?)"
-                    " ON CONFLICT(session_id, command_id)"
-                    " DO UPDATE SET tracker_json = excluded.tracker_json",
-                    (sid, cid, _json.dumps(tracker, separators=(",", ":")), ts),
+                    "INSERT INTO events (session_id, seq, kind, payload_json, ts)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (sid, seq, kind, _json.dumps(payload, separators=(",", ":")), ts),
                 )
-            if inflight_complete is not None:
+                if inflight_upsert is not None:
+                    cid, tracker = inflight_upsert
+                    await self._write_conn.execute(
+                        "INSERT INTO inflight_commands"
+                        " (session_id, command_id, tracker_json, created_at)"
+                        " VALUES (?, ?, ?, ?)"
+                        " ON CONFLICT(session_id, command_id)"
+                        " DO UPDATE SET tracker_json = excluded.tracker_json",
+                        (sid, cid, _json.dumps(tracker, separators=(",", ":")), ts),
+                    )
+                if inflight_complete is not None:
+                    await self._write_conn.execute(
+                        "DELETE FROM inflight_commands WHERE session_id = ? AND command_id = ?",
+                        (sid, inflight_complete),
+                    )
+                for pid in buffered_pids:
+                    await self._write_conn.execute(
+                        "INSERT OR IGNORE INTO buffered_notifications"
+                        " (session_id, participant_id, seq) VALUES (?, ?, ?)",
+                        (sid, pid, seq),
+                    )
                 await self._write_conn.execute(
-                    "DELETE FROM inflight_commands WHERE session_id = ? AND command_id = ?",
-                    (sid, inflight_complete),
+                    "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
+                    (ts, sid),
                 )
-            for pid in buffered_pids:
-                await self._write_conn.execute(
-                    "INSERT OR IGNORE INTO buffered_notifications"
-                    " (session_id, participant_id, seq) VALUES (?, ?, ?)",
-                    (sid, pid, seq),
-                )
-            await self._write_conn.execute(
-                "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
-                (ts, sid),
-            )
-            await self._write_conn.execute("COMMIT")
-        except Exception:
-            await self._write_conn.execute("ROLLBACK")
-            raise
+                await self._write_conn.execute("COMMIT")
+            except Exception:
+                await self._write_conn.execute("ROLLBACK")
+                raise
 
     async def lookup_seq_by_command_id(self, sid: str, command_id: str) -> int | None:
         if not self._read_pool:

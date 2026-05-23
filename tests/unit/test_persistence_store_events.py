@@ -160,3 +160,60 @@ async def test_fetch_events_kind_filter(
                                  payload={}, ts=_now_ms())
     p = await s.fetch_events(sid="sid", kinds=("command.received", "supervisor.note"))
     assert [e["seq"] for e in p.events] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_persist_event_atomic_concurrent_no_nested_transaction(
+    store_with_session: PersistenceStore,
+) -> None:
+    """Regression: two coroutines calling persist_event_atomic at the
+    same time used to trigger ``sqlite3.OperationalError: cannot start
+    a transaction within a transaction`` because both raced to BEGIN on
+    the shared ``_write_conn``. Observed live (2026-05-23) when a
+    relay-side participant joined a persisted session while another
+    session activity was writing — the join's broadcast event collided
+    with the concurrent persist call. The fix serialises BEGIN sequences
+    through an asyncio lock; this test fans out 8 concurrent writes and
+    asserts every one of them lands."""
+    import asyncio
+
+    s = store_with_session
+    n = 8
+    await asyncio.gather(*[
+        s.persist_event_atomic(
+            sid="sid", seq=i + 1, kind="command.received",
+            payload={"i": i}, ts=_now_ms(),
+        )
+        for i in range(n)
+    ])
+    page = await s.fetch_events(sid="sid", limit=n + 5)
+    assert sorted(e["seq"] for e in page.events) == list(range(1, n + 1))
+
+
+@pytest.mark.asyncio
+async def test_persist_event_atomic_concurrent_with_delete(
+    store_with_session: PersistenceStore,
+) -> None:
+    """A concurrent ``delete_session`` also acquires a write transaction.
+    Serialising both methods through the same lock means the delete
+    either lands before some writes (those writes target a no-longer-
+    extant session and raise FK / no-row errors that the caller must
+    handle) or after all of them — but the nested-transaction error
+    must never appear."""
+    import asyncio
+
+    s = store_with_session
+    # Race a delete against a single persist. Either ordering is fine
+    # as long as we don't get OperationalError(nested transaction).
+    persist = s.persist_event_atomic(
+        sid="sid", seq=1, kind="command.received",
+        payload={}, ts=_now_ms(),
+    )
+    delete = s.delete_session("sid")
+    results = await asyncio.gather(persist, delete, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            msg = str(r)
+            assert "cannot start a transaction within a transaction" not in msg, (
+                f"nested-transaction error must not appear: {msg!r}"
+            )
