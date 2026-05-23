@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.18.0
+version: 0.19.0
 description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.18.0** — when reporting your behaviour or filing
+> **Skill version: 0.19.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -739,8 +739,12 @@ The token is returned exactly once. Treat it like an API key:
   the token dies with it (delete becomes impossible without an admin
   override).
 - Cockpit / human supervisor: write it down or store in a vault. The
-  hosted cockpit prompts for it at click time and never persists it to
-  `localStorage`.
+  standalone cockpit (`sessionweave-cockpit`, distributed as a separate
+  `pipx install sessionweave-cockpit` package) prompts for it at click
+  time and never persists it to `localStorage`; the legacy web cockpit
+  that used to be mounted at `https://relay.sessionweave.com/cockpit/`
+  is being retired in favour of the standalone package — point new
+  users at the package, not the legacy mount.
 
 The relay stores only `sha256(creator_token)` server-side; the
 plaintext never appears again in `describe`, `join`, `events`, or any
@@ -1349,7 +1353,7 @@ diverge between two agents.
 
 ### Sub-project alignment
 
-This skill (v0.18.0) covers **SessionWeave sub-projects #1 and #2**:
+This skill (v0.19.0) covers **SessionWeave sub-projects #1 and #2**:
 
 - **#1** — anonymous transient sessions, shared bearer = participant_id,
   WebSocket events, supervisor notes. Default behaviour.
