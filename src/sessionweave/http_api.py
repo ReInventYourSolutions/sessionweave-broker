@@ -15,6 +15,8 @@ drain via ``POST /v1/sessions/{sid}/participants/me/inbox/drain``.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from pydantic import ValidationError
@@ -40,6 +42,8 @@ from sessionweave.tools import (
     session_update_self,
     session_wait_for_event,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class HTTPParticipantHandle:
@@ -342,6 +346,36 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
     return JSONResponse(out)
 
 
+async def _watch_client_disconnect(
+    request: Request, target_task: asyncio.Task[Any]
+) -> None:
+    """Poll the ASGI receive channel for an ``http.disconnect`` event
+    and cancel ``target_task`` when the client gives up.
+
+    Starlette exposes :meth:`Request.is_disconnected` as a one-shot
+    check that drains the receive queue for a disconnect message. The
+    relay's long-poll endpoint can block on the server for up to
+    ``max_wait_seconds`` (default 600 s) while a typical HTTP client
+    has a much shorter read timeout (httpx defaults to 5 s, the
+    SessionWeave SDK to 30 s). Without disconnect-driven cancellation
+    the server keeps the wait alive, ``_wait_in_flight`` stays set for
+    the participant, and every retry the client issues races back with
+    a 409 ``wait_already_in_flight`` until the original 90-second-ish
+    wait expires on its own.
+    """
+    try:
+        while not target_task.done():
+            if await request.is_disconnected():
+                if not target_task.done():
+                    target_task.cancel()
+                return
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        # Watcher itself was cancelled because the wait finished
+        # normally — that's the happy path, not an error.
+        raise
+
+
 async def post_inbox_wait(request: Request) -> JSONResponse:
     sid = request.path_params["sid"]
     deps = _deps(request)
@@ -353,7 +387,62 @@ async def post_inbox_wait(request: Request) -> JSONResponse:
         body = {**body, "session_id": sid}
         handle = await _bind_participant(deps, sid, token)
         try:
-            out = await session_wait_for_event(deps, handle, body)
+            # Race the wait against a disconnect watcher: whichever
+            # finishes first wins. If the watcher fires it cancels the
+            # wait task, the wait's outer finally clears
+            # _wait_in_flight, and we return a 499 sentinel that the
+            # client never sees (the socket is gone). The crucial
+            # invariant is that _wait_in_flight is cleared by the time
+            # we return — without this, a participant whose HTTP
+            # client times out shorter than the server-side wait gets
+            # locked out for the remainder of the wait window.
+            wait_task: asyncio.Task[Any] = asyncio.create_task(
+                session_wait_for_event(deps, handle, body)
+            )
+            watch_task: asyncio.Task[None] = asyncio.create_task(
+                _watch_client_disconnect(request, wait_task)
+            )
+            try:
+                await asyncio.wait(
+                    {wait_task, watch_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # Whatever happened, the watcher has no further job.
+                if not watch_task.done():
+                    watch_task.cancel()
+                    try:
+                        await watch_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+            if wait_task.cancelled():
+                # Disconnect path: wait was cancelled by the watcher.
+                # The wait coroutine's outer finally cleared
+                # _wait_in_flight, so a subsequent reconnection works.
+                # 499 is the conventional "client closed request"
+                # status (nginx); the client won't see this body, but
+                # it makes the log line accurate.
+                logger.info(
+                    "wait_for_event cancelled by client disconnect "
+                    "(sid=%s)",
+                    sid,
+                )
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "client_disconnect",
+                            "message": (
+                                "client closed the request before the "
+                                "wait completed"
+                            ),
+                        }
+                    },
+                    status_code=499,
+                )
+            # Re-raise any exception the wait raised so the existing
+            # ToolError / ValidationError handlers below catch it.
+            out = wait_task.result()
         finally:
             _unbind_participant(deps.registry.connections, handle)
     except ToolError as exc:

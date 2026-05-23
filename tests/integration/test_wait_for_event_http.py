@@ -179,3 +179,72 @@ async def test_wait_for_event_http_returns_timed_out() -> None:
         body = r2.json()
         assert body["timed_out"] is True
         assert body["messages"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_wait_releases_in_flight_when_client_times_out() -> None:
+    """Regression: a client whose HTTP timeout is shorter than the
+    server-side wait must NOT lock itself out with 409.
+
+    The cockpit-side fan-out repro (2026-05-23) hit this: the SDK's
+    httpx default timeout (30 s) is shorter than the cockpit's
+    requested ``timeout_seconds=90``. When httpx gave up, the relay
+    kept the wait alive for the full 90 s and every subsequent
+    wait_for_event from the same participant returned HTTP 409
+    ``wait_already_in_flight`` until the original wait expired on its
+    own.
+
+    The fix: the HTTP handler watches the ASGI receive channel for an
+    ``http.disconnect`` event and cancels the wait_for_event task,
+    which then runs its outer finally to release ``_wait_in_flight``.
+    This test forces the timeout mismatch and asserts that a follow-up
+    wait proceeds normally.
+    """
+    async with relay_subprocess() as base:
+        # First, an httpx client with a SHORT timeout that we will use
+        # to abandon a long wait. Then a fresh client with a normal
+        # timeout to verify the participant is no longer stuck.
+        async with httpx.AsyncClient(base_url=base, timeout=15.0) as setup:
+            r = await setup.post("/v1/sessions", json={})
+            assert r.status_code == 201, r.text
+            sid = r.json()["session_id"]
+
+            r = await setup.post(
+                f"/v1/sessions/{sid}/participants", json={"role": "p"}
+            )
+            assert r.status_code == 201, r.text
+            token = r.json()["participant_token"]
+
+        # 1. Client with a 1 s read timeout calls wait_for_event with a
+        # server-side budget of 30 s. httpx will give up at 1 s and
+        # close the TCP connection while the relay's wait is still
+        # running.
+        async with httpx.AsyncClient(base_url=base, timeout=1.0) as fast:
+            with pytest.raises(httpx.ReadTimeout):
+                await fast.post(
+                    f"/v1/sessions/{sid}/participants/me/inbox/wait",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"timeout_seconds": 30},
+                )
+
+        # 2. Give the relay a brief window to notice the disconnect
+        # and cancel the wait. The watcher polls at 1 Hz, so 2.5 s is
+        # enough for at least one tick + cleanup.
+        await asyncio.sleep(2.5)
+
+        # 3. A fresh client retries the wait. With the disconnect-
+        # cancellation in place, _wait_in_flight has been cleared and
+        # the call must NOT return 409.
+        async with httpx.AsyncClient(base_url=base, timeout=10.0) as fresh:
+            r = await fresh.post(
+                f"/v1/sessions/{sid}/participants/me/inbox/wait",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"timeout_seconds": 0.3},
+            )
+            assert r.status_code == 200, (
+                f"expected 200 timed_out=true; got {r.status_code} {r.text}"
+            )
+            body = r.json()
+            assert body["timed_out"] is True
+            assert body["messages"] == []
