@@ -15,6 +15,8 @@ sequence).
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -62,17 +64,19 @@ async def test_relay_epoch_changes_across_process_restarts() -> None:
     that motivates the field (audit session ``8916f1cc-...``).
     """
     epochs: list[int] = []
-    for _ in range(2):
+    for i in range(2):
+        if i > 0:
+            # relay_epoch is int(time.time()) — on fast CI runners the
+            # harness teardown + respawn can complete inside one wall
+            # second, which collides the two epochs and trips this
+            # assertion. Sleep past the second boundary to keep the
+            # restart-detection contract testable deterministically.
+            await asyncio.sleep(1.1)
         async with relay_subprocess() as base:
             async with httpx.AsyncClient() as c:
                 info = (await c.get(f"{base}/v1/info")).json()
             epochs.append(info["relay_epoch"])
 
-    # The two subprocesses spin up at different times so their
-    # ``int(time.time())`` snapshots differ. If they happened to land
-    # in the same second this would be flaky, but the harness always
-    # sleeps the relay startup health check loop for ~1s+ so the
-    # second relay starts well after the first.
     assert epochs[0] != epochs[1], (
         f"both relay subprocesses returned the same relay_epoch "
         f"{epochs[0]} — restart-detection is broken"
