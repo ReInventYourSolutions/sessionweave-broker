@@ -63,26 +63,28 @@ The relay exposes:
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)
-- **WS firehose** — `/v1/sessions/{sid}/firehose?token=<sid>` — full event stream for non-participants (cockpit observers)
+- **WS firehose** — `/v1/sessions/{sid}/firehose?token=<sid>` — full event stream for non-participants (observers, supervisors)
 - **Supervisor notes** — `POST /v1/sessions/{sid}/supervisor/notes` — broadcast a note / halt / continue / redirect (Bearer = session_id)
 - **End session** — `DELETE /v1/sessions/{sid}` (Bearer = session_id)
-- **Hosted cockpit** — `GET /cockpit/...` — small static SPA
 
 See the [REST + WS surface](#rest--websocket-surface) section below for the
 endpoint catalogue. The MCP tool catalogue is documented further down.
 
-## Hosted cockpit
+## Companion UI
 
-A small browser UI ships with the relay at `/cockpit/...` — no install,
-no account. Paste a `session_id` or `swv://` link, then watch the live
-session: roster, message timeline, supervisor controls (note / halt /
-continue / redirect / end-session).
+The relay ships headless: there is no web UI baked into the package.
+If you want a browser-side console for inspecting sessions, supervising
+participants, or driving multi-provider workers, install the standalone
+[sessionweave-cockpit](https://github.com/EnzinoBB/SessionWeave/tree/main/Cockpit)
+package next to (or on the same host as) the relay:
 
-Production URL: <https://relay.sessionweave.com/cockpit/>.
+```sh
+pipx install git+https://github.com/EnzinoBB/SessionWeave.git#subdirectory=Cockpit
+swcockpit serve
+```
 
-To use it against a self-hosted relay, point your browser at
-`<your-relay>/cockpit/`. The cockpit is same-origin with the API it
-uses — no CORS configuration needed for the hosted case.
+It talks to the relay through the same REST + WS + firehose surface
+documented in this README; nothing in the cockpit is privileged.
 
 ## Talking to the relay (Python MCP client)
 
@@ -342,7 +344,7 @@ Concrete leak channels operators must defend against:
 | Channel | Mitigation |
 |---|---|
 | HTTP access logs that record bearer headers | Strip ``Authorization`` at the reverse proxy (Caddy) or the relay's log formatter. |
-| WebSocket URLs that include ``?token=<participant_id>`` in the Network tab of any browser | Don't share screenshots / videos of DevTools; use a private-mode browser for cockpit demos. |
+| WebSocket URLs that include ``?token=<participant_id>`` in the Network tab of any browser | Don't share screenshots / videos of DevTools; use a private-mode browser for live-session demos. |
 | TLS-terminating proxies that log query strings (CDN, WAF) | Caddy doesn't by default; verify any front-of-relay proxy. |
 | Prometheus labels in a previous build had per-participant cardinality | Locked down: see #58 (structural test guard). |
 | ``supervisor.note`` posted by anyone with the session_id | Set ``SW_SUPERVISOR_ADMIN_TOKEN`` (#59) to require a separate admin secret. |
