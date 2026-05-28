@@ -38,6 +38,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # Forward the PAT to the Dockerfile via a BuildKit secret —
+          # the Dockerfile mounts it at /run/secrets/github_token to
+          # authenticate the cross-repo private dep clone during
+          # `pip wheel`. The secret is NOT baked into image layers.
+          secrets: |
+            github_token=${{ secrets.SESSIONWEAVE_REPO_TOKEN }}
           tags: |
             ghcr.io/enzinobb/sessionweave:${{ github.ref_name }}
             ghcr.io/enzinobb/sessionweave:latest

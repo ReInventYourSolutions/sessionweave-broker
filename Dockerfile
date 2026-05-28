@@ -11,7 +11,19 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir --upgrade pip \
+# Authenticate the cross-repo private dep clone (sessionweave-client @
+# git+https://github.com/EnzinoBB/SessionWeave.git). The runner's git
+# config doesn't propagate into the Docker build context, so use a
+# BuildKit secret mount: release.yml passes the PAT via
+# `secrets: github_token=${{ secrets.SESSIONWEAVE_REPO_TOKEN }}`, which
+# exposes the value at /run/secrets/github_token only for this RUN.
+# The `if -s` guard makes local `docker build` (without the secret)
+# still work for public-dep scenarios — it just skips the rewrite.
+RUN --mount=type=secret,id=github_token \
+    if [ -s /run/secrets/github_token ]; then \
+      git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi \
+    && pip install --no-cache-dir --upgrade pip \
     && pip wheel --no-deps -w /wheels . \
     && pip wheel -w /wheels .
 
