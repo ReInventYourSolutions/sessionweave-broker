@@ -242,6 +242,13 @@ class SessionRegistry:
             )
             self._sessions[session_id] = sess
             if self._metrics is not None:
+                # Cold → hot: balance the dec() the eviction path issued
+                # when this session left RAM. Without this inc(), every
+                # evict+hydrate (or evict+delete, since delete hydrates
+                # internally) net-decrements the gauge once, producing a
+                # steady negative drift over time on relays with
+                # persistence + idle eviction.
+                self._metrics.sessions_active.inc()
                 self._metrics.session_hydrate_total.inc()
                 self._metrics.session_hydrate_seconds.observe(
                     _time.perf_counter() - t0

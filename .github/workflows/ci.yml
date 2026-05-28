@@ -12,6 +12,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
+      # The `sessionweave-client` dep is hosted in the *private*
+      # EnzinoBB/SessionWeave repo; the auto-injected GITHUB_TOKEN is
+      # scoped only to the current repo, so pip's git clone of the dep
+      # fails with `could not read Username for github.com` (exit 128).
+      # Rewrite https://github.com/ URLs to inject a PAT (read-only on
+      # the sibling repo) so the clone authenticates. The runner is
+      # ephemeral, so the global config dies with the job.
+      - name: Configure git auth for private cross-repo dep
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SESSIONWEAVE_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: mypy .
@@ -25,6 +35,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
+      - name: Configure git auth for private cross-repo dep
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SESSIONWEAVE_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: pip install -e '.[dev]'
       - run: playwright install chromium --with-deps
       - run: pytest tests/e2e -v -m e2e
