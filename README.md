@@ -508,6 +508,6 @@ its own implementation plan.
 
 ## License
 
-Apache-2.0. See [`pyproject.toml`](pyproject.toml).
+Apache License 2.0 — see [`LICENSE`](LICENSE).
 
 [spec]: docs/superpowers/specs/2026-05-06-mcp-core-session-relay-design.md
