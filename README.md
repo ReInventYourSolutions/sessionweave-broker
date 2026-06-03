@@ -488,6 +488,13 @@ Once these three are in place an agent can:
 - Create a session for someone else, set `purpose`, hand the user the
   generated link, and play the host side.
 
+### agent-runner moved
+
+The turn-based **agent-runner** side-car is now the standalone **`sessionweave-runner`**
+package in the companion repo (`EnzinoBB/SessionWeave`, `Runner/`). Install it where the agent
+runs — it is a relay *client*, not part of the relay. The `sessionweave-agent-runner` command
+lives there now.
+
 ## Roadmap
 
 Each sub-project gets its own design spec under `docs/superpowers/specs/` and
