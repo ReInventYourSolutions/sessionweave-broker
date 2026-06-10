@@ -17,6 +17,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
+from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.cors import CORSConfig
@@ -494,6 +495,12 @@ def build_app() -> Starlette:
     app.state.supervisor_rate = NoteRateLimiter(
         per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
         per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),
+    )
+    app.state.public_base_url = os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/") or None
+    app.state.brief_upgrades = BriefUpgrades(
+        skill_url=os.environ.get("SW_SKILL_URL", ""),
+        mcp_snippet_url=os.environ.get("SW_MCP_SNIPPET_URL", ""),
+        runner_install_url=os.environ.get("SW_RUNNER_INSTALL_URL", ""),
     )
     return app
 

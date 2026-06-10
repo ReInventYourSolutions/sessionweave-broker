@@ -205,6 +205,31 @@ async def create_session(request: Request) -> JSONResponse:
     return JSONResponse(out, status_code=201)
 
 
+def _public_base_url(request: Request) -> str:
+    configured = getattr(request.app.state, "public_base_url", None)
+    if configured:
+        return str(configured).rstrip("/")
+    # uvicorn runs with proxy_headers=True, so request.base_url reflects
+    # X-Forwarded-Proto/Host behind the configured reverse proxy.
+    return str(request.base_url).rstrip("/")
+
+
+async def invite_brief(request: Request) -> Response:
+    sid = request.path_params["sid"]
+    try:
+        info = await session_describe(_deps(request), {"session_id": sid})
+    except ToolError as exc:
+        return _error_response(exc)
+    from sessionweave.brief import render_brief
+    md = render_brief(
+        base_url=_public_base_url(request),
+        session_id=sid,
+        purpose=info.get("purpose"),
+        upgrades=request.app.state.brief_upgrades,
+    )
+    return Response(md, media_type="text/markdown; charset=utf-8")
+
+
 async def get_session(request: Request) -> JSONResponse:
     sid = request.path_params["sid"]
     try:
@@ -701,6 +726,7 @@ async def _delete_session_handler(request: Request) -> Response:
 def routes() -> list[Route]:
     """Return the list of `/v1/...` routes to mount on the main app."""
     return [
+        Route("/invite/{sid}", invite_brief, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),
         Route("/v1/sessions/{sid}", _delete_session_handler, methods=["DELETE"]),
