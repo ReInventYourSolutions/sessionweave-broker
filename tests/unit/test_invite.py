@@ -95,3 +95,27 @@ def test_parse_legacy_fragment_still_decodes_purpose() -> None:
 def test_parse_rejects_invalid_fragment() -> None:
     with pytest.raises(ValueError):
         parse_link("swv://h:1/sid#not-base64-json!!!")
+
+
+def test_http_invite_url_https():
+    from sessionweave.invite import http_invite_url
+    assert (
+        http_invite_url("https://relay.sessionweave.com/mcp", "sid-1")
+        == "https://relay.sessionweave.com/invite/sid-1"
+    )
+
+
+def test_http_invite_url_http_with_port():
+    from sessionweave.invite import http_invite_url
+    assert (
+        http_invite_url("http://127.0.0.1:8765/mcp", "sid-2")
+        == "http://127.0.0.1:8765/invite/sid-2"
+    )
+
+
+def test_http_invite_url_requires_session_id():
+    import pytest
+
+    from sessionweave.invite import http_invite_url
+    with pytest.raises(ValueError):
+        http_invite_url("https://h/mcp", "")
