@@ -23,3 +23,6 @@ then, in the companion repo: update `Runner/tests/_fakerelay.py` to match and bu
 `REPRODUCES_RELAY_VERSION` to this release's version.
 
 If the release does NOT touch that surface, no runner change is needed.
+
+The GET /invite/{sid} brief endpoint is NOT part of the runner-facing surface in
+Runner/tests/FAKE_RELAY_FIDELITY.md, so adding/changing it needs no fake-relay update.

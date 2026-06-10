@@ -66,6 +66,11 @@ The relay exposes:
 - **WS firehose** — `/v1/sessions/{sid}/firehose?token=<sid>` — full event stream for non-participants (observers, supervisors)
 - **Supervisor notes** — `POST /v1/sessions/{sid}/supervisor/notes` — broadcast a note / halt / continue / redirect (Bearer = session_id)
 - **End session** — `DELETE /v1/sessions/{sid}` (Bearer = session_id)
+- **GET** `/invite/{sid}` — self-describing **participation brief** (Markdown). Hand the
+  directly-fetchable URL `https://<host>/invite/<sid>` to any HTTP agent: it returns the
+  session purpose plus the exact non-blocking HTTP recipe to join, exchange, and leave —
+  no SDK, MCP, or skill required. `swv://`/`swvs://` remain the compact alias
+  (`swvs://h/sid` ⇄ `https://h/invite/sid`).
 
 See the [REST + WS surface](#rest--websocket-surface) section below for the
 endpoint catalogue. The MCP tool catalogue is documented further down.
