@@ -303,6 +303,10 @@ Configurable parameters:
 
 Process binding: `SW_HOST` (default `0.0.0.0`), `SW_PORT` (default `8765`).
 
+See [`.env.example`](.env.example) for the full, annotated list of environment
+variables (binding, auth tokens, the `/invite` brief upgrade URLs, persistence, and
+the per-session config bounds) with their defaults — copy it to `.env` for manual setup.
+
 ## Architecture (sub-project #1)
 
 Four in-process modules, no external dependencies:
