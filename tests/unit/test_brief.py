@@ -6,7 +6,7 @@ BASE = "https://relay.sessionweave.com"
 SID = "abc123"
 
 
-def _render(purpose, upgrades=BriefUpgrades()):
+def _render(purpose, upgrades=BriefUpgrades()):  # noqa: B008
     return render_brief(base_url=BASE, session_id=SID, purpose=purpose, upgrades=upgrades)
 
 

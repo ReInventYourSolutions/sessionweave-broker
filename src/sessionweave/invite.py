@@ -105,6 +105,25 @@ def create_link(relay_url: str, session_id: str) -> str:
     return f"{invite_scheme}://{netloc}/{session_id}"
 
 
+def http_invite_url(relay_url: str, session_id: str) -> str:
+    """Directly-fetchable invite URL: ``<scheme>://<host>/invite/<sid>``.
+
+    Unlike ``create_link`` (the compact ``swv://`` alias) this URL can be GET-ed by any
+    HTTP client to retrieve the participation brief. Derived from the relay's HTTP base.
+
+    - ``https://h[:p]/mcp`` → ``https://h[:p]/invite/<sid>``
+    - ``http://h:p/mcp``   → ``http://h:p/invite/<sid>``
+    """
+    if not session_id:
+        raise ValueError("session_id is required")
+    parsed = urlparse(relay_url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"relay_url must use http or https, got {parsed.scheme!r}")
+    if not parsed.netloc:
+        raise ValueError(f"relay_url missing host: {relay_url!r}")
+    return f"{parsed.scheme}://{parsed.netloc}/invite/{session_id}"
+
+
 def parse_link(link: str) -> InviteLink:
     """Parse a string that may be an ``swv://`` or ``swvs://`` invite link."""
     parsed = urlparse(link)
@@ -138,5 +157,6 @@ __all__ = [
     "SCHEME_HTTPS",
     "InviteLink",
     "create_link",
+    "http_invite_url",
     "parse_link",
 ]
