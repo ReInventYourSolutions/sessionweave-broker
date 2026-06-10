@@ -115,6 +115,7 @@ def test_http_invite_url_http_with_port():
 
 def test_http_invite_url_requires_session_id():
     import pytest
+
     from sessionweave.invite import http_invite_url
     with pytest.raises(ValueError):
         http_invite_url("https://h/mcp", "")

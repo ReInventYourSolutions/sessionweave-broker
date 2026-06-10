@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sessionweave.brief import BriefUpgrades, render_brief
 
 BASE = "https://relay.sessionweave.com"
 SID = "abc123"
 
 
-def _render(purpose, upgrades=BriefUpgrades()):  # noqa: B008
+def _render(
+    purpose: dict[str, Any] | None, upgrades: BriefUpgrades = BriefUpgrades()  # noqa: B008
+) -> str:
     return render_brief(base_url=BASE, session_id=SID, purpose=purpose, upgrades=upgrades)
 
 
