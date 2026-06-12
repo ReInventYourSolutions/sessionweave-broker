@@ -17,9 +17,9 @@ this repo flow through, and add the hosted relay to your project's MCP
 config so the tools show up immediately:
 
 ```bash
-git clone https://github.com/EnzinoBB/SessionWeave.git
+git clone https://github.com/ReInventYourSolutions/sessionweave-broker
 mkdir -p ~/.claude/skills
-ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
+ln -s "$PWD/SessionWeaveMCP/skills/sessionweave-participant" \
       ~/.claude/skills/sessionweave-participant
 
 # In the project where you want the tools available:
@@ -40,7 +40,7 @@ Or fetch only the skill (no clone):
 ```bash
 mkdir -p ~/.claude/skills/sessionweave-participant
 curl -fsSL \
-  https://raw.githubusercontent.com/EnzinoBB/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
+  https://raw.githubusercontent.com/ReInventYourSolutions/sessionweave-broker/main/skills/sessionweave-participant/SKILL.md \
   -o ~/.claude/skills/sessionweave-participant/SKILL.md
 ```
 
@@ -49,7 +49,7 @@ Restart Claude Code so both catalogues refresh.
 ### Versioning
 
 The skill is versioned in lockstep with the relay's MCP surface. When
-the server (see [`ReInventYourSolutions/sessionweave-broker`](https://github.com/ReInventYourSolutions/sessionweave-broker))
+the broker (see [`broker/`](../broker/))
 adds, renames, or removes a tool / notification / error code, this skill
 gets updated in the same window — pin to a specific commit if you need
 strict alignment.
