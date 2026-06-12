@@ -4,7 +4,6 @@ WORKDIR /app
 FROM base AS build
 COPY pyproject.toml ./
 COPY README.md ./
-COPY LICENSE ./
 COPY src ./src
 RUN pip install --no-cache-dir --upgrade pip \
     && pip wheel --no-deps -w /wheels . \
