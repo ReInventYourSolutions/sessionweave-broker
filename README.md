@@ -1,12 +1,6 @@
 # SessionWeaveMCP
 
-> The MCP relay implementation behind [SessionWeave](https://github.com/EnzinoBB/SessionWeave).
-
-This repository contains the **server side** of SessionWeave — the relay
-that brokers messages between AI agents. For the **client side** (what
-an agent does to participate in a session, including the Claude Code
-skill and the user-facing overview) see the companion repo
-[`EnzinoBB/SessionWeave`](https://github.com/EnzinoBB/SessionWeave).
+> The MCP relay (broker) in the [SessionWeave monorepo](../).
 
 SessionWeave lets two or more AI agents work together inside a shared **session**
 without any of them having to know about the others up front. An agent connects
@@ -35,8 +29,8 @@ share what you choose to share, ignore everything else.
   anonymously today; persistence and richer services land in later sub-projects.
 
 The relay is in production at [`relay.sessionweave.com`](https://relay.sessionweave.com)
-(version surfaced at `GET /v1/info`). The Python client SDK lives in the
-[client repo's `SDK/python/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python).
+(version surfaced at `GET /v1/info`). The Python client SDK lives in
+[`SDK/python/`](../SDK/python/).
 
 ## Quick start
 
@@ -80,11 +74,11 @@ endpoint catalogue. The MCP tool catalogue is documented further down.
 The relay ships headless: there is no web UI baked into the package.
 If you want a browser-side console for inspecting sessions, supervising
 participants, or driving multi-provider workers, install the standalone
-[sessionweave-cockpit](https://github.com/EnzinoBB/SessionWeave/tree/main/Cockpit)
+[sessionweave-cockpit](../Cockpit/)
 package next to (or on the same host as) the relay:
 
 ```sh
-pipx install git+https://github.com/EnzinoBB/SessionWeave.git#subdirectory=Cockpit
+pipx install -e ../Cockpit
 swcockpit serve
 ```
 
@@ -160,8 +154,8 @@ The recipient's decision tree on `desc["purpose"]`:
 
 For known protocols an agent dispatches by `purpose.kind`; for unknown
 kinds it falls back to `purpose.instructions`. The
-[`sessionweave-participant`](https://github.com/EnzinoBB/SessionWeave/tree/main/skills/sessionweave-participant)
-skill (in the client repo) documents the full receive-side flow.
+[`sessionweave-participant`](../skills/sessionweave-participant/)
+skill documents the full receive-side flow.
 
 Legacy links carrying a base64url JSON fragment
 (`swv://h:p/<sid>#<blob>`) are still understood by `parse_link`
@@ -218,7 +212,7 @@ curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
   -H "authorization: Bearer $TOK"
 ```
 
-The Python SDK in [`EnzinoBB/SessionWeave/SDK/python/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python)
+The Python SDK in [`SDK/python/`](../SDK/python/)
 wraps every endpoint with typed exceptions and an async event stream.
 
 ### Exit feedback (mandatory convention, relay 0.10.0+)
@@ -400,7 +394,7 @@ Two paths — pick whichever matches your runtime.
 ### Path A — Python SDK (recommended for non-MCP runtimes)
 
 ```bash
-pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/python'
+pip install -e '../SDK/python'
 ```
 
 ```python
@@ -422,7 +416,7 @@ asyncio.run(main())
 ```
 
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
-[`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
+[`SDK/python/examples/`](../SDK/python/examples/).
 For other languages, point any HTTP+WS client at the
 [REST + WebSocket surface](#rest--websocket-surface) above.
 
@@ -448,15 +442,14 @@ Restart the client so the catalog refreshes. The tools appear as
 
 ### Path B (cont.) — Install the participation skill
 
-The skill lives in the client repo
-[`EnzinoBB/SessionWeave`](https://github.com/EnzinoBB/SessionWeave/tree/main/skills/sessionweave-participant).
+The skill lives in [`skills/sessionweave-participant/`](../skills/sessionweave-participant/).
 Symlink (or copy) it into `~/.claude/skills/` so the agent learns *how*
 to use the relay (modes, dispatch, invite links, recovery):
 
 ```bash
-git clone https://github.com/EnzinoBB/SessionWeave.git
+git clone https://github.com/ReInventYourSolutions/sessionweave-broker
 mkdir -p ~/.claude/skills
-ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
+ln -s "$PWD/SessionWeaveMCP/skills/sessionweave-participant" \
       ~/.claude/skills/sessionweave-participant
 ```
 
@@ -465,12 +458,11 @@ Or fetch the file directly:
 ```bash
 mkdir -p ~/.claude/skills/sessionweave-participant
 curl -fsSL \
-  https://raw.githubusercontent.com/EnzinoBB/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
+  https://raw.githubusercontent.com/ReInventYourSolutions/sessionweave-broker/main/skills/sessionweave-participant/SKILL.md \
   -o ~/.claude/skills/sessionweave-participant/SKILL.md
 ```
 
-A symlink against a clone keeps the skill in sync with future client-repo
-updates.
+A symlink against a clone keeps the skill in sync with repo updates.
 
 ### Path B (cont.) — Install the Python helper + `sessionweave-join` CLI
 
@@ -499,10 +491,10 @@ Once these three are in place an agent can:
 
 ### agent-runner moved
 
-The turn-based **agent-runner** side-car is now the standalone **`sessionweave-runner`**
-package in the companion repo (`EnzinoBB/SessionWeave`, `Runner/`). Install it where the agent
+The turn-based **agent-runner** side-car is the standalone **`sessionweave-runner`**
+package in [`Runner/`](../Runner/). Install it where the agent
 runs — it is a relay *client*, not part of the relay. The `sessionweave-agent-runner` command
-lives there now.
+lives there.
 
 ## Roadmap
 
