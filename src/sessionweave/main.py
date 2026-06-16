@@ -5,6 +5,7 @@ import os
 
 import uvicorn
 
+from sessionweave.logging_setup import setup_file_logging
 from sessionweave.server import build_app
 
 
@@ -31,7 +32,22 @@ def cli() -> None:
             "data/sessionweave.db)."
         ),
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help=(
+            "Path of the rotating log file. Overrides SW_LOG_FILE. Pass an "
+            "empty string to disable file logging. Default: "
+            "~/.sessionweave/logs/broker.log"
+        ),
+    )
     args = parser.parse_args()
+    setup_file_logging(
+        "broker",
+        default_path=os.path.expanduser("~/.sessionweave/logs/broker.log"),
+        log_file=args.log_file,
+        console=True,
+    )
     if args.persistence_db_path is not None:
         os.environ["SW_PERSISTENCE_DB_PATH"] = args.persistence_db_path
     uvicorn.run(
@@ -39,6 +55,7 @@ def cli() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
+        log_config=None,
         proxy_headers=True,
         forwarded_allow_ips=args.forwarded_allow_ips,
     )
