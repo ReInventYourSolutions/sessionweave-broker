@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.19.0
-description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every `swv://` / `swvs://` invite link and covers the parse → describe → join flow plus server and client modes.
+version: 0.20.0
+description: Use when an agent must join, host, or test through a SessionWeave relay — a transport-agnostic multi-agent rendezvous reachable over plain HTTP+WebSocket (the primary path, no MCP required) or through MCP tools where the runtime supports them. Triggers on every SessionWeave invite link — the primary directly-fetchable `https://<host>/invite/<sid>` URL and the compact `swv://` / `swvs://` alias — and covers the parse → describe → join flow plus server and client modes.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.19.0** — when reporting your behaviour or filing
+> **Skill version: 0.20.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -309,26 +309,33 @@ includes:
   `session_delete`, …) that clients use to decide which endpoints
   to call. New flags may appear without a major bump.
 
-## Auto-trigger on `swv://` / `swvs://`
+## Auto-trigger on an invite link
 
-When you see a string of the form
-`swv://<host>[:<port>]/<session_id>` (HTTP relay) or
-`swvs://<host>[:<port>]/<session_id>` (HTTPS relay) in the user's
-message, in a file, in another tool's output, or anywhere else, treat
-it as a **SessionWeave invite** and follow the receive-side flow below
-— do not ask the user "what do you want me to do with this URL". The
-link's existence is the request.
+When you see a SessionWeave invite link in the user's message, in a file,
+in another tool's output, or anywhere else, treat it as a request and
+follow the receive-side flow below — do not ask the user "what do you
+want me to do with this URL". The link's existence is the request.
+
+Two equivalent forms point to the same session:
+
+- **Primary — directly-fetchable URL:** `https://<host>/invite/<session_id>`
+  (or `http://…` for a plain-HTTP relay). A plain `GET` returns the
+  self-describing participation brief — purpose plus the exact non-blocking
+  recipe to join, exchange, and leave. This is what the broker hands out today.
+- **Compact alias:** `swv://<host>[:<port>]/<session_id>` (HTTP relay) or
+  `swvs://<host>[:<port>]/<session_id>` (HTTPS relay). A 1:1 shorthand the
+  SDK / runner / cockpit `parse_link` helpers accept for programmatic joins.
 
 ### The link tells you the endpoint
 
-The link's scheme + host + port IS the relay's base URL — same one
-you'd hit for `/v1/...`, `/mcp`, or the WS upgrade:
+The link's host + port IS the relay's base URL — same one you'd hit for
+`/v1/...`, `/mcp`, or the WS upgrade. The session id is the path tail
+(after `/invite/` for the URL form, or after `/` for the compact alias);
+just split on `/` — you do NOT need a "decode the link" tool:
 
-- `swv://h[:p]/sid`  → `http://h[:p]`   (dev / loopback)
-- `swvs://h[:p]/sid` → `https://h[:p]`  (TLS-fronted, the production form)
-
-The session id is the path tail — you do NOT need to call any "decode
-the link" tool; just split on `/`.
+- `https://h[:p]/invite/sid` → relay base `https://h[:p]`  (production)
+- `swvs://h[:p]/sid`         → relay base `https://h[:p]`  (compact alias, TLS)
+- `swv://h[:p]/sid`          → relay base `http://h[:p]`   (compact alias, dev / loopback)
 
 ### The shortest first move
 
@@ -526,19 +533,24 @@ In pull mode the receive pattern is: do work → drain → handle events → rep
 
 - Two or more agents need to coordinate across machines or processes (e.g. one agent runs a server you want to test, another agent issues requests).
 - You can speak HTTP + (optionally) WebSocket. That covers virtually every runtime — Python scripts, OpenAI / Anthropic SDK workers, Node, Go, Lambda, JS/TS frontends, headless coding agents.
-- The user gives you a `session_id` or an `swv://` / `swvs://` invite link and asks you to join, or to expose/consume a capability.
+- The user gives you a `session_id`, an `https://<host>/invite/<sid>` URL, or its compact `swv://` / `swvs://` alias and asks you to join, or to expose/consume a capability.
 
 Skip if: you only need to call tools on one MCP server directly. SessionWeave is for *agent-to-agent* coordination.
 
-## Invite links (`swv://...`)
+## Invite links
 
-The hand-off shape is a compact pointer to a session:
+The hand-off shape is a pointer to a session. The **primary, shareable form is a
+directly-fetchable URL** — `GET` it for the self-describing brief:
 
 ```
-swv://<host>:<port>/<session_id>
+https://<host>/invite/<session_id>
 ```
 
-The link is just an addressable reference. The session's actual
+The compact `swv://` / `swvs://` scheme is a 1:1 alias of the same pointer
+(`swvs://h/sid` ⇄ `https://h/invite/sid`), accepted by the SDK / runner /
+cockpit `parse_link` helpers for programmatic joins.
+
+Either form is just an addressable reference. The session's actual
 **purpose** (what to do, which role to take, which protocol to follow)
 is persisted server-side and read back via `session_describe` — a
 read-only tool that does NOT bind your connection to a participant.
@@ -547,8 +559,10 @@ the link itself.
 
 ### Receiving a link — decision flow
 
-1. **Parse.** Either run `sessionweave-join "<link>"` (if installed) or
-   `from sessionweave.invite import parse_link; inv = parse_link(link)`
+1. **Parse.** For the `https://<host>/invite/<sid>` URL the session id is the
+   path tail after `/invite/` and the host is the relay base — or just `GET`
+   the URL for the brief. For the compact alias, run `sessionweave-join "<link>"`
+   (if installed) or `from sessionweave.invite import parse_link; inv = parse_link(link)`
    → `inv.relay_url`, `inv.session_id`. (Legacy links may carry a
    fragment-encoded purpose; ``parse_link`` returns it as ``inv.purpose``
    for backward compat, but new code shouldn't rely on it.)
@@ -833,8 +847,9 @@ In this exact order, BEFORE you reply to the user with the invite link:
 
    This single command runs `session_create` + `session_join` and spawns
    the background poller for you, returning a JSON envelope with the
-   `swvs://` link, your `participant_id`, the poller PID, and the log
-   path. If you're already inside the session for some other reason and
+   invite link (the compact `swvs://` alias; equivalently
+   `https://<host>/invite/<sid>`), your `participant_id`, the poller PID,
+   and the log path. If you're already inside the session for some other reason and
    only need the poller, run it directly:
 
    ```bash
@@ -901,7 +916,7 @@ How "staying engaged" looks depends on your runtime:
 
 Whatever the runtime, on the way out be explicit:
 
-> "I've created session `<id>` (link: `<swvs://...>`). I will stay
+> "I've created session `<id>` (link: `https://<host>/invite/<id>`). I will stay
 > engaged until <end condition from purpose>. I'll drain the inbox on
 > every turn and respond to commands as they arrive."
 
@@ -1314,8 +1329,8 @@ refreshes; the tools appear as `mcp__sessionweave__session_create`,
 allowlist.
 
 Pre-registration is convenient but not required for either option:
-when an `swv://...` / `swvs://...` invite points to a relay you haven't
-seen, the link itself carries the endpoint. Use the [base URL it
+when an `https://<host>/invite/<sid>` invite (or its `swv://` / `swvs://`
+alias) points to a relay you haven't seen, the link itself carries the endpoint. Use the [base URL it
 encodes](#the-link-tells-you-the-endpoint) directly with the SDK / REST
 or, if you'd prefer MCP, add it to your MCP catalogue at that point.
 

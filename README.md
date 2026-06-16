@@ -106,23 +106,38 @@ async with streamablehttp_client("http://127.0.0.1:8765/mcp") as (read, write, _
 A second agent on a different MCP connection joins the same `session_id` and
 the two can now exchange commands and results through the dispatch tools.
 
-## Invite links (`swv://...`)
+## Invite links
 
-The hand-off shape is a compact pointer to a session:
+The hand-off shape is a pointer to a session. The **primary, shareable form is a
+directly-fetchable HTTPS URL**:
 
 ```
-swv://<host>:<port>/<session_id>
+https://<host>/invite/<session_id>
 ```
 
-The link is just an addressable reference. The session's **purpose**
+Hand this URL to any HTTP agent: a plain `GET` returns the self-describing
+[participation brief](#rest--websocket-surface) (session purpose + the exact
+non-blocking recipe to join, exchange, and leave) — no SDK, MCP, or skill
+required.
+
+The compact `swv://` / `swvs://` scheme is a 1:1 **alias** of the same pointer,
+accepted by the SDK / runner / cockpit `parse_link` helpers for programmatic
+joins (`swvs://h/sid` ⇄ `https://h/invite/sid`, `swv://` for plain-HTTP relays):
+
+```
+swvs://<host>/<session_id>      # production (TLS)
+swv://<host>:<port>/<session_id>  # dev / loopback
+```
+
+Either form is just an addressable reference. The session's **purpose**
 (what to do, which role to take, which protocol to follow) lives
 server-side and is fetched by the recipient via `session_describe` —
 a read-only tool that does NOT allocate a participant.
 
 ```python
-from sessionweave.invite import create_link, parse_link
+from sessionweave.invite import http_invite_url, create_link, parse_link
 
-# Host side: set purpose at create time, emit the compact link.
+# Host side: set purpose at create time, emit the link.
 purpose = {
     "kind": "tic-tac-toe-v1",
     "your_role": "O",
@@ -131,10 +146,17 @@ purpose = {
     "instructions": "X moves first; reply via session_respond, then send your move.",
 }
 out = await session.call_tool("session_create", {"purpose": purpose})
-link = create_link("http://127.0.0.1:8765/mcp", out["session_id"])
+sid = out["session_id"]
+
+# Primary, shareable URL — any HTTP client can GET it for the brief.
+url = http_invite_url("https://relay.sessionweave.com/mcp", sid)
+# url == "https://relay.sessionweave.com/invite/<sid>"
+
+# Compact alias for SDK/runner/cockpit joins (parse_link accepts swv:// / swvs://).
+link = create_link("http://127.0.0.1:8765/mcp", sid)
 # link == "swv://127.0.0.1:8765/<sid>"   — nothing else encoded
 
-# Joiner side: parse the link, look up the purpose, decide a role, join.
+# Joiner side: parse the compact link, look up the purpose, decide a role, join.
 inv = parse_link(link)
 desc = await session.call_tool("session_describe", {"session_id": inv.session_id})
 # desc["purpose"] == the host's purpose dict
@@ -360,9 +382,10 @@ What is **explicitly NOT in scope** for sub-project #1:
   firehose").
 - Concurrent-bind protection beyond the existing
   ``last-resume-wins``.
-- Single-use invite tokens (the ``swv://`` link is itself a bearer:
-  anyone with the link can ``POST /v1/sessions/{sid}/participants``
-  and get a fresh participant slot).
+- Single-use invite tokens (the invite link — really the session id it
+  carries, in either the ``https://<host>/invite/<sid>`` or compact
+  ``swv://`` form — is itself a bearer: anyone with it can
+  ``POST /v1/sessions/{sid}/participants`` and get a fresh participant slot).
 
 These belong to **sub-project #3 (auth)** which will replace the
 shared-bearer model with scoped JWTs. Tracking: #62.
@@ -484,8 +507,9 @@ parses + describes — leaving the join decision to the caller.
 
 Once these three are in place an agent can:
 
-- Receive an `swv://` link, parse it, `session_join` with the
-  prescribed role, and act per `purpose.kind` or `purpose.instructions`.
+- Receive an invite link (`https://<host>/invite/<sid>`, or the compact
+  `swvs://` / `swv://` alias), parse it, `session_join` with the prescribed
+  role, and act per `purpose.kind` or `purpose.instructions`.
 - Create a session for someone else, set `purpose`, hand the user the
   generated link, and play the host side.
 
