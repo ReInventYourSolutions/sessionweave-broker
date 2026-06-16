@@ -14,7 +14,8 @@ from logging.handlers import RotatingFileHandler
 _DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 _DEFAULT_BACKUP_COUNT = 5
 _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-_HANDLER_NAME = "sw_file_log"
+_FILE_HANDLER_NAME = "sw_file_log"
+_CONSOLE_HANDLER_NAME = "sw_console"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -33,23 +34,39 @@ def setup_file_logging(
     default_path: str,
     log_file: str | None = None,
     read_env: bool = True,
+    console: bool = False,
     extra_loggers: tuple[str, ...] = (),
 ) -> None:
-    """Attach a rotating file handler. Idempotent; never raises.
+    """Configure logging: optional stderr console handler + a rotating file
+    handler, attached to the root logger (and any ``extra_loggers`` that set
+    ``propagate = False`` and so never reach root). Idempotent; never raises.
+
+    Use ``console=True`` for components that hand uvicorn ``log_config=None`` so
+    we own logging entirely — the console handler keeps journald/stderr output
+    alive once uvicorn stops installing its own handlers.
 
     Path: ``log_file`` arg -> ``SW_LOG_FILE`` env (only if ``read_env``) ->
-    ``default_path``. An empty resolved path disables file logging.
+    ``default_path``. An empty/whitespace resolved path disables the file
+    handler (the console handler, if any, stays).
     """
+    fmt = logging.Formatter(_FORMAT)
     root = logging.getLogger()
-    if any(getattr(h, "name", None) == _HANDLER_NAME for h in root.handlers):
-        return  # already installed
+
+    if console and not any(getattr(h, "name", None) == _CONSOLE_HANDLER_NAME for h in root.handlers):
+        console_handler = logging.StreamHandler()  # stderr
+        console_handler.set_name(_CONSOLE_HANDLER_NAME)
+        console_handler.setFormatter(fmt)
+        root.addHandler(console_handler)
 
     if log_file is None and read_env:
         log_file = os.environ.get("SW_LOG_FILE")
     path = default_path if log_file is None else log_file
     path = os.path.expanduser(os.path.expandvars(path)).strip()
     if not path:
-        return  # explicitly disabled (empty or whitespace-only)
+        return  # file logging disabled (empty/whitespace path)
+
+    if any(getattr(h, "name", None) == _FILE_HANDLER_NAME for h in root.handlers):
+        return  # file handler already installed
 
     max_bytes = _int_env("SW_LOG_MAX_BYTES", _DEFAULT_MAX_BYTES) if read_env else _DEFAULT_MAX_BYTES
     backups = _int_env("SW_LOG_BACKUP_COUNT", _DEFAULT_BACKUP_COUNT) if read_env else _DEFAULT_BACKUP_COUNT
@@ -64,7 +81,7 @@ def setup_file_logging(
         print(f"[{component}] file logging disabled: {exc}", file=sys.stderr)
         return
 
-    handler.set_name(_HANDLER_NAME)
-    handler.setFormatter(logging.Formatter(_FORMAT))
+    handler.set_name(_FILE_HANDLER_NAME)
+    handler.setFormatter(fmt)
     for name in ("", *extra_loggers):
         logging.getLogger(name).addHandler(handler)

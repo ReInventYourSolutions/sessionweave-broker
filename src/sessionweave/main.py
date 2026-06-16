@@ -46,7 +46,7 @@ def cli() -> None:
         "broker",
         default_path=os.path.expanduser("~/.sessionweave/logs/broker.log"),
         log_file=args.log_file,
-        extra_loggers=("uvicorn", "uvicorn.access", "uvicorn.error"),
+        console=True,
     )
     if args.persistence_db_path is not None:
         os.environ["SW_PERSISTENCE_DB_PATH"] = args.persistence_db_path
@@ -55,6 +55,7 @@ def cli() -> None:
         host=args.host,
         port=args.port,
         log_level="info",
+        log_config=None,
         proxy_headers=True,
         forwarded_allow_ips=args.forwarded_allow_ips,
     )
