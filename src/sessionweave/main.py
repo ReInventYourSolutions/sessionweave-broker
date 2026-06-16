@@ -5,8 +5,8 @@ import os
 
 import uvicorn
 
-from sessionweave.server import build_app
 from sessionweave.logging_setup import setup_file_logging
+from sessionweave.server import build_app
 
 
 def cli() -> None:
