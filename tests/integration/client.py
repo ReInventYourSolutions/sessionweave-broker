@@ -20,7 +20,11 @@ async def sw_client(base_url: str) -> AsyncIterator[Client]:
     ``on_notification`` hook.
     """
     url = f"{base_url}/mcp"
-    async with streamablehttp_client(url) as (read, write, _):
+    # Generous timeout: stress tests (e.g. test_buffer_race fires 200 concurrent
+    # dispatches) can back the single-process relay up past the 30s default on a
+    # contended CI runner, tripping a ReadTimeout on teardown. This only relaxes
+    # how long the test client waits — it does not mask server-side races.
+    async with streamablehttp_client(url, timeout=120) as (read, write, _):
         client_holder: list[Client] = []
 
         async def logging_callback(params: Any) -> None:

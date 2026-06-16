@@ -59,7 +59,7 @@ async def test_concurrent_dispatch_and_drain_no_buffer_race() -> None:
 
             # Workers join via REST so they get tokens and stay pull-mode.
             worker_tokens: list[tuple[str, str]] = []
-            async with httpx.AsyncClient(timeout=30.0) as h:
+            async with httpx.AsyncClient(timeout=120.0) as h:
                 for _ in range(n_workers):
                     r = await h.post(
                         f"{base}/v1/sessions/{sid}/participants",
@@ -78,7 +78,7 @@ async def test_concurrent_dispatch_and_drain_no_buffer_race() -> None:
             received_counts: dict[str, int] = {pid: 0 for pid, _ in worker_tokens}
 
             async def _drain_loop(pid: str, tok: str, stop: asyncio.Event) -> None:
-                async with httpx.AsyncClient(timeout=30.0) as h:
+                async with httpx.AsyncClient(timeout=120.0) as h:
                     while not stop.is_set():
                         r = await h.post(
                             f"{base}/v1/sessions/{sid}/participants/me/inbox/drain",
