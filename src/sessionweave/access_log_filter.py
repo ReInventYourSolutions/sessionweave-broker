@@ -36,8 +36,7 @@ class AccessLogNoiseFilter(logging.Filter):
         except (ValueError, TypeError, IndexError):
             return True
         path = full_path.split("?", 1)[0]
-        if path in _DROP_PATHS:
-            return False
-        if status == 404 and not path.startswith(_REAL_API_PREFIXES):
-            return False
-        return True
+        is_noise = path in _DROP_PATHS or (
+            status == 404 and not path.startswith(_REAL_API_PREFIXES)
+        )
+        return not is_noise
