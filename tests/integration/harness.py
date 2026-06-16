@@ -24,7 +24,11 @@ async def relay_subprocess(
 ) -> AsyncIterator[str]:
     """Spawn the relay as a subprocess on a free port and yield its base URL."""
     port = _free_port()
-    env = {**os.environ, "SW_PORT": str(port), "SW_HOST": "127.0.0.1"}
+    # Disable file logging in the test relay: the CLI defaults it on, but a
+    # synchronous RotatingFileHandler write per request throttles the event
+    # loop under high-volume stress tests (e.g. test_buffer_race) on slow CI
+    # disks, causing ReadTimeouts. Tests don't read the file; stderr is enough.
+    env = {**os.environ, "SW_PORT": str(port), "SW_HOST": "127.0.0.1", "SW_LOG_FILE": ""}
     if persistence_db_path is not None:
         env["SW_PERSISTENCE_DB_PATH"] = persistence_db_path
     if env_overrides:
