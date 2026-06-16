@@ -3,13 +3,13 @@ import logging
 from sessionweave.access_log_filter import AccessLogNoiseFilter
 
 
-def _rec(name: str, args: object) -> logging.LogRecord:
+def _rec(name: str, args: tuple[object, ...] | None) -> logging.LogRecord:
     return logging.LogRecord(
         name, logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d', args, None
     )
 
 
-def _keep(name: str, args: object) -> bool:
+def _keep(name: str, args: tuple[object, ...] | None) -> bool:
     return AccessLogNoiseFilter().filter(_rec(name, args))
 
 
