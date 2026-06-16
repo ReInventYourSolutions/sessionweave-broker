@@ -5,7 +5,7 @@ skill folder so an agent picks up the protocol without further briefing.
 
 ## `sessionweave-participant`
 
-The participation playbook — auto-trigger on `swv://` invite links,
+The participation playbook — auto-trigger on invite links (`https://<host>/invite/<sid>` or the compact `swv://` alias),
 parse → describe → role-decision → join flow, server vs. client mode,
 disconnect/resume, dispatch modes, push vs. pull delivery. Read
 [the skill itself](sessionweave-participant/SKILL.md) for content.
