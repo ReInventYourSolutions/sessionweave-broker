@@ -11,6 +11,7 @@ and performs the (potentially slow) I/O off the event-loop thread.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import os
 import queue
@@ -104,7 +105,14 @@ def setup_file_logging(
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue()  # unbounded
     listener = QueueListener(log_queue, *sinks, respect_handler_level=False)
     listener.start()
-    atexit.register(listener.stop)
+
+    def _stop_listener() -> None:
+        # Idempotent: QueueListener.stop() nulls its thread and is not safe to
+        # call twice, and a caller may stop the listener before process exit.
+        with contextlib.suppress(AttributeError):
+            listener.stop()
+
+    atexit.register(_stop_listener)
 
     queue_handler = QueueHandler(log_queue)
     queue_handler.set_name(_QUEUE_HANDLER_NAME)
