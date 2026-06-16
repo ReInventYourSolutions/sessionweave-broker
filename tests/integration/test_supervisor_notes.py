@@ -23,20 +23,39 @@ async def test_post_note_broadcasts_supervisor_note():
         async with websockets.connect(
             f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
         ) as ws:
-            async with httpx.AsyncClient() as c:
-                r = await c.post(
-                    f"{base}/v1/sessions/{sid}/supervisor/notes",
-                    headers={"authorization": f"Bearer {sid}"},
-                    json={"kind": "note", "target": "all", "message": "remember constraint X"},
-                )
-                assert r.status_code == 200
-                body = r.json()
-                assert body["kind"] == "note"
-                assert body["target"] == "all"
-                assert "note_id" in body
-            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-            frame = json.loads(raw)
-            assert frame["name"] == "supervisor.note"
+            note = {"kind": "note", "target": "all", "message": "remember constraint X"}
+            # The firehose registers its server-side subscription only AFTER
+            # the WS handshake completes (firehose_ws: `subscribe()` runs after
+            # `accept()`), and it is live-only — a note broadcast before the
+            # subscription is registered reaches nobody. The client's connect()
+            # returning does not guarantee the server-side subscription is live,
+            # so wait for the actual condition: re-post until the firehose
+            # delivers the note (converges as soon as the subscription is live).
+            frame = None
+            first = True
+            deadline = asyncio.get_event_loop().time() + 10.0
+            while frame is None and asyncio.get_event_loop().time() < deadline:
+                async with httpx.AsyncClient() as c:
+                    r = await c.post(
+                        f"{base}/v1/sessions/{sid}/supervisor/notes",
+                        headers={"authorization": f"Bearer {sid}"},
+                        json=note,
+                    )
+                    assert r.status_code == 200
+                    body = r.json()
+                    if first:
+                        assert body["kind"] == "note"
+                        assert body["target"] == "all"
+                        assert "note_id" in body
+                        first = False
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                except TimeoutError:
+                    continue
+                candidate = json.loads(raw)
+                if candidate.get("name") == "supervisor.note":
+                    frame = candidate
+            assert frame is not None, "supervisor.note not observed on firehose"
             assert frame["payload"]["message"] == "remember constraint X"
 
 

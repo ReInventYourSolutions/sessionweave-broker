@@ -182,17 +182,31 @@ async def test_ws_reconnect_with_last_acked_seq_skips_acked_events() -> None:
             # filter the buffer replay so we see only seq>last_acked.
             reconnect_url = f"{ws_url}&last_acked_seq={last_acked}"
             second_phase_seqs: list[int] = []
-            async with websockets.connect(reconnect_url) as ws2:
-                # Drain everything currently buffered, stopping when the
-                # stream goes idle. Generous timeout so we don't race
-                # the WS attach replay.
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws2.recv(), timeout=2.0)
-                    except TimeoutError:
-                        break
-                    frame = json.loads(raw)
-                    second_phase_seqs.append(frame["seq"])
+            # Wait for the CONDITION (all six events recovered), not an
+            # arbitrary idle timeout. A reconnect can race the previous
+            # connection's server-side teardown: events_ws re-buffers the
+            # un-ACKed events (seq>last_acked) in its `finally` only AFTER it
+            # observes the disconnect, so the first attach may see an empty
+            # backlog. Re-attach until the buffer has settled and every
+            # seq>last_acked event has been recovered (deduped across attaches),
+            # bounded by a generous overall deadline.
+            expected_total = 6
+            deadline = asyncio.get_event_loop().time() + 15.0
+            while (
+                len(set(first_phase_seqs) | set(second_phase_seqs)) < expected_total
+                and asyncio.get_event_loop().time() < deadline
+            ):
+                async with websockets.connect(reconnect_url) as ws2:
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws2.recv(), timeout=1.0)
+                        except TimeoutError:
+                            break
+                        seq = json.loads(raw)["seq"]
+                        if seq not in second_phase_seqs:
+                            second_phase_seqs.append(seq)
+                if len(set(first_phase_seqs) | set(second_phase_seqs)) < expected_total:
+                    await asyncio.sleep(0.1)
 
             # No overlap between the two phases.
             assert set(first_phase_seqs).isdisjoint(set(second_phase_seqs)), (
