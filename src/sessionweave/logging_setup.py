@@ -28,6 +28,10 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _has_handler(logger: logging.Logger, name: str) -> bool:
+    return any(getattr(h, "name", None) == name for h in logger.handlers)
+
+
 def setup_file_logging(
     component: str,
     *,
@@ -52,7 +56,7 @@ def setup_file_logging(
     fmt = logging.Formatter(_FORMAT)
     root = logging.getLogger()
 
-    if console and not any(getattr(h, "name", None) == _CONSOLE_HANDLER_NAME for h in root.handlers):
+    if console and not _has_handler(root, _CONSOLE_HANDLER_NAME):
         console_handler = logging.StreamHandler()  # stderr
         console_handler.set_name(_CONSOLE_HANDLER_NAME)
         console_handler.setFormatter(fmt)
@@ -65,11 +69,15 @@ def setup_file_logging(
     if not path:
         return  # file logging disabled (empty/whitespace path)
 
-    if any(getattr(h, "name", None) == _FILE_HANDLER_NAME for h in root.handlers):
+    if _has_handler(root, _FILE_HANDLER_NAME):
         return  # file handler already installed
 
-    max_bytes = _int_env("SW_LOG_MAX_BYTES", _DEFAULT_MAX_BYTES) if read_env else _DEFAULT_MAX_BYTES
-    backups = _int_env("SW_LOG_BACKUP_COUNT", _DEFAULT_BACKUP_COUNT) if read_env else _DEFAULT_BACKUP_COUNT
+    if read_env:
+        max_bytes = _int_env("SW_LOG_MAX_BYTES", _DEFAULT_MAX_BYTES)
+        backups = _int_env("SW_LOG_BACKUP_COUNT", _DEFAULT_BACKUP_COUNT)
+    else:
+        max_bytes = _DEFAULT_MAX_BYTES
+        backups = _DEFAULT_BACKUP_COUNT
 
     try:
         parent = os.path.dirname(path) or "."
