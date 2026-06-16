@@ -47,9 +47,9 @@ def setup_file_logging(
     if log_file is None and read_env:
         log_file = os.environ.get("SW_LOG_FILE")
     path = default_path if log_file is None else log_file
-    path = os.path.expanduser(os.path.expandvars(path))
+    path = os.path.expanduser(os.path.expandvars(path)).strip()
     if not path:
-        return  # explicitly disabled
+        return  # explicitly disabled (empty or whitespace-only)
 
     max_bytes = _int_env("SW_LOG_MAX_BYTES", _DEFAULT_MAX_BYTES) if read_env else _DEFAULT_MAX_BYTES
     backups = _int_env("SW_LOG_BACKUP_COUNT", _DEFAULT_BACKUP_COUNT) if read_env else _DEFAULT_BACKUP_COUNT

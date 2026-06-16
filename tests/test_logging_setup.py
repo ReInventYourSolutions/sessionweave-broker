@@ -70,3 +70,11 @@ def test_idempotent(tmp_path):
     setup_file_logging("broker", default_path=target)
     handlers = [h for h in logging.getLogger().handlers if getattr(h, "name", None) == "sw_file_log"]
     assert len(handlers) == 1
+
+
+def test_oserror_degrades_gracefully(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a directory")
+    # parent of the log path is a regular file -> makedirs raises OSError
+    setup_file_logging("broker", default_path=str(blocker / "sub" / "broker.log"))
+    assert _file_handler() is None
