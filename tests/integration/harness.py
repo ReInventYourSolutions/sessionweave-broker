@@ -54,8 +54,14 @@ async def relay_subprocess(
     )
     base = f"http://127.0.0.1:{port}"
     try:
-        # Wait for /healthz to come up, max ~5s
-        for _ in range(50):
+        # Wait for /healthz to come up. Generous cap (~30s): the relay
+        # subprocess imports a heavy dependency tree (starlette/uvicorn/mcp/
+        # aiosqlite) and binds a port before it's healthy; on a loaded CI box
+        # (the full integration suite spawns many relays in parallel) a 5s cap
+        # spuriously trips "relay did not become healthy". The loop returns the
+        # instant /healthz answers 200, so a high cap costs nothing in the
+        # common case — it only adds patience under load.
+        for _ in range(150):
             try:
                 async with httpx.AsyncClient(timeout=1) as c:
                     r = await c.get(f"{base}/healthz")
@@ -63,7 +69,7 @@ async def relay_subprocess(
                         break
             except Exception:
                 pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
         else:
             proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):
