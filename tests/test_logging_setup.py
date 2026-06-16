@@ -19,12 +19,12 @@ def _cleanup_sw_handlers():
                 h.close()
 
 
-def _file_handler(logger_name=""):
+def _file_handler(logger_name: str = "") -> logging.Handler | None:
     lg = logging.getLogger(logger_name)
     return next((h for h in lg.handlers if getattr(h, "name", None) == "sw_file_log"), None)
 
 
-def _console_handler(logger_name=""):
+def _console_handler(logger_name: str = "") -> logging.Handler | None:
     lg = logging.getLogger(logger_name)
     return next((h for h in lg.handlers if getattr(h, "name", None) == "sw_console"), None)
 
