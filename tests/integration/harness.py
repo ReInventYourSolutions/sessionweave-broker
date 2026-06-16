@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 from collections.abc import AsyncIterator
 
 import httpx
@@ -24,15 +25,19 @@ async def relay_subprocess(
 ) -> AsyncIterator[str]:
     """Spawn the relay as a subprocess on a free port and yield its base URL."""
     port = _free_port()
-    # Disable file logging in the test relay: the CLI defaults it on, but a
-    # synchronous RotatingFileHandler write per request throttles the event
-    # loop under high-volume stress tests (e.g. test_buffer_race) on slow CI
-    # disks, causing ReadTimeouts. Tests don't read the file; stderr is enough.
+    # Keep the test relay's file logging off (tests don't read it).
     env = {**os.environ, "SW_PORT": str(port), "SW_HOST": "127.0.0.1", "SW_LOG_FILE": ""}
     if persistence_db_path is not None:
         env["SW_PERSISTENCE_DB_PATH"] = persistence_db_path
     if env_overrides:
         env.update(env_overrides)
+    # Capture the relay's stdout/stderr to temp FILES, not PIPEs. A PIPE has a
+    # fixed (~64KB) OS buffer; if it fills (the relay access-logs every request,
+    # and stress tests like test_buffer_race emit thousands of lines) and nothing
+    # drains it, the relay's logging write() blocks, freezing its event loop and
+    # hanging all requests → ReadTimeout. Files have no such limit.
+    out_f = tempfile.TemporaryFile()
+    err_f = tempfile.TemporaryFile()
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -44,8 +49,8 @@ async def relay_subprocess(
             str(port),
         ],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=out_f,
+        stderr=err_f,
     )
     base = f"http://127.0.0.1:{port}"
     try:
@@ -60,9 +65,14 @@ async def relay_subprocess(
                 pass
             await asyncio.sleep(0.1)
         else:
-            stdout, stderr = proc.communicate(timeout=2)
+            proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
+            out_f.seek(0)
+            err_f.seek(0)
             raise RuntimeError(
-                f"relay did not become healthy. stdout={stdout!r} stderr={stderr!r}"
+                f"relay did not become healthy. "
+                f"stdout={out_f.read()!r} stderr={err_f.read()!r}"
             )
         yield base
     finally:
@@ -71,3 +81,5 @@ async def relay_subprocess(
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        out_f.close()
+        err_f.close()
