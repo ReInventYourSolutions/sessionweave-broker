@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 import uvicorn
 
+from sessionweave.access_log_filter import AccessLogNoiseFilter
 from sessionweave.logging_setup import setup_file_logging
 from sessionweave.server import build_app
 
@@ -48,6 +50,7 @@ def cli() -> None:
         log_file=args.log_file,
         console=True,
     )
+    logging.getLogger("uvicorn.access").addFilter(AccessLogNoiseFilter())
     if args.persistence_db_path is not None:
         os.environ["SW_PERSISTENCE_DB_PATH"] = args.persistence_db_path
     uvicorn.run(
