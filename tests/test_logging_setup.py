@@ -1,4 +1,5 @@
 import logging
+
 import pytest
 
 from sessionweave.logging_setup import setup_file_logging
