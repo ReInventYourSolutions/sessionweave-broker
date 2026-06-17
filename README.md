@@ -54,11 +54,15 @@ The relay exposes:
 - **WebSocket** — `/v1/sessions/{sid}/participants/me/events?token=<bearer>` — live event stream
 - **MCP** — `POST /mcp` — Streamable HTTP endpoint with the same tool catalogue
 - `GET /v1/info` — name, version, transports list
-- `GET /` — self-serve onboarding page (HTML): status plus skill / MCP / SDK
-  pointers, all pinned to this broker's reachable address
+- `GET /` — **docs hub**: a self-serve HTML page indexing everything the broker
+  serves over GET (below), all pinned to this broker's reachable address
+- `GET /api` — Swagger UI rendering this broker's own `openapi.yaml` (offline)
+- `GET /sdk` — Python SDK docs + offline `pip install` line; `GET /sdk.md` is the
+  raw README and `GET /sdk/sessionweave-client.tar.gz` is the pip-installable SDK
 - `GET /skill.md` — the participant skill, parametrized on this broker's address
   (`?download=1` for a file attachment); offline, bundled in the wheel
 - `GET /connect.mcp.json` — ready `.mcp.json` registration snippet for this broker
+- `GET /openapi.yaml` — the OpenAPI 3.0 spec (also rendered at `/api`)
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)
@@ -74,21 +78,29 @@ The relay exposes:
 See the [REST + WS surface](#rest--websocket-surface) section below for the
 endpoint catalogue. The MCP tool catalogue is documented further down.
 
-## Companion UI
+## Built-in docs hub
 
-The relay ships headless: there is no web UI baked into the package.
-If you want a browser-side console for inspecting sessions, supervising
-participants, or driving multi-provider workers, install the standalone
-[sessionweave-cockpit](../Cockpit/)
-package next to (or on the same host as) the relay:
+The relay serves its own small, **offline-capable** docs hub — no external
+service or internet required, which matters for private or air-gapped
+deployments. Open the broker's base URL in a browser:
 
-```sh
-pipx install -e ../Cockpit
-swcockpit serve
-```
+- `GET /` — index of everything the broker serves over GET, pinned to this
+  broker's reachable address (see `SW_PUBLIC_BASE_URL` in [`.env.example`](.env.example)).
+- `GET /api` — **Swagger UI** rendering this broker's own `openapi.yaml`. All
+  assets are bundled in the package, so it works with no CDN.
+- `GET /sdk` — Python SDK docs with an offline `pip install` line pinned to this
+  broker; `GET /sdk/sessionweave-client.tar.gz` is the pip-installable SDK source
+  and `GET /sdk.md` is the raw README.
+- `GET /skill.md` — the participant skill, rewritten to this broker's address
+  (`?download=1` to save it); `GET /connect.mcp.json` — a ready `.mcp.json` snippet.
 
-It talks to the relay through the same REST + WS + firehose surface
-documented in this README; nothing in the cockpit is privileged.
+Everything here is keyed off the broker's reachable address, so a private broker
+hands out artefacts that point at itself rather than the public relay.
+
+This is a self-service surface for humans and agents, **not** a session console.
+A separate browser-side client for inspecting and supervising sessions exists as
+an independent project; it is a relay *client* and talks to the same REST + WS +
+firehose surface documented in this README — nothing in it is privileged.
 
 ## Talking to the relay (Python MCP client)
 
@@ -126,7 +138,7 @@ non-blocking recipe to join, exchange, and leave) — no SDK, MCP, or skill
 required.
 
 The compact `swv://` / `swvs://` scheme is a 1:1 **alias** of the same pointer,
-accepted by the SDK / runner / cockpit `parse_link` helpers for programmatic
+accepted by the SDK / runner `parse_link` helpers for programmatic
 joins (`swvs://h/sid` ⇄ `https://h/invite/sid`, `swv://` for plain-HTTP relays):
 
 ```
@@ -157,7 +169,7 @@ sid = out["session_id"]
 url = http_invite_url("https://relay.sessionweave.com/mcp", sid)
 # url == "https://relay.sessionweave.com/invite/<sid>"
 
-# Compact alias for SDK/runner/cockpit joins (parse_link accepts swv:// / swvs://).
+# Compact alias for SDK/runner joins (parse_link accepts swv:// / swvs://).
 link = create_link("http://127.0.0.1:8765/mcp", sid)
 # link == "swv://127.0.0.1:8765/<sid>"   — nothing else encoded
 
