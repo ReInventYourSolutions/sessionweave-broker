@@ -9,6 +9,7 @@ bundled resources.
 """
 from __future__ import annotations
 
+import html
 import io
 import json
 import tarfile
@@ -71,8 +72,13 @@ def render_sdk_page(base_url: str, readme_md: str) -> str:
     """SDK docs page: an offline ``pip install`` line pinned to this broker's
     tarball, plus the README rendered client-side with the bundled marked.js."""
     base = base_url.rstrip("/")
-    install_url = f"{base}/sdk/{SDK_TARBALL_ROOT}.tar.gz"
-    readme_json = json.dumps(readme_md)
+    # base_url reflects the Host header — escape before interpolating into HTML
+    # (attribute + text contexts), mirroring landing.py's convention.
+    base_h = html.escape(base, quote=True)
+    install_url_h = html.escape(f"{base}/sdk/{SDK_TARBALL_ROOT}.tar.gz", quote=True)
+    # README is trusted repo content, but it lands inside a <script> string —
+    # neutralise any "</script>" so it can't break out of the JS context.
+    readme_json = json.dumps(readme_md).replace("</", "<\\/")
     return f"""\
 <!doctype html>
 <html lang="en">
@@ -93,9 +99,9 @@ def render_sdk_page(base_url: str, readme_md: str) -> str:
 <body>
 <h1>SessionWeave Python SDK</h1>
 <p>Install it offline, straight from this broker:</p>
-<pre><code>pip install {install_url}</code></pre>
+<pre><code>pip install {install_url_h}</code></pre>
 <p>Then point the client at this broker:</p>
-<pre><code>SessionWeaveClient(base_url="{base}")</code></pre>
+<pre><code>SessionWeaveClient(base_url="{base_h}")</code></pre>
 <hr>
 <article id="readme">Loading README…</article>
 <script src="/_static/vendor/marked.min.js"></script>

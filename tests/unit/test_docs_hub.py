@@ -36,6 +36,21 @@ def test_render_sdk_page_pins_install_to_broker_and_embeds_readme() -> None:
     assert "jsdelivr" not in html
 
 
+def test_render_sdk_page_escapes_malicious_base_url() -> None:
+    # base_url reflects the Host header; a crafted host must not break out of
+    # the HTML attribute / text context (reflected XSS).
+    evil = 'https://x"/><script>alert(1)</script>'
+    html = render_sdk_page(evil, "# readme")
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_render_sdk_page_readme_cannot_break_out_of_script() -> None:
+    html = render_sdk_page(BASE, "stuff </script><script>alert(1)</script>")
+    # the closing tag from the README must be neutralised inside the JS string
+    assert "</script><script>alert(1)" not in html
+
+
 def test_build_sdk_tarball_is_a_valid_pip_installable_archive() -> None:
     blob = build_sdk_tarball()
     tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
