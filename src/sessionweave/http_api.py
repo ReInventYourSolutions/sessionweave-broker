@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from sessionweave.connections import ConnectionManager
@@ -214,6 +214,19 @@ def _public_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def _effective_upgrades(request: Request, base: str) -> Any:
+    """Brief upgrade pointers with empty (unconfigured) fields defaulted to the
+    broker's own native onboarding routes. Operator-set env values still win."""
+    from sessionweave.brief import BriefUpgrades
+
+    configured = request.app.state.brief_upgrades
+    return BriefUpgrades(
+        skill_url=configured.skill_url or f"{base}/skill.md",
+        mcp_snippet_url=configured.mcp_snippet_url or f"{base}/connect.mcp.json",
+        runner_install_url=configured.runner_install_url,
+    )
+
+
 async def invite_brief(request: Request) -> Response:
     sid = request.path_params["sid"]
     try:
@@ -221,13 +234,62 @@ async def invite_brief(request: Request) -> Response:
     except ToolError as exc:
         return _error_response(exc)
     from sessionweave.brief import render_brief
+    base = _public_base_url(request)
     md = render_brief(
-        base_url=_public_base_url(request),
+        base_url=base,
         session_id=sid,
         purpose=info.get("purpose"),
-        upgrades=request.app.state.brief_upgrades,
+        upgrades=_effective_upgrades(request, base),
     )
     return Response(md, media_type="text/markdown; charset=utf-8")
+
+
+async def serve_skill(request: Request) -> Response:
+    """The participant skill, parametrized on this broker's reachable address.
+
+    ``?download=1`` returns it as a file attachment rather than inline.
+    """
+    from sessionweave.skill_serve import load_canonical_skill, render_skill
+
+    try:
+        canonical = load_canonical_skill()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return Response(
+            "skill resource missing from this broker build",
+            status_code=500,
+            media_type="text/plain; charset=utf-8",
+        )
+    md = render_skill(canonical, _public_base_url(request))
+    headers = {}
+    if request.query_params.get("download"):
+        headers["content-disposition"] = (
+            'attachment; filename="sessionweave-participant.md"'
+        )
+    return Response(md, media_type="text/markdown; charset=utf-8", headers=headers)
+
+
+async def serve_mcp_snippet(request: Request) -> JSONResponse:
+    """A ready-to-paste ``.mcp.json`` registration snippet for this broker."""
+    from sessionweave.skill_serve import render_mcp_snippet
+
+    return JSONResponse(render_mcp_snippet(_public_base_url(request)))
+
+
+async def landing(request: Request) -> HTMLResponse:
+    """Self-serve onboarding page: status + skill / MCP / SDK pointers, all
+    keyed off the broker's reachable address."""
+    from sessionweave import __version__
+    from sessionweave.landing import render_landing
+
+    relay_epoch = getattr(
+        getattr(request.app.state, "tool_deps", None), "relay_epoch", 0
+    )
+    html = render_landing(
+        base_url=_public_base_url(request),
+        version=__version__,
+        relay_epoch=relay_epoch,
+    )
+    return HTMLResponse(html)
 
 
 async def get_session(request: Request) -> JSONResponse:
@@ -726,6 +788,9 @@ async def _delete_session_handler(request: Request) -> Response:
 def routes() -> list[Route]:
     """Return the list of `/v1/...` routes to mount on the main app."""
     return [
+        Route("/", landing, methods=["GET"]),
+        Route("/skill.md", serve_skill, methods=["GET"]),
+        Route("/connect.mcp.json", serve_mcp_snippet, methods=["GET"]),
         Route("/invite/{sid}", invite_brief, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),

@@ -54,6 +54,11 @@ The relay exposes:
 - **WebSocket** — `/v1/sessions/{sid}/participants/me/events?token=<bearer>` — live event stream
 - **MCP** — `POST /mcp` — Streamable HTTP endpoint with the same tool catalogue
 - `GET /v1/info` — name, version, transports list
+- `GET /` — self-serve onboarding page (HTML): status plus skill / MCP / SDK
+  pointers, all pinned to this broker's reachable address
+- `GET /skill.md` — the participant skill, parametrized on this broker's address
+  (`?download=1` for a file attachment); offline, bundled in the wheel
+- `GET /connect.mcp.json` — ready `.mcp.json` registration snippet for this broker
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)

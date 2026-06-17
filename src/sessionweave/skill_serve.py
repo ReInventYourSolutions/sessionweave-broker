@@ -1,0 +1,73 @@
+"""Serve the participant skill and MCP snippet parametrized on the broker's
+own reachability address.
+
+Pure functions only (no I/O) for ``render_skill`` / ``render_mcp_snippet`` so
+they are trivially testable; ``load_canonical_skill`` reads the bundled skill
+shipped as package data.
+
+The canonical skill hardcodes the public relay host ``relay.sessionweave.com``.
+A private broker rewrites every occurrence to its own ``host[:port]``, adjusting
+the scheme families (``https``/``wss``/``swvs`` → ``http``/``ws``/``swv``) when
+the broker is plain-HTTP, so copy-paste examples work against the private host.
+"""
+from __future__ import annotations
+
+from importlib import resources
+from typing import Any
+from urllib.parse import urlparse
+
+#: The host token the canonical skill hardcodes.
+CANONICAL_HOST = "relay.sessionweave.com"
+
+
+def render_skill(canonical_md: str, base_url: str) -> str:
+    """Rewrite the canonical skill so every relay reference names ``base_url``.
+
+    Scheme-qualified forms are replaced before the bare host so the bare-host
+    pass only mops up leftover prose mentions. When ``base_url`` already names
+    the public relay the result equals ``canonical_md`` (every replacement is a
+    no-op).
+    """
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc
+    if not netloc:
+        raise ValueError(f"base_url missing host: {base_url!r}")
+
+    tls = scheme == "https"
+    ws_scheme = "wss" if tls else "ws"
+    swv_scheme = "swvs" if tls else "swv"
+
+    # Ordered: scheme-qualified first, bare host last.
+    replacements = [
+        (f"https://{CANONICAL_HOST}", f"{scheme}://{netloc}"),
+        (f"wss://{CANONICAL_HOST}", f"{ws_scheme}://{netloc}"),
+        (f"swvs://{CANONICAL_HOST}", f"{swv_scheme}://{netloc}"),
+        (CANONICAL_HOST, netloc),
+    ]
+    out = canonical_md
+    for old, new in replacements:
+        out = out.replace(old, new)
+    return out
+
+
+def render_mcp_snippet(base_url: str) -> dict[str, Any]:
+    """Return a ready ``.mcp.json`` registration snippet for this broker."""
+    base = base_url.rstrip("/")
+    return {
+        "mcpServers": {
+            "sessionweave": {
+                "type": "http",
+                "url": f"{base}/mcp",
+            }
+        }
+    }
+
+
+def load_canonical_skill() -> str:
+    """Read the canonical participant skill bundled as package data."""
+    return (
+        resources.files("sessionweave")
+        .joinpath("_data/skill.md")
+        .read_text(encoding="utf-8")
+    )
