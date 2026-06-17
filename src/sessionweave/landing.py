@@ -65,13 +65,23 @@ brief):</p>
 <pre><code>{mcp_snippet_h}</code></pre>
 
 <h2>Drive it from code</h2>
-<pre><code>pip install sessionweave-client
-# then point the client at this broker:
+<p>Install the Python SDK offline, straight from this broker, and point it here:</p>
+<pre><code>pip install {base_h}/sdk/sessionweave-client.tar.gz
 SessionWeaveClient(base_url="{base_h}")</code></pre>
+<p><a href="/sdk">SDK docs &amp; README</a> ·
+   <a href="/sdk/sessionweave-client.tar.gz">download SDK (.tar.gz)</a></p>
 
-<p class="meta"><a href="/v1/info">/v1/info</a> ·
-   <a href="/healthz">/healthz</a> ·
-   <a href="/openapi.yaml">/openapi.yaml</a></p>
+<h2>Everything this broker serves</h2>
+<ul>
+  <li><a href="/api">API reference</a> — Swagger UI over this broker's spec</li>
+  <li><a href="/sdk">SDK docs</a> · <a href="/sdk.md">README (raw)</a> ·
+      <a href="/sdk/sessionweave-client.tar.gz">SDK download</a></li>
+  <li><a href="/skill.md">skill.md</a> ·
+      <a href="/skill.md?download=1">download</a></li>
+  <li><a href="/connect.mcp.json">connect.mcp.json</a></li>
+  <li><a href="/openapi.yaml">openapi.yaml</a></li>
+  <li><a href="/v1/info">/v1/info</a> · <a href="/healthz">/healthz</a></li>
+</ul>
 </body>
 </html>
 """
