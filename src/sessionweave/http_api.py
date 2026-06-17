@@ -275,6 +275,73 @@ async def serve_mcp_snippet(request: Request) -> JSONResponse:
     return JSONResponse(render_mcp_snippet(_public_base_url(request)))
 
 
+async def serve_api_docs(request: Request) -> HTMLResponse:
+    """Swagger UI over this broker's own openapi.yaml, fully offline."""
+    from sessionweave.docs_hub import render_api_page
+
+    return HTMLResponse(render_api_page())
+
+
+async def serve_sdk_docs(request: Request) -> Response:
+    """SDK docs page: offline pip-install line + rendered README."""
+    from sessionweave.docs_hub import load_sdk_readme, render_sdk_page
+
+    try:
+        readme = load_sdk_readme()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return Response(
+            "SDK docs missing from this broker build",
+            status_code=500,
+            media_type="text/plain; charset=utf-8",
+        )
+    return HTMLResponse(render_sdk_page(_public_base_url(request), readme))
+
+
+async def serve_sdk_readme(request: Request) -> Response:
+    """Raw SDK README (markdown), consistent with /skill.md."""
+    from sessionweave.docs_hub import load_sdk_readme
+
+    try:
+        readme = load_sdk_readme()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return Response("not found", status_code=500, media_type="text/plain")
+    return Response(readme, media_type="text/markdown; charset=utf-8")
+
+
+async def serve_sdk_tarball(request: Request) -> Response:
+    """Pip-installable .tar.gz of the vendored SDK source."""
+    from sessionweave.docs_hub import SDK_TARBALL_ROOT, build_sdk_tarball
+
+    try:
+        blob = build_sdk_tarball()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return Response(
+            "SDK source missing from this broker build",
+            status_code=500,
+            media_type="text/plain; charset=utf-8",
+        )
+    return Response(
+        blob,
+        media_type="application/gzip",
+        headers={
+            "content-disposition": (
+                f'attachment; filename="{SDK_TARBALL_ROOT}.tar.gz"'
+            )
+        },
+    )
+
+
+async def serve_static(request: Request) -> Response:
+    """Bundled static assets (Swagger UI, markdown renderer) under /_static."""
+    from sessionweave.docs_hub import static_asset
+
+    try:
+        body, ctype = static_asset(request.path_params["asset"])
+    except (FileNotFoundError, PermissionError, ValueError):
+        return Response("not found", status_code=404, media_type="text/plain")
+    return Response(body, media_type=ctype)
+
+
 async def landing(request: Request) -> HTMLResponse:
     """Self-serve onboarding page: status + skill / MCP / SDK pointers, all
     keyed off the broker's reachable address."""
@@ -791,6 +858,11 @@ def routes() -> list[Route]:
         Route("/", landing, methods=["GET"]),
         Route("/skill.md", serve_skill, methods=["GET"]),
         Route("/connect.mcp.json", serve_mcp_snippet, methods=["GET"]),
+        Route("/api", serve_api_docs, methods=["GET"]),
+        Route("/sdk", serve_sdk_docs, methods=["GET"]),
+        Route("/sdk.md", serve_sdk_readme, methods=["GET"]),
+        Route("/sdk/sessionweave-client.tar.gz", serve_sdk_tarball, methods=["GET"]),
+        Route("/_static/{asset:path}", serve_static, methods=["GET"]),
         Route("/invite/{sid}", invite_brief, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{sid}", get_session, methods=["GET"]),

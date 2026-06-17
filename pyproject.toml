@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sessionweave"
-version = "0.24.0"
+version = "0.25.0"
 description = "MCP-native session relay for multi-agent collaboration"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -47,6 +47,9 @@ artifacts = ["src/sessionweave/persistence_migrations/*.sql"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vendored data shipped as package assets (SDK source, web assets) — not the
+# broker's own code; don't lint/format it.
+extend-exclude = ["src/sessionweave/_data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF", "N"]
@@ -55,6 +58,8 @@ select = ["E", "F", "I", "B", "UP", "RUF", "N"]
 python_version = "3.12"
 strict = true
 mypy_path = "src"
+# Vendored SDK source under _data/ is shipped as data, not type-checked here.
+exclude = ["src/sessionweave/_data/"]
 namespace_packages = true
 explicit_package_bases = true
 
