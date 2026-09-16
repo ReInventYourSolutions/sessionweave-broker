@@ -215,6 +215,18 @@ class Session:
                 next_seq=p.get("last_seen_seq", 0),
                 last_acked_seq=p.get("last_seen_seq", 0),
             )
+        if metrics is not None and sess._participants:
+            # Cold -> hot: balance the dec() ``release_participant_metrics``
+            # issued when this session left RAM. Restored participants are
+            # always offline (their transport died with the eviction), so
+            # they all land on the ``online="false"`` series; ``resume``
+            # moves each one across as it re-attaches. Without this inc()
+            # that resume dec()s a series it never inc()d, driving the
+            # offline count negative and inventing a phantom online
+            # participant.
+            metrics.participants_active.labels(online="false").inc(
+                len(sess._participants)
+            )
         # Inflight
         for cid, tracker_d in snap.inflight.items():
             sess._inflight[cid] = CommandTracker.from_snapshot(tracker_d)
@@ -1664,6 +1676,29 @@ class Session:
         socket close shortly after; new attaches will work normally.
         """
         self._subscribers.clear()
+
+    def release_participant_metrics(self) -> None:
+        """Drop the ``participants_active`` accounting for this session's
+        participants without ending them.
+
+        Called on hot -> cold eviction, where the ``Session`` object is
+        discarded but the DB rows survive so the participants can resume
+        after a later hydration. The gauge counts participants of
+        *resident* sessions, so it must not keep counting a session that
+        is no longer in RAM — otherwise every evicted session strands its
+        participants as permanently "online" and the relay reports live
+        participants for sessions that no longer exist.
+
+        ``Session.from_snapshot`` re-accounts for them on the way back in.
+        Not idempotent: call it exactly once, on the eviction that drops
+        the object. It deliberately leaves ``_participants`` intact —
+        the whole ``Session`` is discarded by the caller.
+        """
+        if self._metrics is None:
+            return
+        for p in self._participants.values():
+            online_label = "true" if p.online else "false"
+            self._metrics.participants_active.labels(online=online_label).dec()
 
     def cancel_all_wait_for_event(self) -> None:
         """Best-effort: clear any pending wait_for_event state so callers
