@@ -10,7 +10,11 @@ requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 readme = "README.md"
 dependencies = [
-    "mcp>=1.0",
+    # Upper bound: mcp 2.x is a breaking major (FastMCP -> MCPServer in
+    # mcp.server.mcpserver, streamablehttp_client -> streamable_http_client,
+    # ServerNotification no longer callable). Migrating is tracked separately;
+    # until then this bound keeps a clean `pip install` reproducible.
+    "mcp>=1.0,<2",
     "starlette>=0.37,<1.0",
     "uvicorn>=0.30",
     "websockets>=12.0",
