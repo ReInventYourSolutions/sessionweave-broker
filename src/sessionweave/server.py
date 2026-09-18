@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -74,6 +75,31 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
+_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[dict[str, Any]]])
+
+_SERVER_INSTRUCTIONS = """SessionWeave relays messages between agents inside named sessions. The
+relay brokers; it holds no agent's history.
+
+Two rules govern every tool here.
+
+1. One MCP connection is in at most one session at a time. session_join
+   (or session_resume) binds this connection to a session; session_leave
+   unbinds it. A second join on the same connection returns
+   already_in_session — leave first to move elsewhere. To be in two
+   sessions at once you need two MCP connections, or the HTTP API, which
+   has no such limit.
+
+2. Because the connection *is* the session context, most tools take no
+   session_id. They act on the session this connection joined and return
+   not_in_session until session_join has run.
+
+The usual order: session_describe to look without committing,
+session_join to bind, then session_send / session_respond and
+session_wait_for_event to do the work, then session_leave. Open a new
+session with session_create, which returns a one-time creator_token that
+session_delete later requires."""
+
+
 def _build_fastmcp(
     deps: ToolDeps,
     handles: HandleRegistry,
@@ -82,11 +108,27 @@ def _build_fastmcp(
 ) -> FastMCP:
     mcp = FastMCP(
         "sessionweave",
+        instructions=_SERVER_INSTRUCTIONS,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=_allowed_hosts(),
         ),
     )
+
+    def _tool(name: str) -> Callable[[_ToolFn], _ToolFn]:
+        """Register a tool, using its docstring — dedented — as the description.
+
+        FastMCP takes ``fn.__doc__`` verbatim (``description or fn.__doc__
+        or ""``), so an indented docstring reaches the client with the
+        source indentation baked in. Cleaning it here keeps the docstrings
+        readable in this file and flush left on the wire.
+        """
+
+        def deco(fn: _ToolFn) -> _ToolFn:
+            mcp.tool(name=name, description=inspect.cleandoc(fn.__doc__ or ""))(fn)
+            return fn
+
+        return deco
 
     def _handle_for(ctx: Context) -> Any:
         return handles.for_session(
@@ -95,35 +137,59 @@ def _build_fastmcp(
             registry=registry,
         )
 
-    @mcp.tool(name="session_create")
+    @_tool("session_create")
     async def session_create_tool(
         config: dict[str, Any] | None = None,
         purpose: dict[str, Any] | None = None,
         persistence: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Open a new session and return its session_id plus a one-time creator_token.
+
+    Save the creator_token: it is returned exactly once, nothing can
+    recover it, and session_delete requires it. Creating a session does
+    not put you in it — call session_join next.
+
+    persistence is opt-in. Omit it and the session lives in RAM only and
+    is discarded once it goes idle, so nothing touches disk. Pass
+    {"mode": "ttl", "ttl_seconds": N} or {"mode": "until_deleted"} to
+    persist the roster, command timeline and buffered events.
+
+    purpose is free-form JSON echoed to everyone who joins, so a joiner
+    can act without a separate briefing.
+    """
         return await session_create(
             deps, {"config": config, "purpose": purpose, "persistence": persistence}
         )
 
-    @mcp.tool(name="session_describe")
+    @_tool("session_describe")
     async def session_describe_tool(
         session_id: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Read-only snapshot of a session: config, purpose, roster, persistence state.
+
+    Allocates no participant and does not bind this connection, so it is
+    the safe pre-flight before deciding whether to join.
+    """
         return await session_describe(deps, {"session_id": session_id})
 
-    @mcp.tool(name="session_update_purpose")
+    @_tool("session_update_purpose")
     async def session_update_purpose_tool(
         purpose: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Replace the purpose of the session this connection joined, or clear it.
+
+    Pass nothing to clear. Broadcasts session.purpose_updated to the
+    other participants. Requires session_join on this connection first.
+    """
         assert ctx is not None
         return await session_update_purpose(
             deps, _handle_for(ctx), {"purpose": purpose}
         )
 
-    @mcp.tool(name="session_join")
+    @_tool("session_join")
     async def session_join_tool(
         session_id: str,
         role: str | None = None,
@@ -133,6 +199,21 @@ def _build_fastmcp(
         delivery_mode: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Join a session as a new participant and bind this connection to it.
+
+    Returns your participant_id, the current roster, the session purpose
+    and relay_epoch — remember the epoch: a different value on a later
+    resume means the relay restarted underneath you.
+
+    One MCP connection is in at most one session at a time. A second join
+    returns already_in_session; call session_leave first to move
+    elsewhere.
+
+    delivery_mode is "push" (default — events arrive as MCP
+    notifications) or "pull" (events are buffered until you call
+    session_wait_for_event or session_check_inbox). Prefer "push" unless
+    your runtime cannot act on an incoming notification.
+    """
         assert ctx is not None
         payload: dict[str, Any] = {"session_id": session_id}
         if role is not None:
@@ -147,13 +228,24 @@ def _build_fastmcp(
             payload["delivery_mode"] = delivery_mode
         return await session_join(deps, _handle_for(ctx), payload)
 
-    @mcp.tool(name="session_resume")
+    @_tool("session_resume")
     async def session_resume_tool(
         session_id: str,
         participant_id: str,
         last_acked_seq: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Re-attach to a session you already joined, keeping the same participant_id.
+
+    Use this after a disconnect rather than joining again, which would
+    make you a second participant. Buffered events are replayed; pass
+    last_acked_seq to skip the ones you already handled. Compare the
+    returned relay_epoch against the one from your join — a different
+    value means the relay restarted.
+
+    Binds this connection just as session_join does, so it returns
+    already_in_session if this connection is already in a session.
+    """
         assert ctx is not None
         return await session_resume(
             deps,
@@ -165,16 +257,23 @@ def _build_fastmcp(
             },
         )
 
-    @mcp.tool(name="session_leave")
+    @_tool("session_leave")
     async def session_leave_tool(
         feedback: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Leave the session this connection joined and unbind the connection.
+
+    After leaving, this connection is free to join another session.
+    Broadcasts participant.left to the others; the optional feedback
+    object travels with that event as a close-out note. Requires
+    session_join on this connection first.
+    """
         assert ctx is not None
         body = {"feedback": feedback} if feedback is not None else None
         return await session_leave(deps, _handle_for(ctx), body)
 
-    @mcp.tool(name="session_update_self")
+    @_tool("session_update_self")
     async def session_update_self_tool(
         role: str | None = None,
         objective: str | None = None,
@@ -182,6 +281,13 @@ def _build_fastmcp(
         metadata: dict[str, Any] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Replace your own role, objective, capabilities or metadata.
+
+    Applies to the session this connection joined. Fields you omit stay
+    unchanged, but a field you do pass replaces its previous value
+    outright — lists are not merged. Requires session_join on this
+    connection first.
+    """
         assert ctx is not None
         payload: dict[str, Any] = {}
         if role is not None:
@@ -194,27 +300,50 @@ def _build_fastmcp(
             payload["metadata"] = metadata
         return await session_update_self(deps, _handle_for(ctx), payload)
 
-    @mcp.tool(name="session_list_participants")
+    @_tool("session_list_participants")
     async def session_list_participants_tool(
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Return the roster of the session this connection joined.
+
+    Each entry carries the participant's role, capabilities, objective
+    and whether it is currently online. Requires session_join on this
+    connection first.
+    """
         assert ctx is not None
         return await session_list_participants(deps, _handle_for(ctx))
 
-    @mcp.tool(name="session_check_inbox")
+    @_tool("session_check_inbox")
     async def session_check_inbox_tool(
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Drain the events buffered for you right now and return them, empty or not.
+
+    Returns immediately — use session_wait_for_event to block until
+    something arrives instead of polling this in a loop. Needed when you
+    joined with delivery_mode="pull"; push-mode participants receive
+    events as notifications instead. Requires session_join on this
+    connection first.
+    """
         assert ctx is not None
         return await session_check_inbox(deps, _handle_for(ctx))
 
-    @mcp.tool(name="session_wait_for_event")
+    @_tool("session_wait_for_event")
     async def session_wait_for_event_tool(
         session_id: str,
         names: list[str] | None = None,
         timeout_seconds: float = 60.0,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Block until at least one buffered event matches, then return every match.
+
+    The long-poll that keeps a turn alive without busy-polling
+    session_check_inbox. names filters by event name (for example
+    ["command.received"]); omit it to accept anything. A response with
+    timed_out=true means the budget elapsed with nothing matching — that
+    is normal, loop and call again. Requires session_join on this
+    connection first.
+    """
         assert ctx is not None
         body: dict[str, Any] = {
             "session_id": session_id,
@@ -224,7 +353,7 @@ def _build_fastmcp(
             body["names"] = names
         return await session_wait_for_event(deps, _handle_for(ctx), body)
 
-    @mcp.tool(name="session_send")
+    @_tool("session_send")
     async def session_send_tool(
         dispatch: str,
         target: dict[str, Any],
@@ -232,6 +361,25 @@ def _build_fastmcp(
         timeout_seconds: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Dispatch a command to other participants of the session this connection joined.
+
+    Returns as soon as the command reaches its recipients
+    ({command_id, delivered_to}). It does NOT wait for their answers:
+    results arrive later as result.received and command.completed events,
+    which you collect with session_wait_for_event or session_check_inbox.
+
+    dispatch chooses the recipients:
+      "specific" - requires target.participant_ids; exactly those.
+      "all"      - requires target.role or target.capability; every
+                   online match.
+      "any"      - requires target.role or target.capability; one match,
+                   picked round-robin.
+
+    payload is your free-form command body. Pass a stable command_id you
+    generate yourself to make retries idempotent — a repeat with the same
+    id returns the original dispatch's response instead of sending twice.
+    Requires session_join on this connection first.
+    """
         assert ctx is not None
         body: dict[str, Any] = {
             "dispatch": dispatch,
@@ -242,13 +390,19 @@ def _build_fastmcp(
             body["timeout_seconds"] = timeout_seconds
         return await session_send(deps, _handle_for(ctx), body)
 
-    @mcp.tool(name="session_respond")
+    @_tool("session_respond")
     async def session_respond_tool(
         command_id: str,
         payload: dict[str, Any],
         status: str = "ok",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
+        """Answer a command you received.
+
+    command_id comes from the command.received event that delivered the
+    command. status is "ok" or "error" (default "ok"); payload is your
+    free-form answer. Requires session_join on this connection first.
+    """
         assert ctx is not None
         return await session_respond(
             deps,
@@ -256,18 +410,24 @@ def _build_fastmcp(
             {"command_id": command_id, "payload": payload, "status": status},
         )
 
-    @mcp.tool(name="session_delete")
+    @_tool("session_delete")
     async def session_delete_tool(
         session_id: str,
         creator_token: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Delete a session. Requires the creator_token returned at create."""
+        """Delete a session permanently, for everyone in it.
+
+    Requires the creator_token returned once by session_create. Every
+    participant is disconnected with session.ended, and a persisted
+    session's stored timeline is removed. Needs no session_join, and
+    cannot be undone.
+    """
         return await session_delete(
             deps, {"session_id": session_id, "creator_token": creator_token}
         )
 
-    @mcp.tool(name="session_get_events")
+    @_tool("session_get_events")
     async def session_get_events_tool(
         session_id: str,
         after_seq: int | None = None,
@@ -278,7 +438,14 @@ def _build_fastmcp(
         order: str = "asc",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Browse the timeline of a persisted session without hydrating it."""
+        """Browse the timeline of a persisted session without bringing it back into RAM.
+
+    Returns paginated events plus session_state ("hot", "cold" or
+    "ended"). Page with after_seq / before_seq and limit; order is "asc"
+    (default) or "desc". Narrow with kind and participant_id. An
+    ephemeral session stores no timeline and returns no_history. Needs no
+    session_join.
+    """
         payload = {
             "session_id": session_id,
             "after_seq": after_seq,
