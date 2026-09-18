@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
@@ -62,14 +63,21 @@ class MCPConnectionHandle:
         session: ServerSession,
         requeue_callback: _RequeueCB | None = None,
     ) -> None:
-        self._session = session
+        # Held weakly, deliberately. The MCP layer owns the ServerSession
+        # for the life of the connection; a strong reference here (plus a
+        # registry entry that was never released) kept every connection the
+        # relay had ever served reachable for the life of the process. It
+        # also let ``HandleRegistry``'s address-keyed map hand a fresh
+        # connection a dead one's handle once entries were released.
+        self._session: weakref.ref[ServerSession] = weakref.ref(session)
         self._alive = True
         self._pending: set[asyncio.Task[None]] = set()
         self._requeue_callback = requeue_callback
 
     @property
-    def server_session(self) -> ServerSession:
-        return self._session
+    def server_session(self) -> ServerSession | None:
+        """The live ServerSession, or ``None`` once the connection is gone."""
+        return self._session()
 
     def send(
         self,
@@ -91,10 +99,17 @@ class MCPConnectionHandle:
     def is_alive(self) -> bool:
         if not self._alive:
             return False
+        session = self._session()
+        if session is None:
+            # The MCP layer released the connection and it has been
+            # collected. Latch it so the presence sweep can mark the
+            # participant offline.
+            self._alive = False
+            return False
         # The MCP transport closes ``_write_stream`` when the client
         # session ends (HTTP disconnect or session DELETE). Latch the
         # observation so subsequent checks short-circuit.
-        ws = getattr(self._session, "_write_stream", None)
+        ws = getattr(session, "_write_stream", None)
         if ws is not None and getattr(ws, "_closed", False):
             self._alive = False
             return False
@@ -124,8 +139,20 @@ class MCPConnectionHandle:
                 ),
             ),
         )
+        session = self._session()
+        if session is None:
+            # Connection collected between scheduling and running this
+            # coroutine. Same recovery as a failed send: requeue so the
+            # event survives for a later drain.
+            self._alive = False
+            if self._requeue_callback is not None:
+                try:
+                    await self._requeue_callback(name, payload, seq or 0)
+                except Exception as requeue_exc:  # pragma: no cover
+                    logger.debug("requeue failed for %s: %s", name, requeue_exc)
+            return
         try:
-            await self._session.send_notification(notif)
+            await session.send_notification(notif)
         except Exception as exc:
             logger.debug("dropping notification %s: %s", name, exc)
             self._alive = False
@@ -184,12 +211,35 @@ class _RequeueBridge:
 
 
 class HandleRegistry:
-    """Maps an ``id(ServerSession)`` to its stable ``MCPConnectionHandle``."""
+    """Maps each ``ServerSession`` to its stable ``MCPConnectionHandle``.
+
+    Keyed on the session *object*, weakly, so an entry disappears when the
+    MCP layer releases the connection. Two reasons it is not an
+    ``id(session)`` -> handle dict:
+
+    * nothing ever calls ``discard()``, so an ordinary dict grew without
+      bound — one entry per MCP connection ever served, for the life of
+      the process;
+    * addresses are reused. CPython hands a freshly allocated object the
+      address just freed, so once entries *are* released an address-keyed
+      map can return a dead connection's handle to a new connection —
+      which, if that handle is still bound in ``ConnectionManager``, would
+      hand the newcomer a participant identity it never joined as.
+
+    A ``WeakKeyDictionary`` only releases entries if the value does not
+    strongly reference the key, which is why ``MCPConnectionHandle`` holds
+    its ``ServerSession`` weakly too. The two halves only work together.
+    """
 
     __slots__ = ("_handles",)
 
     def __init__(self) -> None:
-        self._handles: dict[int, MCPConnectionHandle] = {}
+        self._handles: weakref.WeakKeyDictionary[
+            ServerSession, MCPConnectionHandle
+        ] = weakref.WeakKeyDictionary()
+
+    def __len__(self) -> int:
+        return len(self._handles)
 
     def for_session(
         self,
@@ -206,8 +256,7 @@ class HandleRegistry:
         the event is pushed back to the participant's buffer instead of being
         silently dropped (audit fix T1.2).
         """
-        key = id(session)
-        h = self._handles.get(key)
+        h = self._handles.get(session)
         if h is None:
             if connections is not None and registry is not None:
                 bridge = _RequeueBridge(connections, registry)
@@ -215,8 +264,14 @@ class HandleRegistry:
                 bridge.set_handle(h)
             else:
                 h = MCPConnectionHandle(session)
-            self._handles[key] = h
+            self._handles[session] = h
         return h
 
     def discard(self, session: ServerSession) -> MCPConnectionHandle | None:
-        return self._handles.pop(id(session), None)
+        """Drop the entry for *session* explicitly.
+
+        Entries release themselves when the connection is collected, so
+        this is only needed to force the issue (tests, or a caller that
+        knows a connection is finished before the GC notices).
+        """
+        return self._handles.pop(session, None)

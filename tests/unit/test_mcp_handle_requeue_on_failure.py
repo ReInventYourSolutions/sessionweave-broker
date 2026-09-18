@@ -6,6 +6,7 @@ TDD: test must FAIL before the fix (event silently dropped), and PASS after.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -38,10 +39,14 @@ def _make_failing_mcp_handle(requeue_callback: Any = None) -> MCPConnectionHandl
         def __init__(self, cb: Any) -> None:
             self._alive = True
             self._pending: set[asyncio.Task[None]] = set()
-            self._session = AsyncMock()
-            self._session.send_notification = AsyncMock(
+            # ``_session`` is a weakref on the real class, so the referent
+            # needs an owner for the duration of the test — that is all
+            # ``_referent`` is for.
+            self._referent = AsyncMock()
+            self._referent.send_notification = AsyncMock(
                 side_effect=RuntimeError("transport closed")
             )
+            self._session = weakref.ref(self._referent)
             self._requeue_callback = cb
 
     return _FailingMCPHandle(requeue_callback)
@@ -135,10 +140,10 @@ async def test_successful_send_does_not_requeue() -> None:
             self._pending: set[asyncio.Task[None]] = set()
             # Use a spec-less mock that does NOT have _write_stream so
             # is_alive() won't be tripped by the mock attribute inspection.
-            session_mock = AsyncMock()
-            del session_mock._write_stream  # ensure getattr returns None
-            session_mock.send_notification = AsyncMock(return_value=None)
-            self._session = session_mock
+            self._referent = AsyncMock()
+            del self._referent._write_stream  # ensure getattr returns None
+            self._referent.send_notification = AsyncMock(return_value=None)
+            self._session = weakref.ref(self._referent)
             self._requeue_callback = cb
 
     handle = _OKHandle(_cb)
