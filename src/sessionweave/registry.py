@@ -309,6 +309,7 @@ class SessionRegistry:
                         pass
                     sess.broadcast_to_subscribers("session.cold", {})
                     sess.close_all_subscribers()
+                    sess.release_participant_metrics()
                     self._sessions.pop(sid, None)
                     if self._metrics is not None:
                         self._metrics.session_cold_total.inc()
