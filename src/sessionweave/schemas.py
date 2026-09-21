@@ -258,7 +258,7 @@ class CommandCompletedNotification(_Strict):
     command_id: str
     received_count: int
     expected_count: int
-    reason: Literal["all_responded", "ttl_expired"]
+    reason: Literal["all_responded", "ttl_expired", "sender_gone", "no_recipients"]
 
 
 class CommandCancelledNotification(_Strict):

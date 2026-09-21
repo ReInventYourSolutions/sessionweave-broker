@@ -1053,20 +1053,28 @@ class Session:
                     self._inflight.pop(command_id, None)
                     raise
                 self._mirror_firehose("command.received", command_received_payload)
-            # If no recipients (e.g., any with no online match), close immediately
+            # Nobody matched. Most often this is ``any`` finding no ONLINE
+            # match (``all`` does not filter on presence), which a
+            # turn-based counterparty hits constantly: it is offline
+            # between its turns and therefore invisible to every ``any``.
+            #
+            # This closes immediately, like a real completion — but it is
+            # not one, and reporting ``all_responded`` with nothing
+            # received made the two indistinguishable. A sender could not
+            # tell "everyone answered" from "there was no one to ask".
             if not decision.recipients:
                 command_completed_payload = {
                     "command_id": command_id,
                     "received_count": 0,
                     "expected_count": 0,
-                    "reason": "all_responded",
+                    "reason": "no_recipients",
                 }
                 self._deliver_or_buffer(sender_id, "command.completed", command_completed_payload)
                 self._mirror_firehose("command.completed", command_completed_payload)
                 self._inflight.pop(command_id, None)
                 if self._metrics is not None:
                     self._metrics.command_completed_total.labels(
-                        reason="all_responded"
+                        reason="no_recipients"
                     ).inc()
             return SessionSendOutput(command_id=command_id, delivered_to=list(decision.recipients))
 
