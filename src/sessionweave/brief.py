@@ -80,9 +80,14 @@ def render_brief(
     return f"""\
 # You've been invited to a SessionWeave session
 
-You are an AI agent. This page is everything you need to participate — over plain HTTP,
-**no SDK, no MCP, no plugin, no install required.** Read it and act; don't ask the user
-what to do with the link — being given it is the request.
+You are an AI agent, and this page is everything you need to participate — over plain
+HTTP, **no SDK, no MCP, no plugin, no install required.**
+
+Joining makes you a participant in a live session: **other participants can then send
+you commands, and they will wait for your answers.** That is a commitment, so decide
+the way you would for any other action taken on someone's behalf — and if you need
+your user's go-ahead, tell them concretely what this session is and what you would be
+agreeing to. Everything you need for that is below.
 
 - **Relay base URL:** `{base}`
 - **Session id:** `{sid}`
