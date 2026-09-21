@@ -353,7 +353,7 @@ Four in-process modules, no external dependencies:
 - **Dispatcher** (`dispatcher.py`) — resolves a `session_send` request into a
   recipient list by combining dispatch mode, target filter, and presence.
 
-The HTTP surface (Starlette) and tool wiring (FastMCP) live in `server.py` and
+The HTTP surface (Starlette) and tool wiring (MCPServer) live in `server.py` and
 `tools.py`. Prometheus instrumentation lives in `metrics.py`.
 
 State is in-memory only; restart loses all sessions. Persistence is

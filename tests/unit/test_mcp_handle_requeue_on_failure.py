@@ -5,12 +5,10 @@ TDD: test must FAIL before the fix (event silently dropped), and PASS after.
 """
 from __future__ import annotations
 
-import asyncio
-import weakref
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
+from mcp.server.connection import Connection
 
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionManager
@@ -32,24 +30,39 @@ async def _build_session_with_participant(
     return sess, pid, cm
 
 
-def _make_failing_mcp_handle(requeue_callback: Any = None) -> MCPConnectionHandle:
-    """Build an MCPConnectionHandle whose _session.send_notification always raises."""
+class _Outbound:
+    """Minimal ``Outbound`` whose ``_closed`` flag we can flip.
 
-    class _FailingMCPHandle(MCPConnectionHandle):
-        def __init__(self, cb: Any) -> None:
-            self._alive = True
-            self._pending: set[asyncio.Task[None]] = set()
-            # ``_session`` is a weakref on the real class, so the referent
-            # needs an owner for the duration of the test — that is all
-            # ``_referent`` is for.
-            self._referent = AsyncMock()
-            self._referent.send_notification = AsyncMock(
-                side_effect=RuntimeError("transport closed")
-            )
-            self._session = weakref.ref(self._referent)
-            self._requeue_callback = cb
+    That flag is the 2.x stand-in for the 1.x "send raised" signal: the SDK
+    sets it when the read loop ends, and ``Connection.notify`` never raises,
+    so a dying connection is something the handle must *observe*, not catch.
+    """
 
-    return _FailingMCPHandle(requeue_callback)
+    def __init__(self) -> None:
+        self.notified: list[tuple[str, Any]] = []
+        self._closed = False
+
+    async def notify(self, method: str, params: Any, opts: Any = None) -> None:
+        self.notified.append((method, params))
+
+    async def send_raw_request(self, *a: Any, **k: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+
+def _make_failing_mcp_handle(
+    requeue_callback: Any = None,
+) -> tuple[MCPConnectionHandle, Connection]:
+    """A handle whose connection is already torn down on the wire.
+
+    The connection is returned so the caller keeps it alive — the handle
+    holds it weakly, and a collected connection would exercise a different
+    branch than the one under test.
+    """
+    outbound = _Outbound()
+    conn = Connection.for_loop(outbound, session_id="dead")
+    handle = MCPConnectionHandle(conn, requeue_callback=requeue_callback)
+    outbound._closed = True
+    return handle, conn
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +73,7 @@ def _make_failing_mcp_handle(requeue_callback: Any = None) -> MCPConnectionHandl
 @pytest.mark.asyncio
 async def test_dispatch_failure_does_not_raise() -> None:
     """_dispatch should swallow the transport error and mark the handle dead."""
-    handle = _make_failing_mcp_handle(requeue_callback=None)
+    handle, _conn = _make_failing_mcp_handle(requeue_callback=None)
     handle.send("test.event", {"x": 1})
     for task in list(handle._pending):
         await task
@@ -83,7 +96,7 @@ async def test_dispatch_failure_calls_requeue_callback() -> None:
     async def _cb(name: str, payload: dict[str, Any], seq: int) -> None:
         requeued.append((name, payload, seq))
 
-    handle = _make_failing_mcp_handle(requeue_callback=_cb)
+    handle, _conn = _make_failing_mcp_handle(requeue_callback=_cb)
     handle.send("test.event", {"x": 1}, seq=7)
     for task in list(handle._pending):
         await task
@@ -105,7 +118,7 @@ async def test_dispatch_failure_requeues_event_to_session_buffer() -> None:
     async def _requeue(name: str, payload: dict[str, Any], seq: int) -> None:
         await sess.requeue_to_buffer(pid, [(name, payload, seq)])
 
-    handle = _make_failing_mcp_handle(requeue_callback=_requeue)
+    handle, _conn = _make_failing_mcp_handle(requeue_callback=_requeue)
     cm.bind(handle, sess.session_id, pid)
 
     try:
@@ -131,22 +144,12 @@ async def test_successful_send_does_not_requeue() -> None:
     """A successful _dispatch must not invoke the requeue_callback."""
     requeued: list[Any] = []
 
-    async def _cb(name: str, payload: dict[str, Any]) -> None:
-        requeued.append((name, payload))
+    async def _cb(name: str, payload: dict[str, Any], seq: int) -> None:
+        requeued.append((name, payload, seq))
 
-    class _OKHandle(MCPConnectionHandle):
-        def __init__(self, cb: Any) -> None:
-            self._alive = True
-            self._pending: set[asyncio.Task[None]] = set()
-            # Use a spec-less mock that does NOT have _write_stream so
-            # is_alive() won't be tripped by the mock attribute inspection.
-            self._referent = AsyncMock()
-            del self._referent._write_stream  # ensure getattr returns None
-            self._referent.send_notification = AsyncMock(return_value=None)
-            self._session = weakref.ref(self._referent)
-            self._requeue_callback = cb
-
-    handle = _OKHandle(_cb)
+    outbound = _Outbound()
+    conn = Connection.for_loop(outbound, session_id="live")
+    handle = MCPConnectionHandle(conn, requeue_callback=_cb)
     handle.send("ok.event", {"y": 2})
     for task in list(handle._pending):
         await task

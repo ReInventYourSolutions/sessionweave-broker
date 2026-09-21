@@ -25,7 +25,7 @@ import sys
 from typing import Any
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from sessionweave.invite import parse_link
 
@@ -42,7 +42,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _unwrap(res: Any) -> Any:
-    sc = getattr(res, "structuredContent", None)
+    sc = res.structured_content
     if sc is None:
         if res.content:
             txt = getattr(res.content[0], "text", "")
@@ -57,14 +57,14 @@ def _unwrap(res: Any) -> Any:
 
 
 async def _describe(relay_url: str, session_id: str) -> dict[str, Any]:
-    async with streamablehttp_client(relay_url) as (r, w, _):
+    async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()
             res = await s.call_tool(
                 name="session_describe",
                 arguments={"session_id": session_id},
             )
-            if getattr(res, "isError", False):
+            if res.is_error:
                 raise RuntimeError(f"session_describe error: {_unwrap(res)}")
             out = _unwrap(res)
             if not isinstance(out, dict):
