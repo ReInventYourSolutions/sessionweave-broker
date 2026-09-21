@@ -854,7 +854,7 @@ that the relay evicts you with `participant.left` (`reason: offline_timeout`).
 |---|---|
 | REST / curl | Keep using the same `participant_token`. Re-attach the WebSocket, or call `inbox/drain` to collect what buffered. There is no REST resume call — your token *is* your continuity. |
 | SDK | Same: the `Participant` keeps working. Re-open `me.events()`, or `await me.drain_inbox()`. |
-| MCP | Call `session_resume {session_id, participant_id, last_acked_seq?}` on the new connection — then keep using that same connection. If your runtime opens a new one per tool call, resume buys you nothing: pass `session_id` + `participant_token` on each call instead ([§7.3](#if-your-runtime-opens-a-new-connection-per-tool-call)). |
+| MCP | Call `session_resume {session_id, participant_id, last_acked_seq?}` on the new connection — then keep using that same connection. If your runtime opens a new one per tool call, resume buys you nothing: pass `session_id` + `participant_token` on each call instead ([§7.3](#if-a-call-after-joining-says-not_in_session)). |
 
 **Never call join again to come back.** A second join makes you a **second
 participant**: the original stays in the roster until the grace expires,
@@ -947,6 +947,7 @@ Prevention is in [§2.4](#24-before-you-join-tool-permissions-mcp-runtimes) — 
 | Joining again to reconnect | Makes you a **second participant**. Reconnect per [§5.1](#51-disconnect-and-reconnect) instead. |
 | Ignoring `command.completed` | Only then are all responders in (or the deadline expired). Don't act on partial results unless you mean to. |
 | Calling tools without joining first | Returns `not_in_session`. Join (or resume) before send/respond. |
+| `not_in_session` on the call *right after* a successful join | Not your mistake: your runtime opened a new connection and the binding did not survive it. Pass `session_id` + `participant_token` on each call — [§7.3](#if-a-call-after-joining-says-not_in_session). |
 | Responding after `command.cancelled` | There is nothing to answer to. Stop the work. |
 | Treating an ephemeral session as durable | Ephemeral state is RAM only; a relay restart loses everything, and idle sessions expire after `idle_ttl_seconds` (default 30 min). Opt into persistence if that matters — [§6.6](#66-persistence-and-ownership). |
 | Client read timeout shorter than `timeout_seconds` | Every long-poll aborts with a `ReadTimeout` on your side (HTTP 499 on the relay). Set it to `timeout_seconds` + slack. |
@@ -1274,15 +1275,28 @@ would be dropped by the standard client validator. Unwrap `data._name` and
 returns `already_in_session`. To be in two sessions at once you need two
 connections — or use REST, which has no such limit.
 
-### If your runtime opens a new connection per tool call
+### If a call after joining says `not_in_session`
 
-Some do. `claude -p` is one (measured: a fresh TCP connection per call, no
-`Mcp-Session-Id`), and so is anything on the 2026-07-28 single-exchange
-protocol era. For those the connection cannot hold your identity: a
-binding does not outlive the call that created it, and `session_resume`
-does not help — it succeeds, and your *next* call is out of session again.
+**That is the signal.** You joined, the join returned a `participant_id`,
+and the next tool call says you are not in a session. Nothing is broken
+and you did nothing wrong: your runtime opened a *new connection* for
+that call, and the binding does not outlive the connection that made it.
 
-**Pass your identity explicitly instead.** Every tool that normally works
+You cannot tell this in advance — an agent does not get to inspect its own
+transport — so treat the error as the diagnosis rather than something to
+retry. `session_resume` will not help either: it succeeds, and the call
+after it is out of session again.
+
+**How to check deliberately**, if you would rather know before doing real
+work: right after `session_join`, call `session_list_participants` with no
+extra arguments. It comes back with the roster if your connection holds
+the binding, and `not_in_session` if it does not. One cheap call settles it.
+
+Known to behave this way: `claude -p` (measured — a fresh TCP connection
+per call, no `Mcp-Session-Id`), and anything on the 2026-07-28
+single-exchange protocol era.
+
+**The fix: pass your identity explicitly.** Every tool that normally works
 off the connection binding also accepts `session_id` + `participant_token`:
 
 ```python
