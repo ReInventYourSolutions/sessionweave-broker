@@ -106,8 +106,17 @@ Full arguments, return shapes and the complete endpoint list are in
 **Dispatch modes** (for `session_send`):
 
 - `specific` — requires `target.participant_ids`. Targets exact recipients.
-- `all` — requires `target.role` or `target.capability`. Fans out to every match online.
-- `any` — requires `target.role` or `target.capability`. Picks one (round-robin).
+- `all` — requires `target.role` or `target.capability`. Fans out to every
+  match, **including participants that are currently offline** — their copy
+  waits in the buffer and is delivered when they come back.
+- `any` — requires `target.role` or `target.capability`. Picks one
+  (round-robin) **from the participants that are online right now**.
+
+That difference matters more than it looks. A turn-based counterparty is
+offline between its turns, so it is invisible to every `any` — the dispatch
+silently reaches nobody while the same session works fine with `all`. If
+your recipient may be between turns, use `all` or `specific`, and see
+[§4.3](#43-dispatching-commands-client-role) for how to tell.
 
 ## 2. You were given an invite link
 
@@ -709,11 +718,16 @@ that will silently kill a long-lived SDK worker.
      deadline expired). Do not act on partial results unless you mean to.
    - `command.cancelled` — a recipient will not answer.
 
-   **A dispatch that matches nobody is not an error.** With `all` or `any`
-   and no online match you get `delivered_to: []` and an immediate
-   `command.completed {received_count: 0, expected_count: 0, reason:
-   all_responded}`. Check `delivered_to` if "nobody was listening" matters
-   to you.
+   **A dispatch that matches nobody is not an error.** You get
+   `delivered_to: []` and an immediate
+   `command.completed {received_count: 0, reason: "no_recipients"}` —
+   a distinct reason precisely so it cannot be mistaken for a real
+   completion. **Check `delivered_to`, or branch on that reason**, if
+   "nobody was listening" matters to you.
+
+   The usual cause is `any` against a counterparty that is offline between
+   turns. `all` would have reached it: the command buffers and is delivered
+   when it returns.
 
    Full payloads in [§6.2](#62-notifications-catalogue).
 
@@ -986,7 +1000,7 @@ Each event arrives as `name` + `payload`; the shapes below are the
 | `participant.left` | `{"participant_id", "reason", "feedback"?}` | `reason` is `left` \| `offline_timeout`. `feedback` present iff the leaver passed one. |
 | `command.received` | `{"command_id", "sender_id", "dispatch_mode", "dispatched_to", "payload", "expires_at"}` | Delivered to recipients. `payload` is whatever the sender passed. |
 | `result.received` | `{"command_id", "responder_id", "status", "payload"}` | Delivered to the SENDER, one per responder. Partial — wait for `command.completed`. |
-| `command.completed` | `{"command_id", "received_count", "expected_count", "reason", "orphaned_results"?}` | Terminal. `reason` is `all_responded` \| `ttl_expired` \| `sender_gone`. The first two go to the sender. `sender_gone` goes to every RESPONDER that answered before the sender left — it carries `orphaned_results: [responder_id, …]` (your own id will be in it) and means the result you sent is buffered for a sender that will never drain it. |
+| `command.completed` | `{"command_id", "received_count", "expected_count", "reason", "orphaned_results"?}` | Terminal. `reason` is `all_responded` \| `ttl_expired` \| `sender_gone` \| `no_recipients` (the dispatch matched nobody — most often `any` with the target offline; not a completion). The first two go to the sender. `sender_gone` goes to every RESPONDER that answered before the sender left — it carries `orphaned_results: [responder_id, …]` (your own id will be in it) and means the result you sent is buffered for a sender that will never drain it. |
 | `command.cancelled` | `{"command_id", "reason"}` | To recipients that had not responded. `reason` is `ttl_expired` \| `sender_gone`. Stop working on that command. |
 | `session.purpose_updated` | `{"purpose"}` | Broadcast when someone updates the purpose. |
 | `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown` \| `host_deleted` \| `admin_deleted` \| `persistence_expired`. |

@@ -1053,20 +1053,28 @@ class Session:
                     self._inflight.pop(command_id, None)
                     raise
                 self._mirror_firehose("command.received", command_received_payload)
-            # If no recipients (e.g., any with no online match), close immediately
+            # Nobody matched. Most often this is ``any`` finding no ONLINE
+            # match (``all`` does not filter on presence), which a
+            # turn-based counterparty hits constantly: it is offline
+            # between its turns and therefore invisible to every ``any``.
+            #
+            # This closes immediately, like a real completion — but it is
+            # not one, and reporting ``all_responded`` with nothing
+            # received made the two indistinguishable. A sender could not
+            # tell "everyone answered" from "there was no one to ask".
             if not decision.recipients:
                 command_completed_payload = {
                     "command_id": command_id,
                     "received_count": 0,
                     "expected_count": 0,
-                    "reason": "all_responded",
+                    "reason": "no_recipients",
                 }
                 self._deliver_or_buffer(sender_id, "command.completed", command_completed_payload)
                 self._mirror_firehose("command.completed", command_completed_payload)
                 self._inflight.pop(command_id, None)
                 if self._metrics is not None:
                     self._metrics.command_completed_total.labels(
-                        reason="all_responded"
+                        reason="no_recipients"
                     ).inc()
             return SessionSendOutput(command_id=command_id, delivered_to=list(decision.recipients))
 
@@ -1396,6 +1404,33 @@ class Session:
             self._buffered_bytes = 0
         return out
 
+    def _persist_left(self, pid: str) -> None:
+        """Record the departure on disk, from a synchronous caller.
+
+        Without this an eviction is not durable: hydration restores every
+        participant whose ``left_at`` is NULL, so a participant the relay
+        evicted reappears from disk on the next cold -> hot cycle —
+        offline, and queued to be evicted again. Nothing errors; the
+        roster is simply wrong, and peers that already acted on
+        ``participant.left`` disagree with the relay.
+
+        ``leave()`` can await ``soft_delete_participant`` directly.
+        ``_evict`` is called from ``tick`` and other sync paths, so the
+        write is scheduled like the firehose mirrors are.
+        """
+        if self._store is None:
+            return
+        left_at_ms = int(_utcnow().timestamp() * 1000)
+        try:
+            task = asyncio.create_task(
+                self._store.soft_delete_participant(
+                    self.session_id, pid, left_at=left_at_ms)
+            )
+        except RuntimeError:  # pragma: no cover - no running loop
+            return
+        self._firehose_tasks.add(task)
+        task.add_done_callback(self._firehose_tasks.discard)
+
     def _discard_buffer(self, buf: NotificationBuffer | None) -> None:
         """Throw away a buffer's contents while keeping
         ``_buffered_bytes`` in sync. Used by participant eviction
@@ -1526,6 +1561,7 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return
+        self._persist_left(pid)
         self._discard_buffer(self._buffers.pop(pid, None))
         if self._metrics is not None:
             online_label = "true" if p.online else "false"
