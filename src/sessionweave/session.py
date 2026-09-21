@@ -1396,6 +1396,33 @@ class Session:
             self._buffered_bytes = 0
         return out
 
+    def _persist_left(self, pid: str) -> None:
+        """Record the departure on disk, from a synchronous caller.
+
+        Without this an eviction is not durable: hydration restores every
+        participant whose ``left_at`` is NULL, so a participant the relay
+        evicted reappears from disk on the next cold -> hot cycle —
+        offline, and queued to be evicted again. Nothing errors; the
+        roster is simply wrong, and peers that already acted on
+        ``participant.left`` disagree with the relay.
+
+        ``leave()`` can await ``soft_delete_participant`` directly.
+        ``_evict`` is called from ``tick`` and other sync paths, so the
+        write is scheduled like the firehose mirrors are.
+        """
+        if self._store is None:
+            return
+        left_at_ms = int(_utcnow().timestamp() * 1000)
+        try:
+            task = asyncio.create_task(
+                self._store.soft_delete_participant(
+                    self.session_id, pid, left_at=left_at_ms)
+            )
+        except RuntimeError:  # pragma: no cover - no running loop
+            return
+        self._firehose_tasks.add(task)
+        task.add_done_callback(self._firehose_tasks.discard)
+
     def _discard_buffer(self, buf: NotificationBuffer | None) -> None:
         """Throw away a buffer's contents while keeping
         ``_buffered_bytes`` in sync. Used by participant eviction
@@ -1526,6 +1553,7 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return
+        self._persist_left(pid)
         self._discard_buffer(self._buffers.pop(pid, None))
         if self._metrics is not None:
             online_label = "true" if p.online else "false"
