@@ -1765,6 +1765,14 @@ class Session:
             name="participant.updated",
             payload={"participant": p.to_public().model_dump()},
         )
+        # Going offline introduces an offline-grace deadline. The registry
+        # only ticks a session when its heap entry comes due, so without
+        # this the grace eviction never becomes due at all: the participant
+        # stays in the roster as offline forever and peers never receive
+        # ``participant.left``. ``_mark_offline`` has always done this; this
+        # method did not, which went unnoticed while it had no caller.
+        if self._on_deadline_shortened is not None:
+            self._on_deadline_shortened(self)
 
     async def resume(
         self,

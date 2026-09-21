@@ -44,10 +44,11 @@ async def _build_session_and_join(
     cm.unbind(fake_join_handle)
 
     class _FakeMCPHandle(MCPConnectionHandle):
-        def __init__(self) -> None:  # bypass real MCP session wiring
+        def __init__(self) -> None:  # bypass real MCP connection wiring
             self._alive = True
             self._pending: set[Any] = set()
-            self._session = None  # type: ignore[assignment]
+            self._connection = lambda: None  # type: ignore[assignment]
+            self._session_id = None
 
     mcp_handle = _FakeMCPHandle()
     http_handle = HTTPParticipantHandle()

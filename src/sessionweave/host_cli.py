@@ -50,13 +50,13 @@ from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from sessionweave.invite import create_link
 
 
 def _unwrap(res: Any) -> dict[str, Any]:
-    sc = getattr(res, "structuredContent", None)
+    sc = res.structured_content
     if sc is None:
         if res.content:
             txt = getattr(res.content[0], "text", "")
@@ -80,7 +80,7 @@ async def _create_and_join(
     my_metadata: dict[str, Any],
     delivery_mode: str,
 ) -> tuple[str, str]:
-    async with streamablehttp_client(relay_url) as (r, w, _):
+    async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
             create_args: dict[str, Any] = {}
@@ -89,7 +89,7 @@ async def _create_and_join(
             res = await session.call_tool(
                 name="session_create", arguments=create_args
             )
-            if getattr(res, "isError", False):
+            if res.is_error:
                 raise RuntimeError(f"session_create error: {_unwrap(res)}")
             sid = _unwrap(res).get("session_id")
             if not isinstance(sid, str):
@@ -104,7 +104,7 @@ async def _create_and_join(
             res = await session.call_tool(
                 name="session_join", arguments=join_args
             )
-            if getattr(res, "isError", False):
+            if res.is_error:
                 raise RuntimeError(f"session_join error: {_unwrap(res)}")
             pid = _unwrap(res).get("participant_id")
             if not isinstance(pid, str):

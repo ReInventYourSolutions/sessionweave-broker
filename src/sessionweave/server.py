@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import os
@@ -8,10 +9,12 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError as MCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -26,7 +29,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.mcp_adapter import HandleRegistry
+from sessionweave.mcp_adapter import HandleRegistry, connection_of
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.persistence import PersistenceStore
 from sessionweave.persistence_token import DeleteRateLimiter
@@ -75,6 +78,46 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
+def _anticipated_failures(fn: _ToolFn) -> _ToolFn:
+    """Re-raise the relay's ``ToolError`` as the SDK's, so its code reaches the client.
+
+    mcp 2.x sorts tool failures into two kinds: its own ``ToolError`` is an
+    *anticipated* failure and keeps its message, while anything else is a
+    crash whose text is deliberately withheld so internals cannot leak
+    ("An anticipated failure keeps its own text after the prefix. A crash
+    does not" — ``mcpserver/tools/base.py``).
+
+    The relay's ``ToolError`` is the anticipated kind: ``session_not_found``,
+    ``not_in_session``, ``payload_too_large`` and the rest are a documented
+    contract that callers branch on. Without this translation every one of
+    them reaches an MCP client as "Error executing tool <name>" and the
+    error contract silently disappears — which is precisely what the
+    integration suite caught during the 2.x migration.
+
+    Only the relay's own errors are translated. A genuine crash keeps the
+    SDK's masking, which is the behaviour we want.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return await fn(*args, **kwargs)
+        except ToolError as exc:
+            # str(exc) is "<code>: <message>", e.g.
+            # "not_in_session: call session_join first".
+            raise MCPToolError(str(exc)) from exc
+        except ValidationError as exc:
+            # The relay validates tool bodies against its own pydantic
+            # models (e.g. dispatch="all" requires target.role or
+            # target.capability), which the JSON schema cannot express.
+            # That is the caller's mistake to read and correct — the same
+            # judgement the SDK makes about its own schema validation, which
+            # it reports as a ToolError rather than a crash.
+            raise MCPToolError(str(exc)) from exc
+
+    return cast("_ToolFn", wrapper)
+
+
 _ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[dict[str, Any]]])
 
 _SERVER_INSTRUCTIONS = """SessionWeave relays messages between agents inside named sessions. The
@@ -100,19 +143,81 @@ session with session_create, which returns a one-time creator_token that
 session_delete later requires."""
 
 
+# mcp 2.x transport defaults, mirrored here so they are visible in the relay's
+# own configuration instead of being inherited silently from the SDK.
+_DEFAULT_MCP_SESSION_IDLE_TIMEOUT = 1800.0
+_DEFAULT_MCP_MAX_SESSIONS = 10_000
+
+def _mcp_session_idle_timeout() -> float | None:
+    """How long the SDK keeps an idle MCP transport before terminating it.
+
+    New in mcp 2.x and on by default (1800 s). It is what finally reclaims a
+    transport whose client vanished without a DELETE — under 1.x those
+    leaked for the life of the process. Set explicitly rather than inherited
+    silently, because it changes a client-visible failure: past the timeout
+    the session id answers 404 and the client must re-initialize onto a new
+    connection, which means calling ``session_resume`` rather than finding
+    itself mysteriously ``not_in_session``.
+
+    ``SW_MCP_SESSION_IDLE_TIMEOUT`` overrides it; ``0`` disables the timeout,
+    which is not recommended — it restores the 1.x leak.
+    """
+    raw = os.environ.get("SW_MCP_SESSION_IDLE_TIMEOUT", "").strip()
+    if not raw:
+        return _DEFAULT_MCP_SESSION_IDLE_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "SW_MCP_SESSION_IDLE_TIMEOUT=%r is not a number; using %s",
+            raw, _DEFAULT_MCP_SESSION_IDLE_TIMEOUT,
+        )
+        return _DEFAULT_MCP_SESSION_IDLE_TIMEOUT
+    return None if value <= 0 else value
+
+
+def _mcp_max_sessions() -> int:
+    """Cap on concurrent MCP transports; beyond it the SDK answers 503.
+
+    Also new in 2.x. Explicit for the same reason as the idle timeout: it is
+    a new refusal path, and an operator hitting it should find the number in
+    the relay's own configuration rather than in the SDK's defaults.
+    """
+    raw = os.environ.get("SW_MCP_MAX_SESSIONS", "").strip()
+    if not raw:
+        return _DEFAULT_MCP_MAX_SESSIONS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "SW_MCP_MAX_SESSIONS=%r is not an integer; using %s",
+            raw, _DEFAULT_MCP_MAX_SESSIONS,
+        )
+        return _DEFAULT_MCP_MAX_SESSIONS
+
+
+def _transport_security() -> TransportSecuritySettings:
+    """DNS-rebinding protection for the MCP endpoint.
+
+    In the mcp 2.x SDK this is no longer a server-constructor argument —
+    it is passed to ``streamable_http_app()`` at mount time, so it lives
+    in its own helper rather than inline at either call site.
+    """
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts(),
+    )
+
+
 def _build_fastmcp(
     deps: ToolDeps,
     handles: HandleRegistry,
     connections: ConnectionManager | None = None,
     registry: SessionRegistry | None = None,
-) -> FastMCP:
-    mcp = FastMCP(
+) -> MCPServer:
+    mcp = MCPServer(
         "sessionweave",
         instructions=_SERVER_INSTRUCTIONS,
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=_allowed_hosts(),
-        ),
     )
 
     def _tool(name: str) -> Callable[[_ToolFn], _ToolFn]:
@@ -125,14 +230,16 @@ def _build_fastmcp(
         """
 
         def deco(fn: _ToolFn) -> _ToolFn:
-            mcp.tool(name=name, description=inspect.cleandoc(fn.__doc__ or ""))(fn)
+            mcp.tool(name=name, description=inspect.cleandoc(fn.__doc__ or ""))(
+                _anticipated_failures(fn)
+            )
             return fn
 
         return deco
 
     def _handle_for(ctx: Context) -> Any:
-        return handles.for_session(
-            ctx.session,
+        return handles.for_connection(
+            connection_of(ctx),
             connections=connections,
             registry=registry,
         )
@@ -482,7 +589,11 @@ def build_app() -> Starlette:
     )
 
     mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
-    mcp_app = mcp.streamable_http_app()
+    mcp_app = mcp.streamable_http_app(
+        transport_security=_transport_security(),
+        session_idle_timeout=_mcp_session_idle_timeout(),
+        max_sessions=_mcp_max_sessions(),
+    )
 
     state: dict[str, bool] = {"draining": False}
 

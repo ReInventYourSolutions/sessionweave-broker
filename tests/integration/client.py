@@ -5,8 +5,9 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+import httpx2
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 @contextlib.asynccontextmanager
@@ -24,7 +25,12 @@ async def sw_client(base_url: str) -> AsyncIterator[Client]:
     # dispatches) can back the single-process relay up past the 30s default on a
     # contended CI runner, tripping a ReadTimeout on teardown. This only relaxes
     # how long the test client waits — it does not mask server-side races.
-    async with streamablehttp_client(url, timeout=120) as (read, write, _):
+    # The mcp 2.x client takes a configured httpx2 client instead of a
+    # ``timeout`` argument.
+    async with (
+        httpx2.AsyncClient(timeout=120) as http_client,
+        streamable_http_client(url, http_client=http_client) as (read, write),
+    ):
         client_holder: list[Client] = []
 
         async def logging_callback(params: Any) -> None:
@@ -73,10 +79,10 @@ class Client:
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         result = await self._session.call_tool(name=name, arguments=args)
-        if getattr(result, "isError", False):
+        if result.is_error:
             payload = _extract_text(result)
             raise RuntimeError(f"tool {name} returned error: {payload}")
-        structured = getattr(result, "structuredContent", None)
+        structured = result.structured_content
         if structured is not None:
             if isinstance(structured, dict):
                 unwrapped = structured.get("result", structured)

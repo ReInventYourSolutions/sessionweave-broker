@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 def _now() -> str:
@@ -41,7 +41,7 @@ def _now() -> str:
 
 
 def _unwrap(res: Any) -> Any:
-    sc = getattr(res, "structuredContent", None)
+    sc = res.structured_content
     if sc is None:
         if res.content:
             txt = getattr(res.content[0], "text", "")
@@ -58,7 +58,7 @@ def _unwrap(res: Any) -> Any:
 async def _drain_once(
     relay_url: str, session_id: str, participant_id: str
 ) -> list[dict[str, Any]]:
-    async with streamablehttp_client(relay_url) as (r, w, _):
+    async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
             await session.call_tool(
