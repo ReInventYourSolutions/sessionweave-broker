@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.connection import Connection
 
+from sessionweave.errors import ErrorCode, ToolError
+
 if TYPE_CHECKING:  # pragma: no cover
     from mcp.server.mcpserver import Context
 
@@ -66,6 +68,32 @@ def connection_of(ctx: Context) -> Connection:
     return connection
 
 
+def require_bindable_connection(connection: Connection) -> Connection:
+    """Reject a transport that cannot carry a participant across requests.
+
+    A participant binding lives on the connection, and eight tools resolve
+    their session from it rather than taking a ``session_id``. The mcp
+    2026-07-28 single-exchange path builds a fresh ``Connection`` per
+    request with ``session_id`` of ``None``, so a binding made during
+    ``session_join`` is unreachable by the next call — and worse, the
+    participant it created lingers in the roster until the offline grace
+    evicts it, so peers see a join/offline/left flap for a client that was
+    never reachable at all.
+
+    Checked on ``session_id`` rather than ``has_standalone_channel``
+    because this is not only about push: a pull-mode client fails on that
+    path in exactly the same way.
+    """
+    if connection.session_id is None:
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            "this MCP transport carries no cross-request session identity "
+            "(single-exchange / stateless); the relay needs a stateful "
+            "connection with an Mcp-Session-Id to hold a participant",
+        )
+    return connection
+
+
 class MCPConnectionHandle:
     """ConnectionHandle adapter wrapping a per-client MCP ``Connection``.
 
@@ -99,7 +127,14 @@ class MCPConnectionHandle:
     only on teardown.
     """
 
-    __slots__ = ("_alive", "_connection", "_pending", "_requeue_callback", "_session_id")
+    __slots__ = (
+        "_alive",
+        "_connection",
+        "_last_binding",
+        "_pending",
+        "_requeue_callback",
+        "_session_id",
+    )
 
     def __init__(
         self,
@@ -113,6 +148,23 @@ class MCPConnectionHandle:
         self._alive = True
         self._pending: set[asyncio.Task[None]] = set()
         self._requeue_callback = requeue_callback
+        # Remembered so an event still in flight when the connection dies
+        # can be requeued: the disconnect callback unbinds the handle, and
+        # the requeue bridge would otherwise have no participant to put it
+        # back for. Set when the binding is torn down, not at bind time.
+        self._last_binding: tuple[str, str] | None = None
+
+    @property
+    def last_binding(self) -> tuple[str, str] | None:
+        """The ``(session_id, participant_id)`` this handle was last bound to.
+
+        Only set once the binding has been released, so it never shadows a
+        live lookup.
+        """
+        return self._last_binding
+
+    def remember_binding(self, binding: tuple[str, str]) -> None:
+        self._last_binding = binding
 
     @property
     def connection(self) -> Connection | None:
@@ -250,6 +302,12 @@ class _RequeueBridge:
             return
         binding = self._connections.session_for(self._handle)
         if binding is None:
+            # The handle was unbound while this event was in flight —
+            # typically by the connection-close callback. Fall back to the
+            # binding it had, so a teardown does not swallow the event that
+            # ``_deliver_or_buffer`` deliberately did not buffer.
+            binding = self._handle.last_binding
+        if binding is None:
             return
         sid, pid = binding
         sess = self._registry.get(sid)
@@ -368,6 +426,10 @@ class HandleRegistry:
         session = registry.get(sid)
         if session is None:
             return
+        # ``handle_disconnect`` unbinds, so capture the binding first: a
+        # dispatch parked in ``await notify(...)`` right now still needs a
+        # participant to requeue to when it resumes.
+        handle.remember_binding(binding)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - teardown outside a loop

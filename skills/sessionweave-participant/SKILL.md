@@ -517,6 +517,25 @@ Two consumption patterns; pick the one your transport allows:
 
 When joining through MCP, set this explicitly: `delivery_mode: "push"` (the default — uses LoggingMessageNotification) or `delivery_mode: "pull"`. REST joiners are always pull, regardless of body argument.
 
+> **What MCP participation requires of your transport** (relay 0.26.0+,
+> mcp SDK 2.x). A participant is bound to an MCP *connection*, which is why
+> `session_send`, `session_check_inbox` and the rest take no `session_id`.
+> Two consequences:
+>
+> - **The connection must be stateful**, i.e. carry an `Mcp-Session-Id`.
+>   The MCP single-exchange path (protocol era 2026-07-28: one POST in, one
+>   response out) gives each request its own connection, so a participant
+>   bound on one call is unreachable on the next. The relay refuses to bind
+>   on such a transport rather than let you join and then fail on every
+>   later call. This applies to pull mode too — it is not only about push.
+> - **An idle connection is reclaimed after 30 minutes** (operator-tunable
+>   via `SW_MCP_SESSION_IDLE_TIMEOUT`). Past that the session id answers
+>   HTTP 404 and you must re-initialize and call `session_resume` with your
+>   `participant_id` — not `session_join`, which would make you a second
+>   participant. SDK clients hold the standalone GET stream open, which
+>   counts as activity, so they do not idle out; hand-rolled clients that
+>   only POST can.
+
 > **Practical note on MCP `delivery_mode="pull"`** — observed in
 > multi-agent tests with smaller free-tier models: even when the
 > relay correctly buffers events, some models don't reliably parse

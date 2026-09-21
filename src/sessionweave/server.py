@@ -4,6 +4,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -29,7 +30,11 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.mcp_adapter import HandleRegistry, connection_of
+from sessionweave.mcp_adapter import (
+    HandleRegistry,
+    connection_of,
+    require_bindable_connection,
+)
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.persistence import PersistenceStore
 from sessionweave.persistence_token import DeleteRateLimiter
@@ -57,9 +62,9 @@ _LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1:*", "localhost:*", "[::1]:*")
 
 
 def _allowed_hosts() -> list[str]:
-    """Build the DNS-rebinding ``allowed_hosts`` list for FastMCP.
+    """Build the DNS-rebinding ``allowed_hosts`` list for the MCP transport.
 
-    Defaults to loopback only (matches FastMCP's stock policy). Extra
+    Defaults to loopback only (matches the SDK's stock policy). Extra
     hosts come from ``SW_ALLOWED_HOSTS`` (comma-separated, e.g.
     ``relay.sessionweave.com,relay.sessionweave.com:443``). Wildcard
     port patterns (``host:*``) are honoured by the upstream middleware.
@@ -78,7 +83,11 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
-def _anticipated_failures(fn: _ToolFn) -> _ToolFn:
+_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[dict[str, Any]]])
+
+def _anticipated_failures[F: Callable[..., Awaitable[dict[str, Any]]]](
+    fn: F,
+) -> F:
     """Re-raise the relay's ``ToolError`` as the SDK's, so its code reaches the client.
 
     mcp 2.x sorts tool failures into two kinds: its own ``ToolError`` is an
@@ -115,10 +124,8 @@ def _anticipated_failures(fn: _ToolFn) -> _ToolFn:
             # it reports as a ToolError rather than a crash.
             raise MCPToolError(str(exc)) from exc
 
-    return cast("_ToolFn", wrapper)
+    return cast("F", wrapper)
 
-
-_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[dict[str, Any]]])
 
 _SERVER_INSTRUCTIONS = """SessionWeave relays messages between agents inside named sessions. The
 relay brokers; it holds no agent's history.
@@ -173,7 +180,11 @@ def _mcp_session_idle_timeout() -> float | None:
             raw, _DEFAULT_MCP_SESSION_IDLE_TIMEOUT,
         )
         return _DEFAULT_MCP_SESSION_IDLE_TIMEOUT
-    return None if value <= 0 else value
+    if not math.isfinite(value) or value <= 0:
+        # The SDK rejects non-finite values outright, which would take the
+        # relay down at startup rather than at the misconfigured setting.
+        return None
+    return value
 
 
 def _mcp_max_sessions() -> int:
@@ -223,7 +234,7 @@ def _build_fastmcp(
     def _tool(name: str) -> Callable[[_ToolFn], _ToolFn]:
         """Register a tool, using its docstring — dedented — as the description.
 
-        FastMCP takes ``fn.__doc__`` verbatim (``description or fn.__doc__
+        MCPServer takes ``fn.__doc__`` verbatim (``description or fn.__doc__
         or ""``), so an indented docstring reaches the client with the
         source indentation baked in. Cleaning it here keeps the docstrings
         readable in this file and flush left on the wire.
@@ -239,7 +250,7 @@ def _build_fastmcp(
 
     def _handle_for(ctx: Context) -> Any:
         return handles.for_connection(
-            connection_of(ctx),
+            require_bindable_connection(connection_of(ctx)),
             connections=connections,
             registry=registry,
         )

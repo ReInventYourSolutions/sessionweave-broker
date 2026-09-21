@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sessionweave"
-version = "0.25.1"
+version = "0.26.0"
 description = "MCP-native session relay for multi-agent collaboration"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -13,7 +13,12 @@ dependencies = [
     # Migrated to the 2.x API (MCPServer, streamable_http_client, unions that
     # are no longer RootModels). The code will not run on 1.x, and 3.x will be
     # another breaking major — keep the range closed at both ends.
-    "mcp>=2.0,<3",
+    #
+    # The floor is 2.2, not 2.0: streamable_http_app() gained max_sessions in
+    # 2.2, and server.py passes it, so build_app() would TypeError at startup
+    # on 2.0.x/2.1.x. 2.2 is also the version test_mcp2_sdk_contract.py pins
+    # the private ServerSession._connection against.
+    "mcp>=2.2,<3",
     "starlette>=0.37,<1.0",
     "uvicorn>=0.30",
     "websockets>=12.0",
@@ -72,7 +77,7 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
 [[tool.mypy.overrides]]
-# FastMCP's tool decorator detects Context parameters via inspect.isclass,
+# MCPServer's tool decorator detects Context parameters via inspect.isclass,
 # which only matches an unparameterized `Context` annotation. Keep the
 # bare form here and silence the strict generic-args check for this shim.
 module = "sessionweave.server"

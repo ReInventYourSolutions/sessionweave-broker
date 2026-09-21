@@ -110,3 +110,27 @@ async def test_handle_disconnect_ignores_an_unbound_handle() -> None:
     await sess.leave(sess.roster_snapshot()[0].participant_id)
 
     sess.handle_disconnect(handle)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_sweep_then_disconnect_does_not_double_count() -> None:
+    """The production interleaving the two-calls test does not reach.
+
+    The presence sweep and the connection-close callback both act on a
+    departed participant, and either can win. The sweep goes through
+    ``_mark_offline``; only then does ``handle_disconnect`` run. Nothing
+    raises if this drifts — the gauge is simply wrong from then on, which
+    is the same silent failure as the participants_active drift.
+    """
+    m = Metrics(registry=CollectorRegistry())
+    cm = ConnectionManager()
+    sess = Session("s", SessionConfig(), cm, metrics=m)
+    handle = FakeHandle()
+    await sess.join(handle, role="r", capabilities=[])
+
+    handle.close()  # the transport dies; is_alive() now False
+    sess.detect_disconnects()  # the sweep notices first
+    sess.handle_disconnect(handle)  # the callback arrives second
+
+    assert _online(m) == 0.0
+    assert _offline(m) == 1.0, "the sweep and the callback both counted it"
