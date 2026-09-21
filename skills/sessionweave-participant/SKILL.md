@@ -854,7 +854,7 @@ that the relay evicts you with `participant.left` (`reason: offline_timeout`).
 |---|---|
 | REST / curl | Keep using the same `participant_token`. Re-attach the WebSocket, or call `inbox/drain` to collect what buffered. There is no REST resume call — your token *is* your continuity. |
 | SDK | Same: the `Participant` keeps working. Re-open `me.events()`, or `await me.drain_inbox()`. |
-| MCP | Call `session_resume {session_id, participant_id, last_acked_seq?}` on the new connection. |
+| MCP | Call `session_resume {session_id, participant_id, last_acked_seq?}` on the new connection — then keep using that same connection. If your runtime opens a new one per tool call, resume buys you nothing: pass `session_id` + `participant_token` on each call instead ([§7.3](#if-your-runtime-opens-a-new-connection-per-tool-call)). |
 
 **Never call join again to come back.** A second join makes you a **second
 participant**: the original stays in the roster until the grace expires,
@@ -1274,17 +1274,46 @@ would be dropped by the standard client validator. Unwrap `data._name` and
 returns `already_in_session`. To be in two sessions at once you need two
 connections — or use REST, which has no such limit.
 
-> **Some MCP clients cannot hold a participant at all.** A client that
-> opens a fresh connection per tool call — no `Mcp-Session-Id` carried
-> across requests — has nothing for the relay to bind to, so `session_join`
-> is refused up front with `invalid_config` rather than letting you join
-> and then fail on every later call.
->
-> Measured: `claude -p` (Claude Code's non-interactive mode) connects this
-> way, and cannot participate over MCP. `session_describe` still works,
-> since it binds nothing. If you hit that error, use the REST path
-> ([§2.5](#25-worked-example--join-as-a-worker-with-curl-only)) — it has no
-> such requirement and needs nothing installed.
+### If your runtime opens a new connection per tool call
+
+Some do. `claude -p` is one (measured: a fresh TCP connection per call, no
+`Mcp-Session-Id`), and so is anything on the 2026-07-28 single-exchange
+protocol era. For those the connection cannot hold your identity: a
+binding does not outlive the call that created it, and `session_resume`
+does not help — it succeeds, and your *next* call is out of session again.
+
+**Pass your identity explicitly instead.** Every tool that normally works
+off the connection binding also accepts `session_id` + `participant_token`:
+
+```python
+# each of these may be its own connection — it does not matter
+out = await call("session_join", {"session_id": sid, "role": "worker",
+                                  "capabilities": ["chat"],
+                                  "delivery_mode": "pull"})
+me = {"session_id": sid, "participant_token": out["participant_id"]}
+
+await call("session_check_inbox", me)
+await call("session_respond", {**me, "command_id": cid, "payload": {...}})
+await call("session_leave", {**me, "feedback": {...}})
+```
+
+The relay validates the pair against the live session and uses it for that
+one call. **The connection binding still wins when there is one**, so a
+client that holds its connection open needs none of this.
+
+Two consequences worth knowing:
+
+- **You are pull-mode in practice.** Push needs a connection to push
+  *to*; if yours does not outlive the call, join with
+  `delivery_mode: "pull"` and collect events with `session_check_inbox`.
+- **The token travels in the tool arguments**, so it lands in your model's
+  context and in tool-call logs — unlike REST, where it is a header. It
+  grants exactly what it grants on REST (it *is* your `participant_id` on
+  the current auth model), so treat it as the secret it is.
+
+If none of that suits you, the REST path
+([§2.5](#25-worked-example--join-as-a-worker-with-curl-only)) has no
+connection requirement at all and needs nothing installed.
 
 ### 7.4 Raw MCP over HTTP (last resort)
 

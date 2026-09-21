@@ -255,6 +255,53 @@ def _build_fastmcp(
             registry=registry,
         )
 
+    @asynccontextmanager
+    async def _participant(
+        ctx: Context,
+        session_id: str | None,
+        participant_token: str | None,
+    ) -> AsyncIterator[Any]:
+        """The handle a connection-bound tool should act through.
+
+        Normally the connection *is* the identity: the participant is
+        bound to it by ``session_join`` and every later tool call on that
+        connection finds it. Some MCP runtimes cannot work that way —
+        they open a fresh connection per tool call, so a binding never
+        survives the call that created it. Measured: `claude -p` does
+        exactly this, and so does anything on the 2026-07-28
+        single-exchange protocol era.
+
+        For those, the caller presents the identity explicitly instead,
+        exactly as a REST client does with its Bearer token: the pair is
+        validated against the live session and bound to an ephemeral
+        handle for the duration of this one call
+        (``http_api._bind_participant``, the same mechanism). Nothing is
+        remembered afterwards, so it works no matter how the transport
+        behaves.
+
+        The connection binding wins when there is one, so nothing changes
+        for a client that holds its connection open.
+        """
+        if connections is not None:
+            try:
+                bound = connections.session_for(_handle_for(ctx))
+            except Exception:
+                bound = None
+            if bound is not None:
+                yield _handle_for(ctx)
+                return
+        if not (session_id and participant_token):
+            # No binding and no explicit identity: let the normal
+            # not_in_session error come from the tool itself.
+            yield _handle_for(ctx)
+            return
+        from sessionweave.http_api import _bind_participant, _unbind_participant
+        handle = await _bind_participant(deps, session_id, participant_token)
+        try:
+            yield handle
+        finally:
+            _unbind_participant(deps.registry.connections, handle)
+
     @_tool("session_create")
     async def session_create_tool(
         config: dict[str, Any] | None = None,
@@ -295,6 +342,8 @@ def _build_fastmcp(
     @_tool("session_update_purpose")
     async def session_update_purpose_tool(
         purpose: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Replace the purpose of the session this connection joined, or clear it.
@@ -303,9 +352,8 @@ def _build_fastmcp(
     other participants. Requires session_join on this connection first.
     """
         assert ctx is not None
-        return await session_update_purpose(
-            deps, _handle_for(ctx), {"purpose": purpose}
-        )
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_update_purpose(deps, h, {"purpose": purpose})
 
     @_tool("session_join")
     async def session_join_tool(
@@ -378,6 +426,8 @@ def _build_fastmcp(
     @_tool("session_leave")
     async def session_leave_tool(
         feedback: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Leave the session this connection joined and unbind the connection.
@@ -389,7 +439,8 @@ def _build_fastmcp(
     """
         assert ctx is not None
         body = {"feedback": feedback} if feedback is not None else None
-        return await session_leave(deps, _handle_for(ctx), body)
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_leave(deps, h, body)
 
     @_tool("session_update_self")
     async def session_update_self_tool(
@@ -397,6 +448,8 @@ def _build_fastmcp(
         objective: str | None = None,
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Replace your own role, objective, capabilities or metadata.
@@ -416,10 +469,13 @@ def _build_fastmcp(
             payload["capabilities"] = capabilities
         if metadata is not None:
             payload["metadata"] = metadata
-        return await session_update_self(deps, _handle_for(ctx), payload)
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_update_self(deps, h, payload)
 
     @_tool("session_list_participants")
     async def session_list_participants_tool(
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Return the roster of the session this connection joined.
@@ -429,10 +485,13 @@ def _build_fastmcp(
     connection first.
     """
         assert ctx is not None
-        return await session_list_participants(deps, _handle_for(ctx))
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_list_participants(deps, h)
 
     @_tool("session_check_inbox")
     async def session_check_inbox_tool(
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Drain the events buffered for you right now and return them, empty or not.
@@ -444,13 +503,15 @@ def _build_fastmcp(
     connection first.
     """
         assert ctx is not None
-        return await session_check_inbox(deps, _handle_for(ctx))
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_check_inbox(deps, h)
 
     @_tool("session_wait_for_event")
     async def session_wait_for_event_tool(
         session_id: str,
         names: list[str] | None = None,
         timeout_seconds: float = 60.0,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Block until at least one buffered event matches, then return every match.
@@ -469,7 +530,8 @@ def _build_fastmcp(
         }
         if names is not None:
             body["names"] = names
-        return await session_wait_for_event(deps, _handle_for(ctx), body)
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_wait_for_event(deps, h, body)
 
     @_tool("session_send")
     async def session_send_tool(
@@ -477,6 +539,8 @@ def _build_fastmcp(
         target: dict[str, Any],
         payload: dict[str, Any],
         timeout_seconds: int | None = None,
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Dispatch a command to other participants of the session this connection joined.
@@ -506,13 +570,16 @@ def _build_fastmcp(
         }
         if timeout_seconds is not None:
             body["timeout_seconds"] = timeout_seconds
-        return await session_send(deps, _handle_for(ctx), body)
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_send(deps, h, body)
 
     @_tool("session_respond")
     async def session_respond_tool(
         command_id: str,
         payload: dict[str, Any],
         status: str = "ok",
+        session_id: str | None = None,
+        participant_token: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Answer a command you received.
@@ -522,11 +589,11 @@ def _build_fastmcp(
     free-form answer. Requires session_join on this connection first.
     """
         assert ctx is not None
-        return await session_respond(
-            deps,
-            _handle_for(ctx),
-            {"command_id": command_id, "payload": payload, "status": status},
-        )
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_respond(
+                deps, h,
+                {"command_id": command_id, "payload": payload, "status": status},
+            )
 
     @_tool("session_delete")
     async def session_delete_tool(
