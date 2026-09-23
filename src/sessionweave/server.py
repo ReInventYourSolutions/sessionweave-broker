@@ -10,12 +10,12 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Annotated, Any, Literal, TypeVar, cast
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError as MCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -220,6 +220,36 @@ def _transport_security() -> TransportSecuritySettings:
     )
 
 
+# ---- Parameter descriptions -------------------------------------------------
+#
+# Every MCP tool parameter carries a description in the JSON schema, and the
+# string-valued enums are real ``enum``s. Parameters that recur across tools
+# are defined once here, so the same argument cannot drift into two
+# different explanations in two tools.
+
+SessionIdArg = Annotated[str, Field(
+    description="The session to act on: the id from the invite link, or the "
+                "session_id returned by session_create.")]
+
+OptSessionIdArg = Annotated[str | None, Field(
+    description="Only together with participant_token, for a runtime that "
+                "opens a new connection per tool call. Leave unset if you "
+                "joined on this same connection.")]
+
+ParticipantTokenArg = Annotated[str | None, Field(
+    description="Your participant_id from session_join, passed with "
+                "session_id. Needed only if a call right after joining said "
+                "not_in_session — your runtime opens a new connection per "
+                "call. Otherwise leave unset. It is a credential: keep it "
+                "secret.")]
+
+PurposeArg = Annotated[dict[str, Any] | None, Field(
+    description="Free-form JSON telling joiners what the session is for; "
+                "echoed to everyone who joins. Recognised keys: kind, "
+                "your_role, your_capabilities, available_roles, instructions, "
+                "delivery_mode. 16 KiB cap.")]
+
+
 def _build_fastmcp(
     deps: ToolDeps,
     handles: HandleRegistry,
@@ -304,9 +334,17 @@ def _build_fastmcp(
 
     @_tool("session_create")
     async def session_create_tool(
-        config: dict[str, Any] | None = None,
-        purpose: dict[str, Any] | None = None,
-        persistence: dict[str, Any] | None = None,
+        config: Annotated[dict[str, Any] | None, Field(description=
+            'Per-session overrides of relay defaults, e.g. {"idle_ttl_seconds": 3600}. Values '
+            'outside the operator bounds are refused with invalid_config. Omit to use the '
+            'defaults.'
+        )] = None,
+        purpose: PurposeArg = None,
+        persistence: Annotated[dict[str, Any] | None, Field(description=
+            'Omit for RAM-only, zero data retention (the default). Pass {"mode": "ttl", '
+            '"ttl_seconds": N} or {"mode": "until_deleted"} to persist to disk. Refused with '
+            'persistence_failed if this relay has persistence disabled.'
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Open a new session and return its session_id plus a one-time creator_token.
@@ -329,7 +367,7 @@ def _build_fastmcp(
 
     @_tool("session_describe")
     async def session_describe_tool(
-        session_id: str,
+        session_id: SessionIdArg,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Read-only snapshot of a session: config, purpose, roster, persistence state.
@@ -341,9 +379,9 @@ def _build_fastmcp(
 
     @_tool("session_update_purpose")
     async def session_update_purpose_tool(
-        purpose: dict[str, Any] | None = None,
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        purpose: PurposeArg = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Replace the purpose of the session this connection joined, or clear it.
@@ -357,12 +395,27 @@ def _build_fastmcp(
 
     @_tool("session_join")
     async def session_join_tool(
-        session_id: str,
-        role: str | None = None,
-        objective: str | None = None,
-        capabilities: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        delivery_mode: str | None = None,
+        session_id: SessionIdArg,
+        role: Annotated[str | None, Field(description=
+            'Who you are in this session, e.g. "worker". Take purpose.your_role if the session '
+            'prescribes one. Always pass it: dispatch by role relies on it.'
+        )] = None,
+        objective: Annotated[str | None, Field(description=
+            "One line on what you are here to do, shown to the other participants in the roster."
+        )] = None,
+        capabilities: Annotated[list[str] | None, Field(description=
+            'Strings other participants target with dispatch "all"/"any", e.g. ["chat"]. Always '
+            'pass them: a participant without capabilities is invisible to capability-filtered '
+            'dispatch.'
+        )] = None,
+        metadata: Annotated[dict[str, Any] | None, Field(description=
+            "Free-form JSON attached to your roster entry."
+        )] = None,
+        delivery_mode: Annotated[Literal["push", "pull"] | None, Field(description=
+            '"push" (default): events arrive as MCP notifications. "pull": events are buffered for'
+            ' session_check_inbox / session_wait_for_event. Choose pull if you intend to long-poll'
+            ' — session_wait_for_event refuses push participants.'
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Join a session as a new participant and bind this connection to it.
@@ -396,9 +449,15 @@ def _build_fastmcp(
 
     @_tool("session_resume")
     async def session_resume_tool(
-        session_id: str,
-        participant_id: str,
-        last_acked_seq: int | None = None,
+        session_id: SessionIdArg,
+        participant_id: Annotated[str, Field(description=
+            "The participant_id session_join returned. Resuming keeps that identity; joining again"
+            " would make you a second participant."
+        )],
+        last_acked_seq: Annotated[int | None, Field(description=
+            "Highest event seq you already processed; buffered events up to it are not replayed. "
+            "Omit to replay everything buffered."
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Re-attach to a session you already joined, keeping the same participant_id.
@@ -425,9 +484,13 @@ def _build_fastmcp(
 
     @_tool("session_leave")
     async def session_leave_tool(
-        feedback: dict[str, Any] | None = None,
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        feedback: Annotated[dict[str, Any] | None, Field(description=
+            'Exit report broadcast to the others on participant.left: {"summary": "...", "rating":'
+            ' 1-5, "issues": [...], "metrics": {...}}. Always send one, even {"summary": "no '
+            'issues", "rating": 5, "issues": []}. 4 KiB cap.'
+        )] = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Leave the session this connection joined and unbind the connection.
@@ -444,12 +507,21 @@ def _build_fastmcp(
 
     @_tool("session_update_self")
     async def session_update_self_tool(
-        role: str | None = None,
-        objective: str | None = None,
-        capabilities: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        role: Annotated[str | None, Field(description=
+            "New role; replaces the old one. Omit to keep it."
+        )] = None,
+        objective: Annotated[str | None, Field(description=
+            "New objective line; replaces the old one. Omit to keep it."
+        )] = None,
+        capabilities: Annotated[list[str] | None, Field(description=
+            "New capability list. REPLACES the old list outright — pass the full set you want, not"
+            " just additions. Omit to keep it."
+        )] = None,
+        metadata: Annotated[dict[str, Any] | None, Field(description=
+            "New metadata object; replaces the old one, no merge. Omit to keep it."
+        )] = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Replace your own role, objective, capabilities or metadata.
@@ -474,8 +546,8 @@ def _build_fastmcp(
 
     @_tool("session_list_participants")
     async def session_list_participants_tool(
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Return the roster of the session this connection joined.
@@ -490,8 +562,8 @@ def _build_fastmcp(
 
     @_tool("session_check_inbox")
     async def session_check_inbox_tool(
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Drain the events buffered for you right now and return them, empty or not.
@@ -508,10 +580,17 @@ def _build_fastmcp(
 
     @_tool("session_wait_for_event")
     async def session_wait_for_event_tool(
-        session_id: str,
-        names: list[str] | None = None,
-        timeout_seconds: float = 60.0,
-        participant_token: str | None = None,
+        session_id: SessionIdArg,
+        names: Annotated[list[str] | None, Field(description=
+            'Event names to wait for, e.g. ["command.received", "supervisor.note"]. Omit to return'
+            ' on any event.'
+        )] = None,
+        timeout_seconds: Annotated[float, Field(description=
+            "How long to block, in seconds. Clamped to the relay MCP cap (default 20 s); "
+            "effective_timeout_seconds in the response says what applied. timed_out=true is normal"
+            " — just call again."
+        )] = 60.0,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Block until at least one buffered event matches, then return every match.
@@ -535,12 +614,25 @@ def _build_fastmcp(
 
     @_tool("session_send")
     async def session_send_tool(
-        dispatch: str,
-        target: dict[str, Any],
-        payload: dict[str, Any],
-        timeout_seconds: int | None = None,
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        dispatch: Annotated[Literal["specific", "all", "any"], Field(description=
+            '"specific": exactly target.participant_ids. "all": every match of target.role / '
+            'target.capability, including offline participants (their copy is buffered). "any": '
+            'ONE match among participants online right now, round-robin — an offline participant '
+            'is never picked.'
+        )],
+        target: Annotated[dict[str, Any], Field(description=
+            'Who receives it: {"participant_ids": [...]} for specific, or {"role": "..."} / '
+            '{"capability": "..."} for all and any.'
+        )],
+        payload: Annotated[dict[str, Any], Field(description=
+            'Your command body, free-form JSON, e.g. {"body": "..."}. 256 KiB cap.'
+        )],
+        timeout_seconds: Annotated[int | None, Field(description=
+            "How long recipients have to answer, in seconds (default 60, max 300). Recipients that"
+            " have not answered get command.cancelled."
+        )] = None,
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Dispatch a command to other participants of the session this connection joined.
@@ -575,11 +667,18 @@ def _build_fastmcp(
 
     @_tool("session_respond")
     async def session_respond_tool(
-        command_id: str,
-        payload: dict[str, Any],
-        status: str = "ok",
-        session_id: str | None = None,
-        participant_token: str | None = None,
+        command_id: Annotated[str, Field(description=
+            "The command_id from the command.received event you are answering. Answer before its "
+            "expires_at, and not at all if command.cancelled arrived for it."
+        )],
+        payload: Annotated[dict[str, Any], Field(description=
+            'Your answer, free-form JSON, e.g. {"body": "..."}.'
+        )],
+        status: Annotated[Literal["ok", "error"], Field(description=
+            '"ok" (default), or "error" if you could not do the work.'
+        )] = "ok",
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Answer a command you received.
@@ -597,8 +696,11 @@ def _build_fastmcp(
 
     @_tool("session_delete")
     async def session_delete_tool(
-        session_id: str,
-        creator_token: str,
+        session_id: SessionIdArg,
+        creator_token: Annotated[str, Field(description=
+            "The one-time token session_create returned. There is no other way to delete the "
+            "session, and it cannot be recovered."
+        )],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a session permanently, for everyone in it.
@@ -614,13 +716,29 @@ def _build_fastmcp(
 
     @_tool("session_get_events")
     async def session_get_events_tool(
-        session_id: str,
-        after_seq: int | None = None,
-        before_seq: int | None = None,
-        kind: str | None = None,
-        participant_id: str | None = None,
-        limit: int = 200,
-        order: str = "asc",
+        session_id: Annotated[str, Field(description=
+            "A persisted session. An ephemeral one keeps no timeline and returns no_history."
+        )],
+        after_seq: Annotated[int | None, Field(description=
+            "Only events with seq strictly greater than this. Pass the last seq you saw to page "
+            "forward."
+        )] = None,
+        before_seq: Annotated[int | None, Field(description=
+            "Only events with seq strictly less than this, to page backward."
+        )] = None,
+        kind: Annotated[str | None, Field(description=
+            'Comma-separated event names to keep, e.g. "command.received,result.received". Omit '
+            'for all kinds.'
+        )] = None,
+        participant_id: Annotated[str | None, Field(description=
+            "Comma-separated participant ids; keep only events involving them."
+        )] = None,
+        limit: Annotated[int, Field(description=
+            "Maximum events to return, 1 to 1000 (default 200)."
+        )] = 200,
+        order: Annotated[Literal["asc", "desc"], Field(description=
+            '"asc" (default) oldest first, or "desc" newest first.'
+        )] = "asc",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Browse the timeline of a persisted session without bringing it back into RAM.
