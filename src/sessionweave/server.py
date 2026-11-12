@@ -147,11 +147,21 @@ Two rules govern every tool here.
    session_id. They act on the session this connection joined and return
    not_in_session until session_join has run.
 
-The usual order: session_describe to look without committing,
-session_join to bind, then session_send / session_respond and
-session_wait_for_event to do the work, then session_leave. Open a new
-session with session_create, which returns a one-time creator_token that
-session_delete later requires."""
+The usual order: session_describe (with an access_token) to look without
+committing, session_join (with the join_token from the invite link) to bind,
+then session_send / session_respond and session_wait_for_event to do the work,
+then session_leave. Joining needs a credential: the join_token carried by an
+invite link (swv://host/<session_id>?jt=<join_token>), the creator_token, or
+the relay admin token. The session id alone grants nothing, and neither does
+a participant_id: session_join returns a secret participant_token, and that is
+the credential for a client that has no stable connection (pass session_id +
+participant_token explicitly, or to session_resume).
+
+Open a new session with session_create. It returns the invite link to hand to
+the agents you want to involve, a creator_token (delete the session, change its
+purpose, mint tokens) and a supervisor_token (observe and post supervisor
+notes), plus the first join_token. Hand each back to whoever asked, labelled
+with its purpose; the plaintext is shown once."""
 
 
 # mcp 2.x transport defaults, mirrored here so they are visible in the relay's
@@ -956,13 +966,11 @@ def build_app() -> Starlette:
         return JSONResponse({"status": "ready", "version": __version__})
 
     async def info(request: Request) -> JSONResponse:
-        # ``auth_model`` lets SDK clients detect they're talking to the
-        # sub-project #1 deployment (bearer == participant_id, no
-        # rotation / expiry / scope). New SDK versions can surface a
-        # one-shot warning when this value is "shared-bearer-sub-project-1"
-        # so users don't unwittingly assume production-grade auth.
-        # Sub-project #3 (JWT scoped tokens) will return a different
-        # string here.
+        # ``auth_model`` lets SDK clients detect which credentials the relay
+        # issues: "scoped-tokens-v1" means a session is joined with a
+        # short-lived join token, each participant then authenticates with its
+        # own secret participant_token (never its participant_id or the
+        # session id), and supervisors / the creator hold their own tokens.
         #
         # ``relay_epoch`` is the UNIX-seconds startup time. External
         # monitors and SDK clients can poll this; a change means the
@@ -973,7 +981,7 @@ def build_app() -> Starlette:
                 "name": "sessionweave",
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
-                "auth_model": "shared-bearer-sub-project-1",
+                "auth_model": "scoped-tokens-v1",
                 "relay_epoch": relay_epoch,
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {

@@ -12,11 +12,23 @@ info:
     at `/mcp` that mirrors every endpoint here as a tool — see the
     repo README for the MCP-side contract.
 
-    **Auth (sub-project #1):** the bearer token IS the `participant_id`
-    returned on join. Send as `Authorization: Bearer <participant_id>`
-    on every authenticated route, or as the `?token=…` query parameter
-    on the WebSocket upgrade. Sub-project #3 will swap this for a JWT
-    without changing the surface.
+    **Auth:** every credential is a 256-bit secret sent as
+    `Authorization: Bearer <token>` (or `?token=…` on a WebSocket upgrade).
+    `POST /v1/sessions` returns an invite link carrying a 15-minute, multi-use
+    **join token**, plus a **creator token** and a **supervisor token**.
+    Joining needs the join, creator or admin token; the join returns a secret
+    **participant token** that authenticates every participant route. The
+    relay-wide admin token is the `SW_ADMIN_TOKEN` environment variable (unset
+    means no admin access). A session id and a `participant_id` are
+    identifiers only; no route accepts either as a credential. Access by role:
+
+    | Operation | participant | join token | supervisor | creator | admin |
+    |---|---|---|---|---|---|
+    | join | | yes | | yes | yes |
+    | read (describe, roster, events, `/invite`) | yes | yes | yes | yes | yes |
+    | send / respond / leave | yes | | | | |
+    | supervisor notes, firehose | | | yes | yes | yes |
+    | purpose update, delete, mint / revoke tokens | | | | yes | yes |
   contact:
     name: SessionWeave
     url: https://sessionweave.com
@@ -46,14 +58,11 @@ components:
       type: http
       scheme: bearer
       description: |
-        Bearer token (= `participant_id` in sub-project #1) returned by
-        `POST /v1/sessions/{sid}/participants`.
-    BearerSessionId:
-      type: http
-      scheme: bearer
-      description: |
-        Bearer token equal to the ``session_id``. Used by cockpit-side
-        endpoints (firehose, supervisor notes, end session).
+        A secret token scoped to one session: the participant token returned
+        by `POST /v1/sessions/{sid}/participants`, or a join, supervisor or
+        creator token returned by `POST /v1/sessions`, or the relay admin
+        token. Each operation states which of these it accepts. The session
+        id and the `participant_id` are never accepted.
 
   schemas:
     Purpose:
@@ -415,22 +424,36 @@ paths:
       summary: Self-describing participation brief (Markdown)
       description: >
         Returns a human/agent-readable Markdown brief: the session's purpose plus the
-        exact HTTP recipe to participate in non-blocking pull mode. Read-only, public,
-        allocates no participant. Hand the URL https://<host>/invite/<sid> to a bare
-        HTTP agent and it can join, exchange, and leave with no SDK/MCP/skill.
+        exact HTTP recipe to participate in non-blocking pull mode. Read-only,
+        allocates no participant. Hand the URL
+        https://<host>/invite/<sid>?jt=<join_token> to a bare HTTP agent and it
+        can join, exchange, and leave with no SDK/MCP/skill. The `jt` query
+        parameter (a join, supervisor, creator or admin token) is required.
       parameters:
         - name: sid
           in: path
           required: true
           schema: { type: string }
+        - name: jt
+          in: query
+          required: true
+          schema: { type: string }
+          description: The join token carried by the invite link.
       responses:
         '200':
           description: The participation brief.
           content:
             text/markdown:
               schema: { type: string }
+        '403':
+          description: Missing, invalid or expired `jt`. The page reveals nothing about the session.
+          content:
+            text/markdown:
+              schema: { type: string }
         '404':
           description: Session not found or ended.
+        '429':
+          description: Too many invalid tokens from this source IP for this session.
 
   /v1/info:
     get:
@@ -452,12 +475,12 @@ paths:
                     description: |
                       Identifier for the relay's authentication shape so
                       SDK clients can detect which security guarantees
-                      apply. ``shared-bearer-sub-project-1`` means
-                      bearer-token equals ``participant_id`` with no
-                      rotation, expiry, or scope (see Threat Model in
-                      README). Sub-project #3 will return a different
-                      string (TBD) when JWT-scoped tokens land.
-                    enum: [shared-bearer-sub-project-1]
+                      apply. ``scoped-tokens-v1`` means join tokens
+                      (15 minutes, multi-use), a secret per-participant
+                      token distinct from ``participant_id``, and
+                      creator / supervisor / admin tokens (see Threat
+                      Model in README).
+                    enum: [scoped-tokens-v1]
                   relay_epoch:
                     type: integer
                     description: |
@@ -485,6 +508,9 @@ paths:
     post:
       tags: [sessions]
       summary: Create a session
+      description: |
+        Unauthenticated. The response carries every credential for the new
+        session, each in plaintext exactly once (only digests are stored).
       requestBody:
         content:
           application/json:
@@ -525,13 +551,34 @@ paths:
                   creator_token:
                     type: string
                     description: |
-                      Opaque token that authorises the creator as the
-                      supervisor of this session: accepted on
-                      DELETE /v1/sessions/{sid} (end session), on
-                      POST /v1/sessions/{sid}/supervisor/notes, AND on
-                      the /v1/sessions/{sid}/firehose WebSocket (see
-                      that endpoint's `token` description). Store
-                      securely; not re-issuable.
+                      Secret that authorises managing this session: delete,
+                      purpose update, minting and revoking join / supervisor
+                      tokens, joining, reading, supervisor notes and the
+                      firehose. Store securely; not re-issuable.
+                  supervisor_token:
+                    type: string
+                    description: |
+                      Secret that authorises observing (firehose, reads) and
+                      posting supervisor notes. Not valid for joining or for
+                      management. Revocable by the creator.
+                  supervisor_token_id:
+                    type: string
+                    description: Id of `supervisor_token`, for revocation.
+                  join_token:
+                    type: string
+                    description: |
+                      Secret that authorises joining and reading. Valid for
+                      15 minutes, multi-use within that window; expiry does
+                      not affect participants already joined.
+                  join_token_expires_at:
+                    type: string
+                    description: ISO-8601 expiry of `join_token`.
+                  invite_url:
+                    type: string
+                    description: "`http(s)://host/invite/<sid>?jt=<join_token>`"
+                  invite_link:
+                    type: string
+                    description: "`swv(s)://host/<sid>?jt=<join_token>`"
                   creator_id:
                     type: string
                     description: |
@@ -555,6 +602,10 @@ paths:
     get:
       tags: [sessions]
       summary: Describe a session (read-only)
+      description: |
+        Bearer: a participant, join, supervisor, creator or admin token.
+      security:
+        - bearerAuth: []
       responses:
         '200':
           description: Snapshot
@@ -568,6 +619,8 @@ paths:
                   persistence:
                     $ref: '#/components/schemas/PersistenceStatePublic'
                     nullable: true
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied (invalid, expired or wrong-role token) }
         '404':
           description: session_not_found
           content:
@@ -594,10 +647,10 @@ paths:
                   deleted_at: { type: string }
         '401': { description: Missing bearer }
         '403':
-          description: Token is not the creator token or the relay admin token. Body is ``{"error": {"code", "message"}}``.
+          description: "Token is not the creator token or the relay admin token. Body is ``{\"error\": {\"code\", \"message\"}}``."
         '404': { description: Session not found }
         '429':
-          description: Too many invalid tokens from this source IP for this session (``rate_limited``). A valid token is never throttled. Body is ``{"error": {"code", "message"}}``.
+          description: "Too many invalid tokens from this source IP for this session (``rate_limited``). A valid token is never throttled. Body is ``{\"error\": {\"code\", \"message\"}}``."
 
   /v1/sessions/{sid}/events:
     parameters:
@@ -608,6 +661,9 @@ paths:
     get:
       tags: [sessions]
       summary: "Browse the timeline of a persisted session"
+      description: "Bearer: a participant, join, supervisor, creator or admin token."
+      security:
+        - bearerAuth: []
       parameters:
         - in: query
           name: after_seq
@@ -660,6 +716,7 @@ paths:
     patch:
       tags: [sessions]
       summary: Update the session's `purpose` (broadcasts session.purpose_updated)
+      description: "Bearer: the creator token or the admin token. A participant may not change the purpose."
       security:
         - bearerAuth: []
       requestBody:
@@ -673,6 +730,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Session' }
         '401': { description: not_in_session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: permission_denied, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/supervisor/notes:
     parameters:
@@ -681,22 +739,10 @@ paths:
       tags: [sessions]
       summary: Post a supervisor note / halt / continue / redirect
       description: |
-        Authentication modes (mirrors the firehose endpoint):
-
-        - **Admin-token mode** (recommended in multi-tenant
-          deployments): the relay is started with
-          ``SW_ADMIN_TOKEN=<value>``; the bearer header
-          must equal that value. Relay-wide operator authority.
-        - **In-session participant**: bearer matches the
-          ``participant_id`` of an active participant in this
-          session. Lets an SDK orchestrator/supervisor role issue
-          notes (kind=note/halt/continue/redirect) from inside the
-          session.
-        - **Per-session creator**: bearer matches the session's
-          ``creator_token`` (when persistence + creator_token were
-          set at create). Symmetric with the firehose WS auth so
-          the cockpit's creator-role has supervisor power on both
-          transports.
+        Bearer: a supervisor token, the creator token or the admin token
+        (``SW_ADMIN_TOKEN``). A participant token is not accepted: participants
+        receive supervisor notes, they do not send them. The session id is
+        never a credential.
 
         Server-side invariants (all modes):
           - ``kind`` is restricted to the documented enum
@@ -706,7 +752,7 @@ paths:
             currently in the session roster.
           - Per-(session, source-ip) rate limit applies.
       security:
-        - BearerSessionId: []
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -733,9 +779,126 @@ paths:
                   ts_ms: { type: integer }
         '400': { description: Malformed request }
         '401': { description: Missing bearer }
-        '403': { description: Bearer does not match session_id }
+        '403': { description: permission_denied (not a supervisor, creator or admin token) }
         '404': { description: Session not found }
         '429': { description: Rate-limited }
+
+  /v1/sessions/{sid}/join-tokens:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [sessions]
+      summary: Mint a fresh join token
+      description: |
+        Bearer: the creator token or the admin token. The new token is valid
+        for 15 minutes and multi-use within that window; earlier join tokens
+        keep their own expiry. The plaintext is returned once.
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Minted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  join_token: { type: string }
+                  expires_at: { type: string }
+                  invite_url: { type: string }
+                  invite_link: { type: string }
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied }
+        '404': { description: session_not_found }
+        '429': { description: Too many invalid tokens from this source IP for this session }
+
+  /v1/sessions/{sid}/supervisor-tokens:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [sessions]
+      summary: Mint an additional supervisor token
+      description: "Bearer: the creator token or the admin token. The plaintext is returned once."
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Minted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token_id: { type: string }
+                  supervisor_token: { type: string }
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied }
+        '404': { description: session_not_found }
+    get:
+      tags: [sessions]
+      summary: List supervisor tokens (ids and timestamps only, never secrets)
+      description: "Bearer: the creator token or the admin token."
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Supervisor tokens, including revoked ones
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    token_id: { type: string }
+                    created_at: { type: string }
+                    revoked_at: { type: string, nullable: true }
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied }
+        '404': { description: session_not_found }
+
+  /v1/sessions/{sid}/supervisor-tokens/{token_id}:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: token_id, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [sessions]
+      summary: Revoke a supervisor token
+      description: "Bearer: the creator token or the admin token. Revocation is immediate."
+      security:
+        - bearerAuth: []
+      responses:
+        '204': { description: Revoked }
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied }
+        '404': { description: session_not_found or unknown token_id }
+
+  /v1/sessions/{sid}/access:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [sessions]
+      summary: Which role does the presented Bearer hold in this session
+      description: |
+        Lets a client (such as the Cockpit) check a pasted token before
+        binding to it. Never reveals anything beyond the role.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The role
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: [participant, joiner, supervisor, creator, admin]
+                  participant_id: { type: string, nullable: true }
+        '401': { description: Missing bearer }
+        '403': { description: permission_denied (unknown or expired token) }
+        '404': { description: session_not_found }
 
   /v1/sessions/{sid}/participants:
     parameters:
@@ -763,7 +926,7 @@ paths:
           description: Missing Authorization header
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '403':
-          description: permission_denied (invalid, wrong-role or expired join token)
+          description: permission_denied (invalid, wrong-role or expired join token; a supervisor token cannot join)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: session_not_found
@@ -774,6 +937,7 @@ paths:
     get:
       tags: [participants]
       summary: List the session roster
+      description: "Bearer: a participant, join, supervisor, creator or admin token."
       security:
         - bearerAuth: []
       responses:
@@ -932,11 +1096,11 @@ paths:
       - name: token
         in: query
         required: true
-        schema: { type: string, format: uuid }
+        schema: { type: string }
         description: |
-          Bearer token (== participant_id in sub-project #1). Required
-          here because browsers can't set custom headers on a WebSocket
-          upgrade.
+          The participant token returned by the join (not the
+          `participant_id`). Required here because browsers can't set custom
+          headers on a WebSocket upgrade.
     get:
       tags: [participants]
       summary: WebSocket events stream — upgrade to wss/ws
@@ -965,29 +1129,18 @@ paths:
           Authentication token, required as a query param because
           browsers can't set custom headers on a WebSocket upgrade.
 
-          Two modes (any one match accepts the connection). The session id is never a credential:
-
-          - **Admin-token mode** (recommended for multi-tenant
-            deployments): when the relay is started with
-            ``SW_ADMIN_TOKEN=<value>``, this query param
-            may equal that value. Relay-wide operator credential —
-            list/manage every session on the relay.
-          - **Creator-token mode** (added in v0.17.0): the
-            ``creator_token`` returned by ``session_create`` for
-            *this* session is accepted as a session-scoped
-            supervisor channel. The user who created the session
-            has the right to observe every event in it (chat
-            between other participants included) without holding
-            the relay-wide admin token. Verified with a
-            constant-time SHA-256 compare against the session's
-            stored ``creator_token_hash``.
+          Accepted: a supervisor token or the creator token of *this*
+          session, or the relay-wide admin token (``SW_ADMIN_TOKEN``). The
+          session id is never a credential, and neither is a participant
+          token (a participant sees its own stream on ``/events``).
+          Verified against stored SHA-256 digests.
     get:
       tags: [sessions]
       summary: WebSocket — full event stream for the session (non-participant)
       description: |
         HTTP/WS upgrade. Authentication via the ``token`` query
         parameter — see the parameter description for the two
-        accepted modes (admin / creator). Frames are JSON
+        accepted tokens (supervisor / creator / admin). Frames are JSON
         ``{name, payload}`` objects, matching the participant inbox
         shape.
 
@@ -996,8 +1149,7 @@ paths:
         (the ``/events`` WS, ``inbox/drain``, MCP push) receive only
         the events targeted at their participant_id. The two streams
         MAY overlap: a participant that opens its own ``/events`` WS
-        AND subscribes to the firehose (it knows its own
-        ``session_id``, which is the firehose token) will observe
+        AND is also handed a supervisor token and subscribes to the firehose will observe
         the same event on both channels. Consumers that subscribe to
         both MUST dedupe by event identity (``command_id`` for
         command-lifecycle events, ``participant_id`` + event name

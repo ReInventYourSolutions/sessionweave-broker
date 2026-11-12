@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -61,15 +61,17 @@ async def test_client_disconnect_marks_participant_offline_promptly() -> None:
         env_overrides={"SW_DEFAULT_OFFLINE_GRACE_SECONDS": "300"}
     ) as base:
         async with sw_client(base) as watcher:
-            sid = (await watcher.call_tool("session_create", {}))["session_id"]
-            await watcher.call_tool("session_join", {"session_id": sid, "role": "w"})
+            sid, _creator, jt = await create_and_invite(watcher, {})
+            await watcher.call_tool(
+                "session_join", {"session_id": sid, "join_token": jt, "role": "w"}
+            )
 
             seen: list[tuple[str, dict[str, Any]]] = []
             watcher.on_notification(lambda n, p: seen.append((n, p)))
 
             async with sw_client(base) as leaver:
                 await leaver.call_tool(
-                    "session_join", {"session_id": sid, "role": "l"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "l"}
                 )
             # leaver's context exit sends DELETE /mcp
 
@@ -102,12 +104,14 @@ async def test_disconnect_does_not_drift_participants_active() -> None:
         env_overrides={"SW_DEFAULT_OFFLINE_GRACE_SECONDS": "300"}
     ) as base:
         async with sw_client(base) as watcher:
-            sid = (await watcher.call_tool("session_create", {}))["session_id"]
-            await watcher.call_tool("session_join", {"session_id": sid, "role": "w"})
+            sid, _creator, jt = await create_and_invite(watcher, {})
+            await watcher.call_tool(
+                "session_join", {"session_id": sid, "join_token": jt, "role": "w"}
+            )
 
             async with sw_client(base) as leaver:
                 await leaver.call_tool(
-                    "session_join", {"session_id": sid, "role": "l"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "l"}
                 )
 
             # Let the disconnect callback land, then give the presence

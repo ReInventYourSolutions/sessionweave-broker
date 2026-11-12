@@ -24,7 +24,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.integration.client import sw_client
+from tests.integration.client import bearer, create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -55,14 +55,16 @@ async def test_check_inbox_respects_authoritative_ack_watermark() -> None:
     async with relay_subprocess() as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as c:
-            sid = (
+            _created = (
                 await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
         # B joins via REST so we have a token + pid.
         async with httpx.AsyncClient() as c:
             join = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "worker", "capabilities": ["respond"]},
             )
             join.raise_for_status()
@@ -71,7 +73,7 @@ async def test_check_inbox_respects_authoritative_ack_watermark() -> None:
 
         async with sw_client(base) as a:
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             for i in range(5):
                 await a.call_tool(
@@ -133,16 +135,16 @@ async def test_session_resume_body_field_last_acked_seq_filters_push_replay() ->
         # context. While offline, A dispatches 5 commands which get
         # buffered for B.
         async with sw_client(base) as a:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
 
             async with sw_client(base) as b:
                 pb = await b.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -173,7 +175,7 @@ async def test_session_resume_body_field_last_acked_seq_filters_push_replay() ->
                     "session_resume",
                     {
                         "session_id": sid,
-                        "participant_id": pb["participant_id"],
+                        "participant_token": pb["participant_token"],
                         "last_acked_seq": 3,
                     },
                 )

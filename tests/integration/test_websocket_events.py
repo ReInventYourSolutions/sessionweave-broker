@@ -17,6 +17,7 @@ import pytest
 import websockets
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -35,15 +36,16 @@ async def _recv_event(ws: Any, timeout: float = 5.0) -> dict[str, object]:
 @pytest.mark.asyncio
 async def test_ws_receives_live_command_received() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         sender = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "sender"}
             )
         ).json()
         receiver = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "receiver"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "receiver"}
             )
         ).json()
         sender_h = {"Authorization": f"Bearer {sender['participant_token']}"}
@@ -79,15 +81,16 @@ async def test_ws_receives_live_command_received() -> None:
 @pytest.mark.asyncio
 async def test_ws_buffer_resumes_after_disconnect() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         sender = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "sender"}
             )
         ).json()
         receiver = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "receiver"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "receiver"}
             )
         ).json()
         sender_h = {"Authorization": f"Bearer {sender['participant_token']}"}
@@ -148,15 +151,16 @@ async def test_ws_buffer_resumes_after_disconnect() -> None:
 @pytest.mark.asyncio
 async def test_ws_replays_pending_buffer_on_attach() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         sender = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "sender"}
             )
         ).json()
         receiver = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "receiver"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "receiver"}
             )
         ).json()
         sender_h = {"Authorization": f"Bearer {sender['participant_token']}"}
@@ -199,15 +203,16 @@ async def test_ws_recovers_undelivered_events_to_buffer_on_disconnect() -> None:
     the subscriber callback succeeded silently and the event was lost.
     """
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         sender = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "sender"}
             )
         ).json()
         receiver = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "receiver"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "receiver"}
             )
         ).json()
         sender_h = {"Authorization": f"Bearer {sender['participant_token']}"}
@@ -271,15 +276,16 @@ async def test_ws_subscriber_receives_command_cancelled_on_ttl_expiry() -> None:
     session's tick to fire the cancellation.
     """
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         sender = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "sender"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "sender"}
             )
         ).json()
         receiver = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "recv"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "recv"}
             )
         ).json()
 
@@ -340,14 +346,26 @@ async def test_ws_rejects_missing_token() -> None:
 @pytest.mark.asyncio
 async def test_ws_rejects_unknown_token() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
-        ws_url = (
-            f"{_ws_base(base)}/v1/sessions/{sid}/participants/me/events"
-            f"?token=00000000-0000-0000-0000-000000000000"
-        )
-        with pytest.raises((ConnectionClosedError, InvalidStatus, OSError)):
-            async with websockets.connect(ws_url) as ws:
-                await _recv_event(ws, timeout=2.0)
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
+        joined = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
+                json={"role": "p"},
+            )
+        ).json()
+        # An unknown token, the session id and the participant_id are all
+        # refused: only the secret participant_token authenticates the socket.
+        for bad in (
+            "00000000-0000-0000-0000-000000000000",
+            sid,
+            joined["participant_id"],
+        ):
+            ws_url = f"{_ws_base(base)}/v1/sessions/{sid}/participants/me/events?token={bad}"
+            with pytest.raises((ConnectionClosedError, InvalidStatus, OSError)):
+                async with websockets.connect(ws_url) as ws:
+                    await _recv_event(ws, timeout=2.0)
 
 
 @pytest.mark.integration
@@ -364,10 +382,11 @@ async def test_ws_attach_keeps_participant_online() -> None:
     offline-grace window.
     """
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        _created = (await c.post("/v1/sessions", json={})).json()
+        sid, jt = _created["session_id"], _created["join_token"]
         observer = (
             await c.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "observer"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "observer"}
             )
         ).json()
         observer_h = {"Authorization": f"Bearer {observer['participant_token']}"}

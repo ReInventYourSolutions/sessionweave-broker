@@ -25,7 +25,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.integration.client import sw_client
+from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -62,17 +62,17 @@ async def test_session_byte_cap_evicts_oldest_and_emits_firehose() -> None:
     ) as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as c:
-            sid = (
-                await c.post(
-                    f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}}
-                )
-            ).json()["session_id"]
+            _created = (
+                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
         # B joins via REST in pull mode so events sit in the buffer
         # waiting to be drained (and we can observe what survives).
         async with httpx.AsyncClient() as c:
             join = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={
                     "role": "worker",
                     "capabilities": ["respond"],
@@ -84,7 +84,7 @@ async def test_session_byte_cap_evicts_oldest_and_emits_firehose() -> None:
             tok_b = join.json()["participant_token"]
 
         firehose_events: list[dict[str, Any]] = []
-        firehose_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
+        firehose_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={_created['supervisor_token']}"
         async with websockets.connect(firehose_url) as ws:
 
             async def _reader() -> None:
@@ -103,7 +103,7 @@ async def test_session_byte_cap_evicts_oldest_and_emits_firehose() -> None:
             large_value = "x" * 3500
             async with sw_client(base) as a:
                 await a.call_tool(
-                    "session_join", {"session_id": sid, "role": "sender"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
                 )
                 for i in range(4):
                     await a.call_tool(

@@ -88,8 +88,8 @@ async def test_brief_auto_wires_to_native_routes() -> None:
         async with httpx.AsyncClient(base_url=base, timeout=5) as c:
             r = await c.post("/v1/sessions", json={"purpose": {"kind": "demo"}})
             r.raise_for_status()
-            sid = r.json()["session_id"]
-            r = await c.get(f"/invite/{sid}")
+            sid, jt = r.json()["session_id"], r.json()["join_token"]
+            r = await c.get(f"/invite/{sid}?jt={jt}")
             assert r.status_code == 200
             body = r.text
             assert "https://broker.internal:9000/skill.md" in body
@@ -108,8 +108,8 @@ async def test_brief_env_override_wins_over_native_routes() -> None:
         async with httpx.AsyncClient(base_url=base, timeout=5) as c:
             r = await c.post("/v1/sessions", json={"purpose": {"kind": "demo"}})
             r.raise_for_status()
-            sid = r.json()["session_id"]
-            r = await c.get(f"/invite/{sid}")
+            sid, jt = r.json()["session_id"], r.json()["join_token"]
+            r = await c.get(f"/invite/{sid}?jt={jt}")
             body = r.text
             assert "https://elsewhere.example/skill" in body
             # native mcp route still fills the unset mcp_snippet_url

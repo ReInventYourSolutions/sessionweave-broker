@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -25,12 +25,12 @@ async def _wait_for(
 async def test_specific_happy_path_round_trip() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             pb = await b.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
 
             received_a: list[tuple[str, dict[str, Any]]] = []
@@ -81,18 +81,18 @@ async def test_dispatch_all_to_three_reviewers() -> None:
             sw_client(base) as c,
             sw_client(base) as d,
         ):
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             await b.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
             await c.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
             await d.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
 
             received_a: list[tuple[str, dict[str, Any]]] = []
@@ -153,15 +153,15 @@ async def test_dispatch_any_picks_one_recipient() -> None:
             sw_client(base) as b,
             sw_client(base) as c,
         ):
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             await b.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
             await c.call_tool(
-                "session_join", {"session_id": sid, "role": "reviewer"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "reviewer"}
             )
 
             received_b: list[tuple[str, dict[str, Any]]] = []
@@ -210,9 +210,9 @@ async def test_dispatch_any_fairness_max_minus_min_le_one() -> None:
             sw_client(base) as r3,
             sw_client(base) as r4,
         ):
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             receivers = [r1, r2, r3, r4]
             inbox_counts: dict[str, int] = {}
@@ -221,7 +221,7 @@ async def test_dispatch_any_fairness_max_minus_min_le_one() -> None:
                 pj = await r.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -308,16 +308,16 @@ async def test_dispatch_any_no_loss_under_roster_churn() -> None:
             sw_client(base) as r3,
             sw_client(base) as transient,
         ):
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             stable_pids: set[str] = set()
             for r in (r1, r2, r3):
                 pj = await r.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -328,7 +328,7 @@ async def test_dispatch_any_no_loss_under_roster_churn() -> None:
                 pj = await transient.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -394,16 +394,16 @@ async def test_dispatch_any_under_multi_worker_simultaneous_churn() -> None:
             sw_client(base) as t1,
             sw_client(base) as t2,
         ):
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             stable_pids: set[str] = set()
             for r in (r1, r2, r3):
                 pj = await r.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -416,7 +416,7 @@ async def test_dispatch_any_under_multi_worker_simultaneous_churn() -> None:
                 pj = await client.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -476,9 +476,9 @@ async def test_dispatch_all_no_double_count_under_fanout() -> None:
             sw_client(base) as w3,
             sw_client(base) as w4,
         ):
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             workers = [w1, w2, w3, w4]
             received_buckets: list[list[tuple[str, dict[str, Any]]]] = []
@@ -486,7 +486,7 @@ async def test_dispatch_all_no_double_count_under_fanout() -> None:
                 await w.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -569,15 +569,15 @@ async def test_dispatch_any_heterogeneous_worker_speeds() -> None:
             sw_client(base) as fast3,
             sw_client(base) as slow,
         ):
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             fast_clients = [fast1, fast2, fast3]
             slow_pj = await slow.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "worker",
                     "capabilities": ["respond"],
                 },
@@ -587,7 +587,7 @@ async def test_dispatch_any_heterogeneous_worker_speeds() -> None:
                 await client.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },

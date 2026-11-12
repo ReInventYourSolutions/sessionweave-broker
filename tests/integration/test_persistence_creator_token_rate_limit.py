@@ -1,9 +1,8 @@
-"""Integration test: creator_token rate limiter blocks correct token after 5 bad attempts.
+"""Integration test: failed-token throttling never refuses a valid token.
 
-The relay's DeleteRateLimiter allows max_failures=5 bad DELETE attempts per
-session within a 60-second window. After 5 wrong-token 403s, any further DELETE
-attempt — even with the CORRECT creator_token — is rejected with 403
-(rate-limited) and does NOT delete the session.
+The relay counts invalid tokens per (session id, source IP). After 5 wrong
+tokens further wrong tokens get 429 (rate_limited), but the CORRECT
+creator_token still works: a valid token is never throttled.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from tests.integration.harness import relay_subprocess
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_rate_limiter_blocks_correct_token_after_five_failures(
+async def test_rate_limiter_never_blocks_correct_token_after_five_failures(
     tmp_path: object,
 ) -> None:
     db = str(tmp_path / "relay.db")  # type: ignore[operator]
@@ -44,19 +43,31 @@ async def test_rate_limiter_blocks_correct_token_after_five_failures(
                     f"got {r_bad.status_code}: {r_bad.text}"
                 )
 
-            # 3. 6th DELETE with the CORRECT creator_token → still 403 (rate-limited)
+            # 3. Further wrong tokens are now throttled (429 rate_limited)...
             r_rl = await c.delete(
                 f"{base}/v1/sessions/{sid}",
-                headers={"Authorization": f"Bearer {correct_token}"},
+                headers={"Authorization": "Bearer wrong-token-attempt"},
             )
-            assert r_rl.status_code == 403, (
-                f"6th attempt with correct token should be rate-limited (403), "
+            assert r_rl.status_code == 429, (
+                f"6th wrong attempt should be rate-limited (429), "
                 f"got {r_rl.status_code}: {r_rl.text}"
             )
 
-            # 4. Confirm session still exists (was NOT deleted)
-            r_get = await c.get(f"{base}/v1/sessions/{sid}")
+            # 4. ...but the throttle never refuses a VALID token: the correct
+            #    creator_token still reads and deletes the session.
+            r_get = await c.get(
+                f"{base}/v1/sessions/{sid}",
+                headers={"Authorization": f"Bearer {correct_token}"},
+            )
             assert r_get.status_code == 200, (
-                f"Session should still exist after rate-limited delete, "
+                f"valid token must not be throttled, "
                 f"got {r_get.status_code}: {r_get.text}"
+            )
+            r_del = await c.delete(
+                f"{base}/v1/sessions/{sid}",
+                headers={"Authorization": f"Bearer {correct_token}"},
+            )
+            assert r_del.status_code == 200, (
+                f"valid creator_token must delete despite prior failures, "
+                f"got {r_del.status_code}: {r_del.text}"
             )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -30,10 +31,12 @@ async def test_persistence_cross_restart_resume(tmp_path: object) -> None:
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
+            creator = r.json()["creator_token"]
             # Sender joins
             ra = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "sender"},
             )
             assert ra.status_code == 201, ra.text
@@ -42,6 +45,7 @@ async def test_persistence_cross_restart_resume(tmp_path: object) -> None:
             # Receiver joins (needed for dispatch=specific target)
             rb = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "receiver"},
             )
             assert rb.status_code == 201, rb.text
@@ -68,6 +72,7 @@ async def test_persistence_cross_restart_resume(tmp_path: object) -> None:
         async with httpx.AsyncClient(timeout=10.0) as c2:
             r_events = await c2.get(
                 f"{base2}/v1/sessions/{sid}/events",
+                headers=bearer(creator),
                 params={"kind": "command.received", "limit": 100},
             )
             assert r_events.status_code == 200, r_events.text

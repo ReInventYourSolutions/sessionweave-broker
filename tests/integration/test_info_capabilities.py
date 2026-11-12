@@ -26,14 +26,13 @@ async def test_info_advertises_capabilities():
 @pytest.mark.asyncio
 async def test_info_advertises_auth_model() -> None:
     """SDK clients use ``/v1/info.auth_model`` to detect the relay's
-    authentication shape (issue #62). Sub-project #1 advertises the
-    shared-bearer model so users don't unwittingly assume production-grade
-    auth; sub-project #3 will return a different string when JWT-scoped
-    tokens land.
+    authentication shape (issue #62). The relay advertises the scoped-token
+    model: join tokens to enter, a secret participant token per participant,
+    and creator / supervisor tokens for the people running the session.
     """
     async with relay_subprocess() as base:
         async with httpx.AsyncClient() as c:
             resp = await c.get(f"{base}/v1/info")
     assert resp.status_code == 200
     body = resp.json()
-    assert body.get("auth_model") == "shared-bearer-sub-project-1"
+    assert body.get("auth_model") == "scoped-tokens-v1"

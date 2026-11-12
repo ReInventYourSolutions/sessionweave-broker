@@ -11,6 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -27,10 +28,11 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
             # Sender joins
             ra = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "sender"},
             )
             assert ra.status_code == 201, ra.text
@@ -40,6 +42,7 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
             # Receiver joins
             rb = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "receiver"},
             )
             assert rb.status_code == 201, rb.text
@@ -61,7 +64,7 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
 
             # ── Page 1: limit=10 ─────────────────────────────────────────────
             r1 = await c.get(
-                f"{base}/v1/sessions/{sid}/events",
+                f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
                 params={"limit": 10, "order": "asc"},
             )
             assert r1.status_code == 200, r1.text
@@ -77,7 +80,7 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
 
             # ── Page 2: after_seq=cursor&limit=10 ───────────────────────────
             r2 = await c.get(
-                f"{base}/v1/sessions/{sid}/events",
+                f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
                 params={"after_seq": first_cursor, "limit": 10, "order": "asc"},
             )
             assert r2.status_code == 200, r2.text
@@ -91,7 +94,7 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
 
             # ── Descending order: last 5 ─────────────────────────────────────
             r_desc = await c.get(
-                f"{base}/v1/sessions/{sid}/events",
+                f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
                 params={"order": "desc", "limit": 5},
             )
             assert r_desc.status_code == 200, r_desc.text
@@ -105,7 +108,7 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
 
             # ── Kind filter: command.received ────────────────────────────────
             r_kind = await c.get(
-                f"{base}/v1/sessions/{sid}/events",
+                f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
                 params={"kind": "command.received", "limit": 100},
             )
             assert r_kind.status_code == 200, r_kind.text
@@ -122,5 +125,8 @@ async def test_persistence_events_pagination_and_filters(tmp_path: object) -> No
             r_ephem = await c.post(f"{base}/v1/sessions", json={})
             assert r_ephem.status_code == 201
             sid_ephem = r_ephem.json()["session_id"]
-            r_no_hist = await c.get(f"{base}/v1/sessions/{sid_ephem}/events")
+            r_no_hist = await c.get(
+                f"{base}/v1/sessions/{sid_ephem}/events",
+                headers=bearer(r_ephem.json()["creator_token"]),
+            )
             assert r_no_hist.status_code == 409, r_no_hist.text

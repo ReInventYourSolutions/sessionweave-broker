@@ -29,7 +29,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -54,14 +54,14 @@ async def test_check_inbox_filters_expired_command_received() -> None:
     """
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             pb = await b.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "worker",
                     "capabilities": ["respond"],
                     "delivery_mode": "pull",
@@ -113,13 +113,12 @@ async def test_sender_gone_emits_orphaned_results_on_firehose() -> None:
     async with relay_subprocess() as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as h:
-            sid = (
-                await h.post(
-                    f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}}
-                )
-            ).json()["session_id"]
+            _created = (
+                await h.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
-        firehose_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
+        firehose_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={_created['supervisor_token']}"
         async with websockets.connect(firehose_url) as ws:
             received: list[dict[str, Any]] = []
 
@@ -139,12 +138,12 @@ async def test_sender_gone_emits_orphaned_results_on_firehose() -> None:
                 sw_client(base) as c,
             ):
                 pa = await a.call_tool(
-                    "session_join", {"session_id": sid, "role": "sender"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
                 )
                 pb = await b.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -152,7 +151,7 @@ async def test_sender_gone_emits_orphaned_results_on_firehose() -> None:
                 await c.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -264,14 +263,14 @@ async def test_sender_gone_delivers_completed_to_responders() -> None:
     """
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b, sw_client(base) as c:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             pb = await b.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "worker",
                     "capabilities": ["respond"],
                 },
@@ -279,7 +278,7 @@ async def test_sender_gone_delivers_completed_to_responders() -> None:
             await c.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "worker",
                     "capabilities": ["respond"],
                 },

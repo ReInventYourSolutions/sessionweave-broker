@@ -17,6 +17,7 @@ import asyncio
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -37,6 +38,7 @@ async def test_sweep_purges_ttl_keeps_until_deleted(tmp_path: object) -> None:
         async with httpx.AsyncClient(timeout=30.0) as c:
             # ── Create 2 TTL sessions (ttl=1 s) ─────────────────────────────
             ttl_sids: list[str] = []
+            tokens: dict[str, str] = {}
             for _ in range(2):
                 r = await c.post(
                     f"{base}/v1/sessions",
@@ -46,6 +48,7 @@ async def test_sweep_purges_ttl_keeps_until_deleted(tmp_path: object) -> None:
                     f"TTL session create failed: {r.status_code} {r.text}"
                 )
                 ttl_sids.append(r.json()["session_id"])
+                tokens[ttl_sids[-1]] = r.json()["creator_token"]
 
             # ── Create 2 until_deleted sessions ──────────────────────────────
             ud_sids: list[str] = []
@@ -58,6 +61,7 @@ async def test_sweep_purges_ttl_keeps_until_deleted(tmp_path: object) -> None:
                     f"until_deleted session create failed: {r.status_code} {r.text}"
                 )
                 ud_sids.append(r.json()["session_id"])
+                tokens[ud_sids[-1]] = r.json()["creator_token"]
 
             # ── Wait for TTL to expire AND at least one sweep to run ─────────
             # TTL expires after 1 s; sweep interval is 10 s; the first sweep
@@ -68,7 +72,9 @@ async def test_sweep_purges_ttl_keeps_until_deleted(tmp_path: object) -> None:
 
             # ── TTL sessions must be gone (purged by sweep) ──────────────────
             for sid in ttl_sids:
-                r_gone = await c.get(f"{base}/v1/sessions/{sid}")
+                r_gone = await c.get(
+                    f"{base}/v1/sessions/{sid}", headers=bearer(tokens[sid])
+                )
                 assert r_gone.status_code == 404, (
                     f"TTL session {sid} should be purged (404) after sweep, "
                     f"got {r_gone.status_code}: {r_gone.text}"
@@ -76,7 +82,9 @@ async def test_sweep_purges_ttl_keeps_until_deleted(tmp_path: object) -> None:
 
             # ── until_deleted sessions must still be present ─────────────────
             for sid in ud_sids:
-                r_alive = await c.get(f"{base}/v1/sessions/{sid}")
+                r_alive = await c.get(
+                    f"{base}/v1/sessions/{sid}", headers=bearer(tokens[sid])
+                )
                 assert r_alive.status_code == 200, (
                     f"until_deleted session {sid} should still be alive (200), "
                     f"got {r_alive.status_code}: {r_alive.text}"

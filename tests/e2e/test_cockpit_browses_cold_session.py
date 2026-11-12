@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -27,9 +28,9 @@ async def test_cockpit_can_load_session_events_endpoint(tmp_path) -> None:
             })
             r.raise_for_status()
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
             # Events endpoint must be reachable
-            r = await c.get(f"{base}/v1/sessions/{sid}/events")
+            r = await c.get(f"{base}/v1/sessions/{sid}/events", headers=bearer(jt))
             r.raise_for_status()
             body = r.json()
             assert body["session_id"] == sid
@@ -51,8 +52,8 @@ async def test_cockpit_events_endpoint_returns_no_events_for_new_session(
             })
             r.raise_for_status()
             sid = r.json()["session_id"]
-
-            r = await c.get(f"{base}/v1/sessions/{sid}/events")
+            jt = r.json()["join_token"]
+            r = await c.get(f"{base}/v1/sessions/{sid}/events", headers=bearer(jt))
             r.raise_for_status()
             body = r.json()
             assert body["events"] == []
@@ -65,5 +66,7 @@ async def test_cockpit_events_endpoint_404_for_unknown_session(tmp_path) -> None
     db = str(tmp_path / "relay3.db")
     async with relay_subprocess(persistence_db_path=db) as base:
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(f"{base}/v1/sessions/nonexistent-sid/events")
+            r = await c.get(
+                f"{base}/v1/sessions/nonexistent-sid/events", headers=bearer("x")
+            )
             assert r.status_code == 404

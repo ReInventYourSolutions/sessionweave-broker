@@ -11,17 +11,21 @@ from tests.integration.harness import relay_subprocess
 async def test_brief_recipe_roundtrip() -> None:
     async with relay_subprocess() as base:
         async with httpx.AsyncClient(base_url=base, timeout=10) as c:
-            sid = (await c.post("/v1/sessions",
-                                json={"purpose": {"kind": "demo"}})).json()["session_id"]
+            created = (await c.post("/v1/sessions",
+                                    json={"purpose": {"kind": "demo"}})).json()
+            sid, jt = created["session_id"], created["join_token"]
+            jt_h = {"authorization": f"Bearer {jt}"}
 
             # Server participant joins (the brief's step 2).
             srv = (await c.post(f"/v1/sessions/{sid}/participants",
+                                headers=jt_h,
                                 json={"role": "worker",
                                       "capabilities": ["respond"]})).json()
             srv_tok, srv_pid = srv["participant_token"], srv["participant_id"]
 
             # Client participant joins and dispatches a command (step 4, client variant).
             cli = (await c.post(f"/v1/sessions/{sid}/participants",
+                                headers=jt_h,
                                 json={"role": "client", "capabilities": []})).json()
             cli_tok = cli["participant_token"]
             disp = await c.post(
