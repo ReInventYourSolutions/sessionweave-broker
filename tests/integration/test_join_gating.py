@@ -42,7 +42,9 @@ def _join(c: TestClient, sid: str, token: str | None):
 
 def test_join_without_token_is_unauthenticated(client: TestClient) -> None:
     sid = _create(client)["session_id"]
-    assert _join(client, sid, None).status_code == 401
+    r = _join(client, sid, None)
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "not_in_session"
 
 
 def test_session_id_is_not_a_join_credential(client: TestClient) -> None:
@@ -156,7 +158,7 @@ async def test_mcp_join_resume_and_explicit_identity_use_secret_token() -> None:
                 "session_list_participants",
                 {"session_id": sid, "participant_token": joined["participant_token"]},
             )
-            assert ok["participants"] if "participants" in ok else ok
+            assert joined["participant_id"] in {r["participant_id"] for r in ok["roster"]}
             with pytest.raises(RuntimeError, match="not_in_session"):
                 await c.call_tool(
                     "session_list_participants",
@@ -169,3 +171,41 @@ async def test_mcp_join_resume_and_explicit_identity_use_secret_token() -> None:
                 {"session_id": sid, "participant_token": joined["participant_token"]},
             )
             assert resumed["roster"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_layer_expired_join_token_message_and_no_plaintext_in_ram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sessionweave.config import load_deployment_defaults
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.errors import ErrorCode, ToolError
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.tools import ToolDeps, session_create, session_join
+    from tests.unit.fakes import FakeHandle
+
+    defaults = load_deployment_defaults({})
+    registry = SessionRegistry(
+        defaults=defaults, connections=ConnectionManager(),
+        metrics=None, firehose=None, store=None,
+    )
+    deps = ToolDeps(registry, bounds=defaults.bounds)
+    created = await session_create(deps, {})
+    sid = created["session_id"]
+
+    joined = await session_join(
+        deps, FakeHandle(), {"session_id": sid, "join_token": created["join_token"]}
+    )
+    sess = registry.get(sid)
+    assert sess._participants[joined["participant_id"]].issued_token is None
+    assert joined["participant_token"]
+
+    real = access._now_ms
+    monkeypatch.setattr(access, "_now_ms", lambda: real() + 901_000)
+    with pytest.raises(ToolError) as exc:
+        await session_join(
+            deps, FakeHandle(), {"session_id": sid, "join_token": created["join_token"]}
+        )
+    assert exc.value.code is ErrorCode.PERMISSION_DENIED
+    assert "expired" in exc.value.message
+    assert "new invite link" in exc.value.message

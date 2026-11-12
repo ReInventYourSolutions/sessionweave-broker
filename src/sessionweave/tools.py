@@ -260,9 +260,13 @@ async def session_join(
         metadata=inp.metadata,
         delivery_mode=inp.delivery_mode,
     )
+    # The plaintext token leaves RAM here: only its hash stays on the Participant.
+    token, p.issued_token = p.issued_token, None
+    if token is None:
+        raise RuntimeError("Session.join returned no participant token")
     return SessionJoinOutput(
         participant_id=p.participant_id,
-        participant_token=p.issued_token or "",
+        participant_token=token,
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),
         config=_int_config(asdict(sess.config)),
