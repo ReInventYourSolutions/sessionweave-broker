@@ -698,20 +698,24 @@ def _build_fastmcp(
     async def session_delete_tool(
         session_id: SessionIdArg,
         creator_token: Annotated[str, Field(description=
-            "The one-time token session_create returned. There is no other way to delete the "
-            "session, and it cannot be recovered."
+            "The one-time creator token session_create returned (it cannot be recovered), or "
+            "the relay operator's admin token."
         )],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a session permanently, for everyone in it.
 
-    Requires the creator_token returned once by session_create. Every
+    Requires the creator_token returned once by session_create (or the relay admin token). Every
     participant is disconnected with session.ended, and a persisted
     session's stored timeline is removed. Needs no session_join, and
     cannot be undone.
     """
+        req = getattr(getattr(ctx, "request_context", None), "request", None)
+        client = getattr(req, "client", None)
         return await session_delete(
-            deps, {"session_id": session_id, "creator_token": creator_token}
+            deps,
+            {"session_id": session_id, "creator_token": creator_token},
+            source_ip=(getattr(client, "host", "") or ""),
         )
 
     @_tool("session_get_events")

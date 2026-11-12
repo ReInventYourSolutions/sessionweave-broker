@@ -764,10 +764,10 @@ async def _get_session_events_handler(request: Request) -> Response:
 
 
 def _request_source_ip(request: Request) -> str:
-    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if not ip and request.client is not None:
-        ip = request.client.host or ""
-    return ip
+    # Trusted client IP only: uvicorn (proxy_headers + forwarded_allow_ips)
+    # already rewrites request.client from X-Forwarded-For for trusted
+    # proxies. Never read the header here: it is attacker-controlled.
+    return (request.client.host if request.client is not None else "") or ""
 
 
 async def _delete_session_handler(request: Request) -> Response:

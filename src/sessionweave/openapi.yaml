@@ -583,12 +583,22 @@ paths:
         relay-wide SW_ADMIN_TOKEN. Distinct ended_reason
         values: host_deleted (creator_token) vs admin_deleted (admin).
       security:
-        - BearerSessionId: []
+        - bearerAuth: []
       responses:
-        '204': { description: Session ended }
+        '200':
+          description: Session ended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_at: { type: string }
         '401': { description: Missing bearer }
-        '403': { description: Bearer does not match session_id }
+        '403':
+          description: Token is not the creator token or the relay admin token. Body is ``{"error": {"code", "message"}}``.
         '404': { description: Session not found }
+        '429':
+          description: Too many invalid tokens from this source IP for this session (``rate_limited``). A valid token is never throttled. Body is ``{"error": {"code", "message"}}``.
 
   /v1/sessions/{sid}/events:
     parameters:
@@ -965,7 +975,7 @@ paths:
       summary: WebSocket — full event stream for the session (non-participant)
       description: |
         HTTP/WS upgrade. Authentication via the ``token`` query
-        parameter — see the parameter description for the three
+        parameter — see the parameter description for the two
         accepted modes (admin / creator). Frames are JSON
         ``{name, payload}`` objects, matching the participant inbox
         shape.

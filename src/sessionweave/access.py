@@ -216,6 +216,8 @@ async def resolve_principal(
     tokens get RATE_LIMITED, while a valid token always passes.
     """
     registry = deps.registry
+    # Session existence is checked before the admin token: an unknown sid is
+    # SESSION_NOT_FOUND for every caller, admin included.
     auth: SessionAuth | None
     if hydrate:
         auth = (await registry.get_or_raise(sid)).auth

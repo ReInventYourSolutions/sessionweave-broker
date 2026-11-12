@@ -159,3 +159,43 @@ def test_require_rejects_other_roles() -> None:
         require(Principal("participant", "p"), "creator", "admin")
     assert exc.value.code is ErrorCode.PERMISSION_DENIED
     assert exc.value.message == "requires one of: creator, admin"
+
+
+@pytest.mark.asyncio
+async def test_cold_resolve_on_ended_session(store) -> None:
+    deps = _deps(store)
+    sid, creator = await _session(
+        deps, persistence=PersistenceConfig(mode="ttl", ttl_seconds=3600)
+    )
+    deps.registry._sessions.pop(sid)
+    await store.mark_session_ended(sid, "host_deleted", int(time.time() * 1000))
+    assert (await resolve_principal(deps, sid, creator, hydrate=False)).role == "creator"
+    assert (await resolve_principal(deps, sid, ADMIN, hydrate=False)).role == "admin"
+    with pytest.raises(ToolError) as exc:
+        await resolve_principal(deps, sid, "bad", hydrate=False)
+    assert exc.value.code is ErrorCode.PERMISSION_DENIED
+    assert sid not in deps.registry._sessions
+
+
+@pytest.mark.asyncio
+async def test_spoofed_x_forwarded_for_shares_one_throttle_bucket(store) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from sessionweave.http_api import _delete_session_handler
+
+    deps = _deps(store, limiter=AuthFailureLimiter(max_failures=2))
+    sid, _ = await _session(deps)
+    route = Route("/v1/sessions/{sid}", _delete_session_handler, methods=["DELETE"])
+    app = Starlette(routes=[route])
+    app.state.tool_deps = deps
+    with TestClient(app) as c:
+        codes = [
+            c.delete(
+                f"/v1/sessions/{sid}",
+                headers={"authorization": "Bearer bad", "x-forwarded-for": f"10.0.0.{i}"},
+            ).status_code
+            for i in range(3)
+        ]
+    assert codes == [403, 403, 429]
