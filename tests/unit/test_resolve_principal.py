@@ -199,3 +199,34 @@ async def test_spoofed_x_forwarded_for_shares_one_throttle_bucket(store) -> None
             for i in range(3)
         ]
     assert codes == [403, 403, 429]
+
+
+@pytest.mark.asyncio
+async def test_invalid_participant_tokens_are_throttled_valid_one_never(store) -> None:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from sessionweave.http_api import patch_self
+    from tests.unit.fakes import FakeHandle
+
+    deps = _deps(store, limiter=AuthFailureLimiter(max_failures=2))
+    sid, _ = await _session(deps)
+    p = await deps.registry.get(sid).join(FakeHandle(), role="worker")
+    ptoken = p.issued_token
+    route = Route("/v1/sessions/{sid}/participants/me", patch_self, methods=["PATCH"])
+    app = Starlette(routes=[route])
+    app.state.tool_deps = deps
+    with TestClient(app) as c:
+        def patch(token: str) -> int:
+            return c.patch(
+                f"/v1/sessions/{sid}/participants/me",
+                headers={"authorization": f"Bearer {token}"},
+                json={"objective": "busy"},
+            ).status_code
+
+        codes = [patch("bad") for _ in range(3)]
+        valid = patch(ptoken)
+    assert codes[2] == 429 and codes[0] == codes[1] != 429
+    assert valid == 200
+    assert deps.auth_limiter.is_throttled(sid, "testclient")

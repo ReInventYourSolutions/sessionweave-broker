@@ -52,6 +52,8 @@ _QUEUE_MAX = 256
 _CLOSE_MISSING_TOKEN = 4401
 _CLOSE_NOT_IN_SESSION = 4401
 _CLOSE_SESSION_NOT_FOUND = 4404
+_CLOSE_TOKEN_REVOKED = 4403
+_CLOSE_RATE_LIMITED = 4429
 
 
 async def events_ws(websocket: WebSocket) -> None:
@@ -74,12 +76,16 @@ async def events_ws(websocket: WebSocket) -> None:
         await websocket.close(code=code, reason=exc.code.value)
         return
 
+    source_ip = (websocket.client.host if websocket.client is not None else "") or ""
     try:
-        pid = participant_id_for_token(session, token)
-    except ToolError:
-        await websocket.close(
-            code=_CLOSE_NOT_IN_SESSION, reason="not_in_session"
+        pid = participant_id_for_token(
+            session, token, limiter=deps.auth_limiter, source_ip=source_ip
         )
+    except ToolError as exc:
+        if exc.code is ErrorCode.RATE_LIMITED:
+            await websocket.close(code=_CLOSE_RATE_LIMITED, reason="rate_limited")
+        else:
+            await websocket.close(code=_CLOSE_NOT_IN_SESSION, reason="not_in_session")
         return
 
     # Parse optional ``?last_acked_seq=N`` so a reconnecting client can
@@ -286,14 +292,32 @@ async def firehose_ws(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    sub = await firehose.subscribe(sid)
+    sub = await firehose.subscribe(sid, token_id=principal.token_id)
+    hot = deps.registry.get(sid)
+    if principal.token_id is not None and (
+        hot is None or hot.auth.supervisor_revoked(principal.token_id)
+    ):
+        # Revoked between the token check and the subscription.
+        sub.close_reason = "supervisor token revoked"
+        sub.closed.set()
+    revoked = asyncio.create_task(sub.closed.wait())
+    getter: asyncio.Task[Any] | None = None
     try:
         while True:
-            event = await sub.queue.get()
+            getter = asyncio.create_task(sub.queue.get())
+            await asyncio.wait({getter, revoked}, return_when=asyncio.FIRST_COMPLETED)
+            if revoked.done():
+                await websocket.close(code=_CLOSE_TOKEN_REVOKED, reason=sub.close_reason)
+                break
+            event = getter.result()
+            getter = None
             await websocket.send_text(json.dumps(event))
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        for task in (getter, revoked):
+            if task is not None and not task.done():
+                task.cancel()
         await firehose.unsubscribe(sub)
 
 

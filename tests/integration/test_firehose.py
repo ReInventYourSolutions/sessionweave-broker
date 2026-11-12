@@ -71,3 +71,41 @@ async def test_firehose_refuses_everything_else():
             with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
                 async with websockets.connect(url) as ws:
                     await ws.recv()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_revoking_supervisor_token_closes_its_live_firehose():
+    async with relay_subprocess() as base:
+        base_ws = base.replace("http://", "ws://")
+        made = await _create(base)
+        sid = made["session_id"]
+        creator = {"authorization": f"Bearer {made['creator_token']}"}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(f"{base}/v1/sessions/{sid}/supervisor-tokens", headers=creator)
+        assert r.status_code == 201, r.text
+        other = r.json()
+        revoked_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={made['supervisor_token']}"
+        kept_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={other['supervisor_token']}"
+        async with websockets.connect(revoked_url) as revoked_ws, \
+                websockets.connect(kept_url) as kept_ws:
+            await _join(base, made)  # both streams are live
+            for ws in (revoked_ws, kept_ws):
+                frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                assert frame["name"] == "participant.joined"
+            async with httpx.AsyncClient() as c:
+                r = await c.delete(
+                    f"{base}/v1/sessions/{sid}/supervisor-tokens/"
+                    f"{made['supervisor_token_id']}",
+                    headers=creator,
+                )
+            assert r.status_code == 204, r.text
+            with pytest.raises(ConnectionClosed) as closed:
+                await asyncio.wait_for(revoked_ws.recv(), timeout=3.0)
+            assert closed.value.rcvd is not None
+            assert closed.value.rcvd.code == 4403
+            assert closed.value.rcvd.reason == "supervisor token revoked"
+            # The other supervisor's stream keeps flowing.
+            await _join(base, made)
+            frame = json.loads(await asyncio.wait_for(kept_ws.recv(), timeout=2.0))
+            assert frame["name"] == "participant.joined"

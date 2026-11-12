@@ -184,10 +184,14 @@ def _hand_back(
         "poller_pid": poller_pid,
         "poller_log": poller_log,
         "who_gets_what": {
-            "invite_link": "give to the agents you invite (carries the join token, expires in 15 min)",
+            "invite_link": (
+                "give to the agents you invite (carries the join token, expires in 15 min)"
+            ),
             "invite_url": "same invite, for a plain HTTP agent",
             "supervisor_token": "give to a Cockpit supervisor (observe + notes); shown once",
-            "creator_token": "for the Cockpit as creator (end, purpose, tokens); never share with participants",
+            "creator_token": (
+                "for the Cockpit as creator (end, purpose, tokens); never share with participants"
+            ),
             "my_participant_token": "your own secret; never share",
             "my_participant_id": "public id, not a credential",
         },

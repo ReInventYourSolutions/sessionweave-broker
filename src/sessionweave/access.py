@@ -14,7 +14,7 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from sessionweave.errors import ErrorCode, ToolError
@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 
 JOIN_TOKEN_TTL_SECONDS: int = 900
 
+# An expired join token is kept in memory this long after expiry, so a stale
+# invite link still gets the "join link expired" message; after that it is
+# pruned (lazily, on the next mint) and reads as an unknown token.
+JOIN_TOKEN_EXPIRED_GRACE_MS: int = 3_600_000
+
 _SWEEP_EVERY = 256
 
 Role = Literal["admin", "creator", "supervisor", "participant", "joiner"]
@@ -34,6 +39,10 @@ Role = Literal["admin", "creator", "supervisor", "participant", "joiner"]
 class Principal:
     role: Role
     participant_id: str | None = None
+    # Which issued supervisor token authenticated this principal (so a live
+    # stream opened with it can be cut off on revocation). Not part of
+    # equality: the role and participant are the identity.
+    token_id: str | None = field(default=None, compare=False)
 
 
 def _now_ms() -> int:
@@ -86,7 +95,16 @@ class SessionAuth:
         self._issued[issued.token_hash] = issued
         return token, issued
 
+    def prune_expired_joins(self, now_ms: int) -> None:
+        cutoff = now_ms - JOIN_TOKEN_EXPIRED_GRACE_MS
+        for digest in [
+            d for d, t in self._issued.items()
+            if t.kind == "join" and t.expires_at_ms is not None and t.expires_at_ms < cutoff
+        ]:
+            del self._issued[digest]
+
     def mint_join(self, now_ms: int) -> tuple[str, IssuedToken]:
+        self.prune_expired_joins(now_ms)
         return self._mint("join", now_ms, JOIN_TOKEN_TTL_SECONDS * 1000)
 
     def mint_supervisor(self, now_ms: int) -> tuple[str, IssuedToken]:
@@ -99,6 +117,12 @@ class SessionAuth:
                     issued.revoked_at_ms = now_ms
                 return issued
         raise KeyError(token_id)
+
+    def supervisor_revoked(self, token_id: str) -> bool:
+        return any(
+            t.kind == "supervisor" and t.token_id == token_id and t.revoked_at_ms is not None
+            for t in self._issued.values()
+        )
 
     def supervisor_tokens(self) -> list[IssuedToken]:
         return [t for t in self._issued.values() if t.kind == "supervisor"]
@@ -120,7 +144,7 @@ class SessionAuth:
             return Principal("creator")
         issued = self._issued.get(digest)
         if issued is not None and issued.kind == "supervisor" and issued.revoked_at_ms is None:
-            return Principal("supervisor")
+            return Principal("supervisor", token_id=issued.token_id)
         pid = self._participants.get(digest)
         if pid is not None:
             return Principal("participant", pid)
@@ -265,15 +289,31 @@ def require(principal: Principal, *allowed: Role) -> None:
         )
 
 
-def participant_id_for_token(sess: Session, token: str | None) -> str:
+def participant_id_for_token(
+    sess: Session,
+    token: str | None,
+    *,
+    limiter: AuthFailureLimiter | None = None,
+    source_ip: str = "",
+) -> str:
     """The participant a secret participant token belongs to, in ``sess``.
 
     Only a participant token qualifies: a participant_id, session id, join,
     supervisor or creator token is NOT_IN_SESSION, as is a token whose
-    participant has since been removed.
+    participant has since been removed. With a ``limiter``, each failure is
+    counted per (sid, source_ip) like any other invalid token; once
+    throttled, invalid tokens get RATE_LIMITED, while a valid participant
+    token is never refused.
     """
     principal = sess.auth.match(token, _now_ms()) if token else None
     pid = principal.participant_id if principal is not None else None
     if principal is None or principal.role != "participant" or pid not in sess._participants:
+        if limiter is not None:
+            sid = sess.session_id
+            if limiter.is_throttled(sid, source_ip):
+                raise ToolError(
+                    ErrorCode.RATE_LIMITED, "too many invalid tokens; retry later"
+                )
+            limiter.record_failure(sid, source_ip)
         raise ToolError(ErrorCode.NOT_IN_SESSION, "unknown or stale participant token")
     return pid

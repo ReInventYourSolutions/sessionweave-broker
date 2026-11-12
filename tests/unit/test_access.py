@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from sessionweave.access import (
+    JOIN_TOKEN_EXPIRED_GRACE_MS,
     JOIN_TOKEN_TTL_SECONDS,
     AuthFailureLimiter,
     IssuedToken,
@@ -170,3 +171,20 @@ def test_limiter_bucket_capped_and_stale_buckets_dropped() -> None:
         lim.record_failure("fresh", f"ip{i}")
     assert ("s", "ip") not in lim._buckets
     assert ("s0", "ip") not in lim._buckets
+
+
+def test_mint_join_prunes_long_expired_join_tokens() -> None:
+    auth, _ = _auth()
+    old, old_issued = auth.mint_join(0)
+    recent, _ = auth.mint_join(1_000_000)
+    sup, _ = auth.mint_supervisor(0)
+    # Just past expiry the old link still reads as "expired" (friendly message).
+    auth.mint_join(900_001)
+    assert auth.join_token_expired(old, 900_001) is True
+    # Long after expiry, the next mint drops it from memory.
+    later = 900_000 + JOIN_TOKEN_EXPIRED_GRACE_MS + 1
+    auth.mint_join(later)
+    assert old_issued.token_hash not in auth._issued
+    assert auth.join_token_expired(old, later) is False
+    assert hash_token(recent) in auth._issued  # expired less than the grace ago
+    assert auth.match(sup, later) == Principal("supervisor")

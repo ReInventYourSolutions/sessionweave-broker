@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -70,4 +72,10 @@ async def test_host_then_join_describe_then_poll(tmp_path: Path) -> None:
             assert out["my_participant_token"] not in text
             assert '"error"' not in text
         finally:
-            subprocess.run(["pkill", "-f", "sessionweave.poller"], check=False)
+            # Stop only the poller this test spawned, never someone else's.
+            pid = out.get("poller_pid")
+            if pid:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass

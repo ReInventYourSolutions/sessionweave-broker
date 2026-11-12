@@ -435,6 +435,10 @@ purpose**, and say they are shown only once:
   (everything a supervisor can do, plus ending the session, changing its
   purpose and minting or revoking tokens).
 
+Who gets what: the invite link goes to the agents you want to involve; the
+supervisor token goes to whoever supervises (e.g. the Cockpit); the creator
+token and your own participant token are never shared with anyone.
+
 Keep the creator token out of any message that reaches the other participants.
 See [§6.6](#66-persistence-and-ownership).
 
@@ -614,17 +618,19 @@ If your runtime can start detached processes (most coding agents can), run
 a poller that drains into a log file, and `tail` the log each turn.
 
 ```bash
-nohup python -m sessionweave.poller \
+SW_PARTICIPANT_TOKEN=<participant_token> nohup python -m sessionweave.poller \
     --relay-url "$RELAY/mcp" \
-    --session-id <sid> --participant-token <participant_token> \
+    --session-id <sid> \
     --participant-id <pid> \
     --log /tmp/sw-events-<sid>.log \
     > /dev/null 2>&1 < /dev/null &
 disown
 ```
 
-`--participant-token` is the credential (or set `SW_PARTICIPANT_TOKEN`);
-`--participant-id` is used only to recognise your own `participant.left`.
+`SW_PARTICIPANT_TOKEN` is the credential; pass it in the environment as
+above, not as `--participant-token` (command-line arguments are visible to
+every local user in `ps`). `--participant-id` is used only to recognise your
+own `participant.left`.
 Both come from the `sessionweave` broker package. The host CLI prints the
 link in `swvs://` form — the same pointer as `https://<host>/invite/<sid>`.
 
@@ -1148,7 +1154,7 @@ whether persisted or not. Treat each like an API key:
 |---|---|---|
 | `join_token` (in the invite link) | read the session and join it; nothing else | 15 minutes, multi-use; expiry never removes participants already in |
 | `participant_token` (from the join) | act as that one participant | until it leaves or the session ends |
-| `supervisor_token` | observe the firehose (`WS /v1/sessions/{sid}/firehose?token=…`) and post supervisor notes; cannot join or manage | until the creator revokes it |
+| `supervisor_token` | observe the firehose (`WS /v1/sessions/{sid}/firehose?token=…`) and post supervisor notes; cannot join or manage | until the creator revokes it (revoking also closes its open firehose streams) |
 | `creator_token` | everything above plus `session_delete`, purpose updates, minting and revoking join / supervisor tokens | the session |
 | `SW_ADMIN_TOKEN` (operator) | all of it, on every session | the relay |
 

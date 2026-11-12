@@ -318,12 +318,16 @@ async def session_resume(
     deps: ToolDeps,
     handle: ConnectionHandle,
     payload: dict[str, Any],
+    *,
+    source_ip: str = "",
 ) -> dict[str, Any]:
     inp = SessionResumeInput.model_validate(payload)
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = await deps.registry.get_or_raise(inp.session_id)
-    pid = participant_id_for_token(sess, inp.participant_token)
+    pid = participant_id_for_token(
+        sess, inp.participant_token, limiter=deps.auth_limiter, source_ip=source_ip
+    )
     await sess.resume(
         handle, pid, last_acked_seq=inp.last_acked_seq
     )

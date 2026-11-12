@@ -111,3 +111,26 @@ async def test_delete_session_removes_tokens(store: PersistenceStore) -> None:
     assert len(await store.load_tokens(sid)) == 2
     await reg.delete(sid, reason="deleted")
     assert await store.load_tokens(sid) == []
+
+
+@pytest.mark.asyncio
+async def test_token_writes_serialise_with_event_transactions(store: PersistenceStore) -> None:
+    """save/revoke/prune share the write connection with BEGIN..ROLLBACK
+    transactions, so they must wait for the transaction lock (a concurrent
+    ROLLBACK would otherwise swallow a revocation)."""
+    import asyncio
+
+    reg = _registry(store)
+    sid, sess = await _create(reg, generate_creator_token())
+    _, issued = await sess.mint_supervisor_token()
+    calls = [
+        store.save_token(sid, issued),
+        store.revoke_token(sid, issued.token_id, _now()),
+        store.load_tokens(sid),
+    ]
+    for coro in calls:
+        async with store._write_tx_lock:
+            task = asyncio.ensure_future(coro)
+            await asyncio.sleep(0.05)
+            assert not task.done(), "token write ran outside the transaction lock"
+        await asyncio.wait_for(task, timeout=2.0)

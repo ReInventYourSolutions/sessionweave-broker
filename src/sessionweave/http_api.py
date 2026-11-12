@@ -146,7 +146,7 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 
 async def _bind_participant(
-    deps: ToolDeps, session_id: str, token: str
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
 ) -> HTTPParticipantHandle:
     """Resolve the secret participant token then create + bind a fresh
     ``HTTPParticipantHandle`` to that pair for the duration of one tool
@@ -159,7 +159,9 @@ async def _bind_participant(
     tokens get rejected uniformly.
     """
     sess = await deps.registry.get_or_raise(session_id)
-    participant_id = participant_id_for_token(sess, token)
+    participant_id = participant_id_for_token(
+        sess, token, limiter=deps.auth_limiter, source_ip=source_ip
+    )
     handle = HTTPParticipantHandle()
     deps.registry.connections.bind(handle, session_id, participant_id)
     return handle
@@ -234,6 +236,19 @@ _INVITE_EXPIRED_PAGE = (
     "Ask the session creator for a new invite link.\n"
 )
 
+_INVITE_NOT_FOUND_PAGE = (
+    "# Session not found\n\n"
+    "This invite link points to a session that does not exist on this relay "
+    "(it may have ended or been deleted). Ask the session creator for a new "
+    "invite link.\n"
+)
+
+_INVITE_RATE_LIMITED_PAGE = (
+    "# Too many invalid invite links\n\n"
+    "Too many invalid tokens were tried for this session from your address. "
+    "Wait a minute, then open the invite link again exactly as you received it.\n"
+)
+
 
 async def invite_brief(request: Request) -> Response:
     from sessionweave.access import require, resolve_principal
@@ -249,10 +264,16 @@ async def invite_brief(request: Request) -> Response:
         require(principal, "joiner", "participant", "supervisor", "creator", "admin")
         purpose = (await deps.registry.get_or_raise(sid)).purpose
     except ToolError as exc:
-        if exc.code is ErrorCode.PERMISSION_DENIED:
+        pages = {
+            ErrorCode.PERMISSION_DENIED: (_INVITE_EXPIRED_PAGE, 403),
+            ErrorCode.SESSION_NOT_FOUND: (_INVITE_NOT_FOUND_PAGE, 404),
+            ErrorCode.RATE_LIMITED: (_INVITE_RATE_LIMITED_PAGE, 429),
+        }
+        if exc.code in pages:
+            page, status_code = pages[exc.code]
             return Response(
-                _INVITE_EXPIRED_PAGE,
-                status_code=403,
+                page,
+                status_code=status_code,
                 media_type="text/markdown; charset=utf-8",
             )
         return _error_response(exc)
@@ -463,7 +484,9 @@ async def patch_self(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_update_self(deps, handle, body)
         finally:
@@ -488,7 +511,9 @@ async def delete_self(request: Request) -> Response:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             await session_leave(deps, handle, body if body else None)
         finally:
@@ -518,7 +543,9 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
             last_acked_seq = None
     try:
         token = _require_bearer(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_check_inbox(
                 deps, handle, last_acked_seq=last_acked_seq
@@ -569,7 +596,9 @@ async def post_inbox_wait(request: Request) -> JSONResponse:
         # session_id is mandatory in the MCP schema but path-derived here;
         # populate from the path for parity with the other endpoints.
         body = {**body, "session_id": sid}
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             # Race the wait against a disconnect watcher: whichever
             # finishes first wins. If the watcher fires it cancels the
@@ -642,7 +671,9 @@ async def post_commands(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_send(deps, handle, body)
         finally:
@@ -662,7 +693,9 @@ async def post_command_response(request: Request) -> JSONResponse:
         token = _require_bearer(request)
         body = await _read_json_body(request)
         body = {**body, "command_id": cid}
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             await session_respond(deps, handle, body)
         finally:

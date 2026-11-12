@@ -405,7 +405,11 @@ class Session:
                 await self._store.revoke_token(
                     self.session_id, token_id, issued.revoked_at_ms
                 )
-            return issued
+        # Live firehose streams opened with this token end now: the token was
+        # only checked at the WebSocket upgrade.
+        if self._firehose is not None:
+            await self._firehose.close_for(self.session_id, token_id)
+        return issued
 
     async def leave(
         self,

@@ -864,7 +864,7 @@ paths:
     delete:
       tags: [sessions]
       summary: Revoke a supervisor token
-      description: "Bearer: the creator token or the admin token. Revocation is immediate."
+      description: "Bearer: the creator token or the admin token. Revocation is immediate: firehose streams opened with this token are closed (WebSocket close code 4403, reason `supervisor token revoked`)."
       security:
         - bearerAuth: []
       responses:

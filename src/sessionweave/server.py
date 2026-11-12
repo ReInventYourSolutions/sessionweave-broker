@@ -376,7 +376,9 @@ def _build_fastmcp(
             yield _handle_for(ctx)
             return
         from sessionweave.http_api import _bind_participant, _unbind_participant
-        handle = await _bind_participant(deps, session_id, participant_token)
+        handle = await _bind_participant(
+            deps, session_id, participant_token, source_ip=_client_ip(ctx)
+        )
         try:
             yield handle
         finally:
@@ -560,6 +562,7 @@ def _build_fastmcp(
                 "participant_token": participant_token,
                 "last_acked_seq": last_acked_seq,
             },
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_leave")

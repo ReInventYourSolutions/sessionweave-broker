@@ -439,33 +439,39 @@ class PersistenceStore:
 
     async def save_token(self, sid: str, t: IssuedToken) -> None:
         assert self._write_conn is not None
-        await self._write_conn.execute(
-            "INSERT OR REPLACE INTO session_tokens ("
-            " session_id, token_id, kind, token_hash,"
-            " created_at, expires_at, revoked_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sid, t.token_id, t.kind, t.token_hash,
-             t.created_at_ms, t.expires_at_ms, t.revoked_at_ms),
-        )
+        # Token writes share the autocommit write connection with the
+        # BEGIN..COMMIT/ROLLBACK transactions; outside the lock a concurrent
+        # ROLLBACK could undo them (a lost revocation fails open on restart).
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "INSERT OR REPLACE INTO session_tokens ("
+                " session_id, token_id, kind, token_hash,"
+                " created_at, expires_at, revoked_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, t.token_id, t.kind, t.token_hash,
+                 t.created_at_ms, t.expires_at_ms, t.revoked_at_ms),
+            )
 
     async def revoke_token(self, sid: str, token_id: str, revoked_at_ms: int) -> None:
         assert self._write_conn is not None
-        await self._write_conn.execute(
-            "UPDATE session_tokens SET revoked_at = ?"
-            " WHERE session_id = ? AND token_id = ?",
-            (revoked_at_ms, sid, token_id),
-        )
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "UPDATE session_tokens SET revoked_at = ?"
+                " WHERE session_id = ? AND token_id = ?",
+                (revoked_at_ms, sid, token_id),
+            )
 
     async def load_tokens(self, sid: str) -> list[IssuedToken]:
         """Load a session's tokens, pruning expired join tokens first."""
         assert self._write_conn is not None
         if not self._read_pool:
             return []
-        await self._write_conn.execute(
-            "DELETE FROM session_tokens"
-            " WHERE session_id = ? AND kind = 'join' AND expires_at < ?",
-            (sid, int(time.time() * 1000)),
-        )
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "DELETE FROM session_tokens"
+                " WHERE session_id = ? AND kind = 'join' AND expires_at < ?",
+                (sid, int(time.time() * 1000)),
+            )
         tokens: list[IssuedToken] = []
         async with self._read_pool[0].execute(
             "SELECT token_id, kind, token_hash, created_at, expires_at, revoked_at"
