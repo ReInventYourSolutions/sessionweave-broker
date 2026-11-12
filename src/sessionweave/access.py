@@ -19,6 +19,8 @@ from typing import Literal
 
 JOIN_TOKEN_TTL_SECONDS: int = 900
 
+_SWEEP_EVERY = 256
+
 Role = Literal["admin", "creator", "supervisor", "participant", "joiner"]
 
 
@@ -35,7 +37,7 @@ def generate_token() -> str:
 
 def hash_token(token: str) -> bytes:
     """Return the SHA-256 raw digest of the token."""
-    return hashlib.sha256(token.encode("utf-8")).digest()
+    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).digest()
 
 
 @dataclass
@@ -130,7 +132,7 @@ class SessionAuth:
 class AuthFailureLimiter:
     """Sliding-window counter of invalid-token attempts per (sid, source IP)."""
 
-    __slots__ = ("_buckets", "_clock", "_max", "_window")
+    __slots__ = ("_buckets", "_clock", "_max", "_since_sweep", "_window")
 
     def __init__(
         self,
@@ -142,11 +144,26 @@ class AuthFailureLimiter:
         self._window = window_seconds
         self._clock = clock
         self._buckets: dict[tuple[str, str], deque[float]] = {}
+        self._since_sweep = 0
 
     def record_failure(self, sid: str, ip: str) -> None:
-        bucket = self._buckets.setdefault((sid, ip), deque())
+        bucket = self._buckets.get((sid, ip))
+        if bucket is None:
+            bucket = self._buckets[(sid, ip)] = deque(maxlen=self._max)
         bucket.append(self._clock())
         self._gc(bucket)
+        self._since_sweep += 1
+        if self._since_sweep >= _SWEEP_EVERY:
+            self._sweep()
+
+    def _sweep(self) -> None:
+        """Drop buckets whose failures have all aged out."""
+        self._since_sweep = 0
+        for key in list(self._buckets):
+            bucket = self._buckets[key]
+            self._gc(bucket)
+            if not bucket:
+                del self._buckets[key]
 
     def is_throttled(self, sid: str, ip: str) -> bool:
         bucket = self._buckets.get((sid, ip))
@@ -168,4 +185,6 @@ def admin_matches(token: str, admin_token: str | None) -> bool:
     """Constant-time compare against the relay admin token; False when unset."""
     if not admin_token:
         return False
-    return hmac.compare_digest(token.encode("utf-8"), admin_token.encode("utf-8"))
+    return hmac.compare_digest(
+        token.encode("utf-8", "surrogatepass"), admin_token.encode("utf-8", "surrogatepass")
+    )

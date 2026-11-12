@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from sessionweave.access import (
     JOIN_TOKEN_TTL_SECONDS,
     AuthFailureLimiter,
+    IssuedToken,
     Principal,
     SessionAuth,
     admin_matches,
@@ -64,11 +67,8 @@ def test_supervisor_revoked_no_longer_matches() -> None:
 
 def test_revoke_unknown_raises() -> None:
     auth, _ = _auth()
-    try:
+    with pytest.raises(KeyError):
         auth.revoke_supervisor("missing", 0)
-    except KeyError:
-        return
-    raise AssertionError("expected KeyError")
 
 
 def test_participant_matches_with_its_id() -> None:
@@ -92,7 +92,19 @@ def test_restore_round_trip() -> None:
     s_tok, s = auth.mint_supervisor(0)
     auth.revoke_supervisor(s.token_id, 5)
     fresh = SessionAuth(hash_token(creator))
-    fresh.restore([j, s])
+    fresh.restore(
+        [
+            IssuedToken(
+                t.token_id,
+                t.kind,
+                t.token_hash,
+                t.created_at_ms,
+                t.expires_at_ms,
+                t.revoked_at_ms,
+            )
+            for t in (j, s)
+        ]
+    )
     assert fresh.match(j_tok, 899_999) == Principal("joiner")
     assert fresh.match(j_tok, 900_000) is None
     assert fresh.match(s_tok, 10) is None
@@ -117,3 +129,44 @@ def test_admin_matches_unset_is_false() -> None:
     assert admin_matches("x", "") is False
     assert admin_matches("x", "x") is True
     assert admin_matches("y", "x") is False
+
+
+def test_lone_surrogate_does_not_crash() -> None:
+    auth, _ = _auth()
+    assert isinstance(hash_token("\ud800"), bytes)
+    assert auth.match("\ud800", 0) is None
+    assert admin_matches("\ud800", "x") is False
+    assert admin_matches("\ud800", "\ud800") is True
+
+
+def test_limiter_below_threshold_not_throttled() -> None:
+    lim = AuthFailureLimiter(clock=lambda: 0.0)
+    for _ in range(4):
+        lim.record_failure("s", "ip")
+    assert lim.is_throttled("s", "ip") is False
+
+
+def test_limiter_window_boundary() -> None:
+    now = [0.0]
+    lim = AuthFailureLimiter(clock=lambda: now[0])
+    for _ in range(5):
+        lim.record_failure("s", "ip")
+    now[0] = 60.0
+    assert lim.is_throttled("s", "ip") is True
+    now[0] = 60.001
+    assert lim.is_throttled("s", "ip") is False
+
+
+def test_limiter_bucket_capped_and_stale_buckets_dropped() -> None:
+    now = [0.0]
+    lim = AuthFailureLimiter(clock=lambda: now[0])
+    for _ in range(50):
+        lim.record_failure("s", "ip")
+    assert len(lim._buckets[("s", "ip")]) == 5
+    for i in range(10):
+        lim.record_failure(f"s{i}", "ip")
+    now[0] = 1000.0
+    for i in range(300):
+        lim.record_failure("fresh", f"ip{i}")
+    assert ("s", "ip") not in lim._buckets
+    assert ("s0", "ip") not in lim._buckets
