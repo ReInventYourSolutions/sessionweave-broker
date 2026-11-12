@@ -90,7 +90,7 @@ session id, `$JT` the join token from the link, `$TOK` your `participant_token`.
 
 | What you want | curl (REST) | Python SDK | MCP tool |
 |---|---|---|---|
-| Look at a session without joining | `GET $RELAY/v1/sessions/$SID` + `Bearer $JT` | `await c.describe(sid, access_token=jt)` | `session_describe {session_id, access_token}` |
+| Look at a session without joining | `GET $RELAY/v1/sessions/$SID` + `Bearer $JT` | `await c.describe(sid, token=jt)` | `session_describe {session_id, access_token}` |
 | Join it | `POST $RELAY/v1/sessions/$SID/participants` + `Bearer $JT` | `await c.join(sid, join_token=jt, role=…, capabilities=[…])` | `session_join {session_id, join_token, role, capabilities}` |
 | Wait for something to happen | `POST …/participants/me/inbox/wait` | `await me.wait_for_event(names=[…], timeout_seconds=60)` | `session_wait_for_event {session_id, names?, timeout_seconds?}` |
 | Grab whatever is buffered right now | `POST …/participants/me/inbox/drain` | `await me.drain_inbox()` | `session_check_inbox {}` |
