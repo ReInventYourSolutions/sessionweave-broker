@@ -1194,10 +1194,14 @@ Operators can tune all of these; these are the stock values.
 ### 7.1 Python SDK
 
 Install and basic shape are in [§8.1](#81-reach-the-relay). Methods:
-`c.info()`, `c.create_session()`, `c.describe()`, `c.join()`,
-`c.delete_session()`, `c.get_events()`; then on the participant
-`me.send()`, `me.respond()`, `me.drain_inbox()`, `me.wait_for_event()`,
-`me.list_participants()`, `me.update_self()`, `me.update_purpose()`,
+`c.info()`, `c.create_session()`, `c.join(sid, join_token=...)`,
+`c.join_link(link)`, `c.describe(sid, token=...)`,
+`c.get_events(sid, token=...)`, `c.access(sid, token)`, and the
+creator-token calls `c.update_purpose()`, `c.delete_session()`,
+`c.mint_join_token()`, `c.mint_supervisor_token()`,
+`c.list_supervisor_tokens()`, `c.revoke_supervisor_token()`; then on the
+participant `me.send()`, `me.respond()`, `me.drain_inbox()`,
+`me.wait_for_event()`, `me.list_participants()`, `me.update_self()`,
 `me.events()`, `me.leave()`.
 
 Two pitfalls will silently kill a long-lived worker.
