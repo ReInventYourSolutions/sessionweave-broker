@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Literal
 
+from sessionweave.access import (
+    AuthFailureLimiter,
+    generate_token,
+    hash_token,
+    require,
+    resolve_principal,
+)
 from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.registry import SessionRegistry
@@ -38,14 +44,13 @@ if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
     from sessionweave.metrics import Metrics
     from sessionweave.persistence import PersistenceStore
-    from sessionweave.persistence_token import DeleteRateLimiter
     from sessionweave.schemas import PersistenceStatePublic
 
 
 class ToolDeps:
     """Bag of dependencies passed to each tool handler."""
 
-    __slots__ = ("bounds", "delete_rate_limiter", "metrics", "registry", "relay_epoch")
+    __slots__ = ("admin_token", "auth_limiter", "bounds", "metrics", "registry", "relay_epoch")
 
     def __init__(
         self,
@@ -53,7 +58,8 @@ class ToolDeps:
         relay_epoch: int = 0,
         bounds: ConfigBounds | None = None,
         metrics: Metrics | None = None,
-        delete_rate_limiter: DeleteRateLimiter | None = None,
+        auth_limiter: AuthFailureLimiter | None = None,
+        admin_token: str | None = None,
     ) -> None:
         self.registry = registry
         # Per-process startup epoch (UNIX seconds at server build_app).
@@ -68,7 +74,9 @@ class ToolDeps:
         else:
             self.bounds = bounds
         self.metrics = metrics
-        self.delete_rate_limiter = delete_rate_limiter
+        self.auth_limiter = auth_limiter if auth_limiter is not None else AuthFailureLimiter()
+        # Relay-wide admin token (SW_ADMIN_TOKEN); None means no admin access.
+        self.admin_token = admin_token or None
 
 
 def _int_config(cfg_dict: dict[str, Any]) -> dict[str, int]:
@@ -108,8 +116,6 @@ async def _session_for_handle(
 
 
 async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
-    from sessionweave.persistence_token import generate_creator_token, hash_creator_token
-
     inp = SessionCreateInput.model_validate(payload)
 
     # Validate persistence ttl up-front against operator bounds
@@ -134,8 +140,8 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
             "persistence is not enabled on this relay",
         )
 
-    token = generate_creator_token()
-    token_hash = hash_creator_token(token)
+    token = generate_token()
+    token_hash = hash_token(token)
     sid, expires_at, cfg, purpose, persistence_state = await deps.registry.create(
         inp.config or {},
         purpose=inp.purpose,
@@ -383,46 +389,32 @@ async def session_respond(
     return {}
 
 
-async def session_delete(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
-    from sessionweave.persistence_token import (
-        verify_creator_token,
-    )
+async def session_delete(
+    deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
+) -> dict[str, Any]:
     inp = SessionDeleteInput.model_validate(payload)
-    rl = deps.delete_rate_limiter
-    # Uniform back-pressure sleep on EVERY failure path so an attacker
-    # can't distinguish "rate-limited" from "invalid token" via response
-    # latency. This costs callers a 0.5 s tax on their first wrong guess,
-    # which is negligible against the 256-bit creator_token entropy.
-    if rl is not None and rl.is_banned(inp.session_id):
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="rate_limited"
-                ).inc()
-            except Exception:
-                pass
-        await asyncio.sleep(0.5)
-        raise ToolError(ErrorCode.PERMISSION_DENIED, "rate-limited")
-    sess = await deps.registry.get_or_raise(inp.session_id)
-    if sess.auth.creator_token_hash is None or not verify_creator_token(
-        inp.creator_token, sess.auth.creator_token_hash
-    ):
-        if rl is not None:
-            rl.record_failure(inp.session_id)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="invalid_token"
-                ).inc()
-            except Exception:
-                pass
-        # Same 0.5 s tax as the rate-limited path — see comment above.
-        await asyncio.sleep(0.5)
-        raise ToolError(ErrorCode.PERMISSION_DENIED, "invalid creator_token")
-    deleted_at = await deps.registry.delete(inp.session_id, reason="host_deleted")
-    if rl is not None:
-        rl.reset(inp.session_id)
+    try:
+        principal = await resolve_principal(
+            deps, inp.session_id, inp.creator_token, source_ip=source_ip
+        )
+        require(principal, "creator", "admin")
+    except ToolError as exc:
+        if exc.code in (ErrorCode.PERMISSION_DENIED, ErrorCode.RATE_LIMITED):
+            _count_delete_failure(
+                deps, "rate_limited" if exc.code is ErrorCode.RATE_LIMITED else "invalid_token"
+            )
+        raise
+    reason = "admin_deleted" if principal.role == "admin" else "host_deleted"
+    deleted_at = await deps.registry.delete(inp.session_id, reason=reason)
     return SessionDeleteOutput(deleted_at=deleted_at).model_dump()
+
+
+def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
+    if deps.metrics is not None:
+        try:
+            deps.metrics.session_delete_failed_total.labels(reason=reason).inc()
+        except Exception:
+            pass
 
 
 async def session_get_events(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:

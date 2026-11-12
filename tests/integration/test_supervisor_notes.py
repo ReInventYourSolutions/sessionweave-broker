@@ -114,7 +114,7 @@ async def test_post_note_rate_limited():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_post_note_admin_token_mode_rejects_session_id() -> None:
-    """When ``SW_SUPERVISOR_ADMIN_TOKEN`` is set, a bearer equal to
+    """When ``SW_ADMIN_TOKEN`` is set, a bearer equal to
     the session_id must be rejected — only the admin token is
     accepted. Closes the authz gap from #55: a session participant
     who knows its own ``session_id`` cannot post supervisor notes
@@ -122,7 +122,7 @@ async def test_post_note_admin_token_mode_rejects_session_id() -> None:
     """
     admin = "test-supervisor-secret-cafebabe"
     async with relay_subprocess(
-        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+        env_overrides={"SW_ADMIN_TOKEN": admin}
     ) as base:
         async with httpx.AsyncClient() as c:
             sid = (
@@ -177,13 +177,13 @@ async def test_post_note_unknown_kind_rejected() -> None:
 @pytest.mark.asyncio
 async def test_in_session_participant_can_post_supervisor_note_with_admin_token_set() -> None:
     """An in-session participant's participant_token is accepted by
-    /supervisor/notes even when SW_SUPERVISOR_ADMIN_TOKEN is set.
+    /supervisor/notes even when SW_ADMIN_TOKEN is set.
     This enables broadcast-as-self patterns (e.g. a director posting a
     session_summary kind=note target=all) without exposing the relay-wide
     admin token to in-session callers."""
     admin = "deadbeefcafebabe-admin-secret"
     async with relay_subprocess(
-        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+        env_overrides={"SW_ADMIN_TOKEN": admin}
     ) as base:
         async with httpx.AsyncClient() as c:
             sid = (
@@ -215,7 +215,7 @@ async def test_non_participant_token_rejected_when_admin_set() -> None:
     participant_token must be rejected with 403 (regression guard)."""
     admin = "deadbeefcafebabe-admin-secret-2"
     async with relay_subprocess(
-        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin}
+        env_overrides={"SW_ADMIN_TOKEN": admin}
     ) as base:
         async with httpx.AsyncClient() as c:
             sid = (
@@ -235,11 +235,11 @@ async def test_post_note_accepts_creator_token(tmp_path) -> None:
     """A session's creator_token is accepted on /supervisor/notes —
     symmetric with the firehose WS auth. Lets the cockpit's creator-role
     surface post supervisor notes without needing a relay-wide admin
-    token. Stays accepted even when SW_SUPERVISOR_ADMIN_TOKEN is set."""
+    token. Stays accepted even when SW_ADMIN_TOKEN is set."""
     admin = "creator-token-test-admin-secret"
     db_path = str(tmp_path / "creator_token_notes.db")
     async with relay_subprocess(
-        env_overrides={"SW_SUPERVISOR_ADMIN_TOKEN": admin},
+        env_overrides={"SW_ADMIN_TOKEN": admin},
         persistence_db_path=db_path,
     ) as base:
         async with httpx.AsyncClient() as c:

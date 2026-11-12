@@ -28,6 +28,7 @@ doesn't need a separate REST drain to seed itself.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 from typing import Any
@@ -263,7 +264,7 @@ async def events_ws(websocket: WebSocket) -> None:
 async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
-    admin_token = getattr(websocket.app.state, "firehose_admin_token", None)
+    admin_token = getattr(websocket.app.state, "admin_token", None)
     registry = websocket.app.state.tool_deps.registry
     firehose = websocket.app.state.firehose
     session = registry.get(sid)
@@ -271,39 +272,18 @@ async def firehose_ws(websocket: WebSocket) -> None:
         await websocket.close(code=_CLOSE_SESSION_NOT_FOUND, reason="session_not_found")
         return
 
-    # Three authentication modes for the firehose endpoint:
-    #
-    #   1. admin-token mode (``SW_FIREHOSE_ADMIN_TOKEN`` set at startup):
-    #      subscription requires ``?token=<admin_token>``. Relay-wide
-    #      operator (list/manage all sessions).
-    #
-    #   2. creator_token of *this* session: accepted as a session-scoped
-    #      supervisor channel. The user who created the session has the
-    #      right to observe every event in it (supervisor / orchestrator
-    #      view), distinct from the relay-wide operator. Verified via
-    #      ``verify_creator_token`` against the session's stored hash.
-    #
-    #   3. legacy mode (admin env var unset): accept ``?token=<sid>``.
-    #      Historical behaviour for local dev / cockpit setups. The
-    #      startup logger emits a one-shot warning advising operators
-    #      to set the env var in multi-tenant deployments.
-    from sessionweave.persistence_token import verify_creator_token
+    # Two authentication modes for the firehose endpoint:
+    #   1. relay-wide admin token (``SW_ADMIN_TOKEN``): ``?token=<admin_token>``.
+    #   2. creator token of *this* session: a session-scoped supervisor channel.
+    from sessionweave.access import admin_matches, hash_token
 
-    accepted = False
-    if admin_token is not None and token == admin_token:
-        accepted = True
-    elif session.auth.creator_token_hash is not None and verify_creator_token(
-        token, session.auth.creator_token_hash
-    ):
-        accepted = True
-    elif admin_token is None and token == sid:
-        accepted = True
+    accepted = admin_matches(token, admin_token) or (
+        session.auth.creator_token_hash is not None
+        and hmac.compare_digest(hash_token(token), session.auth.creator_token_hash)
+    )
 
     if not accepted:
-        await websocket.close(
-            code=_CLOSE_MISSING_TOKEN,
-            reason="invalid firehose token" if admin_token is not None else "invalid token",
-        )
+        await websocket.close(code=_CLOSE_MISSING_TOKEN, reason="invalid token")
         return
 
     await websocket.accept()

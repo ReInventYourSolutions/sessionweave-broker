@@ -28,7 +28,6 @@ from sessionweave.config import DeploymentDefaults, load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import (
     ToolDeps,
@@ -61,7 +60,6 @@ async def deps(store):
     )
     return ToolDeps(
         registry=registry, bounds=defaults.bounds, metrics=None,
-        delete_rate_limiter=DeleteRateLimiter(max_failures=5, window_seconds=60.0),
     )
 
 

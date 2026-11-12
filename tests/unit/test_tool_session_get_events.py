@@ -7,7 +7,6 @@ from sessionweave.config import DeploymentDefaults, load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import ToolDeps, session_create, session_get_events
 
@@ -31,10 +30,7 @@ async def deps(store):
         defaults=defaults, connections=ConnectionManager(),
         metrics=None, firehose=None, store=store,
     )
-    return ToolDeps(
-        registry=registry, bounds=defaults.bounds, metrics=None,
-        delete_rate_limiter=DeleteRateLimiter(),
-    )
+    return ToolDeps(registry=registry, bounds=defaults.bounds, metrics=None)
 
 
 @pytest.mark.asyncio

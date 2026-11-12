@@ -16,6 +16,7 @@ drain via ``POST /v1/sessions/{sid}/participants/me/inbox/drain``.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from typing import Any
 
@@ -97,6 +98,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
     ErrorCode.TOO_MANY_WAITS: 429,
+    ErrorCode.RATE_LIMITED: 429,
     ErrorCode.INVALID_DISPATCH_FILTERS: 422,
     ErrorCode.INVALID_TARGETS: 422,
     ErrorCode.INVALID_CONFIG: 422,
@@ -650,56 +652,34 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
-    # Four authentication modes (priority order):
-    #   1. admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set): token ==
-    #      admin_token → relay-wide override.
-    #   2. in-session participant: token matches the participant_id of an
-    #      active participant in THIS session → accept. Lets an SDK caller
-    #      broadcast supervisor notes (e.g. kind=note target=all "session
-    #      summary") without requiring the admin token. An orchestrator/
-    #      supervisor role can also issue kind=halt targeting peers — that's
-    #      the intended power-of-an-in-session-role model.
-    #   3. per-session creator: token matches the session's creator_token
-    #      (when persistence + creator_token are set at create). Symmetric
-    #      with the firehose WS auth (events_ws.py) so the cockpit's
-    #      creator-role surface has matching supervisor power on both
-    #      transports.
-    #   4. legacy: admin token unset AND token == sid. Local-dev cockpit
-    #      backwards-compat (startup logger warns operators to set the env
-    #      var in prod).
+    # Authentication modes (priority order):
+    #   1. relay-wide admin token (``SW_ADMIN_TOKEN``).
+    #   2. in-session participant (removed in a later phase).
+    #   3. per-session creator token.
     registry = _deps(request).registry
     session = registry.get(sid)
     if session is None:
         return JSONResponse({"error": "not_found"}, status_code=404)
 
-    import hmac as _hmac
+    from sessionweave.access import admin_matches, hash_token
 
-    from sessionweave.persistence_token import verify_creator_token
-
-    admin_token = getattr(request.app.state, "supervisor_admin_token", None)
+    admin_token = getattr(request.app.state, "admin_token", None)
     accepted = False
-    # Constant-time comparison on the admin_token path; falling back to
-    # plain `==` would let a local attacker recover the admin token via
-    # timing side-channel on this hot endpoint.
-    if admin_token is not None and _hmac.compare_digest(token, admin_token):
+    if admin_matches(token, admin_token):
         accepted = True
     elif token in session._participants:
         # participant_id is a uuid4 lookup — dict membership is O(1) and
         # already constant-time for any fixed key size.
         accepted = True
-    elif session.auth.creator_token_hash is not None and verify_creator_token(
-        token, session.auth.creator_token_hash
+    elif session.auth.creator_token_hash is not None and hmac.compare_digest(
+        hash_token(token), session.auth.creator_token_hash
     ):
-        accepted = True
-    elif admin_token is None and _hmac.compare_digest(token, sid):
         accepted = True
     if not accepted:
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     limiter = request.app.state.supervisor_rate
-    source_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if not source_ip and request.client is not None:
-        source_ip = request.client.host or ""
+    source_ip = _request_source_ip(request)
     if not limiter.try_acquire(sid, source_ip):
         return JSONResponse({"error": "rate_limited"}, status_code=429)
 
@@ -783,14 +763,18 @@ async def _get_session_events_handler(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
-async def _delete_session_handler(request: Request) -> Response:
-    """End a session. Accepts the per-session creator_token or the
-    relay-wide SW_SUPERVISOR_ADMIN_TOKEN as Bearer."""
-    import asyncio as _asyncio
-    import hmac as _hmac
+def _request_source_ip(request: Request) -> str:
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if not ip and request.client is not None:
+        ip = request.client.host or ""
+    return ip
 
+
+async def _delete_session_handler(request: Request) -> Response:
+    """End a session. Accepts the session creator token or the relay-wide
+    SW_ADMIN_TOKEN as Bearer."""
+    from sessionweave.access import require, resolve_principal
     from sessionweave.errors import ErrorCode, ToolError
-    from sessionweave.persistence_token import verify_creator_token
 
     sid = request.path_params["sid"]
     auth = request.headers.get("authorization", "")
@@ -798,54 +782,29 @@ async def _delete_session_handler(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
 
-    state = request.app.state
     deps = _deps(request)
-    rl = deps.delete_rate_limiter
-    if rl is not None and rl.is_banned(sid):
-        await _asyncio.sleep(0.5)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="rate_limited").inc()
-            except Exception:
-                pass
-        return JSONResponse({"error": "permission_denied"}, status_code=403)
-
     try:
-        sess = await deps.registry.get_or_raise(sid)
+        principal = await resolve_principal(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
+        require(principal, "creator", "admin")
     except ToolError as e:
         if e.code is ErrorCode.SESSION_NOT_FOUND:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        raise
+        if e.code in (ErrorCode.PERMISSION_DENIED, ErrorCode.RATE_LIMITED):
+            if deps.metrics is not None:
+                try:
+                    deps.metrics.session_delete_failed_total.labels(
+                        reason="rate_limited"
+                        if e.code is ErrorCode.RATE_LIMITED
+                        else "invalid_token"
+                    ).inc()
+                except Exception:
+                    pass
+        return _error_response(e)
 
-    reason: str | None = None
-    if sess.auth.creator_token_hash is not None and verify_creator_token(
-        token, sess.auth.creator_token_hash
-    ):
-        reason = "host_deleted"
-    else:
-        admin = getattr(state, "supervisor_admin_token", None)
-        if admin is not None and _hmac.compare_digest(token, admin):
-            reason = "admin_deleted"
-
-    if reason is None:
-        if rl is not None:
-            rl.record_failure(sid)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="invalid_token").inc()
-            except Exception:
-                pass
-        # Uniform 0.5 s tax matches the rate-limited path so callers
-        # can't distinguish "rate-limited" from "invalid token" via
-        # response latency. See session_delete in tools.py for rationale.
-        await _asyncio.sleep(0.5)
-        return JSONResponse({"error": "permission_denied"}, status_code=403)
-
+    reason = "admin_deleted" if principal.role == "admin" else "host_deleted"
     deleted_at = await deps.registry.delete(sid, reason=reason)
-    if rl is not None:
-        rl.reset(sid)
     return JSONResponse({"deleted_at": deleted_at}, status_code=200)
 
 

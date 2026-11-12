@@ -58,7 +58,7 @@ async def test_firehose_rejects_wrong_token():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_firehose_admin_token_mode_rejects_session_id() -> None:
-    """When ``SW_FIREHOSE_ADMIN_TOKEN`` is set, a token equal to the
+    """When ``SW_ADMIN_TOKEN`` is set, a token equal to the
     session_id must be rejected — only the admin token is accepted.
     Closes the info-leak gap from #54: a session participant who
     knows its own ``session_id`` can no longer subscribe to the
@@ -66,7 +66,7 @@ async def test_firehose_admin_token_mode_rejects_session_id() -> None:
     """
     admin = "test-admin-secret-d3b07384"
     async with relay_subprocess(
-        env_overrides={"SW_FIREHOSE_ADMIN_TOKEN": admin}
+        env_overrides={"SW_ADMIN_TOKEN": admin}
     ) as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as c:

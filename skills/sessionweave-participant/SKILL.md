@@ -970,7 +970,7 @@ routes take `Authorization: Bearer <participant_token>`.
 |---|---|---|
 | `session_create` | `POST /v1/sessions` | `{config?, purpose?, persistence?, creator_id?}` (`creator_id` is REST/SDK only) → `session_id`, `purpose` echo, **`creator_token`** (one-time), `creator_id`, `persistence` state. |
 | `session_describe` | `GET /v1/sessions/{sid}` | `{session_id}` → `{config, purpose, roster, persistence?}`. Read-only, allocates no participant. |
-| `session_delete` | `DELETE /v1/sessions/{sid}` | `{session_id, creator_token}`. Terminates the session. The REST form also accepts the relay-wide `SW_SUPERVISOR_ADMIN_TOKEN` as Bearer for a supervisor override (recorded as `ended_reason=admin_deleted`). |
+| `session_delete` | `DELETE /v1/sessions/{sid}` | `{session_id, creator_token}`. Terminates the session. The REST form also accepts the relay-wide `SW_ADMIN_TOKEN` as Bearer for a supervisor override (recorded as `ended_reason=admin_deleted`). |
 | `session_update_purpose` | `PATCH /v1/sessions/{sid}/purpose` | `{purpose?}` — replaces it, or `null` to clear. Broadcasts `session.purpose_updated`. Caller must be in the session. |
 | `session_join` | `POST /v1/sessions/{sid}/participants` | `{role?, capabilities?, objective?, metadata?, delivery_mode?}` → `participant_id`, `roster`, `config`, `purpose`, `relay_epoch`, `persistence?`. REST also returns `participant_token`; over MCP your `participant_id` is the credential. |
 | `session_list_participants` | `GET /v1/sessions/{sid}/participants` | → `{roster: [ParticipantPublic, …]}`. |

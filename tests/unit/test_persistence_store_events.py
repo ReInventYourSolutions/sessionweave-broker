@@ -5,8 +5,9 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
+from sessionweave.access import generate_token as generate_creator_token
+from sessionweave.access import hash_token as hash_creator_token
 from sessionweave.persistence import PersistenceStore, SessionMetadata
-from sessionweave.persistence_token import generate_creator_token, hash_creator_token
 
 
 def _now_ms() -> int:

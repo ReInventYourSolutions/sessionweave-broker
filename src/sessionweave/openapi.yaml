@@ -580,7 +580,7 @@ paths:
       description: |
         Delete a session. Authorization: Bearer accepts either the
         per-session creator_token (returned at session_create) OR the
-        relay-wide SW_SUPERVISOR_ADMIN_TOKEN. Distinct ended_reason
+        relay-wide SW_ADMIN_TOKEN. Distinct ended_reason
         values: host_deleted (creator_token) vs admin_deleted (admin).
       security:
         - BearerSessionId: []
@@ -672,12 +672,11 @@ paths:
       tags: [sessions]
       summary: Post a supervisor note / halt / continue / redirect
       description: |
-        Authentication has four modes (mirrors the firehose
-        endpoint's auth lattice):
+        Authentication modes (mirrors the firehose endpoint):
 
         - **Admin-token mode** (recommended in multi-tenant
           deployments): the relay is started with
-          ``SW_SUPERVISOR_ADMIN_TOKEN=<value>``; the bearer header
+          ``SW_ADMIN_TOKEN=<value>``; the bearer header
           must equal that value. Relay-wide operator authority.
         - **In-session participant**: bearer matches the
           ``participant_id`` of an active participant in this
@@ -689,10 +688,6 @@ paths:
           set at create). Symmetric with the firehose WS auth so
           the cockpit's creator-role has supervisor power on both
           transports.
-        - **Legacy mode** (default when the admin-token env var is
-          unset): bearer must equal the ``session_id``. Suitable
-          for local-dev cockpits; the relay logs a warning at
-          startup advising operators to switch.
 
         Server-side invariants (all modes):
           - ``kind`` is restricted to the documented enum
@@ -949,11 +944,11 @@ paths:
           Authentication token, required as a query param because
           browsers can't set custom headers on a WebSocket upgrade.
 
-          Three modes (any one match accepts the connection):
+          Two modes (any one match accepts the connection). The session id is never a credential:
 
           - **Admin-token mode** (recommended for multi-tenant
             deployments): when the relay is started with
-            ``SW_FIREHOSE_ADMIN_TOKEN=<value>``, this query param
+            ``SW_ADMIN_TOKEN=<value>``, this query param
             may equal that value. Relay-wide operator credential —
             list/manage every session on the relay.
           - **Creator-token mode** (added in v0.17.0): the
@@ -965,20 +960,13 @@ paths:
             the relay-wide admin token. Verified with a
             constant-time SHA-256 compare against the session's
             stored ``creator_token_hash``.
-          - **Legacy SID mode** (default when the admin env var is
-            unset): the token may equal the ``session_id``. Any
-            session participant can subscribe and observe the full
-            event stream. Suitable for local dev / single-tenant
-            cockpit deployments only; the relay logs a warning at
-            startup advising operators to switch to admin-token
-            mode for multi-tenant production.
     get:
       tags: [sessions]
       summary: WebSocket — full event stream for the session (non-participant)
       description: |
         HTTP/WS upgrade. Authentication via the ``token`` query
         parameter — see the parameter description for the three
-        accepted modes (admin / creator / legacy). Frames are JSON
+        accepted modes (admin / creator). Frames are JSON
         ``{name, payload}`` objects, matching the participant inbox
         shape.
 

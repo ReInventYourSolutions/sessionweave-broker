@@ -15,7 +15,12 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+from sessionweave.errors import ErrorCode, ToolError
+
+if TYPE_CHECKING:
+    from sessionweave.tools import ToolDeps
 
 JOIN_TOKEN_TTL_SECONDS: int = 900
 
@@ -192,3 +197,62 @@ def admin_matches(token: str, admin_token: str | None) -> bool:
     return hmac.compare_digest(
         token.encode("utf-8", "surrogatepass"), admin_token.encode("utf-8", "surrogatepass")
     )
+
+
+async def resolve_principal(
+    deps: ToolDeps,
+    sid: str,
+    token: str | None,
+    *,
+    source_ip: str = "",
+    hydrate: bool = True,
+) -> Principal:
+    """Resolve a presented token to a Principal for session ``sid``.
+
+    Admin is checked first, then the session's own credentials. With
+    ``hydrate=False`` a cold or ended persisted session is authenticated from
+    its stored hashes without being loaded into RAM. Invalid and expired
+    tokens are counted per (sid, source_ip); once throttled, further invalid
+    tokens get RATE_LIMITED, while a valid token always passes.
+    """
+    registry = deps.registry
+    auth: SessionAuth | None
+    if hydrate:
+        auth = (await registry.get_or_raise(sid)).auth
+    else:
+        hot = registry.get(sid)
+        if hot is not None:
+            auth = hot.auth
+        else:
+            store = registry._store
+            auth = await store.load_auth(sid) if store is not None else None
+    if auth is None:
+        raise ToolError(ErrorCode.SESSION_NOT_FOUND, "session not found")
+
+    if not token:
+        raise ToolError(ErrorCode.PERMISSION_DENIED, "missing or invalid token")
+    if admin_matches(token, deps.admin_token):
+        return Principal("admin")
+    now_ms = int(time.time() * 1000)
+    principal = auth.match(token, now_ms)
+    if principal is not None:
+        return principal
+
+    limiter = deps.auth_limiter
+    if limiter.is_throttled(sid, source_ip):
+        raise ToolError(ErrorCode.RATE_LIMITED, "too many invalid tokens; retry later")
+    limiter.record_failure(sid, source_ip)
+    if auth.join_token_expired(token, now_ms):
+        raise ToolError(
+            ErrorCode.PERMISSION_DENIED,
+            "join link expired \u2014 ask the session creator for a new invite link",
+        )
+    raise ToolError(ErrorCode.PERMISSION_DENIED, "missing or invalid token")
+
+
+def require(principal: Principal, *allowed: Role) -> None:
+    """Raise PERMISSION_DENIED unless the principal's role is one of ``allowed``."""
+    if principal.role not in allowed:
+        raise ToolError(
+            ErrorCode.PERMISSION_DENIED, f"requires one of: {', '.join(allowed)}"
+        )

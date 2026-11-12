@@ -1,7 +1,7 @@
 """Integration test: DELETE /v1/sessions/{sid} ends a session.
 
 Auth (sub-project #2): Bearer accepts the per-session ``creator_token``
-returned at create, OR the relay-wide ``SW_SUPERVISOR_ADMIN_TOKEN``.
+returned at create, OR the relay-wide ``SW_ADMIN_TOKEN``.
 The legacy "token == session_id" path was retired in Task 14.
 """
 from __future__ import annotations

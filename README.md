@@ -389,8 +389,7 @@ Concrete leak channels operators must defend against:
 | WebSocket URLs that include ``?token=<participant_id>`` in the Network tab of any browser | Don't share screenshots / videos of DevTools; use a private-mode browser for live-session demos. |
 | TLS-terminating proxies that log query strings (CDN, WAF) | Caddy doesn't by default; verify any front-of-relay proxy. |
 | Prometheus labels in a previous build had per-participant cardinality | Locked down: see #58 (structural test guard). |
-| ``supervisor.note`` posted by anyone with the session_id | Set ``SW_SUPERVISOR_ADMIN_TOKEN`` (#59) to require a separate admin secret. |
-| ``firehose`` open to any session participant | Set ``SW_FIREHOSE_ADMIN_TOKEN`` (#57) to require an admin secret. |
+| ``supervisor.note`` / ``firehose`` by anyone with the session_id | The session_id is never a credential; these require the creator token or the relay-wide ``SW_ADMIN_TOKEN``. |
 
 What is **explicitly NOT in scope** for sub-project #1:
 

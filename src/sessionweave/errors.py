@@ -26,6 +26,7 @@ class ErrorCode(StrEnum):
     PERSISTENCE_FAILED = "persistence_failed"
     PERSISTENCE_CORRUPTED = "persistence_corrupted"
     TOKEN_NOT_FOUND = "token_not_found"
+    RATE_LIMITED = "rate_limited"
 
 
 @dataclass(slots=True)

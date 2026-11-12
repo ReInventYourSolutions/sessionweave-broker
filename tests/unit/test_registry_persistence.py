@@ -4,11 +4,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from sessionweave.access import generate_token as generate_creator_token
+from sessionweave.access import hash_token as hash_creator_token
 from sessionweave.config import DeploymentDefaults, load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import generate_creator_token, hash_creator_token
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import PersistenceConfig
 

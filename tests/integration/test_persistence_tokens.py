@@ -8,7 +8,7 @@ from sessionweave.access import IssuedToken, Principal, hash_token
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import generate_creator_token, hash_creator_token
+from sessionweave.access import generate_token as generate_creator_token, hash_token as hash_creator_token
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import PersistenceConfig
 from tests.unit.fakes import FakeHandle

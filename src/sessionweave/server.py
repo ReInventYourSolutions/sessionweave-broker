@@ -22,6 +22,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
+from sessionweave.access import AuthFailureLimiter
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
@@ -37,7 +38,6 @@ from sessionweave.mcp_adapter import (
 )
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
@@ -775,13 +775,15 @@ def build_app() -> Starlette:
     # and session_resume so SDK clients can detect relay restart and
     # invalidate their local seq cursor. See #65.
     relay_epoch = int(time.time())
-    delete_rate_limiter = DeleteRateLimiter()
+    auth_limiter = AuthFailureLimiter()
+    admin_token = os.environ.get("SW_ADMIN_TOKEN", "") or None
     tool_deps = ToolDeps(
         registry,
         relay_epoch=relay_epoch,
         bounds=deps_cfg.bounds,
         metrics=metrics,
-        delete_rate_limiter=delete_rate_limiter,
+        auth_limiter=auth_limiter,
+        admin_token=admin_token,
     )
 
     mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
@@ -931,41 +933,14 @@ def build_app() -> Starlette:
     app.state.handles = handles
     app.state.metrics = metrics
     app.state.tool_deps = tool_deps
-    app.state.delete_rate_limiter = delete_rate_limiter
+    app.state.auth_limiter = auth_limiter
     app.state.state = state
     app.state.firehose = firehose
-    # Optional relay-wide admin token gating the firehose endpoint.
-    # When set, the firehose WS upgrade requires ``?token=<this value>``
-    # — knowing the session_id is no longer sufficient. When unset, the
-    # legacy ``token == session_id`` check remains active so existing
-    # dev clients keep working (with a startup warning).
-    # Operators in multi-tenant production should set this.
-    app.state.firehose_admin_token = os.environ.get("SW_FIREHOSE_ADMIN_TOKEN", "") or None
-    if app.state.firehose_admin_token is None:
-        logging.getLogger(__name__).warning(
-            "SW_FIREHOSE_ADMIN_TOKEN not set; firehose authenticates with "
-            "token==session_id (LEGACY mode). Any session participant can "
-            "subscribe and observe the full event stream. Set the env var "
-            "in production deployments."
-        )
-    # Optional relay-wide admin token gating the supervisor-notes
-    # endpoint. Mirrors the firehose-admin-token pattern: when set, the
-    # supervisor /notes POST requires this token instead of accepting
-    # ``token == session_id``. Knowing the session_id alone is no longer
-    # enough to halt or redirect participants, so an XSS on a session
-    # roster page cannot escalate to "kill all agents".
-    app.state.supervisor_admin_token = (
-        os.environ.get("SW_SUPERVISOR_ADMIN_TOKEN", "") or None
-    )
-    if app.state.supervisor_admin_token is None:
-        logging.getLogger(__name__).warning(
-            "SW_SUPERVISOR_ADMIN_TOKEN not set; supervisor /notes endpoint "
-            "authenticates with token==session_id (LEGACY mode). Any holder "
-            "of the session_id (every session participant inherently) can "
-            "POST supervisor notes targeting any participant, including "
-            "kind=halt. Set the env var in multi-tenant production "
-            "deployments."
-        )
+    # Relay-wide admin token (SW_ADMIN_TOKEN). Unset is a valid, closed
+    # configuration: no admin access and no fallback.
+    app.state.admin_token = admin_token
+    if admin_token is None:
+        logging.getLogger(__name__).info("admin access disabled")
     app.state.supervisor_rate = NoteRateLimiter(
         per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
         per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),
