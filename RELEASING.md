@@ -17,7 +17,7 @@ shape / event names / bearer model listed in `FAKE_RELAY_FIDELITY.md`:
 - WS `/v1/sessions/{sid}/participants/me/events` frame shape `{"name","payload"}`
 - wake event names: `supervisor.note`, `command.received`, `result.received`,
   `command.completed`, `command.cancelled`, `session.ended`
-- the bearer model (`participant_token == participant_id`)
+- the bearer model (join needs a join/creator token; `participant_token` is a secret distinct from `participant_id` and authenticates every participant route)
 
 then, in the companion repo: update `Runner/tests/_fakerelay.py` to match and bump
 `REPRODUCES_RELAY_VERSION` to this release's version.
