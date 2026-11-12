@@ -31,7 +31,7 @@ REQUIRED = {
     "session_describe": ["session_id"],
     "session_update_purpose": [],
     "session_join": ["session_id"],
-    "session_resume": ["participant_id", "session_id"],
+    "session_resume": ["participant_token", "session_id"],
     "session_leave": [],
     "session_update_self": [],
     "session_list_participants": [],

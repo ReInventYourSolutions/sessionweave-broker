@@ -7,11 +7,10 @@ adds an optional WebSocket upgrade so the same client can receive
 live ``command.received`` / ``result.received`` / etc. events without
 busy-polling.
 
-Auth shape mirrors the REST surface (sub-project #1): the bearer token
-IS the participant_id. Browsers can't easily set an ``Authorization``
-header on a WebSocket upgrade, so the token is accepted as the
-``token`` query parameter. Once sub-project #3 swaps tokens for JWTs
-this same query param will carry the JWT.
+Auth shape mirrors the REST surface: the credential is the participant's
+secret ``participant_token`` (never the participant_id). Browsers can't
+easily set an ``Authorization`` header on a WebSocket upgrade, so the
+token is accepted as the ``token`` query parameter.
 
 Wire format: each frame is a single JSON object
 ``{"name": "<event>", "payload": {...}, "seq": <int>}`` matching the
@@ -36,6 +35,7 @@ from typing import Any
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from sessionweave.access import participant_id_for_token
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.tools import ToolDeps
 
@@ -75,13 +75,13 @@ async def events_ws(websocket: WebSocket) -> None:
         await websocket.close(code=code, reason=exc.code.value)
         return
 
-    if token not in session._participants:
+    try:
+        pid = participant_id_for_token(session, token)
+    except ToolError:
         await websocket.close(
             code=_CLOSE_NOT_IN_SESSION, reason="not_in_session"
         )
         return
-
-    pid = token
 
     # Parse optional ``?last_acked_seq=N`` so a reconnecting client can
     # tell the relay it has already consumed events up to N. The relay

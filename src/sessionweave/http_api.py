@@ -4,10 +4,11 @@ Mirrors the MCP tool catalogue under ``/v1/...`` so a non-MCP client
 (plain HTTP, language SDKs, agents whose runtime hasn't refreshed its
 MCP catalogue yet) can drive the same backend.
 
-Auth shape (sub-project #1): the Bearer token IS the participant_id.
-Sub-project #3 will swap that for a JWT. The token is returned by
-``POST /v1/sessions/{sid}/participants`` (alongside ``participant_id``)
-and required on every authenticated route.
+Auth shape: every authenticated route takes ``Authorization: Bearer
+<token>``. Joining (``POST /v1/sessions/{sid}/participants``) needs a join
+token (or the creator/admin token) and returns the participant's secret
+``participant_token``, which is the Bearer for every later participant
+route. The participant_id is an identifier, never a credential.
 
 HTTP is request/response — there is no persistent transport for push.
 HTTP-joined participants therefore always operate in pull mode and
@@ -25,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from sessionweave.access import participant_id_for_token
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
@@ -146,22 +148,20 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 
 async def _bind_participant(
-    deps: ToolDeps, session_id: str, participant_id: str
+    deps: ToolDeps, session_id: str, token: str
 ) -> HTTPParticipantHandle:
-    """Validate the Bearer token then create + bind a fresh
+    """Resolve the secret participant token then create + bind a fresh
     ``HTTPParticipantHandle`` to that pair for the duration of one tool
     call. The caller MUST pass the returned handle to
     ``_unbind_participant`` in a ``finally`` block.
 
-    Raises ``ToolError(NOT_IN_SESSION)`` if the token doesn't correspond
-    to an active participant of the named session — that's how unknown
-    or stale Bearer tokens get rejected uniformly.
+    Raises ``ToolError(NOT_IN_SESSION)`` if the token isn't a participant
+    token of the named session (a participant_id, join, supervisor or
+    creator token all land here) — that's how unknown or stale Bearer
+    tokens get rejected uniformly.
     """
     sess = await deps.registry.get_or_raise(session_id)
-    if participant_id not in sess._participants:
-        raise ToolError(
-            ErrorCode.NOT_IN_SESSION, "unknown or stale participant token"
-        )
+    participant_id = participant_id_for_token(sess, token)
     handle = HTTPParticipantHandle()
     deps.registry.connections.bind(handle, session_id, participant_id)
     return handle
@@ -392,27 +392,31 @@ async def patch_session_purpose(request: Request) -> JSONResponse:
 
 
 async def post_participants(request: Request) -> JSONResponse:
-    """Join — body shape mirrors session_join. Returns participant_id; the
-    caller MUST keep that as the Bearer token for subsequent calls."""
+    """Join — body shape mirrors session_join. The Bearer is a join token
+    (or the creator/admin token). Returns participant_id and the secret
+    participant_token, which the caller MUST keep as the Bearer token for
+    subsequent calls."""
     sid = request.path_params["sid"]
     deps = _deps(request)
     # session_join itself binds the handle to the new participant; we
     # provide a fresh per-request handle and release it before returning.
     handle = HTTPParticipantHandle()
     try:
+        token = _require_bearer(request)
         body = await _read_json_body(request)
-        body = {**body, "session_id": sid}
+        body = {**body, "session_id": sid, "join_token": token}
         # Force pull delivery — HTTP has no push transport.
         body["delivery_mode"] = "pull"
-        out = await session_join(deps, handle, body)
+        out = await session_join(
+            deps, handle, body, source_ip=_request_source_ip(request)
+        )
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
         return _validation_error(exc)
     finally:
         _unbind_participant(deps.registry.connections, handle)
-    response = {**out, "participant_token": out["participant_id"]}
-    return JSONResponse(response, status_code=201)
+    return JSONResponse(out, status_code=201)
 
 
 async def get_participants(request: Request) -> JSONResponse:

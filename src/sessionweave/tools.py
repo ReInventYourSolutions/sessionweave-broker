@@ -8,6 +8,7 @@ from sessionweave.access import (
     AuthFailureLimiter,
     generate_token,
     hash_token,
+    participant_id_for_token,
     require,
     resolve_principal,
 )
@@ -240,11 +241,17 @@ async def session_join(
     deps: ToolDeps,
     handle: ConnectionHandle,
     payload: dict[str, Any],
+    *,
+    source_ip: str = "",
 ) -> dict[str, Any]:
     inp = SessionJoinInput.model_validate(payload)
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = await deps.registry.get_or_raise(inp.session_id)
+    principal = await resolve_principal(
+        deps, inp.session_id, inp.join_token, source_ip=source_ip
+    )
+    require(principal, "joiner", "creator", "admin")
     p = await sess.join(
         handle,
         role=inp.role,
@@ -255,6 +262,7 @@ async def session_join(
     )
     return SessionJoinOutput(
         participant_id=p.participant_id,
+        participant_token=p.issued_token or "",
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),
         config=_int_config(asdict(sess.config)),
@@ -273,8 +281,9 @@ async def session_resume(
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = await deps.registry.get_or_raise(inp.session_id)
+    pid = participant_id_for_token(sess, inp.participant_token)
     await sess.resume(
-        handle, inp.participant_id, last_acked_seq=inp.last_acked_seq
+        handle, pid, last_acked_seq=inp.last_acked_seq
     )
     return SessionResumeOutput(
         expires_at=sess.expires_at_iso(),

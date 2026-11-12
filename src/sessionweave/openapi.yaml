@@ -194,10 +194,9 @@ components:
         participant_id: { type: string, format: uuid }
         participant_token:
           type: string
-          format: uuid
           description: |
-            The bearer token to use on subsequent authenticated calls.
-            Equal to `participant_id` in sub-project #1.
+            Secret bearer token for subsequent participant calls. Returned
+            once; unrelated to `participant_id`.
         role: { type: string, nullable: true }
         session_id: { type: string, format: uuid }
         persistence:
@@ -744,6 +743,12 @@ paths:
     post:
       tags: [participants]
       summary: Join a session
+      description: |
+        Bearer is a join token (or the creator/admin token). The response's
+        `participant_token` is the secret Bearer for all later participant
+        routes; `participant_id` is an identifier only and authenticates nothing.
+      security:
+        - bearerAuth: []
       requestBody:
         content:
           application/json:
@@ -754,6 +759,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/JoinResponse' }
+        '401':
+          description: Missing Authorization header
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (invalid, wrong-role or expired join token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: session_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

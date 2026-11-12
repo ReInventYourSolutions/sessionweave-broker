@@ -241,11 +241,11 @@ OptSessionIdArg = Annotated[str | None, Field(
                 "joined on this same connection.")]
 
 ParticipantTokenArg = Annotated[str | None, Field(
-    description="Your participant_id from session_join, passed with "
-                "session_id. Needed only if a call right after joining said "
-                "not_in_session — your runtime opens a new connection per "
-                "call. Otherwise leave unset. It is a credential: keep it "
-                "secret.")]
+    description="The participant_token session_join returned — not your "
+                "participant_id — passed with session_id. Needed only if a "
+                "call right after joining said not_in_session — your runtime "
+                "opens a new connection per call. Otherwise leave unset. It "
+                "is a credential: keep it secret.")]
 
 ManagerTokenArg = Annotated[str, Field(
     description="The one-time creator_token session_create returned (it cannot "
@@ -446,11 +446,20 @@ def _build_fastmcp(
             ' session_check_inbox / session_wait_for_event. Choose pull if you intend to long-poll'
             ' — session_wait_for_event refuses push participants.'
         )] = None,
+        join_token: Annotated[str | None, Field(description=
+            "The join token from your invite link (the jt value). The session creator's token "
+            "or the relay admin token also works. Required: without a valid one the join is "
+            "refused with permission_denied; an expired link means ask the creator for a new one."
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Join a session as a new participant and bind this connection to it.
 
-    Returns your participant_id, the current roster, the session purpose
+    Needs a join token (see join_token). Returns your participant_id and
+    your secret participant_token (keep it: it is your credential, shown
+    once — pass it to session_resume, or as participant_token with
+    session_id if your runtime opens a new connection per call), the
+    current roster, the session purpose
     and relay_epoch — remember the epoch: a different value on a later
     resume means the relay restarted underneath you.
 
@@ -475,14 +484,18 @@ def _build_fastmcp(
             payload["metadata"] = metadata
         if delivery_mode is not None:
             payload["delivery_mode"] = delivery_mode
-        return await session_join(deps, _handle_for(ctx), payload)
+        if join_token is not None:
+            payload["join_token"] = join_token
+        return await session_join(
+            deps, _handle_for(ctx), payload, source_ip=_client_ip(ctx)
+        )
 
     @_tool("session_resume")
     async def session_resume_tool(
         session_id: SessionIdArg,
-        participant_id: Annotated[str, Field(description=
-            "The participant_id session_join returned. Resuming keeps that identity; joining again"
-            " would make you a second participant."
+        participant_token: Annotated[str, Field(description=
+            "The participant_token session_join returned (not your participant_id). Resuming "
+            "keeps that identity; joining again would make you a second participant."
         )],
         last_acked_seq: Annotated[int | None, Field(description=
             "Highest event seq you already processed; buffered events up to it are not replayed. "
@@ -490,7 +503,7 @@ def _build_fastmcp(
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Re-attach to a session you already joined, keeping the same participant_id.
+        """Re-attach to a session you already joined, keeping the same participant.
 
     Use this after a disconnect rather than joining again, which would
     make you a second participant. Buffered events are replayed; pass
@@ -507,7 +520,7 @@ def _build_fastmcp(
             _handle_for(ctx),
             {
                 "session_id": session_id,
-                "participant_id": participant_id,
+                "participant_token": participant_token,
                 "last_acked_seq": last_acked_seq,
             },
         )

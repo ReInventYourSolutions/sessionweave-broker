@@ -111,6 +111,10 @@ class AccessOutput(_Strict):
 
 class SessionJoinInput(_Strict):
     session_id: str
+    # Join token from the invite link (the creator or admin token also
+    # works). Optional in the schema so a missing one is a permission
+    # error rather than a validation error.
+    join_token: str | None = None
     role: str | None = None
     objective: str | None = None
     capabilities: list[str] = Field(default_factory=list)
@@ -120,6 +124,8 @@ class SessionJoinInput(_Strict):
 
 class SessionJoinOutput(_Strict):
     participant_id: str
+    # Secret credential for this participant, returned exactly once.
+    participant_token: str
     expires_at: str
     roster: list[ParticipantPublic]
     config: dict[str, int]
@@ -132,7 +138,7 @@ class SessionJoinOutput(_Strict):
 
 class SessionResumeInput(_Strict):
     session_id: str
-    participant_id: str
+    participant_token: str
     # Highest seq the caller has already consumed in memory over some
     # prior channel (typically a WS that died mid-stream). When set,
     # the push-mode buffer replay on resume filters out events with

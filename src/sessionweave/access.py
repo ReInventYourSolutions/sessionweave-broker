@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Literal
 from sessionweave.errors import ErrorCode, ToolError
 
 if TYPE_CHECKING:
+    from sessionweave.session import Session
     from sessionweave.tools import ToolDeps
 
 JOIN_TOKEN_TTL_SECONDS: int = 900
@@ -33,6 +34,10 @@ Role = Literal["admin", "creator", "supervisor", "participant", "joiner"]
 class Principal:
     role: Role
     participant_id: str | None = None
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def generate_token() -> str:
@@ -235,7 +240,7 @@ async def resolve_principal(
         raise ToolError(ErrorCode.PERMISSION_DENIED, "missing or invalid token")
     if admin_matches(token, deps.admin_token):
         return Principal("admin")
-    now_ms = int(time.time() * 1000)
+    now_ms = _now_ms()
     principal = auth.match(token, now_ms)
     if principal is not None:
         return principal
@@ -258,3 +263,17 @@ def require(principal: Principal, *allowed: Role) -> None:
         raise ToolError(
             ErrorCode.PERMISSION_DENIED, f"requires one of: {', '.join(allowed)}"
         )
+
+
+def participant_id_for_token(sess: Session, token: str | None) -> str:
+    """The participant a secret participant token belongs to, in ``sess``.
+
+    Only a participant token qualifies: a participant_id, session id, join,
+    supervisor or creator token is NOT_IN_SESSION, as is a token whose
+    participant has since been removed.
+    """
+    principal = sess.auth.match(token, _now_ms()) if token else None
+    pid = principal.participant_id if principal is not None else None
+    if principal is None or principal.role != "participant" or pid not in sess._participants:
+        raise ToolError(ErrorCode.NOT_IN_SESSION, "unknown or stale participant token")
+    return pid

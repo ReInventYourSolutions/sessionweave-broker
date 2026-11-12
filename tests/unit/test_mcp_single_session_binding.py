@@ -38,6 +38,8 @@ from sessionweave.tools import (
 )
 from tests.unit.fakes import FakeHandle
 
+ADM = "admin-token-for-tests"
+
 
 def _defaults() -> DeploymentDefaults:
     return load_deployment_defaults({})
@@ -60,6 +62,7 @@ async def deps(store):
     )
     return ToolDeps(
         registry=registry, bounds=defaults.bounds, metrics=None,
+        admin_token=ADM,
     )
 
 
@@ -72,10 +75,10 @@ async def _new_session(deps: ToolDeps) -> str:
 async def test_second_join_on_the_same_connection_is_rejected(deps) -> None:
     sid = await _new_session(deps)
     handle = FakeHandle()
-    await session_join(deps, handle, {"session_id": sid, "role": "a"})
+    await session_join(deps, handle, {"session_id": sid, "role": "a", "join_token": ADM})
 
     with pytest.raises(ToolError) as exc:
-        await session_join(deps, handle, {"session_id": sid, "role": "b"})
+        await session_join(deps, handle, {"session_id": sid, "role": "b", "join_token": ADM})
     assert exc.value.code is ErrorCode.ALREADY_IN_SESSION
 
 
@@ -88,10 +91,10 @@ async def test_join_to_a_different_session_on_the_same_connection_is_rejected(
     sid_a = await _new_session(deps)
     sid_b = await _new_session(deps)
     handle = FakeHandle()
-    await session_join(deps, handle, {"session_id": sid_a, "role": "a"})
+    await session_join(deps, handle, {"session_id": sid_a, "role": "a", "join_token": ADM})
 
     with pytest.raises(ToolError) as exc:
-        await session_join(deps, handle, {"session_id": sid_b, "role": "a"})
+        await session_join(deps, handle, {"session_id": sid_b, "role": "a", "join_token": ADM})
     assert exc.value.code is ErrorCode.ALREADY_IN_SESSION
 
 
@@ -101,12 +104,12 @@ async def test_resume_on_a_connection_already_in_a_session_is_rejected(
 ) -> None:
     sid = await _new_session(deps)
     handle = FakeHandle()
-    joined = await session_join(deps, handle, {"session_id": sid, "role": "a"})
+    joined = await session_join(deps, handle, {"session_id": sid, "role": "a", "join_token": ADM})
 
     with pytest.raises(ToolError) as exc:
         await session_resume(deps, handle, {
             "session_id": sid,
-            "participant_id": joined["participant_id"],
+            "participant_token": joined["participant_token"],
         })
     assert exc.value.code is ErrorCode.ALREADY_IN_SESSION
 
@@ -116,8 +119,8 @@ async def test_a_second_connection_may_join_the_same_session(deps) -> None:
     """The limit is per connection, not per session — the whole point of
     the relay is several agents in one session."""
     sid = await _new_session(deps)
-    a = await session_join(deps, FakeHandle(), {"session_id": sid, "role": "a"})
-    b = await session_join(deps, FakeHandle(), {"session_id": sid, "role": "b"})
+    a = await session_join(deps, FakeHandle(), {"session_id": sid, "role": "a", "join_token": ADM})
+    b = await session_join(deps, FakeHandle(), {"session_id": sid, "role": "b", "join_token": ADM})
     assert a["participant_id"] != b["participant_id"]
 
 
@@ -129,8 +132,10 @@ async def test_after_leave_the_same_connection_can_join_another_session(
     sid_a = await _new_session(deps)
     sid_b = await _new_session(deps)
     handle = FakeHandle()
-    await session_join(deps, handle, {"session_id": sid_a, "role": "a"})
+    await session_join(deps, handle, {"session_id": sid_a, "role": "a", "join_token": ADM})
     await session_leave(deps, handle)
 
-    rejoined = await session_join(deps, handle, {"session_id": sid_b, "role": "a"})
+    rejoined = await session_join(
+        deps, handle, {"session_id": sid_b, "role": "a", "join_token": ADM}
+    )
     assert rejoined["participant_id"]
