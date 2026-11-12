@@ -48,8 +48,11 @@ def _session(c: TestClient) -> tuple[str, dict[str, str | None]]:
     return sid, tokens
 
 
-def _allowed(status: int) -> bool:
-    return status not in (401, 403, 429)
+def _outcome_ok(row: str, role: str, allowed_roles: set[str], status: int) -> bool:
+    if role in allowed_roles:
+        # events on an ephemeral session is 409 no_history: authorised, nothing stored
+        return 200 <= status < 300 or (row == "events" and status == 409)
+    return status in (401, 403)
 
 
 HTTP_ROWS = {
@@ -73,7 +76,9 @@ def test_matrix_http(client: TestClient, row: str, role: str) -> None:
     method, path, body, allowed_roles = HTTP_ROWS[row]
     sid, tokens = _session(client)
     r = client.request(method, path.format(sid=sid), json=body, headers=_h(tokens[role]))
-    assert _allowed(r.status_code) is (role in allowed_roles), (row, role, r.status_code, r.text)
+    assert _outcome_ok(row, role, allowed_roles, r.status_code), (
+        row, role, r.status_code, r.text
+    )
 
 
 @pytest.mark.parametrize("role", ROLES)
@@ -127,6 +132,15 @@ def test_invite_brief_jt_with_trailing_newline_ok(client: TestClient) -> None:
     assert r.status_code == 200
     assert PURPOSE_TEXT in r.text
     assert f"Bearer {tokens['joiner']}" in r.text
+
+
+@pytest.mark.parametrize("role", ["supervisor", "creator", "participant", "admin"])
+def test_invite_brief_echoes_only_a_join_token(client: TestClient, role: str) -> None:
+    sid, tokens = _session(client)
+    r = client.get(f"/invite/{sid}", params={"jt": tokens[role]})
+    assert r.status_code == 200
+    assert tokens[role] not in r.text
+    assert "Bearer <join_token>" in r.text
 
 
 def test_invite_brief_unknown_session_is_404(client: TestClient) -> None:

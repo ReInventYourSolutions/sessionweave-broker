@@ -32,8 +32,13 @@ class AccessLogNoiseFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "uvicorn.access":
+        if record.name not in ("uvicorn.access", "uvicorn.error"):
             return True
+        # uvicorn writes WebSocket lines ('%s - "WebSocket %s" [accepted]') to
+        # uvicorn.error, with the query string in the args: redact there too,
+        # but never drop anything outside uvicorn.access.
+        if isinstance(record.msg, str):
+            record.msg = _redact(record.msg)
         args = record.args
         # Redact join / WebSocket tokens from every string arg (HTTP lines
         # carry the path in args[2]; WebSocket lines in args[1] or inside a
@@ -46,6 +51,8 @@ class AccessLogNoiseFilter(logging.Filter):
         # uvicorn HTTP access records carry a 5-tuple:
         #   (client_addr, method, full_path, http_version, status_code)
         # WebSocket / other shapes differ in length -> keep them.
+        if record.name != "uvicorn.access":
+            return True
         if not isinstance(args, tuple) or len(args) != 5:
             return True
         try:
@@ -58,3 +65,12 @@ class AccessLogNoiseFilter(logging.Filter):
             status == 404 and not path.startswith(_REAL_API_PREFIXES)
         )
         return not is_noise
+
+
+def install_uvicorn_log_filters() -> None:
+    """Attach the noise/redaction filter to uvicorn's access and error loggers.
+
+    ``uvicorn.error`` only redacts (WebSocket lines with ``?token=`` land there).
+    """
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logging.getLogger(name).addFilter(AccessLogNoiseFilter())

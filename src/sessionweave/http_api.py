@@ -247,10 +247,7 @@ async def invite_brief(request: Request) -> Response:
             deps, sid, jt, source_ip=_request_source_ip(request)
         )
         require(principal, "joiner", "participant", "supervisor", "creator", "admin")
-        info = await session_describe(
-            deps, {"session_id": sid, "access_token": jt},
-            source_ip=_request_source_ip(request),
-        )
+        purpose = (await deps.registry.get_or_raise(sid)).purpose
     except ToolError as exc:
         if exc.code is ErrorCode.PERMISSION_DENIED:
             return Response(
@@ -263,9 +260,10 @@ async def invite_brief(request: Request) -> Response:
     md = render_brief(
         base_url=base,
         session_id=sid,
-        purpose=info.get("purpose"),
+        purpose=purpose,
         upgrades=_effective_upgrades(request, base),
-        join_token=jt,
+        # Only a join token is meant to be shared; never echo a stronger credential.
+        join_token=jt if principal.role == "joiner" else "<join_token>",
     )
     return Response(md, media_type="text/markdown; charset=utf-8")
 

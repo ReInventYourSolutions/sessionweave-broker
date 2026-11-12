@@ -114,3 +114,96 @@ def test_participant_id_cannot_act(client: TestClient) -> None:
         r = client.get(f"/v1/sessions/{sid}/participants", headers=_h(tok))
         assert r.status_code == 403
         assert r.json()["error"]["code"] == "permission_denied"
+
+
+def test_events_ws_takes_secret_token_only(client: TestClient) -> None:
+    out = _create(client)
+    sid = out["session_id"]
+    joined = _join(client, sid, out["join_token"]).json()
+    with client.websocket_connect(
+        f"/v1/sessions/{sid}/participants/me/events?token={joined['participant_token']}"
+    ):
+        pass
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(
+            f"/v1/sessions/{sid}/participants/me/events?token={joined['participant_id']}"
+        ):
+            pass
+    assert exc.value.reason == "not_in_session"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_mcp_join_resume_and_explicit_identity_use_secret_token() -> None:
+    async with relay_subprocess({"SW_ADMIN_TOKEN": ADMIN}) as base:
+        async with sw_client(base) as a, sw_client(base) as b, sw_client(base) as c:
+            created = await a.call_tool("session_create", {})
+            sid = created["session_id"]
+
+            with pytest.raises(RuntimeError, match="permission_denied"):
+                await b.call_tool("session_join", {"session_id": sid})
+            with pytest.raises(RuntimeError, match="permission_denied"):
+                await b.call_tool("session_join", {"session_id": sid, "join_token": sid})
+            joined = await a.call_tool(
+                "session_join",
+                {"session_id": sid, "join_token": created["join_token"],
+                 "role": "w", "delivery_mode": "pull"},
+            )
+            assert joined["participant_token"] != joined["participant_id"]
+
+            # Fresh connection, explicit identity.
+            ok = await c.call_tool(
+                "session_list_participants",
+                {"session_id": sid, "participant_token": joined["participant_token"]},
+            )
+            assert joined["participant_id"] in {r["participant_id"] for r in ok["roster"]}
+            with pytest.raises(RuntimeError, match="not_in_session"):
+                await c.call_tool(
+                    "session_list_participants",
+                    {"session_id": sid, "participant_token": joined["participant_id"]},
+                )
+
+            # Resume on another connection by secret token.
+            resumed = await b.call_tool(
+                "session_resume",
+                {"session_id": sid, "participant_token": joined["participant_token"]},
+            )
+            assert resumed["roster"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_layer_expired_join_token_message_and_no_plaintext_in_ram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sessionweave.config import load_deployment_defaults
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.errors import ErrorCode, ToolError
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.tools import ToolDeps, session_create, session_join
+    from tests.unit.fakes import FakeHandle
+
+    defaults = load_deployment_defaults({})
+    registry = SessionRegistry(
+        defaults=defaults, connections=ConnectionManager(),
+        metrics=None, firehose=None, store=None,
+    )
+    deps = ToolDeps(registry, bounds=defaults.bounds)
+    created = await session_create(deps, {})
+    sid = created["session_id"]
+
+    joined = await session_join(
+        deps, FakeHandle(), {"session_id": sid, "join_token": created["join_token"]}
+    )
+    sess = registry.get(sid)
+    assert sess._participants[joined["participant_id"]].issued_token is None
+    assert joined["participant_token"]
+
+    real = access._now_ms
+    monkeypatch.setattr(access, "_now_ms", lambda: real() + 901_000)
+    with pytest.raises(ToolError) as exc:
+        await session_join(
+            deps, FakeHandle(), {"session_id": sid, "join_token": created["join_token"]}
+        )
+    assert exc.value.code is ErrorCode.PERMISSION_DENIED
+    assert "expired" in exc.value.message
+    assert "new invite link" in exc.value.message

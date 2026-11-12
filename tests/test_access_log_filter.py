@@ -75,15 +75,33 @@ def test_redacts_token_value_in_http_path() -> None:
     assert "a=b&token=[REDACTED]" in out
 
 
-def test_redacts_websocket_two_arg_shape() -> None:
-    out = _emitted(("1.2.3.4:5", "/v1/sessions/s1/events?token=SECRET123"))
-    assert "SECRET123" not in out
-    assert "token=[REDACTED]" in out
+def _ws_record(args: tuple[object, ...]) -> logging.LogRecord:
+    return logging.LogRecord(
+        "uvicorn.error", logging.INFO, "", 0, '%s - "WebSocket %s" [accepted]', args, None
+    )
 
 
-def test_redacts_websocket_three_arg_shape() -> None:
-    out = _emitted(("c", "WebSocket /v1/x?jt=SECRET123", 403))
+def test_redacts_real_websocket_line_on_uvicorn_error() -> None:
+    rec = _ws_record(("1.2.3.4:5", "/v1/sessions/s/firehose?token=SECRET123&a=b"))
+    assert AccessLogNoiseFilter().filter(rec) is True
+    out = rec.getMessage()
     assert "SECRET123" not in out
+    assert "token=[REDACTED]&a=b" in out
+
+
+def test_uvicorn_error_records_are_never_dropped() -> None:
+    rec = _ws_record(("c", "/healthz"))
+    assert AccessLogNoiseFilter().filter(rec) is True
+    rec = logging.LogRecord("uvicorn.error", logging.INFO, "", 0, "/metrics 404", None, None)
+    assert AccessLogNoiseFilter().filter(rec) is True
+
+
+def test_redacts_secret_in_msg() -> None:
+    rec = logging.LogRecord(
+        "uvicorn.error", logging.INFO, "", 0, "GET /x?jt=SECRET123", None, None
+    )
+    AccessLogNoiseFilter().filter(rec)
+    assert "SECRET123" not in rec.getMessage()
 
 
 def test_does_not_touch_lookalike_params() -> None:
@@ -93,3 +111,13 @@ def test_does_not_touch_lookalike_params() -> None:
 
 def test_redaction_never_raises_on_odd_args() -> None:
     assert _keep("uvicorn.access", ("c", None, b"\xff", object(), "x")) is True
+
+
+def test_install_attaches_to_access_and_error_loggers() -> None:
+    from sessionweave.access_log_filter import install_uvicorn_log_filters
+
+    install_uvicorn_log_filters()
+    for name in ("uvicorn.access", "uvicorn.error"):
+        assert any(
+            isinstance(f, AccessLogNoiseFilter) for f in logging.getLogger(name).filters
+        )
