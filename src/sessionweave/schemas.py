@@ -5,6 +5,8 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from sessionweave.access import Role
+
 
 class DispatchMode(StrEnum):
     ALL = "all"
@@ -76,6 +78,35 @@ class SessionCreateOutput(_Strict):
     persistence: PersistenceStatePublic | None = None
     creator_token: str = ""
     creator_id: str = ""
+    supervisor_token: str = ""
+    supervisor_token_id: str = ""
+    join_token: str = ""
+    join_token_expires_at: str = ""
+    invite_url: str = ""
+    invite_link: str = ""
+
+
+class JoinTokenOutput(_Strict):
+    join_token: str
+    expires_at: str
+    invite_url: str
+    invite_link: str
+
+
+class SupervisorTokenOutput(_Strict):
+    token_id: str
+    supervisor_token: str
+
+
+class SupervisorTokenInfo(_Strict):
+    token_id: str
+    created_at: str
+    revoked_at: str | None = None
+
+
+class AccessOutput(_Strict):
+    role: Role
+    participant_id: str | None = None
 
 
 class SessionJoinInput(_Strict):

@@ -41,6 +41,10 @@ REQUIRED = {
     "session_respond": ["command_id", "payload"],
     "session_delete": ["creator_token", "session_id"],
     "session_get_events": ["session_id"],
+    "session_mint_join_token": ["creator_token", "session_id"],
+    "session_mint_supervisor_token": ["creator_token", "session_id"],
+    "session_list_supervisor_tokens": ["creator_token", "session_id"],
+    "session_revoke_supervisor_token": ["creator_token", "session_id", "token_id"],
 }
 
 # String parameters with a closed set of values.

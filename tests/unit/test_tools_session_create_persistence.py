@@ -91,3 +91,20 @@ async def test_create_persistence_without_store_raises(deps_no_store):
             "persistence": {"mode": "ttl", "ttl_seconds": 3600},
         })
     assert exc.value.code is ErrorCode.PERSISTENCE_FAILED
+
+
+@pytest.mark.asyncio
+async def test_persisted_create_hands_back_all_credentials(deps_with_store):
+    from sessionweave.access import hash_token
+
+    out = await session_create(
+        deps_with_store,
+        {"persistence": {"mode": "until_deleted"}},
+        public_base_url="https://r.example",
+    )
+    assert out["invite_link"] == f"swvs://r.example/{out['session_id']}?jt={out['join_token']}"
+    assert out["invite_url"] == f"https://r.example/invite/{out['session_id']}?jt={out['join_token']}"
+    assert out["supervisor_token_id"] and out["join_token_expires_at"]
+    auth = await deps_with_store.registry._store.load_auth(out["session_id"])
+    assert auth.match(out["supervisor_token"], 0) is not None
+    assert auth.creator_token_hash == hash_token(out["creator_token"])

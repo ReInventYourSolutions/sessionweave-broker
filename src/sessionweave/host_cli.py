@@ -52,8 +52,6 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from sessionweave.invite import create_link
-
 
 def _unwrap(res: Any) -> dict[str, Any]:
     sc = res.structured_content
@@ -79,7 +77,7 @@ async def _create_and_join(
     my_capabilities: list[str],
     my_metadata: dict[str, Any],
     delivery_mode: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
@@ -91,7 +89,11 @@ async def _create_and_join(
             )
             if res.is_error:
                 raise RuntimeError(f"session_create error: {_unwrap(res)}")
-            sid = _unwrap(res).get("session_id")
+            created = _unwrap(res)
+            sid = created.get("session_id")
+            link = created.get("invite_link")
+            if not isinstance(link, str) or not link:
+                raise RuntimeError(f"session_create returned no invite_link: {link!r}")
             if not isinstance(sid, str):
                 raise RuntimeError(f"session_create returned no session_id: {sid!r}")
             join_args: dict[str, Any] = {
@@ -109,7 +111,7 @@ async def _create_and_join(
             pid = _unwrap(res).get("participant_id")
             if not isinstance(pid, str):
                 raise RuntimeError(f"session_join returned no participant_id: {pid!r}")
-            return sid, pid
+            return sid, pid, link
 
 
 def _spawn_poller(
@@ -227,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         metadata["display_name"] = args.my_display_name
 
     try:
-        sid, pid = asyncio.run(
+        sid, pid, link = asyncio.run(
             _create_and_join(
                 args.relay_url,
                 purpose,
@@ -243,8 +245,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         sys.stderr.write(f"create/join failed: {exc}\n")
         return 4
-
-    link = create_link(args.relay_url, sid)
 
     poller_pid: int | None = None
     poller_log: str | None = None

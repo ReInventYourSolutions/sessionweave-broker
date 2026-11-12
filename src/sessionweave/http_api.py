@@ -88,6 +88,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.SESSION_NOT_FOUND: 404,
     ErrorCode.PARTICIPANT_NOT_FOUND: 404,
     ErrorCode.COMMAND_NOT_FOUND: 404,
+    ErrorCode.TOKEN_NOT_FOUND: 404,
     ErrorCode.NOT_IN_SESSION: 401,
     ErrorCode.ALREADY_IN_SESSION: 409,
     ErrorCode.SESSION_FULL: 409,
@@ -199,7 +200,7 @@ async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         body = await _read_json_body(request)
-        out = await session_create(deps, body)
+        out = await session_create(deps, body, public_base_url=_public_base_url(request))
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -808,6 +809,66 @@ async def _delete_session_handler(request: Request) -> Response:
     return JSONResponse({"deleted_at": deleted_at}, status_code=200)
 
 
+async def _run_credential_call(request: Request, call: Any, status: int = 200) -> Response:
+    """Run a tools.session_* credential call; map ToolError to the error body."""
+    try:
+        out = await call(
+            _deps(request),
+            request.path_params["sid"],
+            _bearer(request) or "",
+            source_ip=_request_source_ip(request),
+        )
+    except ToolError as exc:
+        return _error_response(exc)
+    if status == 204:
+        return Response(status_code=204)
+    return JSONResponse(out, status_code=status)
+
+
+async def _mint_join_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    base = _public_base_url(request)
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_mint_join_token(
+            deps, sid, token, public_base_url=base, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 201)
+
+
+async def _mint_supervisor_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_mint_supervisor_token, 201)
+
+
+async def _list_supervisor_tokens_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_list_supervisor_tokens)
+
+
+async def _revoke_supervisor_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    token_id = request.path_params["token_id"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        await tools.session_revoke_supervisor_token(
+            deps, sid, token, token_id, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 204)
+
+
+async def _access_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_access)
+
+
 # ---------- routing ----------
 
 
@@ -871,6 +932,26 @@ def routes() -> list[Route]:
             "/v1/sessions/{sid}/commands/{cid}/responses",
             post_command_response,
             methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/join-tokens",
+            _mint_join_token_handler, methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens",
+            _mint_supervisor_token_handler, methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens",
+            _list_supervisor_tokens_handler, methods=["GET"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens/{token_id}",
+            _revoke_supervisor_token_handler, methods=["DELETE"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/access",
+            _access_handler, methods=["GET"],
         ),
         Route(
             "/v1/sessions/{sid}/supervisor/notes",

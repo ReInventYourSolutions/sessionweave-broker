@@ -50,8 +50,12 @@ from sessionweave.tools import (
     session_join,
     session_leave,
     session_list_participants,
+    session_list_supervisor_tokens,
+    session_mint_join_token,
+    session_mint_supervisor_token,
     session_respond,
     session_resume,
+    session_revoke_supervisor_token,
     session_send,
     session_update_purpose,
     session_update_self,
@@ -243,6 +247,10 @@ ParticipantTokenArg = Annotated[str | None, Field(
                 "call. Otherwise leave unset. It is a credential: keep it "
                 "secret.")]
 
+ManagerTokenArg = Annotated[str, Field(
+    description="The one-time creator_token session_create returned (it cannot "
+                "be recovered), or the relay operator's admin token.")]
+
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
                 "echoed to everyone who joins. Recognised keys: kind, "
@@ -277,6 +285,22 @@ def _build_fastmcp(
             return fn
 
         return deco
+
+    def _request_of(ctx: Context | None) -> Any:
+        return getattr(getattr(ctx, "request_context", None), "request", None)
+
+    def _client_ip(ctx: Context | None) -> str:
+        client = getattr(_request_of(ctx), "client", None)
+        return getattr(client, "host", "") or ""
+
+    def _public_base_url(ctx: Context | None) -> str | None:
+        """Configured public base URL, else the MCP HTTP request's own base URL."""
+        configured = os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/")
+        if configured:
+            return configured
+        req = _request_of(ctx)
+        base = getattr(req, "base_url", None)
+        return str(base).rstrip("/") if base is not None else None
 
     def _handle_for(ctx: Context) -> Any:
         return handles.for_connection(
@@ -347,11 +371,15 @@ def _build_fastmcp(
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Open a new session and return its session_id plus a one-time creator_token.
+        """Open a new session; returns session_id, invite_link and the one-time tokens.
 
-    Save the creator_token: it is returned exactly once, nothing can
-    recover it, and session_delete requires it. Creating a session does
-    not put you in it — call session_join next.
+    Save creator_token and supervisor_token: each is returned exactly once
+    and nothing can recover it. creator_token manages the session
+    (session_delete, minting and revoking tokens); supervisor_token lets a
+    supervisor observe it. invite_link (swv:// or swvs://) and invite_url
+    (HTTP) carry join_token, a credential valid for 15 minutes that anyone
+    can use to join; mint a fresh one with session_mint_join_token.
+    Creating a session does not put you in it — call session_join next.
 
     persistence is opt-in. Omit it and the session lives in RAM only and
     is discarded once it goes idle, so nothing touches disk. Pass
@@ -362,7 +390,9 @@ def _build_fastmcp(
     can act without a separate briefing.
     """
         return await session_create(
-            deps, {"config": config, "purpose": purpose, "persistence": persistence}
+            deps,
+            {"config": config, "purpose": purpose, "persistence": persistence},
+            public_base_url=_public_base_url(ctx),
         )
 
     @_tool("session_describe")
@@ -710,13 +740,84 @@ def _build_fastmcp(
     session's stored timeline is removed. Needs no session_join, and
     cannot be undone.
     """
-        req = getattr(getattr(ctx, "request_context", None), "request", None)
-        client = getattr(req, "client", None)
         return await session_delete(
             deps,
             {"session_id": session_id, "creator_token": creator_token},
-            source_ip=(getattr(client, "host", "") or ""),
+            source_ip=_client_ip(ctx),
         )
+
+    @_tool("session_mint_join_token")
+    async def session_mint_join_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint a fresh join token and invite link for a session.
+
+    Requires the creator_token (or the relay admin token). The join token
+    is valid for 15 minutes and can be used by several joiners within that
+    time; participants who already joined are unaffected when it expires.
+    Returns join_token, expires_at, invite_url and invite_link.
+    """
+        return await session_mint_join_token(
+            deps, session_id, creator_token,
+            public_base_url=_public_base_url(ctx), source_ip=_client_ip(ctx),
+        )
+
+    @_tool("session_mint_supervisor_token")
+    async def session_mint_supervisor_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint an additional supervisor token for a session.
+
+    Requires the creator_token (or the relay admin token). The token is
+    returned exactly once as supervisor_token, with a token_id you can
+    pass to session_revoke_supervisor_token. A supervisor token cannot
+    mint or revoke tokens.
+    """
+        return await session_mint_supervisor_token(
+            deps, session_id, creator_token, source_ip=_client_ip(ctx)
+        )
+
+    @_tool("session_list_supervisor_tokens")
+    async def session_list_supervisor_tokens_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List a session's supervisor tokens (ids and timestamps, never the secrets).
+
+    Requires the creator_token (or the relay admin token). Each entry has
+    token_id, created_at and revoked_at (null while the token is active).
+    """
+        return {
+            "supervisor_tokens": await session_list_supervisor_tokens(
+                deps, session_id, creator_token, source_ip=_client_ip(ctx)
+            )
+        }
+
+    @_tool("session_revoke_supervisor_token")
+    async def session_revoke_supervisor_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        token_id: Annotated[str, Field(description=
+            "The token_id of the supervisor token to revoke, from "
+            "session_mint_supervisor_token, session_create or "
+            "session_list_supervisor_tokens."
+        )],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Revoke a supervisor token so it stops working immediately.
+
+    Requires the creator_token (or the relay admin token). Fails with
+    token_not_found if token_id is unknown. Returns {"revoked": true}.
+    """
+        await session_revoke_supervisor_token(
+            deps, session_id, creator_token, token_id, source_ip=_client_ip(ctx)
+        )
+        return {"revoked": True}
 
     @_tool("session_get_events")
     async def session_get_events_tool(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from sessionweave.access import (
@@ -12,9 +13,12 @@ from sessionweave.access import (
 )
 from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.invite import create_link, http_invite_url
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import (
+    AccessOutput,
     InboxMessage,
+    JoinTokenOutput,
     SessionCheckInboxOutput,
     SessionCreateInput,
     SessionCreateOutput,
@@ -37,6 +41,8 @@ from sessionweave.schemas import (
     SessionUpdateSelfOutput,
     SessionWaitForEventInput,
     SessionWaitForEventOutput,
+    SupervisorTokenInfo,
+    SupervisorTokenOutput,
 )
 from sessionweave.session import Session
 
@@ -115,7 +121,30 @@ async def _session_for_handle(
     return sess, binding[1]
 
 
-async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+def _iso_from_ms(ms: int) -> str:
+    return (
+        datetime.fromtimestamp(ms / 1000, UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _invite_fields(
+    public_base_url: str | None, sid: str, join_token: str
+) -> tuple[str, str]:
+    """(invite_url, invite_link) for a join token; empty when no base URL is known."""
+    if not public_base_url:
+        return "", ""
+    return (
+        http_invite_url(public_base_url, sid, join_token),
+        create_link(public_base_url, sid, join_token),
+    )
+
+
+async def session_create(
+    deps: ToolDeps, payload: dict[str, Any], *, public_base_url: str | None = None
+) -> dict[str, Any]:
     inp = SessionCreateInput.model_validate(payload)
 
     # Validate persistence ttl up-front against operator bounds
@@ -155,6 +184,11 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
     # forward-compat shim the cockpit (and future identities) can populate.
     from uuid import uuid4
     creator_id = inp.creator_id if inp.creator_id else str(uuid4())
+    sess = await deps.registry.get_or_raise(sid)
+    supervisor_token, supervisor_issued = await sess.mint_supervisor_token()
+    join_token, join_issued = await sess.mint_join_token()
+    assert join_issued.expires_at_ms is not None
+    invite_url, invite_link = _invite_fields(public_base_url, sid, join_token)
     return SessionCreateOutput(
         session_id=sid,
         expires_at=expires_at,
@@ -163,6 +197,12 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
         persistence=persistence_state,
         creator_token=token,
         creator_id=creator_id,
+        supervisor_token=supervisor_token,
+        supervisor_token_id=supervisor_issued.token_id,
+        join_token=join_token,
+        join_token_expires_at=_iso_from_ms(join_issued.expires_at_ms),
+        invite_url=invite_url,
+        invite_link=invite_link,
     ).model_dump()
 
 
@@ -407,6 +447,80 @@ async def session_delete(
     reason = "admin_deleted" if principal.role == "admin" else "host_deleted"
     deleted_at = await deps.registry.delete(inp.session_id, reason=reason)
     return SessionDeleteOutput(deleted_at=deleted_at).model_dump()
+
+
+async def _resolve_manager(
+    deps: ToolDeps, session_id: str, token: str, source_ip: str
+) -> Session:
+    """Authenticate a creator or admin token and return the live session."""
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    require(principal, "creator", "admin")
+    return await deps.registry.get_or_raise(session_id)
+
+
+async def session_mint_join_token(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    *,
+    public_base_url: str | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    join_token, issued = await sess.mint_join_token()
+    assert issued.expires_at_ms is not None
+    invite_url, invite_link = _invite_fields(public_base_url, session_id, join_token)
+    return JoinTokenOutput(
+        join_token=join_token,
+        expires_at=_iso_from_ms(issued.expires_at_ms),
+        invite_url=invite_url,
+        invite_link=invite_link,
+    ).model_dump()
+
+
+async def session_mint_supervisor_token(
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
+) -> dict[str, Any]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    supervisor_token, issued = await sess.mint_supervisor_token()
+    return SupervisorTokenOutput(
+        token_id=issued.token_id, supervisor_token=supervisor_token
+    ).model_dump()
+
+
+async def session_list_supervisor_tokens(
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
+) -> list[dict[str, Any]]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    return [
+        SupervisorTokenInfo(
+            token_id=t.token_id,
+            created_at=_iso_from_ms(t.created_at_ms),
+            revoked_at=None if t.revoked_at_ms is None else _iso_from_ms(t.revoked_at_ms),
+        ).model_dump()
+        for t in sess.auth.supervisor_tokens()
+    ]
+
+
+async def session_revoke_supervisor_token(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    token_id: str,
+    *,
+    source_ip: str = "",
+) -> None:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    await sess.revoke_supervisor_token(token_id)
+
+
+async def session_access(
+    deps: ToolDeps, session_id: str, token: str | None, *, source_ip: str = ""
+) -> dict[str, Any]:
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    return AccessOutput(
+        role=principal.role, participant_id=principal.participant_id
+    ).model_dump()
 
 
 def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
