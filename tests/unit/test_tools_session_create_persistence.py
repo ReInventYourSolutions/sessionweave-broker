@@ -63,7 +63,7 @@ async def test_create_persisted_ttl_returns_state(deps_with_store, store):
     assert await store.exists(out["session_id"]) is True
     # The stored hash matches the returned plaintext
     sess = await deps_with_store.registry.get_or_raise(out["session_id"])
-    assert sess.creator_token_hash == hash_creator_token(out["creator_token"])
+    assert sess.auth.creator_token_hash == hash_creator_token(out["creator_token"])
 
 
 @pytest.mark.asyncio

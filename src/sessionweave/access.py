@@ -58,6 +58,10 @@ class SessionAuth:
         self._issued: dict[bytes, IssuedToken] = {}
         self._participants: dict[bytes, str] = {}
 
+    @property
+    def creator_token_hash(self) -> bytes | None:
+        return self._creator_hash
+
     def _mint(
         self, kind: Literal["join", "supervisor"], now_ms: int, ttl_ms: int | None
     ) -> tuple[str, IssuedToken]:

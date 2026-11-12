@@ -14,6 +14,12 @@ if TYPE_CHECKING:
     from sessionweave.connections import ConnectionHandle
     from sessionweave.persistence import PersistenceStore, SessionSnapshot
 
+from sessionweave.access import (
+    IssuedToken,
+    SessionAuth,
+    generate_token,
+    hash_token,
+)
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionHandle, ConnectionManager
 from sessionweave.dispatcher import RoundRobinPicker, decide_dispatch
@@ -38,6 +44,10 @@ _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _isoformat(dt: datetime) -> str:
@@ -104,8 +114,8 @@ class Session:
         "_store",
         "_subscribers",
         "_wait_in_flight",
+        "auth",
         "config",
-        "creator_token_hash",
         "lock",
         "purpose",
         "session_id",
@@ -164,7 +174,7 @@ class Session:
         self._store = store
         self._persistence_mode = persistence_mode
         self._event_seq: int = 0
-        self.creator_token_hash: bytes | None = None
+        self.auth: SessionAuth = SessionAuth(None)
 
     # --- hydration ---
 
@@ -198,11 +208,13 @@ class Session:
             store=store,
             persistence_mode=snap.persistence_mode,
         )
-        sess.creator_token_hash = snap.creator_token_hash
+        sess.auth = SessionAuth(snap.creator_token_hash)
+        sess.auth.restore(snap.tokens)
         # Participants (only active — left_at NULL)
         for p in snap.participants:
             s = p["snapshot"]
             joined_at = datetime.fromtimestamp(p["joined_at"] / 1000, tz=UTC)
+            token_hash = bytes.fromhex(s.get("token_hash") or "")
             sess._participants[p["participant_id"]] = Participant(
                 participant_id=p["participant_id"],
                 role=s.get("role"),
@@ -214,7 +226,10 @@ class Session:
                 delivery_mode=s.get("delivery_mode", "push"),
                 next_seq=p.get("last_seen_seq", 0),
                 last_acked_seq=p.get("last_seen_seq", 0),
+                token_hash=token_hash,
             )
+            if token_hash:
+                sess.auth.register_participant(p["participant_id"], token_hash)
         if metrics is not None and sess._participants:
             # Cold -> hot: balance the dec() ``release_participant_metrics``
             # issued when this session left RAM. Restored participants are
@@ -329,8 +344,12 @@ class Session:
             )
             p.online = True
             p.connection_ref = handle
+            token = generate_token()
+            p.token_hash = hash_token(token)
+            p.issued_token = token
             self._connections.bind(handle, self.session_id, p.participant_id)
             self._participants[p.participant_id] = p
+            self.auth.register_participant(p.participant_id, p.token_hash)
             self.bump_activity()
             if self._metrics is not None:
                 self._metrics.participants_active.labels(online="true").inc()
@@ -342,6 +361,7 @@ class Session:
                     "metadata": dict(p.metadata),
                     "delivery_mode": p.delivery_mode,
                     "online": p.online,
+                    "token_hash": p.token_hash.hex(),
                 }
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
                 await self._store.upsert_participant(
@@ -357,6 +377,35 @@ class Session:
             )
             self._mirror_firehose("participant.joined", joined_payload)
             return p
+
+    async def mint_join_token(self) -> tuple[str, IssuedToken]:
+        async with self.lock:
+            token, issued = self.auth.mint_join(_now_ms())
+            if self._store is not None:
+                await self._store.save_token(self.session_id, issued)
+            return token, issued
+
+    async def mint_supervisor_token(self) -> tuple[str, IssuedToken]:
+        async with self.lock:
+            token, issued = self.auth.mint_supervisor(_now_ms())
+            if self._store is not None:
+                await self._store.save_token(self.session_id, issued)
+            return token, issued
+
+    async def revoke_supervisor_token(self, token_id: str) -> IssuedToken:
+        async with self.lock:
+            try:
+                issued = self.auth.revoke_supervisor(token_id, _now_ms())
+            except KeyError:
+                raise ToolError(
+                    ErrorCode.TOKEN_NOT_FOUND, "supervisor token not found"
+                ) from None
+            if self._store is not None:
+                assert issued.revoked_at_ms is not None
+                await self._store.revoke_token(
+                    self.session_id, token_id, issued.revoked_at_ms
+                )
+            return issued
 
     async def leave(
         self,
@@ -382,6 +431,7 @@ class Session:
             p = self._participants.pop(participant_id, None)
             if p is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            self.auth.forget_participant(participant_id)
             handle = p.connection_ref
             if handle is not None:
                 # handle is a ConnectionHandle (set by join/resume)
@@ -455,6 +505,7 @@ class Session:
                     "metadata": dict(p.metadata),
                     "delivery_mode": p.delivery_mode,
                     "online": p.online,
+                    "token_hash": p.token_hash.hex(),
                 }
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
                 await self._store.upsert_participant(
@@ -1561,6 +1612,7 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return
+        self.auth.forget_participant(pid)
         self._persist_left(pid)
         self._discard_buffer(self._buffers.pop(pid, None))
         if self._metrics is not None:

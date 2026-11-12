@@ -292,8 +292,8 @@ async def firehose_ws(websocket: WebSocket) -> None:
     accepted = False
     if admin_token is not None and token == admin_token:
         accepted = True
-    elif session.creator_token_hash is not None and verify_creator_token(
-        token, session.creator_token_hash
+    elif session.auth.creator_token_hash is not None and verify_creator_token(
+        token, session.auth.creator_token_hash
     ):
         accepted = True
     elif admin_token is None and token == sid:

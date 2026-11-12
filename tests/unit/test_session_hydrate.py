@@ -46,7 +46,7 @@ def test_from_snapshot_reconstructs_metadata() -> None:
     assert s.session_id == "sid"
     assert s._persistence_mode == "ttl"
     assert s.purpose is None
-    assert s.creator_token_hash == b"\x00" * 32
+    assert s.auth.creator_token_hash == b"\x00" * 32
 
 
 def test_from_snapshot_reconstructs_participants() -> None:

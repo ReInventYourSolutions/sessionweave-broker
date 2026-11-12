@@ -687,8 +687,8 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         # participant_id is a uuid4 lookup — dict membership is O(1) and
         # already constant-time for any fixed key size.
         accepted = True
-    elif session.creator_token_hash is not None and verify_creator_token(
-        token, session.creator_token_hash
+    elif session.auth.creator_token_hash is not None and verify_creator_token(
+        token, session.auth.creator_token_hash
     ):
         accepted = True
     elif admin_token is None and _hmac.compare_digest(token, sid):
@@ -819,8 +819,8 @@ async def _delete_session_handler(request: Request) -> Response:
         raise
 
     reason: str | None = None
-    if sess.creator_token_hash is not None and verify_creator_token(
-        token, sess.creator_token_hash
+    if sess.auth.creator_token_hash is not None and verify_creator_token(
+        token, sess.auth.creator_token_hash
     ):
         reason = "host_deleted"
     else:

@@ -50,6 +50,13 @@ class Participant:
     # didn't pass an explicit ``last_acked_seq`` (so clients that ACK
     # promptly don't need to track a watermark themselves).
     last_acked_seq: int = 0
+    # SHA-256 of the participant's secret token (persisted as hex in the
+    # participant snapshot). The plaintext is never stored.
+    token_hash: bytes = b""
+    # Plaintext token; transient. Set only on the object ``Session.join``
+    # returns so the caller can hand it back once. Never persisted or
+    # serialised (``to_public`` does not read it).
+    issued_token: str | None = None
 
     @staticmethod
     def create(

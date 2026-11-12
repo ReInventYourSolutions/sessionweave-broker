@@ -404,8 +404,8 @@ async def session_delete(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
         await asyncio.sleep(0.5)
         raise ToolError(ErrorCode.PERMISSION_DENIED, "rate-limited")
     sess = await deps.registry.get_or_raise(inp.session_id)
-    if sess.creator_token_hash is None or not verify_creator_token(
-        inp.creator_token, sess.creator_token_hash
+    if sess.auth.creator_token_hash is None or not verify_creator_token(
+        inp.creator_token, sess.auth.creator_token_hash
     ):
         if rl is not None:
             rl.record_failure(inp.session_id)
