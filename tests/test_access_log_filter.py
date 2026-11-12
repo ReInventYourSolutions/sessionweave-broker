@@ -55,3 +55,41 @@ def test_keeps_non_access_record() -> None:
 
 def test_keeps_on_none_args() -> None:
     assert _keep("uvicorn.access", None) is True
+
+
+def _emitted(args: tuple[object, ...]) -> str:
+    rec = _rec("uvicorn.access", args)
+    assert AccessLogNoiseFilter().filter(rec) is True
+    return rec.getMessage() if len(args) == 5 else str(rec.args)
+
+
+def test_redacts_jt_value_keeps_rest_of_query() -> None:
+    out = _emitted(("c", "GET", "/invite/s1?jt=SECRET123&x=1", "1.1", 200))
+    assert "SECRET123" not in out
+    assert "jt=[REDACTED]&x=1" in out
+
+
+def test_redacts_token_value_in_http_path() -> None:
+    out = _emitted(("c", "GET", "/v1/sessions/s1/events?a=b&token=SECRET123", "1.1", 200))
+    assert "SECRET123" not in out
+    assert "a=b&token=[REDACTED]" in out
+
+
+def test_redacts_websocket_two_arg_shape() -> None:
+    out = _emitted(("1.2.3.4:5", "/v1/sessions/s1/events?token=SECRET123"))
+    assert "SECRET123" not in out
+    assert "token=[REDACTED]" in out
+
+
+def test_redacts_websocket_three_arg_shape() -> None:
+    out = _emitted(("c", "WebSocket /v1/x?jt=SECRET123", 403))
+    assert "SECRET123" not in out
+
+
+def test_does_not_touch_lookalike_params() -> None:
+    out = _emitted(("c", "GET", "/v1/x?mytoken=keep&jt2=keep", "1.1", 200))
+    assert "mytoken=keep" in out and "jt2=keep" in out
+
+
+def test_redaction_never_raises_on_odd_args() -> None:
+    assert _keep("uvicorn.access", ("c", None, b"\xff", object(), "x")) is True

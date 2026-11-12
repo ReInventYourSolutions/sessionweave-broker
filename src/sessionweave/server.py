@@ -251,6 +251,13 @@ ManagerTokenArg = Annotated[str, Field(
     description="The one-time creator_token session_create returned (it cannot "
                 "be recovered), or the relay operator's admin token.")]
 
+AccessTokenArg = Annotated[str | None, Field(
+    description="Any credential that may read the session: the join token "
+                "from the invite link, your participant_token, a "
+                "supervisor_token, the creator_token, or the relay admin "
+                "token. Not needed if you already joined on this same "
+                "connection. It is a credential: keep it secret.")]
+
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
                 "echoed to everyone who joins. Recognised keys: kind, "
@@ -308,6 +315,15 @@ def _build_fastmcp(
             connections=connections,
             registry=registry,
         )
+
+    def _optional_handle(ctx: Context | None) -> Any:
+        """This connection's handle, or None when there is none to bind."""
+        if ctx is None:
+            return None
+        try:
+            return _handle_for(ctx)
+        except Exception:
+            return None
 
     @asynccontextmanager
     async def _participant(
@@ -398,30 +414,41 @@ def _build_fastmcp(
     @_tool("session_describe")
     async def session_describe_tool(
         session_id: SessionIdArg,
+        access_token: AccessTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Read-only snapshot of a session: config, purpose, roster, persistence state.
 
     Allocates no participant and does not bind this connection, so it is
-    the safe pre-flight before deciding whether to join.
+    the safe pre-flight before deciding whether to join. Needs an
+    access_token (the join token from the invite link will do) unless this
+    connection already joined the session.
     """
-        return await session_describe(deps, {"session_id": session_id})
+        return await session_describe(
+            deps,
+            {"session_id": session_id, "access_token": access_token},
+            handle=_optional_handle(ctx),
+            source_ip=_client_ip(ctx),
+        )
 
     @_tool("session_update_purpose")
     async def session_update_purpose_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
         purpose: PurposeArg = None,
-        session_id: OptSessionIdArg = None,
-        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Replace the purpose of the session this connection joined, or clear it.
+        """Replace the purpose of a session, or clear it.
 
-    Pass nothing to clear. Broadcasts session.purpose_updated to the
-    other participants. Requires session_join on this connection first.
+    Pass no purpose to clear. Requires the creator_token (or the relay
+    admin token); participants cannot change the purpose. Broadcasts
+    session.purpose_updated to the participants. Needs no session_join.
     """
-        assert ctx is not None
-        async with _participant(ctx, session_id, participant_token) as h:
-            return await session_update_purpose(deps, h, {"purpose": purpose})
+        return await session_update_purpose(
+            deps,
+            {"session_id": session_id, "creator_token": creator_token, "purpose": purpose},
+            source_ip=_client_ip(ctx),
+        )
 
     @_tool("session_join")
     async def session_join_tool(
@@ -857,6 +884,7 @@ def _build_fastmcp(
         order: Annotated[Literal["asc", "desc"], Field(description=
             '"asc" (default) oldest first, or "desc" newest first.'
         )] = "asc",
+        access_token: AccessTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Browse the timeline of a persisted session without bringing it back into RAM.
@@ -865,7 +893,7 @@ def _build_fastmcp(
     "ended"). Page with after_seq / before_seq and limit; order is "asc"
     (default) or "desc". Narrow with kind and participant_id. An
     ephemeral session stores no timeline and returns no_history. Needs no
-    session_join.
+    session_join, but an access_token unless this connection joined the session.
     """
         payload = {
             "session_id": session_id,
@@ -875,8 +903,11 @@ def _build_fastmcp(
             "participant_id": participant_id,
             "limit": limit,
             "order": order,
+            "access_token": access_token,
         }
-        return await session_get_events(deps, payload)
+        return await session_get_events(
+            deps, payload, handle=_optional_handle(ctx), source_ip=_client_ip(ctx)
+        )
 
     return mcp
 

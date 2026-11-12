@@ -8,15 +8,25 @@ noise never reaches the file / journald sinks.
 from __future__ import annotations
 
 import logging
+import re
 
 _REAL_API_PREFIXES = ("/v1", "/mcp", "/invite")
 _DROP_PATHS = frozenset({"/healthz", "/metrics"})
+# Secrets that travel in the query string (join token, WebSocket token).
+_SECRET_QUERY = re.compile(r"([?&](?:jt|token)=)[^&#\s\"]*")
+
+
+def _redact(value: object) -> object:
+    if isinstance(value, str):
+        return _SECRET_QUERY.sub(r"\1[REDACTED]", value)
+    return value
 
 
 class AccessLogNoiseFilter(logging.Filter):
     """Drop health-ping, metrics-scrape, and scanner-404 access records.
 
-    Keeps every non-access record and all real traffic (``/v1`` / ``/mcp`` /
+    Redacts the values of ``jt`` and ``token`` query parameters. Keeps every
+    non-access record and all real traffic (``/v1`` / ``/mcp`` /
     ``/invite`` at any status, plus WebSocket access lines). Never raises: on
     any unexpected record shape it keeps the record.
     """
@@ -25,6 +35,14 @@ class AccessLogNoiseFilter(logging.Filter):
         if record.name != "uvicorn.access":
             return True
         args = record.args
+        # Redact join / WebSocket tokens from every string arg (HTTP lines
+        # carry the path in args[2]; WebSocket lines in args[1] or inside a
+        # "WebSocket <path>" string) before the record is emitted.
+        if isinstance(args, tuple):
+            try:
+                record.args = args = tuple(_redact(a) for a in args)
+            except Exception:
+                pass
         # uvicorn HTTP access records carry a 5-tuple:
         #   (client_addr, method, full_path, http_version, status_code)
         # WebSocket / other shapes differ in length -> keep them.

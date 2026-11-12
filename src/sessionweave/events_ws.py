@@ -27,7 +27,6 @@ doesn't need a separate REST drain to seed itself.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 from typing import Any
@@ -264,26 +263,26 @@ async def events_ws(websocket: WebSocket) -> None:
 async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
-    admin_token = getattr(websocket.app.state, "admin_token", None)
-    registry = websocket.app.state.tool_deps.registry
+    deps = websocket.app.state.tool_deps
     firehose = websocket.app.state.firehose
-    session = registry.get(sid)
-    if session is None:
+    if deps.registry.get(sid) is None:
         await websocket.close(code=_CLOSE_SESSION_NOT_FOUND, reason="session_not_found")
         return
 
-    # Two authentication modes for the firehose endpoint:
-    #   1. relay-wide admin token (``SW_ADMIN_TOKEN``): ``?token=<admin_token>``.
-    #   2. creator token of *this* session: a session-scoped supervisor channel.
-    from sessionweave.access import admin_matches, hash_token
+    # Supervisor, creator or relay admin (``SW_ADMIN_TOKEN``) tokens only.
+    from sessionweave.access import require, resolve_principal
 
-    accepted = admin_matches(token, admin_token) or (
-        session.auth.creator_token_hash is not None
-        and hmac.compare_digest(hash_token(token), session.auth.creator_token_hash)
-    )
-
-    if not accepted:
-        await websocket.close(code=_CLOSE_MISSING_TOKEN, reason="invalid token")
+    source_ip = (websocket.client.host if websocket.client is not None else "") or ""
+    try:
+        principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
+        require(principal, "supervisor", "creator", "admin")
+    except ToolError as exc:
+        code = (
+            _CLOSE_SESSION_NOT_FOUND
+            if exc.code is ErrorCode.SESSION_NOT_FOUND
+            else _CLOSE_MISSING_TOKEN
+        )
+        await websocket.close(code=code, reason="invalid token")
         return
 
     await websocket.accept()

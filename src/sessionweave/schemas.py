@@ -177,9 +177,14 @@ class SessionListParticipantsOutput(_Strict):
 
 class SessionDescribeInput(_Strict):
     session_id: str
+    # Any session credential (participant, join, supervisor, creator, admin).
+    # Optional only for a connection already bound as a participant.
+    access_token: str | None = None
 
 
 class SessionUpdatePurposeInput(_Strict):
+    session_id: str
+    creator_token: str
     # Pass `None` (or omit) to clear the purpose entirely.
     purpose: dict[str, Any] | None = None
 
@@ -331,6 +336,7 @@ class SessionDeleteOutput(_Strict):
 
 class SessionGetEventsInput(_Strict):
     session_id: str
+    access_token: str | None = None
     after_seq: int | None = None
     before_seq: int | None = None
     kind: list[str] | None = None

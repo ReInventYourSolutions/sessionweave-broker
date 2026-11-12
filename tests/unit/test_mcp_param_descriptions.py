@@ -29,7 +29,7 @@ from sessionweave.server import _build_fastmcp
 REQUIRED = {
     "session_create": [],
     "session_describe": ["session_id"],
-    "session_update_purpose": [],
+    "session_update_purpose": ["creator_token", "session_id"],
     "session_join": ["session_id"],
     "session_resume": ["participant_token", "session_id"],
     "session_leave": [],

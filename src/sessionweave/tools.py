@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from sessionweave.access import (
     AuthFailureLimiter,
+    Principal,
+    Role,
     generate_token,
     hash_token,
     participant_id_for_token,
@@ -208,24 +210,60 @@ async def session_create(
 
 
 async def session_update_purpose(
-    deps: ToolDeps,
-    handle: ConnectionHandle,
-    payload: dict[str, Any],
+    deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
 ) -> dict[str, Any]:
-    sess, pid = await _session_for_handle(deps, handle)
+    """Replace or clear the purpose. Creator or admin only."""
     inp = SessionUpdatePurposeInput.model_validate(payload)
-    new_purpose = await sess.update_purpose(pid, inp.purpose)
+    sess = await _resolve_manager(deps, inp.session_id, inp.creator_token, source_ip)
+    new_purpose = await sess.update_purpose(None, inp.purpose)
     return SessionUpdatePurposeOutput(purpose=new_purpose).model_dump()
 
 
-async def session_describe(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+_READ_ROLES: tuple[Role, ...] = ("participant", "joiner", "supervisor", "creator", "admin")
+
+
+async def _resolve_reader(
+    deps: ToolDeps,
+    sid: str,
+    token: str | None,
+    handle: ConnectionHandle | None,
+    *,
+    source_ip: str,
+    hydrate: bool = True,
+) -> Principal:
+    """Principal for a read of session ``sid``.
+
+    A connection already bound as a participant of ``sid`` needs no token;
+    anyone else presents one.
+    """
+    if not token and handle is not None:
+        binding = deps.registry.connections.session_for(handle)
+        if binding is not None and binding[0] == sid:
+            return Principal("participant", binding[1])
+    principal = await resolve_principal(
+        deps, sid, token, source_ip=source_ip, hydrate=hydrate
+    )
+    require(principal, *_READ_ROLES)
+    return principal
+
+
+async def session_describe(
+    deps: ToolDeps,
+    payload: dict[str, Any],
+    *,
+    handle: ConnectionHandle | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
     """Read-only snapshot of a session: purpose + config + roster.
 
-    Does NOT bind the calling MCP connection to a participant. Use it as a
-    pre-flight before deciding whether to ``session_join`` and which role
-    to take.
+    Needs a session credential (``access_token``) unless the connection is
+    already a participant of the session. Does NOT bind the calling MCP
+    connection to a participant.
     """
     inp = SessionDescribeInput.model_validate(payload)
+    await _resolve_reader(
+        deps, inp.session_id, inp.access_token, handle, source_ip=source_ip
+    )
     sess = await deps.registry.get_or_raise(inp.session_id)
     return SessionDescribeOutput(
         session_id=sess.session_id,
@@ -348,6 +386,15 @@ async def session_list_participants(
     deps: ToolDeps, handle: ConnectionHandle
 ) -> dict[str, Any]:
     sess, _ = await _session_for_handle(deps, handle)
+    return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
+
+
+async def session_roster(
+    deps: ToolDeps, sid: str, token: str | None, *, source_ip: str = ""
+) -> dict[str, Any]:
+    """The roster for any credential that may read the session (REST)."""
+    await _resolve_reader(deps, sid, token, None, source_ip=source_ip)
+    sess = await deps.registry.get_or_raise(sid)
     return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
 
 
@@ -544,9 +591,20 @@ def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
             pass
 
 
-async def session_get_events(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+async def session_get_events(
+    deps: ToolDeps,
+    payload: dict[str, Any],
+    *,
+    handle: ConnectionHandle | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
     inp = SessionGetEventsInput.model_validate(payload)
     sid = inp.session_id
+    # Cold and ended sessions are authenticated from their stored hashes
+    # without being loaded into RAM.
+    await _resolve_reader(
+        deps, sid, inp.access_token, handle, source_ip=source_ip, hydrate=False
+    )
     state: Literal["hot", "cold", "ended"]
     event_store: PersistenceStore
     # First check the in-RAM map without triggering hydrate

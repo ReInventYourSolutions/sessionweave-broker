@@ -1,4 +1,7 @@
-"""WS /v1/sessions/{sid}/firehose delivers all events for the session."""
+"""WS /v1/sessions/{sid}/firehose delivers all events for the session.
+
+Allowed: supervisor token, creator token, relay admin token (``?token=``).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,93 +10,64 @@ import json
 import httpx
 import pytest
 import websockets
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from tests.integration.harness import relay_subprocess
 
+ADMIN = "test-admin-secret-d3b07384"
+
+
+async def _create(base: str) -> dict:
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def _join(base: str, made: dict) -> None:
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{base}/v1/sessions/{made['session_id']}/participants",
+            headers={"authorization": f"Bearer {made['join_token']}"},
+            json={"role": "worker"},
+        )
+    assert r.status_code in (200, 201), r.text
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_firehose_receives_participant_join():
-    async with relay_subprocess() as base:
+@pytest.mark.parametrize("who", ["supervisor_token", "creator_token", "admin"])
+async def test_firehose_receives_participant_join(who: str):
+    async with relay_subprocess(env_overrides={"SW_ADMIN_TOKEN": ADMIN}) as base:
         base_ws = base.replace("http://", "ws://")
-        async with httpx.AsyncClient() as c:
-            sid = (
-                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
-        ws_url = f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
-        async with websockets.connect(ws_url) as ws:
-            async with httpx.AsyncClient() as c:
-                r = await c.post(
-                    f"{base}/v1/sessions/{sid}/participants",
-                    json={"role": "worker"},
-                )
-            assert r.status_code in (200, 201)
-            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-            frame = json.loads(raw)
+        made = await _create(base)
+        token = ADMIN if who == "admin" else made[who]
+        url = f"{base_ws}/v1/sessions/{made['session_id']}/firehose?token={token}"
+        async with websockets.connect(url) as ws:
+            await _join(base, made)
+            frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
             assert frame["name"] == "participant.joined"
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_firehose_rejects_wrong_token():
-    async with relay_subprocess() as base:
+async def test_firehose_refuses_everything_else():
+    async with relay_subprocess(env_overrides={"SW_ADMIN_TOKEN": ADMIN}) as base:
         base_ws = base.replace("http://", "ws://")
+        made = await _create(base)
+        sid = made["session_id"]
+        joined = None
         async with httpx.AsyncClient() as c:
-            sid = (
-                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
-        ws_url = f"{base_ws}/v1/sessions/{sid}/firehose?token=wrong"
-        # Wrong token → server closes during handshake. Both modern
-        # (InvalidStatus) and older (InvalidStatusCode) websockets builds
-        # are accepted; ConnectionClosed covers post-handshake close.
-        from websockets.exceptions import (
-            ConnectionClosed,
-            InvalidStatus,
-        )
-        with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
-            async with websockets.connect(ws_url):
-                pass
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_firehose_admin_token_mode_rejects_session_id() -> None:
-    """When ``SW_ADMIN_TOKEN`` is set, a token equal to the
-    session_id must be rejected — only the admin token is accepted.
-    Closes the info-leak gap from #54: a session participant who
-    knows its own ``session_id`` can no longer subscribe to the
-    firehose without the admin secret.
-    """
-    admin = "test-admin-secret-d3b07384"
-    async with relay_subprocess(
-        env_overrides={"SW_ADMIN_TOKEN": admin}
-    ) as base:
-        base_ws = base.replace("http://", "ws://")
-        async with httpx.AsyncClient() as c:
-            sid = (
-                await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
-
-        from websockets.exceptions import (
-            ConnectionClosed,
-            InvalidStatus,
-        )
-
-        # Token == session_id must FAIL in admin-token mode.
-        url_legacy = f"{base_ws}/v1/sessions/{sid}/firehose?token={sid}"
-        with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
-            async with websockets.connect(url_legacy):
-                pass
-
-        # Token == admin_token must succeed.
-        url_admin = f"{base_ws}/v1/sessions/{sid}/firehose?token={admin}"
-        async with websockets.connect(url_admin) as ws:
-            async with httpx.AsyncClient() as c:
-                r = await c.post(
+            joined = (
+                await c.post(
                     f"{base}/v1/sessions/{sid}/participants",
+                    headers={"authorization": f"Bearer {made['join_token']}"},
                     json={"role": "worker"},
                 )
-            assert r.status_code in (200, 201)
-            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-            frame = json.loads(raw)
-            assert frame["name"] == "participant.joined"
+            ).json()
+        for bad in ("wrong", sid, made["join_token"], joined["participant_token"],
+                    joined["participant_id"]):
+            url = f"{base_ws}/v1/sessions/{sid}/firehose?token={bad}"
+            with pytest.raises((InvalidStatus, ConnectionClosed, ConnectionError)):
+                async with websockets.connect(url) as ws:
+                    await ws.recv()

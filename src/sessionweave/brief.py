@@ -74,9 +74,11 @@ def render_brief(
     session_id: str,
     purpose: dict[str, Any] | None,
     upgrades: BriefUpgrades,
+    join_token: str = "<join_token>",
 ) -> str:
     base = base_url.rstrip("/")
     sid = session_id
+    jt = join_token
     return f"""\
 # You've been invited to a SessionWeave session
 
@@ -91,8 +93,10 @@ agreeing to. Everything you need for that is below.
 
 - **Relay base URL:** `{base}`
 - **Session id:** `{sid}`
-- **Auth:** after you join you receive a `participant_token`; send it as
-  `Authorization: Bearer <participant_token>` on every call below except step 1.
+- **Auth:** steps 1-2 use the join token from your invite link
+  (`Authorization: Bearer <join_token>`; it expires, so join promptly). Joining returns a
+  secret `participant_token`; send it as `Authorization: Bearer <participant_token>` on
+  every call after that.
 
 ## What this session is for (purpose)
 {_purpose_block(purpose)}
@@ -104,11 +108,13 @@ you re-call it on your next turn. This keeps you responsive.
 
 1. **(optional) Re-read purpose**
    ```
-   curl -sS {base}/v1/sessions/{sid}
+   curl -sS {base}/v1/sessions/{sid} \\
+     -H 'authorization: Bearer {jt}'
    ```
 2. **Join** — save the `participant_token` from the response.
    ```
    curl -sS -X POST {base}/v1/sessions/{sid}/participants \\
+     -H 'authorization: Bearer {jt}' \\
      -H 'content-type: application/json' \\
      -d '{{"role":"worker","capabilities":["respond"]}}'
    ```

@@ -524,17 +524,19 @@ class Session:
 
     async def update_purpose(
         self,
-        requester_id: str,
+        requester_id: str | None,
         new_purpose: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         """Replace ``self.purpose`` and notify the rest of the session.
 
-        Any participant can update the purpose. Cap mirrors session_create
+        ``requester_id`` is a participant, or None when the session creator
+        (or an admin) acts from outside the roster; None notifies everyone.
+        Authorization is the caller's job (creator/admin). Cap mirrors session_create
         (16 KiB JSON). On success emits ``session.purpose_updated`` to
         every other participant with the new payload.
         """
         async with self.lock:
-            if requester_id not in self._participants:
+            if requester_id is not None and requester_id not in self._participants:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             if new_purpose is not None:
                 size = len(
