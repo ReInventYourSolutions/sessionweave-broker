@@ -12,7 +12,7 @@ Usage:
 Exit codes:
   0  — link parsed, describe succeeded.
   2  — usage / argument error.
-  3  — invalid invite link.
+  3  — invalid invite link, or a link without its join token (``jt``).
   4  — relay reachable but session_describe failed (e.g. session_not_found).
   5  — relay unreachable.
 """
@@ -56,13 +56,15 @@ def _unwrap(res: Any) -> Any:
     return sc
 
 
-async def _describe(relay_url: str, session_id: str) -> dict[str, Any]:
+async def _describe(
+    relay_url: str, session_id: str, join_token: str
+) -> dict[str, Any]:
     async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()
             res = await s.call_tool(
                 name="session_describe",
-                arguments={"session_id": session_id},
+                arguments={"session_id": session_id, "access_token": join_token},
             )
             if res.is_error:
                 raise RuntimeError(f"session_describe error: {_unwrap(res)}")
@@ -112,8 +114,17 @@ async def _async_main(args: argparse.Namespace) -> int:
         sys.stderr.write(f"invalid invite link: {exc}\n")
         return 3
 
+    if not invite.join_token:
+        sys.stderr.write(
+            "invite link is missing its join token — ask the session creator "
+            "for a new invite link\n"
+        )
+        return 3
+
     try:
-        desc = await _describe(invite.relay_url, invite.session_id)
+        desc = await _describe(
+            invite.relay_url, invite.session_id, invite.join_token
+        )
     except OSError as exc:
         sys.stderr.write(f"relay unreachable at {invite.relay_url}: {exc}\n")
         return 5

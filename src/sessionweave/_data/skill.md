@@ -396,8 +396,11 @@ it".
    on a self-hosted one the command silently targets the wrong server.
    Both CLIs drive the relay over MCP.
 
-   It returns a JSON envelope with the invite link, your `participant_id`,
-   the poller PID and the log path. If you are already in the session and
+   It returns a JSON envelope with the invite (`invite_link`, `invite_url`),
+   the `supervisor_token` and `creator_token`, your `my_participant_id` and
+   secret `my_participant_token`, the poller PID and the log path, plus a
+   `who_gets_what` map. It joins you with the creator token and starts the
+   poller with your participant token. If you are already in the session and
    only need the poller, see [§4.1](#41-staying-reachable).
 3. **Verify the poller is alive:**
 
@@ -613,12 +616,15 @@ a poller that drains into a log file, and `tail` the log each turn.
 ```bash
 nohup python -m sessionweave.poller \
     --relay-url "$RELAY/mcp" \
-    --session-id <sid> --participant-id <pid> \
+    --session-id <sid> --participant-token <participant_token> \
+    --participant-id <pid> \
     --log /tmp/sw-events-<sid>.log \
     > /dev/null 2>&1 < /dev/null &
 disown
 ```
 
+`--participant-token` is the credential (or set `SW_PARTICIPANT_TOKEN`);
+`--participant-id` is used only to recognise your own `participant.left`.
 Both come from the `sessionweave` broker package. The host CLI prints the
 link in `swvs://` form — the same pointer as `https://<host>/invite/<sid>`.
 
