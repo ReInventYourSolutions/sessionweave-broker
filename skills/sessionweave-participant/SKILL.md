@@ -262,20 +262,21 @@ JOINED=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
   -H "authorization: Bearer $JT" -H 'content-type: application/json' \
   -d '{"role":"worker","capabilities":["respond"]}')
 TOK=$(echo "$JOINED" | jq -r .participant_token)
-PID=$(echo "$JOINED" | jq -r .participant_id)   # to recognise your own removal
 
 # 3. LOOP: wait for work, handle it, wait again. This is the job — you stay
 #    here until the work is done or you are told to stop. Do NOT fall
 #    through to step 4 after one command.
 #    The wait blocks server-side and costs no tokens while it waits.
 while true; do
-  EVENTS=$(curl -sS --max-time 70 -X POST \
+  EVENTS=$(curl -sS --max-time 70 -w '\n%{http_code}' -X POST \
     "$RELAY/v1/sessions/$SID/participants/me/inbox/wait" \
     -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
-    -d '{"names":["command.received","supervisor.note","participant.left","session.ended"],"timeout_seconds":60}')
+    -d '{"names":["command.received","supervisor.note","session.ended"],"timeout_seconds":60}')
+  CODE=${EVENTS##*$'\n'}; EVENTS=${EVENTS%$'\n'*}
 
-  # Session gone, or the call failed: stop rather than spinning.
-  [ -z "$EVENTS" ] && break
+  # Session gone, or the call failed: stop rather than spinning. A 403
+  # participant_removed means the creator removed you: stop work and sub-agents.
+  [ "$CODE" = 200 ] || { echo "$EVENTS" >&2; break; }
   echo "$EVENTS" | jq -e '.messages[] | select(.name=="session.ended")' >/dev/null && break
 
   # 3a. Answer EVERY command in the batch — a single wait can return more
@@ -288,11 +289,15 @@ while true; do
   done
 
   # 3b. Supervisor notes: act on each by kind — see §4.4. A halt is NOT a
-  #     leave: stop working, stay in the session and keep waiting for
-  #     "continue" or "redirect". Only your own removal ends the loop.
-  echo "$EVENTS" | jq -e --arg me "$PID" '.messages[]
-      | select(.name=="participant.left" and .payload.participant_id==$me
-               and .payload.reason=="removed")' >/dev/null && break
+  #     leave: stop working (and your sub-agents), stay in the session and
+  #     keep waiting for "continue" or "redirect".
+  for KIND in $(echo "$EVENTS" | jq -r '.messages[] | select(.name=="supervisor.note")
+                                        | .payload.kind'); do
+    case "$KIND" in
+      halt)     PAUSED=1; echo "halted: stopping all work" >&2 ;;  # + stop sub-agents
+      continue) PAUSED=0 ;;                                         # resume where stopped
+    esac
+  done
 done
 
 # 4. ONLY when the work is finished: leave, with
@@ -634,7 +639,7 @@ disown
 `SW_PARTICIPANT_TOKEN` is the credential; pass it in the environment as
 above, not as `--participant-token` (command-line arguments are visible to
 every local user in `ps`). `--participant-id` is used only to recognise your
-own `participant.left`.
+own `participant.left` (when you leave yourself).
 Both come from the `sessionweave` broker package. The host CLI prints the
 link in `swvs://` form — the same pointer as `https://<host>/invite/<sid>`.
 
@@ -647,7 +652,8 @@ tail -n 50 /tmp/sw-events-<sid>.log
 Then act on new events with send/respond from your main turn — those are
 decisions, not pure forwarding. When the session ends, kill the poller
 (`pkill -f 'sessionweave.poller'`). The bundled module also self-exits when
-it sees `session.ended` or your own `participant.left`.
+it sees `session.ended`, your own `participant.left`, or a `participant_removed`
+error (the creator removed you — you never get your own `participant.left` for that).
 
 If the `sessionweave` broker package is not installed, this standalone
 equivalent works over
@@ -864,11 +870,14 @@ by supervisors only. An unknown or wrong-session `note_id` answers
 **Removal.** The creator or admin can remove a participant
 (`DELETE /v1/sessions/{sid}/participants/{pid}`). You first receive a `halt`
 note — "removed by the session creator" — and then the session closes for you:
-your events WebSocket closes with code 4410 `removed`, `participant.left`
-carries `reason: "removed"`, and for one hour every call with your token
+your events WebSocket closes with code 4410 `removed`, and for one hour every
+call with your token
 answers 403 `participant_removed` ("you were removed from this session by its
-creator — stop your work and your sub-agents"). Stop your work and your
-sub-agents; do not try to rejoin. This is the one case where a `halt` is
+creator — stop your work and your sub-agents"). You never receive your own
+`participant.left`: that event (`reason: "removed"`) is what the *other*
+participants and the supervisors see. Stop your work and your sub-agents on
+the 4410 close or on the first `participant_removed` error, whichever comes
+first; do not try to rejoin. This is the one case where a `halt` is
 followed by the end of your participation.
 
 Minimum handler for a worker (a pull-mode loop or any dispatch function):
@@ -886,13 +895,14 @@ async def handle(evt):
             adopt(evt["payload"]["message"])   # you and your sub-agents
         else:                          # "note"
             fold_into_current_work(evt["payload"]["message"])
-    elif evt["name"] == "participant.left":
-        p = evt["payload"]
-        if p.get("participant_id") == my_id and p.get("reason") == "removed":
-            stop_all_work()
-            raise SystemExit(0)        # removed by the creator
     elif evt["name"] == "command.received":
         ...
+
+# Removal is not an event for you: stop when the events WebSocket closes with
+# 4410, or when any call raises/returns the error code `participant_removed`.
+def on_removed():
+    stop_all_work()
+    raise SystemExit(0)
 ```
 
 **Verify your handler with a unit test of your dispatch function.** Feed it
@@ -1547,6 +1557,7 @@ async def main() -> None:
             sess["session_id"], join_token=sess["join_token"],
             role="worker", capabilities=["respond"],
         )
+        paused = removed = False
         try:
             async with me.events() as stream:         # live WS push
                 async for evt in stream:
@@ -1555,15 +1566,22 @@ async def main() -> None:
                     if evt.name == "command.received":
                         await me.respond(evt.payload["command_id"], payload={"a": "..."})
                     elif evt.name == "supervisor.note":
-                        ...  # act on evt.payload["kind"] — see §4.4; halt is not a leave
-                    elif (evt.name == "participant.left"
-                          and evt.payload.get("reason") == "removed"
-                          and evt.payload.get("participant_id") == me.participant_id):
-                        break  # removed by the creator: stop work and sub-agents
+                        kind = evt.payload["kind"]      # see §4.4
+                        if kind == "halt":
+                            paused = True               # stop work + sub-agents; stay and keep waiting
+                        elif kind == "continue":
+                            paused = False
                     elif evt.name == "session.ended":
                         break
+        except Exception as exc:
+            # Removed by the creator: the stream closes (WS 4410) or a call
+            # fails with `participant_removed`. Stop work and sub-agents; do not leave.
+            if "participant_removed" not in str(exc) and "4410" not in str(exc):
+                raise
+            removed = True
         finally:
-            await me.leave(feedback={"summary": "…", "rating": 5, "issues": []})
+            if not removed:
+                await me.leave(feedback={"summary": "…", "rating": 5, "issues": []})
 
 asyncio.run(main())
 ```

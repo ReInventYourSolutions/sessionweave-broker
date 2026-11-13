@@ -27,8 +27,9 @@ output; it is used ONLY to recognise this participant's own
 ``participant.left`` event and is never sent to the relay as a credential.
 
 Exit when ``session.ended`` or a matching ``participant.left`` event
-is observed for the polled participant (this includes ``reason: removed``,
-the creator removed you), or when the relay answers ``participant_removed``.
+is observed for the polled participant (the participant leaving by itself),
+or when the relay answers ``participant_removed`` (the creator removed you;
+a removed participant never receives its own ``participant.left``).
 A ``supervisor.note`` of kind ``halt`` is NOT terminal: a halted participant
 stays in the session, paused, and waits for ``continue`` or ``redirect``.
 Otherwise runs until killed.
@@ -67,24 +68,41 @@ def _unwrap(res: Any) -> Any:
     return sc
 
 
+class RemovedError(Exception):
+    """The relay answered ``participant_removed``: the creator removed us."""
+
+
 async def _drain_once(
     relay_url: str, session_id: str, participant_token: str
 ) -> list[dict[str, Any]]:
     async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
-            await session.call_tool(
+            resumed = await session.call_tool(
                 name="session_resume",
                 arguments={
                     "session_id": session_id,
                     "participant_token": participant_token,
                 },
             )
+            _raise_if_removed(resumed)
             res = await session.call_tool(
                 name="session_check_inbox", arguments={}
             )
+            _raise_if_removed(res)
             out = _unwrap(res)
             return out.get("messages", []) if isinstance(out, dict) else []
+
+
+def _raise_if_removed(res: Any) -> None:
+    """call_tool returns an ``isError`` result instead of raising."""
+    if not getattr(res, "isError", False):
+        return
+    texts = [getattr(c, "text", "") or "" for c in (res.content or [])]
+    if "participant_removed" in " ".join(texts) + json.dumps(
+        res.structured_content, default=str
+    ):
+        raise RemovedError("participant_removed")
 
 
 def _is_terminal(msg: dict[str, Any], own_pid: str) -> bool:
@@ -123,16 +141,18 @@ async def run(
                 msgs = await _drain_once(
                     relay_url, session_id, participant_token
                 )
+            except RemovedError as exc:
+                log_file.write(
+                    json.dumps({"ts": _now(), "error": str(exc)}) + "\n"
+                )
+                log_file.write(
+                    json.dumps({"ts": _now(), "event": "poller-stop"}) + "\n"
+                )
+                return 0
             except Exception as exc:
                 log_file.write(
                     json.dumps({"ts": _now(), "error": str(exc)}) + "\n"
                 )
-                if "participant_removed" in str(exc):
-                    log_file.write(
-                        json.dumps({"ts": _now(), "event": "poller-stop"})
-                        + "\n"
-                    )
-                    return 0
                 msgs = []
             terminal = False
             for m in msgs:
