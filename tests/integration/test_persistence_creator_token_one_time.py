@@ -14,6 +14,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -35,14 +36,16 @@ async def test_creator_token_not_reemitted(tmp_path: object) -> None:
             assert token is not None and token != "", "creator_token must be in create response"
 
             # 1. GET /v1/sessions/{sid} must not expose the token
-            r_desc = await c.get(f"{base}/v1/sessions/{sid}")
+            r_desc = await c.get(f"{base}/v1/sessions/{sid}", headers=bearer(token))
             assert r_desc.status_code == 200, r_desc.text
             assert token not in r_desc.text, (
                 "creator_token leaked in GET /v1/sessions/{sid} response"
             )
 
             # 2. GET /v1/sessions/{sid}/events must not expose the token
-            r_events = await c.get(f"{base}/v1/sessions/{sid}/events")
+            r_events = await c.get(
+                f"{base}/v1/sessions/{sid}/events", headers=bearer(token)
+            )
             # 200 (events page, possibly empty) or 409 (non-persisted would be 409;
             # here it's persisted so we expect 200)
             assert r_events.status_code in (200, 404), r_events.text
@@ -53,6 +56,7 @@ async def test_creator_token_not_reemitted(tmp_path: object) -> None:
             # 3. POST join must not expose the token
             r_join = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(created["join_token"]),
                 json={"role": "worker"},
             )
             assert r_join.status_code == 201, r_join.text

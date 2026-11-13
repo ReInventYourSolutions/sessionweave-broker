@@ -8,6 +8,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from sessionweave.access import SessionAuth
 from sessionweave.config import DeploymentDefaults, apply_overrides
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
@@ -169,7 +170,7 @@ class SessionRegistry:
                 store=self._store if persistence is not None else None,
                 persistence_mode=persistence.mode if persistence is not None else None,
             )
-            sess.creator_token_hash = creator_token_hash
+            sess.auth = SessionAuth(creator_token_hash)
             self._sessions[sid] = sess
             self._schedule(sess)
             if self._metrics is not None:

@@ -34,7 +34,7 @@ import asyncio
 import httpx
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import bearer, create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -52,9 +52,9 @@ async def test_concurrent_dispatch_and_drain_no_buffer_race() -> None:
     async with relay_subprocess() as base:
         # Create session via sender's MCP client.
         async with sw_client(base) as sender:
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
 
             # Workers join via REST so they get tokens and stay pull-mode.
@@ -63,6 +63,7 @@ async def test_concurrent_dispatch_and_drain_no_buffer_race() -> None:
                 for _ in range(n_workers):
                     r = await h.post(
                         f"{base}/v1/sessions/{sid}/participants",
+                        headers=bearer(jt),
                         json={
                             "role": "worker",
                             "capabilities": ["respond"],

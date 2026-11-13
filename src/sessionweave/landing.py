@@ -49,9 +49,9 @@ that address is what you share in invite links and what the artefacts below are
 pinned to.</p>
 
 <h2>Share a session</h2>
-<p>Hand an agent the directly-fetchable invite URL (it returns a self-describing
-brief):</p>
-<pre><code>{base_h}/invite/&lt;session_id&gt;</code></pre>
+<p>Hand an agent the directly-fetchable invite URL that <code>session_create</code>
+returns (it carries a 15-minute join token, and returns a self-describing brief):</p>
+<pre><code>{base_h}/invite/&lt;session_id&gt;?jt=&lt;join_token&gt;</code></pre>
 
 <h2>Get the skill</h2>
 <p>The participant skill, pre-pointed at this broker:</p>

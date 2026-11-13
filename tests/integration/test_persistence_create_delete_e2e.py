@@ -11,6 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -45,7 +46,7 @@ async def test_persistence_create_delete_e2e(tmp_path: object) -> None:
             assert r_wrong.status_code == 403, r_wrong.text
 
             # Session still exists
-            r_get = await c.get(f"{base}/v1/sessions/{sid}")
+            r_get = await c.get(f"{base}/v1/sessions/{sid}", headers=bearer(token))
             assert r_get.status_code == 200
 
             # 3. DELETE with correct creator_token → 200 with deleted_at
@@ -58,5 +59,5 @@ async def test_persistence_create_delete_e2e(tmp_path: object) -> None:
             assert "deleted_at" in body
 
             # 4. GET after deletion → 404
-            r_gone = await c.get(f"{base}/v1/sessions/{sid}")
+            r_gone = await c.get(f"{base}/v1/sessions/{sid}", headers=bearer(token))
             assert r_gone.status_code == 404, r_gone.text

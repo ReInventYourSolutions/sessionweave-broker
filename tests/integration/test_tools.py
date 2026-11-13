@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -33,11 +33,11 @@ async def test_session_create_with_overrides() -> None:
 async def test_session_join_returns_participant_id_and_roster() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as client_a, sw_client(base) as client_b:
-            sid = (await client_a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client_a, {})
             join = await client_b.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "reviewer",
                     "capabilities": ["sec"],
                 },
@@ -55,14 +55,14 @@ async def test_session_join_returns_participant_id_and_roster() -> None:
 async def test_session_send_specific_returns_command_id() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as sender, sw_client(base) as recipient:
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             sender_join = await sender.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "lead"},
+                {"session_id": sid, "join_token": jt, "role": "lead"},
             )
             recv_join = await recipient.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "reviewer", "capabilities": ["sec"]},
+                {"session_id": sid, "join_token": jt, "role": "reviewer", "capabilities": ["sec"]},
             )
             send_result = await sender.call_tool(
                 "session_send",

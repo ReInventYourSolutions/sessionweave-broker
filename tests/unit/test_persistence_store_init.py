@@ -3,8 +3,9 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from sessionweave.access import generate_token as generate_creator_token
+from sessionweave.access import hash_token as hash_creator_token
 from sessionweave.persistence import PersistenceStore, SessionMetadata
-from sessionweave.persistence_token import generate_creator_token, hash_creator_token
 
 
 def _now_ms() -> int:
@@ -48,7 +49,7 @@ async def test_init_idempotent(tmp_path: Path) -> None:
         _n_row = await cur.fetchone()
     assert _n_row is not None
     (n,) = _n_row
-    assert n == 1
+    assert n == 2
     await s2.close()
 
 

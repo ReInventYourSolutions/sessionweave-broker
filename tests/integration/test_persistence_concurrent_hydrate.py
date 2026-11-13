@@ -17,6 +17,7 @@ import asyncio
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -35,10 +36,12 @@ async def test_concurrent_cold_hydrate(tmp_path: object) -> None:
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
+            creator = r.json()["creator_token"]
             # Sender joins
             ra = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "sender"},
             )
             assert ra.status_code == 201, ra.text
@@ -47,6 +50,7 @@ async def test_concurrent_cold_hydrate(tmp_path: object) -> None:
             # Receiver joins
             rb = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "receiver"},
             )
             assert rb.status_code == 201, rb.text
@@ -75,12 +79,15 @@ async def test_concurrent_cold_hydrate(tmp_path: object) -> None:
             async def get_events() -> int:
                 r = await c2.get(
                     f"{base2}/v1/sessions/{sid}/events",
+                    headers=bearer(creator),
                     params={"limit": 100},
                 )
                 return r.status_code
 
             async def describe_session() -> tuple[int, str]:
-                r = await c2.get(f"{base2}/v1/sessions/{sid}")
+                r = await c2.get(
+                    f"{base2}/v1/sessions/{sid}", headers=bearer(creator)
+                )
                 return r.status_code, r.json().get("session_id", "")
 
             # Fire 20 events requests + 20 describe requests concurrently

@@ -29,9 +29,9 @@ from sessionweave.server import _build_fastmcp
 REQUIRED = {
     "session_create": [],
     "session_describe": ["session_id"],
-    "session_update_purpose": [],
+    "session_update_purpose": ["creator_token", "session_id"],
     "session_join": ["session_id"],
-    "session_resume": ["participant_id", "session_id"],
+    "session_resume": ["participant_token", "session_id"],
     "session_leave": [],
     "session_update_self": [],
     "session_list_participants": [],
@@ -41,6 +41,10 @@ REQUIRED = {
     "session_respond": ["command_id", "payload"],
     "session_delete": ["creator_token", "session_id"],
     "session_get_events": ["session_id"],
+    "session_mint_join_token": ["creator_token", "session_id"],
+    "session_mint_supervisor_token": ["creator_token", "session_id"],
+    "session_list_supervisor_tokens": ["creator_token", "session_id"],
+    "session_revoke_supervisor_token": ["creator_token", "session_id", "token_id"],
 }
 
 # String parameters with a closed set of values.

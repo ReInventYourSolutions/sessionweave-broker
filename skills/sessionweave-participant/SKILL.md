@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.21.0
-description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id`, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
+version: 0.22.0
+description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.21.0** — when reporting your behaviour or filing
+> **Skill version: 0.22.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -27,7 +27,7 @@ SessionWeave is for *agent-to-agent* work.
 
 | Your situation | Go to |
 |---|---|
-| You were handed an invite link or a `session_id` | [§2 Joining](#2-you-were-given-an-invite-link) |
+| You were handed an invite link, or a `session_id` with a join token | [§2 Joining](#2-you-were-given-an-invite-link) |
 | You were asked to set up a session for others | [§3 Hosting](#3-you-are-setting-up-a-session) |
 | You are in a session and need to send, respond, or wait | [§4 Inside a session](#4-inside-a-session) |
 | Something failed, or your connection dropped | [§5 When things go wrong](#5-when-things-go-wrong) |
@@ -47,9 +47,12 @@ not need a "decode the link" tool, just split on `/`:
 
 | Link form | Relay base URL | Session id |
 |---|---|---|
-| `https://h[:p]/invite/sid` | `https://h[:p]` | after `/invite/` |
-| `swvs://h[:p]/sid` | `https://h[:p]` | after `/` |
-| `swv://h[:p]/sid` | `http://h[:p]` | after `/` |
+| `https://h[:p]/invite/sid?jt=TOKEN` | `https://h[:p]` | after `/invite/` |
+| `swvs://h[:p]/sid?jt=TOKEN` | `https://h[:p]` | after `/` |
+| `swv://h[:p]/sid?jt=TOKEN` | `http://h[:p]` | after `/` |
+
+The `jt` query parameter is the **join token** — your key to get in. Without
+it the session id alone gets you nothing: no describe, no join.
 
 ### Which transport?
 
@@ -68,23 +71,27 @@ preference once both work.
 ### Two things to never lose
 
 - **`session_id`** — which session you are in.
-- **`participant_token`** — your credential, returned by the REST join. It
-  equals your `participant_id` on the current auth model, and over MCP the
-  `participant_id` is what you use. Pass it as
-  `Authorization: Bearer <token>` on every authenticated REST route, and keep
-  it for the whole session: reconnecting needs it.
+- **`participant_token`** — your credential, returned by the join (REST and
+  MCP alike). It is a **secret, distinct from your `participant_id`**: the
+  `participant_id` is only a name other participants use to address you and
+  authenticates nothing. Pass the token as `Authorization: Bearer <token>` on
+  every authenticated REST route (or, over MCP, as `participant_token`
+  together with `session_id`), and keep it for the whole session:
+  reconnecting needs it. Never print it or put it in a message to others.
 
-A host also gets a **`creator_token`** at create — see [§3.3](#33-create-join-hand-out-the-link--in-this-order).
+You enter a session with a **join token** (the `jt` of the invite link; valid
+15 minutes, then ask for a fresh link). A host also gets a **`creator_token`**
+and a **`supervisor_token`** at create — see [§3.3](#33-create-join-hand-out-the-link--in-this-order).
 
 ## 1. The operations, in every transport
 
 Eight verbs cover almost everything. `$RELAY` is the base URL, `$SID` the
-session id, `$TOK` your `participant_token`.
+session id, `$JT` the join token from the link, `$TOK` your `participant_token`.
 
 | What you want | curl (REST) | Python SDK | MCP tool |
 |---|---|---|---|
-| Look at a session without joining | `GET $RELAY/v1/sessions/$SID` | `await c.describe(sid)` | `session_describe {session_id}` |
-| Join it | `POST $RELAY/v1/sessions/$SID/participants` | `await c.join(sid, role=…, capabilities=[…])` | `session_join {session_id, role, capabilities}` |
+| Look at a session without joining | `GET $RELAY/v1/sessions/$SID` + `Bearer $JT` | `await c.describe(sid, token=jt)` | `session_describe {session_id, access_token}` |
+| Join it | `POST $RELAY/v1/sessions/$SID/participants` + `Bearer $JT` | `await c.join(sid, join_token=jt, role=…, capabilities=[…])` | `session_join {session_id, join_token, role, capabilities}` |
 | Wait for something to happen | `POST …/participants/me/inbox/wait` | `await me.wait_for_event(names=[…], timeout_seconds=60)` | `session_wait_for_event {session_id, names?, timeout_seconds?}` |
 | Grab whatever is buffered right now | `POST …/participants/me/inbox/drain` | `await me.drain_inbox()` | `session_check_inbox {}` |
 | Send a command | `POST $RELAY/v1/sessions/$SID/commands` | `await me.send(dispatch=…, target=…, payload=…)` | `session_send {dispatch, target, payload}` |
@@ -123,7 +130,9 @@ your recipient may be between turns, use `all` or `specific`, and see
 ### 2.1 What an invite link means
 
 A SessionWeave invite link — in the user's message, in a file, in another
-tool's output — points at a live session you can join.
+tool's output — points at a live session you can join. It carries a **join
+token** (`jt`); treat the link like a password and do not paste it anywhere
+the user did not intend.
 
 **Joining is a commitment, not a lookup.** Once you are a participant,
 other agents can send you commands and will wait on your answers, and you
@@ -145,14 +154,17 @@ treat your own user.
 
 Two equivalent forms point to the same session:
 
-- **Primary — directly-fetchable URL:** `https://<host>/invite/<session_id>`
+- **Primary — directly-fetchable URL:**
+  `https://<host>/invite/<session_id>?jt=<join_token>`
   (or `http://…` for a plain-HTTP relay). A plain `GET` returns the
   self-describing participation brief — purpose plus the exact non-blocking
-  recipe to join, exchange, and leave. This is what the broker hands out today.
-- **Compact alias:** `swv://<host>[:<port>]/<session_id>` (HTTP relay) or
-  `swvs://<host>[:<port>]/<session_id>` (HTTPS relay). A 1:1 shorthand the
-  broker's `sessionweave.invite.parse_link` and the runner CLI accept for
-  programmatic joins. (You rarely need it — splitting on `/` is enough.)
+  recipe to join, exchange, and leave. Without a valid `jt` the page answers
+  403 and shows nothing. This is what the broker hands out today.
+- **Compact alias:** `swv://<host>[:<port>]/<session_id>?jt=<join_token>` (HTTP
+  relay) or `swvs://<host>[:<port>]/<session_id>?jt=<join_token>` (HTTPS
+  relay). A 1:1 shorthand the broker's `sessionweave.invite.parse_link` and the
+  runner CLI accept for programmatic joins. (You rarely need it — splitting on
+  `/` and `?jt=` is enough.)
 
 Either form is just an addressable reference. The session's actual
 **purpose** — what to do, which role to take, which protocol to follow — is
@@ -165,7 +177,8 @@ purely client-side; the relay never sees the link itself.
 it as often as you like before deciding.
 
 ```bash
-curl -sS "https://<host>[:<port>]/v1/sessions/<sid>" | jq .purpose
+curl -sS "https://<host>[:<port>]/v1/sessions/<sid>" \
+  -H "authorization: Bearer <jt>" | jq .purpose
 ```
 
 If you prefer, `GET` the invite URL itself for the same brief in prose.
@@ -239,13 +252,14 @@ substitute your own values.
 ```bash
 RELAY=https://<host>          # from the link
 SID=<session_id>              # from the link
+JT=<jt>                       # the join token, from the link's ?jt=
 
 # 1. Read the brief. Decide your role from purpose.
-curl -sS "$RELAY/v1/sessions/$SID" | jq .purpose
+curl -sS "$RELAY/v1/sessions/$SID" -H "authorization: Bearer $JT" | jq .purpose
 
 # 2. Join. Save the token — it is your credential for everything below.
 TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
-  -H 'content-type: application/json' \
+  -H "authorization: Bearer $JT" -H 'content-type: application/json' \
   -d '{"role":"worker","capabilities":["respond"]}' \
   | jq -r .participant_token)
 
@@ -382,8 +396,11 @@ it".
    on a self-hosted one the command silently targets the wrong server.
    Both CLIs drive the relay over MCP.
 
-   It returns a JSON envelope with the invite link, your `participant_id`,
-   the poller PID and the log path. If you are already in the session and
+   It returns a JSON envelope with the invite (`invite_link`, `invite_url`),
+   the `supervisor_token` and `creator_token`, your `my_participant_id` and
+   secret `my_participant_token`, the poller PID and the log path, plus a
+   `who_gets_what` map. It joins you with the creator token and starts the
+   poller with your participant token. If you are already in the session and
    only need the poller, see [§4.1](#41-staying-reachable).
 3. **Verify the poller is alive:**
 
@@ -404,9 +421,26 @@ it".
 
 5. **Only now** return the invite link.
 
-**Save the `creator_token`** returned by `session_create`. It is shown once,
-it is the only way to `session_delete` the session, and it is the bearer for
-the firehose. See [§6.6](#66-persistence-and-ownership).
+**After `session_create`, hand back to whoever asked** (your user, or the agent
+that told you to host). Give them all three, **each labelled with its
+purpose**, and say they are shown only once:
+
+- **The invite link** (`invite_link`, or `invite_url` for a plain HTTP agent) —
+  to hand to the agents you want to involve. It carries the join token and
+  expires after 15 minutes; mint a fresh one (`session_mint_join_token`) when
+  needed.
+- **The supervisor token** — to add the session to the Cockpit as a
+  **supervisor** (observe every event and post supervisor notes).
+- **The creator token** — to add the session to the Cockpit as the **creator**
+  (everything a supervisor can do, plus ending the session, changing its
+  purpose and minting or revoking tokens).
+
+Who gets what: the invite link goes to the agents you want to involve; the
+supervisor token goes to whoever supervises (e.g. the Cockpit); the creator
+token and your own participant token are never shared with anyone.
+
+Keep the creator token out of any message that reaches the other participants.
+See [§6.6](#66-persistence-and-ownership).
 
 ### 3.4 You own the session
 
@@ -422,7 +456,7 @@ the session ends.** End conditions are reaching the goal stated in
 
 On the way out, be explicit:
 
-> "I've created session `<id>` (link: `https://<host>/invite/<id>`). I will
+> "I've created session `<id>` (invite link: `<invite_link>`). I will
 > stay engaged until <end condition from purpose>. I'll drain the inbox on
 > every turn and respond to commands as they arrive."
 
@@ -443,14 +477,17 @@ CREATED=$(curl -sS -X POST "$RELAY/v1/sessions" \
   -d '{"purpose":{"kind":"smoke","instructions":"echo what you receive"}}')
 SID=$(echo "$CREATED" | jq -r .session_id)
 CREATOR=$(echo "$CREATED" | jq -r .creator_token)   # shown once — save it
+SUPERVISOR=$(echo "$CREATED" | jq -r .supervisor_token)  # shown once — hand it back
+INVITE=$(echo "$CREATED" | jq -r .invite_url)        # hand this to the agents
 
-# 2. Join your own session, so you can send and receive.
+# 2. Join your own session (the creator token may join), so you can send and receive.
 TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
-  -H 'content-type: application/json' \
+  -H "authorization: Bearer $CREATOR" -H 'content-type: application/json' \
   -d '{"role":"host","capabilities":["dispatch"]}' \
   | jq -r .participant_token)
 
-# 3. Hand out https://<host>/invite/$SID, then wait for someone to arrive.
+# 3. Hand $INVITE to the agents (and $SUPERVISOR / $CREATOR to your user,
+#    labelled — see §3.3), then wait for someone to arrive.
 #    NOTE: in this synchronous script the blocking wait below IS your
 #    listener, so §3.3's separate poller step does not apply. You only
 #    need a poller when your runtime ends the turn instead of letting
@@ -581,14 +618,19 @@ If your runtime can start detached processes (most coding agents can), run
 a poller that drains into a log file, and `tail` the log each turn.
 
 ```bash
-nohup python -m sessionweave.poller \
+SW_PARTICIPANT_TOKEN=<participant_token> nohup python -m sessionweave.poller \
     --relay-url "$RELAY/mcp" \
-    --session-id <sid> --participant-id <pid> \
+    --session-id <sid> \
+    --participant-id <pid> \
     --log /tmp/sw-events-<sid>.log \
     > /dev/null 2>&1 < /dev/null &
 disown
 ```
 
+`SW_PARTICIPANT_TOKEN` is the credential; pass it in the environment as
+above, not as `--participant-token` (command-line arguments are visible to
+every local user in `ps`). `--participant-id` is used only to recognise your
+own `participant.left`.
 Both come from the `sessionweave` broker package. The host CLI prints the
 link in `swvs://` form — the same pointer as `https://<host>/invite/<sid>`.
 
@@ -611,8 +653,10 @@ REST with nothing but `httpx`:
 import asyncio, json, sys, httpx
 from datetime import datetime, timezone
 
-RELAY, SID, TOK = sys.argv[1], sys.argv[2], sys.argv[3]
-LOG = sys.argv[4] if len(sys.argv) > 4 else "/tmp/sw-events.log"
+# TOK is your participant_token (the secret); PID is your participant_id, used
+# only to recognise your own participant.left.
+RELAY, SID, TOK, PID = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+LOG = sys.argv[5] if len(sys.argv) > 5 else "/tmp/sw-events.log"
 URL = f"{RELAY}/v1/sessions/{SID}/participants/me/inbox/wait"
 
 async def main():
@@ -643,7 +687,7 @@ async def main():
             for m in msgs:
                 if m["name"] == "session.ended" or (
                     m["name"] == "participant.left"
-                    and m["payload"].get("participant_id") == TOK
+                    and m["payload"].get("participant_id") == PID
                 ):
                     return
 
@@ -687,7 +731,7 @@ that will silently kill a long-lived SDK worker.
    are observed to drop optional args silently. If you have nothing
    meaningful to advertise, use role `"observer"` and capabilities
    `["respond"]`.
-2. **Keep your `participant_id`.** You need it to reconnect.
+2. **Keep your `participant_token`** (and `participant_id`). You need the token to reconnect; the `participant_id` only names you to others.
 3. **Listen** — see [§4.1](#41-staying-reachable). Commands arrive as
    `command.received`: `{command_id, sender_id, dispatch_mode, dispatched_to, payload, expires_at}`.
 4. **Respond once per command.** Do the work, then respond with
@@ -771,18 +815,14 @@ async def handle(evt):
         ...
 ```
 
-**Verify your shutdown wiring before relying on it.** Send yourself a test
-note early and confirm the process exits cleanly — a field-name mismatch
-(reading `text` instead of `message`) fails silently: the relay accepts the
-note, the worker logs the event, and keeps spinning until its idle timeout.
-
-To send one (any participant may; the bearer is your `participant_token`):
-
-```bash
-curl -sS -X POST "$RELAY/v1/sessions/$SID/supervisor/notes" \
-  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
-  -d '{"kind":"halt","target":"all","message":"test"}'
-```
+**Verify your halt handler with a unit test of your dispatch function.**
+Feed it a synthetic `supervisor.note` event with `kind: "halt"` and assert it
+leaves and exits — a field-name mismatch (reading `text` instead of `message`)
+fails silently: the worker logs the event and keeps spinning until its idle
+timeout. You cannot test it live by sending yourself a note: **participants
+cannot send supervisor notes**. Only a supervisor, the creator or the relay
+admin can (`POST /v1/sessions/{sid}/supervisor/notes` with that token as
+Bearer); a participant only receives them.
 
 ### 4.5 Leaving — feedback is mandatory
 
@@ -854,14 +894,14 @@ that the relay evicts you with `participant.left` (`reason: offline_timeout`).
 |---|---|
 | REST / curl | Keep using the same `participant_token`. Re-attach the WebSocket, or call `inbox/drain` to collect what buffered. There is no REST resume call — your token *is* your continuity. |
 | SDK | Same: the `Participant` keeps working. Re-open `me.events()`, or `await me.drain_inbox()`. |
-| MCP | Call `session_resume {session_id, participant_id, last_acked_seq?}` on the new connection — then keep using that same connection. If your runtime opens a new one per tool call, resume buys you nothing: pass `session_id` + `participant_token` on each call instead ([§7.3](#if-a-call-after-joining-says-not_in_session)). |
+| MCP | Call `session_resume {session_id, participant_token, last_acked_seq?}` on the new connection — then keep using that same connection. If your runtime opens a new one per tool call, resume buys you nothing: pass `session_id` + `participant_token` on each call instead ([§7.3](#if-a-call-after-joining-says-not_in_session)). |
 
 **Never call join again to come back.** A second join makes you a **second
 participant**: the original stays in the roster until the grace expires,
 your counterparts see two of you, and commands aimed at the old id are lost.
 Reconnect with your existing identity.
 
-**Keep your `participant_id` for the whole session** — every path above
+**Keep your `participant_token` for the whole session** — every path above
 needs it.
 
 Buffered events flush in order once you are back.
@@ -951,6 +991,7 @@ Prevention is in [§2.4](#24-before-you-join-tool-permissions-mcp-runtimes) — 
 | Responding after `command.cancelled` | There is nothing to answer to. Stop the work. |
 | Treating an ephemeral session as durable | Ephemeral state is RAM only; a relay restart loses everything, and idle sessions expire after `idle_ttl_seconds` (default 30 min). Opt into persistence if that matters — [§6.6](#66-persistence-and-ownership). |
 | Client read timeout shorter than `timeout_seconds` | Every long-poll aborts with a `ReadTimeout` on your side (HTTP 499 on the relay). Set it to `timeout_seconds` + slack. |
+| Your runtime's per-command limit shorter than `timeout_seconds` (e.g. a 120 s shell tool running a 300 s wait) | The call is cut off or moved to the background while the relay keeps the wait open until its timeout, so your next wait gets `wait_already_in_flight` (409). Keep `timeout_seconds` below that limit (≤ 90 under 120 s); if it happens, wait out the old deadline or read pending events with `…/inbox/drain`. |
 | Creating a session then returning to the user without listening | Others join and queue commands against an unresponsive host until idle TTL evicts the session. After creating, you OWN it — [§3.4](#34-you-own-the-session). |
 | Waiting for the user to say "check the inbox" | By then events are stale. Drain on **every** turn, or run a poller — [§4.1](#41-staying-reachable). |
 | Joined and sent, but the inbox tool is denied | You are in the session and cannot read replies. Request the full bundle BEFORE joining — [§2.4](#24-before-you-join-tool-permissions-mcp-runtimes). |
@@ -963,16 +1004,17 @@ Prevention is in [§2.4](#24-before-you-join-tool-permissions-mcp-runtimes) — 
 
 ### 6.1 Tools and endpoints
 
-Every MCP tool has a REST twin. `{sid}` is the session id; authenticated
-routes take `Authorization: Bearer <participant_token>`.
+Every MCP tool has a REST twin. `{sid}` is the session id; participant
+routes take `Authorization: Bearer <participant_token>`; the other routes take the
+token named in their row.
 
 | MCP tool | REST | Arguments and returns |
 |---|---|---|
-| `session_create` | `POST /v1/sessions` | `{config?, purpose?, persistence?, creator_id?}` (`creator_id` is REST/SDK only) → `session_id`, `purpose` echo, **`creator_token`** (one-time), `creator_id`, `persistence` state. |
-| `session_describe` | `GET /v1/sessions/{sid}` | `{session_id}` → `{config, purpose, roster, persistence?}`. Read-only, allocates no participant. |
-| `session_delete` | `DELETE /v1/sessions/{sid}` | `{session_id, creator_token}`. Terminates the session. The REST form also accepts the relay-wide `SW_SUPERVISOR_ADMIN_TOKEN` as Bearer for a supervisor override (recorded as `ended_reason=admin_deleted`). |
-| `session_update_purpose` | `PATCH /v1/sessions/{sid}/purpose` | `{purpose?}` — replaces it, or `null` to clear. Broadcasts `session.purpose_updated`. Caller must be in the session. |
-| `session_join` | `POST /v1/sessions/{sid}/participants` | `{role?, capabilities?, objective?, metadata?, delivery_mode?}` → `participant_id`, `roster`, `config`, `purpose`, `relay_epoch`, `persistence?`. REST also returns `participant_token`; over MCP your `participant_id` is the credential. |
+| `session_create` | `POST /v1/sessions` | `{config?, purpose?, persistence?, creator_id?}` (`creator_id` is REST/SDK only) → `session_id`, `purpose` echo, **`creator_token`**, **`supervisor_token`** + `supervisor_token_id`, **`join_token`** + `join_token_expires_at`, `invite_url`, `invite_link` (all one-time), `creator_id`, `persistence` state. No credential needed. |
+| `session_describe` | `GET /v1/sessions/{sid}` | `{session_id, access_token?}` → `{config, purpose, roster, persistence?}`. Read-only, allocates no participant. Bearer / `access_token`: a join, participant, supervisor, creator or admin token (a connection already bound to that session needs none). |
+| `session_delete` | `DELETE /v1/sessions/{sid}` | `{session_id, creator_token}`. Terminates the session. The relay-wide `SW_ADMIN_TOKEN` is also accepted (as `creator_token` in the MCP tool, as Bearer over REST) for a supervisor override (recorded as `ended_reason=admin_deleted`). |
+| `session_update_purpose` | `PATCH /v1/sessions/{sid}/purpose` | `{session_id, creator_token, purpose?}` — replaces it, or `null` to clear. Broadcasts `session.purpose_updated`. **Creator or admin only**; a participant is refused. |
+| `session_join` | `POST /v1/sessions/{sid}/participants` | `{join_token, role?, capabilities?, objective?, metadata?, delivery_mode?}` (REST: the join token, or the creator / admin token, goes in `Authorization: Bearer`) → `participant_id`, **`participant_token`** (secret, distinct from the id), `roster`, `config`, `purpose`, `relay_epoch`, `persistence?`. |
 | `session_list_participants` | `GET /v1/sessions/{sid}/participants` | → `{roster: [ParticipantPublic, …]}`. |
 | `session_update_self` | `PATCH /v1/sessions/{sid}/participants/me` | `{role?, objective?, capabilities?, metadata?}`. Replaces fields; omitted = unchanged, no merge. |
 | `session_leave` | `DELETE /v1/sessions/{sid}/participants/me` | `{feedback?}`. Broadcasts `participant.left` (`reason: left`). |
@@ -981,11 +1023,16 @@ routes take `Authorization: Bearer <participant_token>`.
 | `session_send` | `POST /v1/sessions/{sid}/commands` | `{dispatch, target, payload, timeout_seconds?, command_id?}` — `command_id` is **REST/SDK only**, the MCP tool has no such argument; → `{command_id, delivered_to}`. **Returns as soon as the command is delivered — results arrive later as events.** |
 | `session_respond` | `POST /v1/sessions/{sid}/commands/{cid}/responses` | `{payload, status?}`. `status` defaults to `"ok"`. |
 | `session_get_events` | `GET /v1/sessions/{sid}/events` | `{after_seq?, before_seq?, kind?, participant_id?, limit?, order?}` → paginated `events` + `session_state` (`hot`/`cold`/`ended`). **Persisted sessions only**; returns `no_history` otherwise. |
-| `session_resume` | *(MCP only)* | `{session_id, participant_id, last_acked_seq?}` → `roster`, `config`, `purpose`, `relay_epoch`. There is no separate token argument: `participant_id` **is** the credential (it equals your `participant_token`), so treat it as a secret. On REST/SDK you reconnect with your token instead — [§5.1](#51-disconnect-and-reconnect). |
+| `session_resume` | *(MCP only)* | `{session_id, participant_token, last_acked_seq?}` → `roster`, `config`, `purpose`, `relay_epoch`. The `participant_token` from your join is the credential; the `participant_id` is not. On REST/SDK you reconnect with your token instead — [§5.1](#51-disconnect-and-reconnect). |
+| `session_mint_join_token` | `POST /v1/sessions/{sid}/join-tokens` | `{session_id, creator_token}` → a fresh `join_token` (15 min, multi-use), `expires_at`, `invite_url`, `invite_link`. Creator or admin. |
+| `session_mint_supervisor_token` | `POST /v1/sessions/{sid}/supervisor-tokens` | `{session_id, creator_token}` → `token_id`, `supervisor_token`. Creator or admin. |
+| `session_list_supervisor_tokens` | `GET /v1/sessions/{sid}/supervisor-tokens` | → token ids with created / revoked timestamps (never secrets). Creator or admin. |
+| `session_revoke_supervisor_token` | `DELETE /v1/sessions/{sid}/supervisor-tokens/{token_id}` | Revokes one supervisor token immediately. Creator or admin. |
 | *(none)* | `GET /v1/info` | Unauthenticated pre-flight — see [§6.5](#65-get-v1info). |
-| *(none)* | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` — see [§4.4](#44-supervisor-notes). |
+| *(none)* | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` — Bearer is a supervisor, creator or admin token; see [§4.4](#44-supervisor-notes). |
+| *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |
-| *(none)* | `WS /v1/sessions/{sid}/firehose?token=…` | Every event in the session, for a supervisor. Bearer is the `creator_token` — [§6.6](#66-persistence-and-ownership). |
+| *(none)* | `WS /v1/sessions/{sid}/firehose?token=…` | Every event in the session, for a supervisor. `token` is a supervisor, creator or admin token — [§6.6](#66-persistence-and-ownership). |
 
 ### 6.2 Notifications catalogue
 
@@ -1056,8 +1103,8 @@ Anything else you add is free-form and preserved. 16 KiB JSON cap.
 
 Your unauthenticated pre-flight probe:
 
-- `auth_model` — `shared-bearer-sub-project-1` today (bearer token equals
-  `participant_id`; no rotation, expiry or scope). If your client caches
+- `auth_model` — `scoped-tokens-v1` today (join tokens to enter, a secret
+  per-participant token, creator / supervisor / admin tokens). If your client caches
   credentials across restarts, branch on this string rather than the
   relay's version number.
 - `relay_epoch` — the relay process's UNIX-seconds start time. A change
@@ -1101,21 +1148,27 @@ Which mode:
 - **`until_deleted`** — stateful workspaces that live until the host tears
   them down. Subject to a relay-wide safety cap (default 90 d of inactivity).
 
-**`creator_token`** — returned exactly once at create, on **every** session
-whether persisted or not. Treat it like an API key:
+**The tokens** — returned exactly once at create, on **every** session
+whether persisted or not. Treat each like an API key:
 
-- It is the only way to `session_delete` (absent a relay-wide admin token).
-- It is the bearer for the per-session firehose
-  (`WS /v1/sessions/{sid}/firehose?token=<creator_token>`), the supervisor
-  stream carrying every event including chat between other participants.
-- Agents and SDK callers: keep it in process memory; if the process dies the
-  token dies with it and deleting becomes impossible without an admin override.
-- Humans: write it down or store it in a vault. The standalone cockpit
-  (`pipx install sessionweave-cockpit`) prompts for it at click time and
-  never persists it.
+| Token | Lets its holder | Lifetime |
+|---|---|---|
+| `join_token` (in the invite link) | read the session and join it; nothing else | 15 minutes, multi-use; expiry never removes participants already in |
+| `participant_token` (from the join) | act as that one participant | until it leaves or the session ends |
+| `supervisor_token` | observe the firehose (`WS /v1/sessions/{sid}/firehose?token=…`) and post supervisor notes; cannot join or manage | until the creator revokes it (revoking also closes its open firehose streams) |
+| `creator_token` | everything above plus `session_delete`, purpose updates, minting and revoking join / supervisor tokens | the session |
+| `SW_ADMIN_TOKEN` (operator) | all of it, on every session | the relay |
 
-The relay stores only `sha256(creator_token)`; the plaintext never appears
-again in any response.
+- The session id is **never** a credential on any route.
+- Agents and SDK callers: keep tokens in process memory; if the process dies
+  they die with it (the creator token is the only way to delete short of the
+  admin token).
+- Humans: write them down or store them in a vault. The standalone cockpit
+  (`pipx install sessionweave-cockpit`) prompts for a supervisor or creator
+  token at click time and never persists it.
+
+The relay stores only SHA-256 digests; the plaintext never appears again in
+any response.
 
 **`creator_id`** is an opaque display handle echoed back. Pass your own to
 bind a stable identity (`{"creator_id": "alice@team"}`); omit it and the
@@ -1148,10 +1201,14 @@ Operators can tune all of these; these are the stock values.
 ### 7.1 Python SDK
 
 Install and basic shape are in [§8.1](#81-reach-the-relay). Methods:
-`c.info()`, `c.create_session()`, `c.describe()`, `c.join()`,
-`c.delete_session()`, `c.get_events()`; then on the participant
-`me.send()`, `me.respond()`, `me.drain_inbox()`, `me.wait_for_event()`,
-`me.list_participants()`, `me.update_self()`, `me.update_purpose()`,
+`c.info()`, `c.create_session()`, `c.join(sid, join_token=...)`,
+`c.join_link(link)`, `c.describe(sid, token=...)`,
+`c.get_events(sid, token=...)`, `c.access(sid, token)`, and the
+creator-token calls `c.update_purpose()`, `c.delete_session()`,
+`c.mint_join_token()`, `c.mint_supervisor_token()`,
+`c.list_supervisor_tokens()`, `c.revoke_supervisor_token()`; then on the
+participant `me.send()`, `me.respond()`, `me.drain_inbox()`,
+`me.wait_for_event()`, `me.list_participants()`, `me.update_self()`,
 `me.events()`, `me.leave()`.
 
 Two pitfalls will silently kill a long-lived worker.
@@ -1214,10 +1271,9 @@ Vendor-neutral examples (Anthropic, OpenAI, plain) live under
 
 ### 7.2 REST + WebSocket
 
-Your `participant_token` equals your `participant_id` on the current auth
-model — pass it as `Authorization: Bearer <token>` on every authenticated
-route. Branch on `auth_model` from [`GET /v1/info`](#65-get-v1info) rather
-than assuming this stays true.
+Your `participant_token` is a secret distinct from your `participant_id` —
+pass it as `Authorization: Bearer <token>` on every participant route. Joining
+itself takes the join token (or the creator / admin token) as the Bearer.
 
 For real-time push, upgrade to a WebSocket:
 
@@ -1266,7 +1322,7 @@ would be dropped by the standard client validator. Unwrap `data._name` and
 > - **An idle connection is reclaimed after 30 minutes** (operator-tunable
 >   via `SW_MCP_SESSION_IDLE_TIMEOUT`). Past that the session id answers
 >   HTTP 404 and you must re-initialize and call `session_resume` with your
->   `participant_id` — not `session_join`, which would make you a second
+>   `participant_token` — not `session_join`, which would make you a second
 >   participant. SDK clients hold the standalone GET stream open, which
 >   counts as activity, so they do not idle out; hand-rolled clients that
 >   only POST can.
@@ -1301,10 +1357,11 @@ off the connection binding also accepts `session_id` + `participant_token`:
 
 ```python
 # each of these may be its own connection — it does not matter
-out = await call("session_join", {"session_id": sid, "role": "worker",
+out = await call("session_join", {"session_id": sid, "join_token": jt,
+                                  "role": "worker",
                                   "capabilities": ["chat"],
                                   "delivery_mode": "pull"})
-me = {"session_id": sid, "participant_token": out["participant_id"]}
+me = {"session_id": sid, "participant_token": out["participant_token"]}
 
 await call("session_check_inbox", me)
 await call("session_respond", {**me, "command_id": cid, "payload": {...}})
@@ -1322,8 +1379,7 @@ Two consequences worth knowing:
   `delivery_mode: "pull"` and collect events with `session_check_inbox`.
 - **The token travels in the tool arguments**, so it lands in your model's
   context and in tool-call logs — unlike REST, where it is a header. It
-  grants exactly what it grants on REST (it *is* your `participant_id` on
-  the current auth model), so treat it as the secret it is.
+  grants exactly what it grants on REST, so treat it as the secret it is.
 
 If none of that suits you, the REST path
 ([§2.5](#25-worked-example--join-as-a-worker-with-curl-only)) has no
@@ -1398,7 +1454,10 @@ from sessionweave_client import SessionWeaveClient
 async def main() -> None:
     async with SessionWeaveClient() as client:        # default: relay.sessionweave.com
         sess = await client.create_session(purpose={"kind": "demo"})
-        me = await client.join(sess["session_id"], role="worker", capabilities=["respond"])
+        me = await client.join(
+            sess["session_id"], join_token=sess["join_token"],
+            role="worker", capabilities=["respond"],
+        )
         try:
             async with me.events() as stream:         # live WS push
                 async for evt in stream:
@@ -1485,5 +1544,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.21.0 — joined as
+> "I'm acting under `sessionweave-participant` v0.22.0 — joined as
 > observer, long-polling on every turn."

@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import importlib.resources as ir
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
+
+from sessionweave.access import IssuedToken, SessionAuth
 
 
 @dataclass(slots=True, frozen=True)
@@ -58,6 +60,7 @@ class SessionSnapshot:
     # row (which would raise SQLITE_CONSTRAINT on the (session_id, seq)
     # PK). For sessions that never recorded any event this is 0.
     max_event_seq: int
+    tokens: list[IssuedToken] = field(default_factory=list)
 
 
 class PersistenceStore:
@@ -183,6 +186,8 @@ class PersistenceStore:
                     "DELETE FROM participants WHERE session_id = ?", (sid,))
                 await self._write_conn.execute(
                     "DELETE FROM events WHERE session_id = ?", (sid,))
+                await self._write_conn.execute(
+                    "DELETE FROM session_tokens WHERE session_id = ?", (sid,))
                 await self._write_conn.execute(
                     "DELETE FROM sessions WHERE session_id = ?", (sid,))
                 await self._write_conn.execute("COMMIT")
@@ -427,7 +432,84 @@ class PersistenceStore:
             relay_epoch_at_create=srow[9],
             participants=participants, inflight=inflight, buffered=buffered,
             max_event_seq=int(max_event_seq or 0),
+            tokens=await self.load_tokens(sid),
         )
+
+    # ----- session credentials -----
+
+    async def save_token(self, sid: str, t: IssuedToken) -> None:
+        assert self._write_conn is not None
+        # Token writes share the autocommit write connection with the
+        # BEGIN..COMMIT/ROLLBACK transactions; outside the lock a concurrent
+        # ROLLBACK could undo them (a lost revocation fails open on restart).
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "INSERT OR REPLACE INTO session_tokens ("
+                " session_id, token_id, kind, token_hash,"
+                " created_at, expires_at, revoked_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, t.token_id, t.kind, t.token_hash,
+                 t.created_at_ms, t.expires_at_ms, t.revoked_at_ms),
+            )
+
+    async def revoke_token(self, sid: str, token_id: str, revoked_at_ms: int) -> None:
+        assert self._write_conn is not None
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "UPDATE session_tokens SET revoked_at = ?"
+                " WHERE session_id = ? AND token_id = ?",
+                (revoked_at_ms, sid, token_id),
+            )
+
+    async def load_tokens(self, sid: str) -> list[IssuedToken]:
+        """Load a session's tokens, pruning expired join tokens first."""
+        assert self._write_conn is not None
+        if not self._read_pool:
+            return []
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "DELETE FROM session_tokens"
+                " WHERE session_id = ? AND kind = 'join' AND expires_at < ?",
+                (sid, int(time.time() * 1000)),
+            )
+        tokens: list[IssuedToken] = []
+        async with self._read_pool[0].execute(
+            "SELECT token_id, kind, token_hash, created_at, expires_at, revoked_at"
+            " FROM session_tokens WHERE session_id = ? ORDER BY created_at, token_id",
+            (sid,),
+        ) as cur:
+            async for tid, kind, thash, created, expires, revoked in cur:
+                tokens.append(IssuedToken(
+                    token_id=tid, kind=kind, token_hash=bytes(thash),
+                    created_at_ms=created, expires_at_ms=expires,
+                    revoked_at_ms=revoked,
+                ))
+        return tokens
+
+    async def load_auth(self, sid: str) -> SessionAuth | None:
+        """Rebuild a session's credential registry from disk (cold/ended sessions)."""
+        import json as _json
+        if not self._read_pool:
+            return None
+        conn = self._read_pool[0]
+        async with conn.execute(
+            "SELECT creator_token_hash FROM sessions WHERE session_id = ?", (sid,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        auth = SessionAuth(bytes(row[0]))
+        auth.restore(await self.load_tokens(sid))
+        async with conn.execute(
+            "SELECT participant_id, snapshot_json FROM participants"
+            " WHERE session_id = ? AND left_at IS NULL",
+            (sid,),
+        ) as cur:
+            async for pid, snap_json in cur:
+                token_hex = _json.loads(snap_json).get("token_hash")
+                if token_hex:
+                    auth.register_participant(pid, bytes.fromhex(token_hex))
+        return auth
 
     # ----- sweep helpers -----
 

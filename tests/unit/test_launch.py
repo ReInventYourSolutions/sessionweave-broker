@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sessionweave.invite import InviteLink
 from sessionweave.launch import _human_summary
 
@@ -60,3 +62,41 @@ def test_human_summary_without_purpose() -> None:
     }
     out = _human_summary(inv, desc)
     assert "kind       : (none)" in out
+
+
+def test_missing_join_token_exits_3(capsys) -> None:
+    from sessionweave.launch import main
+
+    rc = main(["swv://localhost:8765/abc"])
+    assert rc == 3
+    assert (
+        "invite link is missing its join token — ask the session creator for a new invite link"
+        in capsys.readouterr().err
+    )
+
+
+def test_describe_uses_access_token(monkeypatch, capsys) -> None:
+    from sessionweave import launch
+
+    seen: dict[str, Any] = {}
+
+    async def fake_describe(relay_url: str, session_id: str, join_token: str):
+        seen["args"] = (relay_url, session_id, join_token)
+        return {"expires_at": "x", "roster": [], "purpose": None}
+
+    monkeypatch.setattr(launch, "_describe", fake_describe)
+    rc = launch.main(["swv://localhost:8765/abc?jt=JT"])
+    assert rc == 0
+    assert seen["args"] == ("http://localhost:8765/mcp", "abc", "JT")
+
+
+def test_invalid_token_is_nonzero_with_relay_message(monkeypatch, capsys) -> None:
+    from sessionweave import launch
+
+    async def fake_describe(relay_url, session_id, join_token):
+        raise RuntimeError("session_describe error: join token expired")
+
+    monkeypatch.setattr(launch, "_describe", fake_describe)
+    rc = launch.main(["swv://localhost:8765/abc?jt=JT"])
+    assert rc == 4
+    assert "join token expired" in capsys.readouterr().err

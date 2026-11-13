@@ -12,10 +12,11 @@ import pytest_asyncio
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from sessionweave.access import generate_token as generate_creator_token
+from sessionweave.access import hash_token as hash_creator_token
 from sessionweave.config import SessionConfig
 from sessionweave.connections import ConnectionManager
 from sessionweave.persistence import PersistenceStore, SessionMetadata
-from sessionweave.persistence_token import generate_creator_token, hash_creator_token
 from sessionweave.session import Session
 
 

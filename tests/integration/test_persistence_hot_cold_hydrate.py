@@ -27,7 +27,6 @@ async def test_persistence_db_row_created_on_session_create(tmp_path: object) ->
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
             # Session is "hot" (in memory); still verify the DB row is there
             conn = sqlite3.connect(db)
             try:
@@ -55,7 +54,6 @@ async def test_ephemeral_session_not_in_db(tmp_path: object) -> None:
             r = await c.post(f"{base}/v1/sessions", json={})
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
             conn = sqlite3.connect(db)
             try:
                 cur = conn.execute(

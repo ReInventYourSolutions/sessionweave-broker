@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -14,8 +14,8 @@ from tests.integration.harness import relay_subprocess
 async def test_join_emits_participant_joined_to_others() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "x"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "x"})
 
             received: list[tuple[str, dict[str, Any]]] = []
             a.on_notification(
@@ -23,7 +23,7 @@ async def test_join_emits_participant_joined_to_others() -> None:
             )
 
             await b.call_tool(
-                "session_join", {"session_id": sid, "role": "y"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "y"}
             )
 
             for _ in range(20):
@@ -40,13 +40,13 @@ async def test_join_emits_participant_joined_to_others() -> None:
 async def test_send_specific_emits_command_received_to_recipient() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as sender, sw_client(base) as recipient:
-            sid = (await sender.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(sender, {})
             await sender.call_tool(
-                "session_join", {"session_id": sid, "role": "lead"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "lead"}
             )
             recv_join = await recipient.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "reviewer", "capabilities": ["sec"]},
+                {"session_id": sid, "join_token": jt, "role": "reviewer", "capabilities": ["sec"]},
             )
 
             received: list[tuple[str, dict[str, Any]]] = []

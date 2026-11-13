@@ -1,14 +1,27 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from sessionweave.access import (
+    AuthFailureLimiter,
+    Principal,
+    Role,
+    generate_token,
+    hash_token,
+    participant_id_for_token,
+    require,
+    resolve_principal,
+)
 from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.invite import create_link, http_invite_url
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import (
+    AccessOutput,
     InboxMessage,
+    JoinTokenOutput,
     SessionCheckInboxOutput,
     SessionCreateInput,
     SessionCreateOutput,
@@ -31,6 +44,8 @@ from sessionweave.schemas import (
     SessionUpdateSelfOutput,
     SessionWaitForEventInput,
     SessionWaitForEventOutput,
+    SupervisorTokenInfo,
+    SupervisorTokenOutput,
 )
 from sessionweave.session import Session
 
@@ -38,14 +53,13 @@ if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
     from sessionweave.metrics import Metrics
     from sessionweave.persistence import PersistenceStore
-    from sessionweave.persistence_token import DeleteRateLimiter
     from sessionweave.schemas import PersistenceStatePublic
 
 
 class ToolDeps:
     """Bag of dependencies passed to each tool handler."""
 
-    __slots__ = ("bounds", "delete_rate_limiter", "metrics", "registry", "relay_epoch")
+    __slots__ = ("admin_token", "auth_limiter", "bounds", "metrics", "registry", "relay_epoch")
 
     def __init__(
         self,
@@ -53,7 +67,8 @@ class ToolDeps:
         relay_epoch: int = 0,
         bounds: ConfigBounds | None = None,
         metrics: Metrics | None = None,
-        delete_rate_limiter: DeleteRateLimiter | None = None,
+        auth_limiter: AuthFailureLimiter | None = None,
+        admin_token: str | None = None,
     ) -> None:
         self.registry = registry
         # Per-process startup epoch (UNIX seconds at server build_app).
@@ -68,7 +83,9 @@ class ToolDeps:
         else:
             self.bounds = bounds
         self.metrics = metrics
-        self.delete_rate_limiter = delete_rate_limiter
+        self.auth_limiter = auth_limiter if auth_limiter is not None else AuthFailureLimiter()
+        # Relay-wide admin token (SW_ADMIN_TOKEN); None means no admin access.
+        self.admin_token = admin_token or None
 
 
 def _int_config(cfg_dict: dict[str, Any]) -> dict[str, int]:
@@ -107,9 +124,30 @@ async def _session_for_handle(
     return sess, binding[1]
 
 
-async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
-    from sessionweave.persistence_token import generate_creator_token, hash_creator_token
+def _iso_from_ms(ms: int) -> str:
+    return (
+        datetime.fromtimestamp(ms / 1000, UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
+
+def _invite_fields(
+    public_base_url: str | None, sid: str, join_token: str
+) -> tuple[str, str]:
+    """(invite_url, invite_link) for a join token; empty when no base URL is known."""
+    if not public_base_url:
+        return "", ""
+    return (
+        http_invite_url(public_base_url, sid, join_token),
+        create_link(public_base_url, sid, join_token),
+    )
+
+
+async def session_create(
+    deps: ToolDeps, payload: dict[str, Any], *, public_base_url: str | None = None
+) -> dict[str, Any]:
     inp = SessionCreateInput.model_validate(payload)
 
     # Validate persistence ttl up-front against operator bounds
@@ -134,8 +172,8 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
             "persistence is not enabled on this relay",
         )
 
-    token = generate_creator_token()
-    token_hash = hash_creator_token(token)
+    token = generate_token()
+    token_hash = hash_token(token)
     sid, expires_at, cfg, purpose, persistence_state = await deps.registry.create(
         inp.config or {},
         purpose=inp.purpose,
@@ -149,6 +187,11 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
     # forward-compat shim the cockpit (and future identities) can populate.
     from uuid import uuid4
     creator_id = inp.creator_id if inp.creator_id else str(uuid4())
+    sess = await deps.registry.get_or_raise(sid)
+    supervisor_token, supervisor_issued = await sess.mint_supervisor_token()
+    join_token, join_issued = await sess.mint_join_token()
+    assert join_issued.expires_at_ms is not None
+    invite_url, invite_link = _invite_fields(public_base_url, sid, join_token)
     return SessionCreateOutput(
         session_id=sid,
         expires_at=expires_at,
@@ -157,28 +200,70 @@ async def session_create(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, A
         persistence=persistence_state,
         creator_token=token,
         creator_id=creator_id,
+        supervisor_token=supervisor_token,
+        supervisor_token_id=supervisor_issued.token_id,
+        join_token=join_token,
+        join_token_expires_at=_iso_from_ms(join_issued.expires_at_ms),
+        invite_url=invite_url,
+        invite_link=invite_link,
     ).model_dump()
 
 
 async def session_update_purpose(
-    deps: ToolDeps,
-    handle: ConnectionHandle,
-    payload: dict[str, Any],
+    deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
 ) -> dict[str, Any]:
-    sess, pid = await _session_for_handle(deps, handle)
+    """Replace or clear the purpose. Creator or admin only."""
     inp = SessionUpdatePurposeInput.model_validate(payload)
-    new_purpose = await sess.update_purpose(pid, inp.purpose)
+    sess = await _resolve_manager(deps, inp.session_id, inp.creator_token, source_ip)
+    new_purpose = await sess.update_purpose(None, inp.purpose)
     return SessionUpdatePurposeOutput(purpose=new_purpose).model_dump()
 
 
-async def session_describe(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+_READ_ROLES: tuple[Role, ...] = ("participant", "joiner", "supervisor", "creator", "admin")
+
+
+async def _resolve_reader(
+    deps: ToolDeps,
+    sid: str,
+    token: str | None,
+    handle: ConnectionHandle | None,
+    *,
+    source_ip: str,
+    hydrate: bool = True,
+) -> Principal:
+    """Principal for a read of session ``sid``.
+
+    A connection already bound as a participant of ``sid`` needs no token;
+    anyone else presents one.
+    """
+    if not token and handle is not None:
+        binding = deps.registry.connections.session_for(handle)
+        if binding is not None and binding[0] == sid:
+            return Principal("participant", binding[1])
+    principal = await resolve_principal(
+        deps, sid, token, source_ip=source_ip, hydrate=hydrate
+    )
+    require(principal, *_READ_ROLES)
+    return principal
+
+
+async def session_describe(
+    deps: ToolDeps,
+    payload: dict[str, Any],
+    *,
+    handle: ConnectionHandle | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
     """Read-only snapshot of a session: purpose + config + roster.
 
-    Does NOT bind the calling MCP connection to a participant. Use it as a
-    pre-flight before deciding whether to ``session_join`` and which role
-    to take.
+    Needs a session credential (``access_token``) unless the connection is
+    already a participant of the session. Does NOT bind the calling MCP
+    connection to a participant.
     """
     inp = SessionDescribeInput.model_validate(payload)
+    await _resolve_reader(
+        deps, inp.session_id, inp.access_token, handle, source_ip=source_ip
+    )
     sess = await deps.registry.get_or_raise(inp.session_id)
     return SessionDescribeOutput(
         session_id=sess.session_id,
@@ -194,11 +279,17 @@ async def session_join(
     deps: ToolDeps,
     handle: ConnectionHandle,
     payload: dict[str, Any],
+    *,
+    source_ip: str = "",
 ) -> dict[str, Any]:
     inp = SessionJoinInput.model_validate(payload)
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = await deps.registry.get_or_raise(inp.session_id)
+    principal = await resolve_principal(
+        deps, inp.session_id, inp.join_token, source_ip=source_ip
+    )
+    require(principal, "joiner", "creator", "admin")
     p = await sess.join(
         handle,
         role=inp.role,
@@ -207,8 +298,13 @@ async def session_join(
         metadata=inp.metadata,
         delivery_mode=inp.delivery_mode,
     )
+    # The plaintext token leaves RAM here: only its hash stays on the Participant.
+    token, p.issued_token = p.issued_token, None
+    if token is None:
+        raise RuntimeError("Session.join returned no participant token")
     return SessionJoinOutput(
         participant_id=p.participant_id,
+        participant_token=token,
         expires_at=sess.expires_at_iso(),
         roster=sess.roster_snapshot(),
         config=_int_config(asdict(sess.config)),
@@ -222,13 +318,18 @@ async def session_resume(
     deps: ToolDeps,
     handle: ConnectionHandle,
     payload: dict[str, Any],
+    *,
+    source_ip: str = "",
 ) -> dict[str, Any]:
     inp = SessionResumeInput.model_validate(payload)
     if deps.registry.connections.session_for(handle) is not None:
         raise ToolError(ErrorCode.ALREADY_IN_SESSION, "connection already in a session")
     sess = await deps.registry.get_or_raise(inp.session_id)
+    pid = participant_id_for_token(
+        sess, inp.participant_token, limiter=deps.auth_limiter, source_ip=source_ip
+    )
     await sess.resume(
-        handle, inp.participant_id, last_acked_seq=inp.last_acked_seq
+        handle, pid, last_acked_seq=inp.last_acked_seq
     )
     return SessionResumeOutput(
         expires_at=sess.expires_at_iso(),
@@ -289,6 +390,15 @@ async def session_list_participants(
     deps: ToolDeps, handle: ConnectionHandle
 ) -> dict[str, Any]:
     sess, _ = await _session_for_handle(deps, handle)
+    return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
+
+
+async def session_roster(
+    deps: ToolDeps, sid: str, token: str | None, *, source_ip: str = ""
+) -> dict[str, Any]:
+    """The roster for any credential that may read the session (REST)."""
+    await _resolve_reader(deps, sid, token, None, source_ip=source_ip)
+    sess = await deps.registry.get_or_raise(sid)
     return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
 
 
@@ -383,51 +493,122 @@ async def session_respond(
     return {}
 
 
-async def session_delete(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
-    from sessionweave.persistence_token import (
-        verify_creator_token,
-    )
+async def session_delete(
+    deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
+) -> dict[str, Any]:
     inp = SessionDeleteInput.model_validate(payload)
-    rl = deps.delete_rate_limiter
-    # Uniform back-pressure sleep on EVERY failure path so an attacker
-    # can't distinguish "rate-limited" from "invalid token" via response
-    # latency. This costs callers a 0.5 s tax on their first wrong guess,
-    # which is negligible against the 256-bit creator_token entropy.
-    if rl is not None and rl.is_banned(inp.session_id):
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="rate_limited"
-                ).inc()
-            except Exception:
-                pass
-        await asyncio.sleep(0.5)
-        raise ToolError(ErrorCode.PERMISSION_DENIED, "rate-limited")
-    sess = await deps.registry.get_or_raise(inp.session_id)
-    if sess.creator_token_hash is None or not verify_creator_token(
-        inp.creator_token, sess.creator_token_hash
-    ):
-        if rl is not None:
-            rl.record_failure(inp.session_id)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="invalid_token"
-                ).inc()
-            except Exception:
-                pass
-        # Same 0.5 s tax as the rate-limited path — see comment above.
-        await asyncio.sleep(0.5)
-        raise ToolError(ErrorCode.PERMISSION_DENIED, "invalid creator_token")
-    deleted_at = await deps.registry.delete(inp.session_id, reason="host_deleted")
-    if rl is not None:
-        rl.reset(inp.session_id)
+    try:
+        principal = await resolve_principal(
+            deps, inp.session_id, inp.creator_token, source_ip=source_ip
+        )
+        require(principal, "creator", "admin")
+    except ToolError as exc:
+        if exc.code in (ErrorCode.PERMISSION_DENIED, ErrorCode.RATE_LIMITED):
+            _count_delete_failure(
+                deps, "rate_limited" if exc.code is ErrorCode.RATE_LIMITED else "invalid_token"
+            )
+        raise
+    reason = "admin_deleted" if principal.role == "admin" else "host_deleted"
+    deleted_at = await deps.registry.delete(inp.session_id, reason=reason)
     return SessionDeleteOutput(deleted_at=deleted_at).model_dump()
 
 
-async def session_get_events(deps: ToolDeps, payload: dict[str, Any]) -> dict[str, Any]:
+async def _resolve_manager(
+    deps: ToolDeps, session_id: str, token: str, source_ip: str
+) -> Session:
+    """Authenticate a creator or admin token and return the live session."""
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    require(principal, "creator", "admin")
+    return await deps.registry.get_or_raise(session_id)
+
+
+async def session_mint_join_token(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    *,
+    public_base_url: str | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    join_token, issued = await sess.mint_join_token()
+    assert issued.expires_at_ms is not None
+    invite_url, invite_link = _invite_fields(public_base_url, session_id, join_token)
+    return JoinTokenOutput(
+        join_token=join_token,
+        expires_at=_iso_from_ms(issued.expires_at_ms),
+        invite_url=invite_url,
+        invite_link=invite_link,
+    ).model_dump()
+
+
+async def session_mint_supervisor_token(
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
+) -> dict[str, Any]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    supervisor_token, issued = await sess.mint_supervisor_token()
+    return SupervisorTokenOutput(
+        token_id=issued.token_id, supervisor_token=supervisor_token
+    ).model_dump()
+
+
+async def session_list_supervisor_tokens(
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
+) -> list[dict[str, Any]]:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    return [
+        SupervisorTokenInfo(
+            token_id=t.token_id,
+            created_at=_iso_from_ms(t.created_at_ms),
+            revoked_at=None if t.revoked_at_ms is None else _iso_from_ms(t.revoked_at_ms),
+        ).model_dump()
+        for t in sess.auth.supervisor_tokens()
+    ]
+
+
+async def session_revoke_supervisor_token(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    token_id: str,
+    *,
+    source_ip: str = "",
+) -> None:
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    await sess.revoke_supervisor_token(token_id)
+
+
+async def session_access(
+    deps: ToolDeps, session_id: str, token: str | None, *, source_ip: str = ""
+) -> dict[str, Any]:
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    return AccessOutput(
+        role=principal.role, participant_id=principal.participant_id
+    ).model_dump()
+
+
+def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
+    if deps.metrics is not None:
+        try:
+            deps.metrics.session_delete_failed_total.labels(reason=reason).inc()
+        except Exception:
+            pass
+
+
+async def session_get_events(
+    deps: ToolDeps,
+    payload: dict[str, Any],
+    *,
+    handle: ConnectionHandle | None = None,
+    source_ip: str = "",
+) -> dict[str, Any]:
     inp = SessionGetEventsInput.model_validate(payload)
     sid = inp.session_id
+    # Cold and ended sessions are authenticated from their stored hashes
+    # without being loaded into RAM.
+    await _resolve_reader(
+        deps, sid, inp.access_token, handle, source_ip=source_ip, hydrate=False
+    )
     state: Literal["hot", "cold", "ended"]
     event_store: PersistenceStore
     # First check the in-RAM map without triggering hydrate

@@ -26,6 +26,13 @@ class FirehoseSubscriber:
     id: str
     session_id: str
     queue: asyncio.Queue[dict[str, Any]]
+    # The supervisor token that authenticated this stream (None for creator
+    # or admin streams). Revoking that token closes the stream.
+    token_id: str | None = None
+    # Set when the stream must end (e.g. its token was revoked); the reason
+    # is sent as the WebSocket close reason.
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
+    close_reason: str = ""
     _lagged: bool = field(default=False)
 
 
@@ -40,7 +47,9 @@ class FirehoseRegistry:
         self._subs: dict[str, list[FirehoseSubscriber]] = {}
         self._lock = asyncio.Lock()
 
-    async def subscribe(self, session_id: str) -> FirehoseSubscriber:
+    async def subscribe(
+        self, session_id: str, token_id: str | None = None
+    ) -> FirehoseSubscriber:
         async with self._lock:
             bucket = self._subs.setdefault(session_id, [])
             if len(bucket) >= self._cap:
@@ -49,6 +58,7 @@ class FirehoseRegistry:
                 id=f"fh-{uuid4().hex[:10]}",
                 session_id=session_id,
                 queue=asyncio.Queue(maxsize=self._queue_capacity),
+                token_id=token_id,
             )
             bucket.append(sub)
             return sub
@@ -60,6 +70,21 @@ class FirehoseRegistry:
                 bucket.remove(sub)
             if not bucket and sub.session_id in self._subs:
                 del self._subs[sub.session_id]
+
+    async def close_for(
+        self, session_id: str, token_id: str, reason: str = "supervisor token revoked"
+    ) -> int:
+        """Signal every stream of ``session_id`` opened with ``token_id`` to close.
+
+        Returns how many subscribers were signalled. The WebSocket handler
+        closes the socket and unsubscribes.
+        """
+        async with self._lock:
+            hits = [s for s in self._subs.get(session_id, ()) if s.token_id == token_id]
+        for sub in hits:
+            sub.close_reason = reason
+            sub.closed.set()
+        return len(hits)
 
     async def publish(self, session_id: str, event: dict[str, Any]) -> None:
         """Best-effort fan-out. Subscribers whose queue is full get the

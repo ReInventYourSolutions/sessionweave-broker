@@ -25,18 +25,22 @@ async def test_purpose_round_trips_through_create_and_join() -> None:
                 "session_join",
                 {
                     "session_id": created["session_id"],
+                    "join_token": created["join_token"],
                     "role": "player",
                     "capabilities": ["tictactoe-o"],
                 },
             )
             assert joined["purpose"] == purpose
             # And resume after disconnect echoes it back too:
-            pid = joined["participant_id"]
+            ptoken = joined["participant_token"]
 
         async with sw_client(base) as joiner2:
             resumed = await joiner2.call_tool(
                 "session_resume",
-                {"session_id": created["session_id"], "participant_id": pid},
+                {
+                    "session_id": created["session_id"],
+                    "participant_token": ptoken,
+                },
             )
             assert resumed["purpose"] == purpose
 

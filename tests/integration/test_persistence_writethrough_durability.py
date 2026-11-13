@@ -11,6 +11,7 @@ import sqlite3
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -27,10 +28,11 @@ async def test_persistence_writethrough_durability(tmp_path: object) -> None:
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
             # Participant A joins as "sender"
             ra = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "sender"},
             )
             assert ra.status_code == 201, ra.text
@@ -40,6 +42,7 @@ async def test_persistence_writethrough_durability(tmp_path: object) -> None:
             # Participant B joins as "receiver"
             rb = await c.post(
                 f"{base}/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": "receiver"},
             )
             assert rb.status_code == 201, rb.text

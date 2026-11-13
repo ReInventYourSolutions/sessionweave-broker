@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -20,18 +20,18 @@ async def test_wait_for_event_mcp_wakes_on_send() -> None:
     """Client A long-polls; Client B sends a targeted command; A wakes before timeout."""
     async with relay_subprocess() as base:
         async with sw_client(base) as client_a, sw_client(base) as client_b:
-            sid = (await client_a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client_a, {})
 
             # Both join in pull mode.
             join_a = await client_a.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "waiter", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "waiter", "delivery_mode": "pull"},
             )
             pid_a = join_a["participant_id"]
 
             join_b = await client_b.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "sender", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "sender", "delivery_mode": "pull"},
             )
             pid_b = join_b["participant_id"]
             assert pid_a != pid_b
@@ -77,10 +77,10 @@ async def test_wait_for_event_mcp_returns_timed_out() -> None:
     """Returns ``timed_out: true`` with empty messages when no event arrives."""
     async with relay_subprocess() as base:
         async with sw_client(base) as client:
-            sid = (await client.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client, {})
             await client.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "lone", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "lone", "delivery_mode": "pull"},
             )
 
             out = await client.call_tool(
@@ -98,10 +98,10 @@ async def test_wait_for_event_mcp_rejects_push_mode() -> None:
     """Push-mode participant cannot call session_wait_for_event."""
     async with relay_subprocess() as base:
         async with sw_client(base) as client:
-            sid = (await client.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client, {})
             await client.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "pusher", "delivery_mode": "push"},
+                {"session_id": sid, "join_token": jt, "role": "pusher", "delivery_mode": "push"},
             )
 
             with pytest.raises(RuntimeError, match="invalid_delivery_mode"):
@@ -122,10 +122,10 @@ async def test_wait_for_event_mcp_clamps_above_cap() -> None:
 
     async with relay_subprocess() as base:
         async with sw_client(base) as client:
-            sid = (await client.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client, {})
             await client.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "lone", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "lone", "delivery_mode": "pull"},
             )
 
             start = time.monotonic()

@@ -7,11 +7,10 @@ adds an optional WebSocket upgrade so the same client can receive
 live ``command.received`` / ``result.received`` / etc. events without
 busy-polling.
 
-Auth shape mirrors the REST surface (sub-project #1): the bearer token
-IS the participant_id. Browsers can't easily set an ``Authorization``
-header on a WebSocket upgrade, so the token is accepted as the
-``token`` query parameter. Once sub-project #3 swaps tokens for JWTs
-this same query param will carry the JWT.
+Auth shape mirrors the REST surface: the credential is the participant's
+secret ``participant_token`` (never the participant_id). Browsers can't
+easily set an ``Authorization`` header on a WebSocket upgrade, so the
+token is accepted as the ``token`` query parameter.
 
 Wire format: each frame is a single JSON object
 ``{"name": "<event>", "payload": {...}, "seq": <int>}`` matching the
@@ -35,6 +34,7 @@ from typing import Any
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from sessionweave.access import participant_id_for_token
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.tools import ToolDeps
 
@@ -52,6 +52,8 @@ _QUEUE_MAX = 256
 _CLOSE_MISSING_TOKEN = 4401
 _CLOSE_NOT_IN_SESSION = 4401
 _CLOSE_SESSION_NOT_FOUND = 4404
+_CLOSE_TOKEN_REVOKED = 4403
+_CLOSE_RATE_LIMITED = 4429
 
 
 async def events_ws(websocket: WebSocket) -> None:
@@ -74,13 +76,17 @@ async def events_ws(websocket: WebSocket) -> None:
         await websocket.close(code=code, reason=exc.code.value)
         return
 
-    if token not in session._participants:
-        await websocket.close(
-            code=_CLOSE_NOT_IN_SESSION, reason="not_in_session"
+    source_ip = (websocket.client.host if websocket.client is not None else "") or ""
+    try:
+        pid = participant_id_for_token(
+            session, token, limiter=deps.auth_limiter, source_ip=source_ip
         )
+    except ToolError as exc:
+        if exc.code is ErrorCode.RATE_LIMITED:
+            await websocket.close(code=_CLOSE_RATE_LIMITED, reason="rate_limited")
+        else:
+            await websocket.close(code=_CLOSE_NOT_IN_SESSION, reason="not_in_session")
         return
-
-    pid = token
 
     # Parse optional ``?last_acked_seq=N`` so a reconnecting client can
     # tell the relay it has already consumed events up to N. The relay
@@ -263,58 +269,55 @@ async def events_ws(websocket: WebSocket) -> None:
 async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
-    admin_token = getattr(websocket.app.state, "firehose_admin_token", None)
-    registry = websocket.app.state.tool_deps.registry
+    deps = websocket.app.state.tool_deps
     firehose = websocket.app.state.firehose
-    session = registry.get(sid)
-    if session is None:
+    if deps.registry.get(sid) is None:
         await websocket.close(code=_CLOSE_SESSION_NOT_FOUND, reason="session_not_found")
         return
 
-    # Three authentication modes for the firehose endpoint:
-    #
-    #   1. admin-token mode (``SW_FIREHOSE_ADMIN_TOKEN`` set at startup):
-    #      subscription requires ``?token=<admin_token>``. Relay-wide
-    #      operator (list/manage all sessions).
-    #
-    #   2. creator_token of *this* session: accepted as a session-scoped
-    #      supervisor channel. The user who created the session has the
-    #      right to observe every event in it (supervisor / orchestrator
-    #      view), distinct from the relay-wide operator. Verified via
-    #      ``verify_creator_token`` against the session's stored hash.
-    #
-    #   3. legacy mode (admin env var unset): accept ``?token=<sid>``.
-    #      Historical behaviour for local dev / cockpit setups. The
-    #      startup logger emits a one-shot warning advising operators
-    #      to set the env var in multi-tenant deployments.
-    from sessionweave.persistence_token import verify_creator_token
+    # Supervisor, creator or relay admin (``SW_ADMIN_TOKEN``) tokens only.
+    from sessionweave.access import require, resolve_principal
 
-    accepted = False
-    if admin_token is not None and token == admin_token:
-        accepted = True
-    elif session.creator_token_hash is not None and verify_creator_token(
-        token, session.creator_token_hash
-    ):
-        accepted = True
-    elif admin_token is None and token == sid:
-        accepted = True
-
-    if not accepted:
-        await websocket.close(
-            code=_CLOSE_MISSING_TOKEN,
-            reason="invalid firehose token" if admin_token is not None else "invalid token",
+    source_ip = (websocket.client.host if websocket.client is not None else "") or ""
+    try:
+        principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
+        require(principal, "supervisor", "creator", "admin")
+    except ToolError as exc:
+        code = (
+            _CLOSE_SESSION_NOT_FOUND
+            if exc.code is ErrorCode.SESSION_NOT_FOUND
+            else _CLOSE_MISSING_TOKEN
         )
+        await websocket.close(code=code, reason="invalid token")
         return
 
     await websocket.accept()
-    sub = await firehose.subscribe(sid)
+    sub = await firehose.subscribe(sid, token_id=principal.token_id)
+    hot = deps.registry.get(sid)
+    if principal.token_id is not None and (
+        hot is None or hot.auth.supervisor_revoked(principal.token_id)
+    ):
+        # Revoked between the token check and the subscription.
+        sub.close_reason = "supervisor token revoked"
+        sub.closed.set()
+    revoked = asyncio.create_task(sub.closed.wait())
+    getter: asyncio.Task[Any] | None = None
     try:
         while True:
-            event = await sub.queue.get()
+            getter = asyncio.create_task(sub.queue.get())
+            await asyncio.wait({getter, revoked}, return_when=asyncio.FIRST_COMPLETED)
+            if revoked.done():
+                await websocket.close(code=_CLOSE_TOKEN_REVOKED, reason=sub.close_reason)
+                break
+            event = getter.result()
+            getter = None
             await websocket.send_text(json.dumps(event))
     except (WebSocketDisconnect, Exception):
         pass
     finally:
+        for task in (getter, revoked):
+            if task is not None and not task.done():
+                task.cancel()
         await firehose.unsubscribe(sub)
 
 

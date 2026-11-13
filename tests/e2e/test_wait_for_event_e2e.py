@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import bearer, create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 # ---------------------------------------------------------------------------
@@ -52,10 +52,11 @@ async def test_wait_for_event_http_wakes_on_buffered_event() -> None:
         r = await c.post("/v1/sessions", json={})
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
-
+        jt = r.json()["join_token"]
         # Join two participants (HTTP join always forces pull mode).
         r = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "waiter", "capabilities": ["listen"]},
         )
         assert r.status_code == 201, r.text
@@ -64,6 +65,7 @@ async def test_wait_for_event_http_wakes_on_buffered_event() -> None:
 
         r = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "sender"},
         )
         assert r.status_code == 201, r.text
@@ -107,9 +109,10 @@ async def test_wait_for_event_http_timeout() -> None:
         r = await c.post("/v1/sessions", json={})
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
-
+        jt = r.json()["join_token"]
         r = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "lone-participant"},
         )
         assert r.status_code == 201, r.text
@@ -142,18 +145,18 @@ async def test_wait_for_event_mcp_wakes_on_send() -> None:
     """
     async with relay_subprocess() as base:
         async with sw_client(base) as client_a, sw_client(base) as client_b:
-            sid = (await client_a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client_a, {})
 
             # Both participants join in pull mode.
             join_a = await client_a.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "waiter", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "waiter", "delivery_mode": "pull"},
             )
             pid_a = join_a["participant_id"]
 
             join_b = await client_b.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "sender", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "sender", "delivery_mode": "pull"},
             )
             pid_b = join_b["participant_id"]
             assert pid_a != pid_b
@@ -201,10 +204,10 @@ async def test_wait_for_event_mcp_timeout() -> None:
     """MCP session_wait_for_event returns timed_out=true when no event arrives."""
     async with relay_subprocess() as base:
         async with sw_client(base) as client:
-            sid = (await client.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(client, {})
             await client.call_tool(
                 "session_join",
-                {"session_id": sid, "role": "lone", "delivery_mode": "pull"},
+                {"session_id": sid, "join_token": jt, "role": "lone", "delivery_mode": "pull"},
             )
 
             out = await client.call_tool(

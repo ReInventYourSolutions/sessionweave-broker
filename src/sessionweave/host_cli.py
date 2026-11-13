@@ -5,8 +5,9 @@ The intent is to remove the "I have to write the orchestration myself"
 friction for agents on turn-based runtimes. After this command exits,
 the user gets back:
 
-* the ``swvs://`` invite link to share with the joiner
-* the host's ``participant_id``
+* the invite link to share with the joiner (``invite_link`` / ``invite_url``)
+* the ``supervisor_token`` and ``creator_token`` (Cockpit credentials)
+* the host's own ``my_participant_id`` and secret ``my_participant_token``
 * the poller PID and log path (unless ``--no-poller`` is set)
 
 Standalone usage:
@@ -25,11 +26,18 @@ Output is a JSON object on stdout:
 
     {
       "session_id": "...",
-      "link": "swvs://...",
-      "my_participant_id": "...",
+      "invite_link": "swvs://...?jt=...",   # for the agents you invite
+      "invite_url": "https://...",          # same, for plain HTTP agents
+      "supervisor_token": "...",            # for a Cockpit supervisor
+      "creator_token": "...",               # for the Cockpit creator; keep private
+      "my_participant_id": "...",           # public
+      "my_participant_token": "...",        # your secret; never share
       "poller_pid": 12345,
-      "poller_log": "/tmp/sw-events-<sid>.log"
+      "poller_log": "/tmp/sw-events-<sid>.log",
+      "who_gets_what": {...}
     }
+
+All tokens are shown once, here only.
 
 Exit codes:
   0  — session created and joined; poller (if any) spawned.
@@ -51,8 +59,6 @@ from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-
-from sessionweave.invite import create_link
 
 
 def _unwrap(res: Any) -> dict[str, Any]:
@@ -79,7 +85,7 @@ async def _create_and_join(
     my_capabilities: list[str],
     my_metadata: dict[str, Any],
     delivery_mode: str,
-) -> tuple[str, str]:
+) -> tuple[dict[str, Any], str, str]:
     async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
@@ -91,11 +97,18 @@ async def _create_and_join(
             )
             if res.is_error:
                 raise RuntimeError(f"session_create error: {_unwrap(res)}")
-            sid = _unwrap(res).get("session_id")
+            created = _unwrap(res)
+            sid = created.get("session_id")
+            creator_token = created.get("creator_token")
+            if not isinstance(created.get("invite_link"), str):
+                raise RuntimeError("session_create returned no invite_link")
             if not isinstance(sid, str):
                 raise RuntimeError(f"session_create returned no session_id: {sid!r}")
+            if not isinstance(creator_token, str):
+                raise RuntimeError("session_create returned no creator_token")
             join_args: dict[str, Any] = {
                 "session_id": sid,
+                "join_token": creator_token,
                 "role": my_role,
                 "capabilities": my_capabilities,
                 "metadata": my_metadata,
@@ -106,19 +119,25 @@ async def _create_and_join(
             )
             if res.is_error:
                 raise RuntimeError(f"session_join error: {_unwrap(res)}")
-            pid = _unwrap(res).get("participant_id")
+            joined = _unwrap(res)
+            pid = joined.get("participant_id")
+            ptoken = joined.get("participant_token")
             if not isinstance(pid, str):
                 raise RuntimeError(f"session_join returned no participant_id: {pid!r}")
-            return sid, pid
+            if not isinstance(ptoken, str):
+                raise RuntimeError("session_join returned no participant_token")
+            return created, pid, ptoken
 
 
 def _spawn_poller(
     relay_url: str,
     session_id: str,
+    participant_token: str,
     participant_id: str,
     log_path: Path,
     interval: float,
 ) -> int:
+    # The secret goes through the environment, not argv (visible in ps).
     log_path.parent.mkdir(parents=True, exist_ok=True)
     out_log = log_path.with_suffix(log_path.suffix + ".stderr")
     proc = subprocess.Popen(
@@ -137,12 +156,46 @@ def _spawn_poller(
             "--interval",
             str(interval),
         ],
+        env={**os.environ, "SW_PARTICIPANT_TOKEN": participant_token},
         stdout=open(out_log, "ab"),
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
     return proc.pid
+
+
+def _hand_back(
+    created: dict[str, Any],
+    participant_id: str,
+    participant_token: str,
+    poller_pid: int | None,
+    poller_log: str | None,
+) -> dict[str, Any]:
+    """The JSON envelope printed to stdout: every credential, labelled."""
+    return {
+        "session_id": created["session_id"],
+        "invite_link": created["invite_link"],
+        "invite_url": created.get("invite_url"),
+        "supervisor_token": created.get("supervisor_token"),
+        "creator_token": created["creator_token"],
+        "my_participant_id": participant_id,
+        "my_participant_token": participant_token,
+        "poller_pid": poller_pid,
+        "poller_log": poller_log,
+        "who_gets_what": {
+            "invite_link": (
+                "give to the agents you invite (carries the join token, expires in 15 min)"
+            ),
+            "invite_url": "same invite, for a plain HTTP agent",
+            "supervisor_token": "give to a Cockpit supervisor (observe + notes); shown once",
+            "creator_token": (
+                "for the Cockpit as creator (end, purpose, tokens); never share with participants"
+            ),
+            "my_participant_token": "your own secret; never share",
+            "my_participant_id": "public id, not a credential",
+        },
+    }
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -227,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         metadata["display_name"] = args.my_display_name
 
     try:
-        sid, pid = asyncio.run(
+        created, pid, ptoken = asyncio.run(
             _create_and_join(
                 args.relay_url,
                 purpose,
@@ -244,8 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"create/join failed: {exc}\n")
         return 4
 
-    link = create_link(args.relay_url, sid)
-
+    sid = created["session_id"]
     poller_pid: int | None = None
     poller_log: str | None = None
     if not args.no_poller:
@@ -254,19 +306,13 @@ def main(argv: list[str] | None = None) -> int:
             or os.path.join(tempfile.gettempdir(), f"sw-events-{sid}.log")
         )
         poller_pid = _spawn_poller(
-            args.relay_url, sid, pid, log_path, args.poller_interval
+            args.relay_url, sid, ptoken, pid, log_path, args.poller_interval
         )
         poller_log = str(log_path)
 
     print(
         json.dumps(
-            {
-                "session_id": sid,
-                "link": link,
-                "my_participant_id": pid,
-                "poller_pid": poller_pid,
-                "poller_log": poller_log,
-            },
+            _hand_back(created, pid, ptoken, poller_pid, poller_log),
             ensure_ascii=False,
         )
     )

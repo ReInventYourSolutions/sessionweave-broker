@@ -22,6 +22,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
+from sessionweave.access import AuthFailureLimiter
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
@@ -37,7 +38,6 @@ from sessionweave.mcp_adapter import (
 )
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
@@ -50,8 +50,12 @@ from sessionweave.tools import (
     session_join,
     session_leave,
     session_list_participants,
+    session_list_supervisor_tokens,
+    session_mint_join_token,
+    session_mint_supervisor_token,
     session_respond,
     session_resume,
+    session_revoke_supervisor_token,
     session_send,
     session_update_purpose,
     session_update_self,
@@ -143,11 +147,21 @@ Two rules govern every tool here.
    session_id. They act on the session this connection joined and return
    not_in_session until session_join has run.
 
-The usual order: session_describe to look without committing,
-session_join to bind, then session_send / session_respond and
-session_wait_for_event to do the work, then session_leave. Open a new
-session with session_create, which returns a one-time creator_token that
-session_delete later requires."""
+The usual order: session_describe (with an access_token) to look without
+committing, session_join (with the join_token from the invite link) to bind,
+then session_send / session_respond and session_wait_for_event to do the work,
+then session_leave. Joining needs a credential: the join_token carried by an
+invite link (swv://host/<session_id>?jt=<join_token>), the creator_token, or
+the relay admin token. The session id alone grants nothing, and neither does
+a participant_id: session_join returns a secret participant_token, and that is
+the credential for a client that has no stable connection (pass session_id +
+participant_token explicitly, or to session_resume).
+
+Open a new session with session_create. It returns the invite link to hand to
+the agents you want to involve, a creator_token (delete the session, change its
+purpose, mint tokens) and a supervisor_token (observe and post supervisor
+notes), plus the first join_token. Hand each back to whoever asked, labelled
+with its purpose; the plaintext is shown once."""
 
 
 # mcp 2.x transport defaults, mirrored here so they are visible in the relay's
@@ -237,11 +251,22 @@ OptSessionIdArg = Annotated[str | None, Field(
                 "joined on this same connection.")]
 
 ParticipantTokenArg = Annotated[str | None, Field(
-    description="Your participant_id from session_join, passed with "
-                "session_id. Needed only if a call right after joining said "
-                "not_in_session — your runtime opens a new connection per "
-                "call. Otherwise leave unset. It is a credential: keep it "
-                "secret.")]
+    description="The participant_token session_join returned — not your "
+                "participant_id — passed with session_id. Needed only if a "
+                "call right after joining said not_in_session — your runtime "
+                "opens a new connection per call. Otherwise leave unset. It "
+                "is a credential: keep it secret.")]
+
+ManagerTokenArg = Annotated[str, Field(
+    description="The one-time creator_token session_create returned (it cannot "
+                "be recovered), or the relay operator's admin token.")]
+
+AccessTokenArg = Annotated[str | None, Field(
+    description="Any credential that may read the session: the join token "
+                "from the invite link, your participant_token, a "
+                "supervisor_token, the creator_token, or the relay admin "
+                "token. Not needed if you already joined on this same "
+                "connection. It is a credential: keep it secret.")]
 
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
@@ -278,12 +303,37 @@ def _build_fastmcp(
 
         return deco
 
+    def _request_of(ctx: Context | None) -> Any:
+        return getattr(getattr(ctx, "request_context", None), "request", None)
+
+    def _client_ip(ctx: Context | None) -> str:
+        client = getattr(_request_of(ctx), "client", None)
+        return getattr(client, "host", "") or ""
+
+    def _public_base_url(ctx: Context | None) -> str | None:
+        """Configured public base URL, else the MCP HTTP request's own base URL."""
+        configured = os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/")
+        if configured:
+            return configured
+        req = _request_of(ctx)
+        base = getattr(req, "base_url", None)
+        return str(base).rstrip("/") if base is not None else None
+
     def _handle_for(ctx: Context) -> Any:
         return handles.for_connection(
             require_bindable_connection(connection_of(ctx)),
             connections=connections,
             registry=registry,
         )
+
+    def _optional_handle(ctx: Context | None) -> Any:
+        """This connection's handle, or None when there is none to bind."""
+        if ctx is None:
+            return None
+        try:
+            return _handle_for(ctx)
+        except Exception:
+            return None
 
     @asynccontextmanager
     async def _participant(
@@ -326,7 +376,9 @@ def _build_fastmcp(
             yield _handle_for(ctx)
             return
         from sessionweave.http_api import _bind_participant, _unbind_participant
-        handle = await _bind_participant(deps, session_id, participant_token)
+        handle = await _bind_participant(
+            deps, session_id, participant_token, source_ip=_client_ip(ctx)
+        )
         try:
             yield handle
         finally:
@@ -347,11 +399,15 @@ def _build_fastmcp(
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Open a new session and return its session_id plus a one-time creator_token.
+        """Open a new session; returns session_id, invite_link and the one-time tokens.
 
-    Save the creator_token: it is returned exactly once, nothing can
-    recover it, and session_delete requires it. Creating a session does
-    not put you in it — call session_join next.
+    Save creator_token and supervisor_token: each is returned exactly once
+    and nothing can recover it. creator_token manages the session
+    (session_delete, minting and revoking tokens); supervisor_token lets a
+    supervisor observe it. invite_link (swv:// or swvs://) and invite_url
+    (HTTP) carry join_token, a credential valid for 15 minutes that anyone
+    can use to join; mint a fresh one with session_mint_join_token.
+    Creating a session does not put you in it — call session_join next.
 
     persistence is opt-in. Omit it and the session lives in RAM only and
     is discarded once it goes idle, so nothing touches disk. Pass
@@ -362,36 +418,49 @@ def _build_fastmcp(
     can act without a separate briefing.
     """
         return await session_create(
-            deps, {"config": config, "purpose": purpose, "persistence": persistence}
+            deps,
+            {"config": config, "purpose": purpose, "persistence": persistence},
+            public_base_url=_public_base_url(ctx),
         )
 
     @_tool("session_describe")
     async def session_describe_tool(
         session_id: SessionIdArg,
+        access_token: AccessTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Read-only snapshot of a session: config, purpose, roster, persistence state.
 
     Allocates no participant and does not bind this connection, so it is
-    the safe pre-flight before deciding whether to join.
+    the safe pre-flight before deciding whether to join. Needs an
+    access_token (the join token from the invite link will do) unless this
+    connection already joined the session.
     """
-        return await session_describe(deps, {"session_id": session_id})
+        return await session_describe(
+            deps,
+            {"session_id": session_id, "access_token": access_token},
+            handle=_optional_handle(ctx),
+            source_ip=_client_ip(ctx),
+        )
 
     @_tool("session_update_purpose")
     async def session_update_purpose_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
         purpose: PurposeArg = None,
-        session_id: OptSessionIdArg = None,
-        participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Replace the purpose of the session this connection joined, or clear it.
+        """Replace the purpose of a session, or clear it.
 
-    Pass nothing to clear. Broadcasts session.purpose_updated to the
-    other participants. Requires session_join on this connection first.
+    Pass no purpose to clear. Requires the creator_token (or the relay
+    admin token); participants cannot change the purpose. Broadcasts
+    session.purpose_updated to the participants. Needs no session_join.
     """
-        assert ctx is not None
-        async with _participant(ctx, session_id, participant_token) as h:
-            return await session_update_purpose(deps, h, {"purpose": purpose})
+        return await session_update_purpose(
+            deps,
+            {"session_id": session_id, "creator_token": creator_token, "purpose": purpose},
+            source_ip=_client_ip(ctx),
+        )
 
     @_tool("session_join")
     async def session_join_tool(
@@ -416,11 +485,20 @@ def _build_fastmcp(
             ' session_check_inbox / session_wait_for_event. Choose pull if you intend to long-poll'
             ' — session_wait_for_event refuses push participants.'
         )] = None,
+        join_token: Annotated[str | None, Field(description=
+            "The join token from your invite link (the jt value). The session creator's token "
+            "or the relay admin token also works. Required: without a valid one the join is "
+            "refused with permission_denied; an expired link means ask the creator for a new one."
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Join a session as a new participant and bind this connection to it.
 
-    Returns your participant_id, the current roster, the session purpose
+    Needs a join token (see join_token). Returns your participant_id and
+    your secret participant_token (keep it: it is your credential, shown
+    once — pass it to session_resume, or as participant_token with
+    session_id if your runtime opens a new connection per call), the
+    current roster, the session purpose
     and relay_epoch — remember the epoch: a different value on a later
     resume means the relay restarted underneath you.
 
@@ -445,14 +523,18 @@ def _build_fastmcp(
             payload["metadata"] = metadata
         if delivery_mode is not None:
             payload["delivery_mode"] = delivery_mode
-        return await session_join(deps, _handle_for(ctx), payload)
+        if join_token is not None:
+            payload["join_token"] = join_token
+        return await session_join(
+            deps, _handle_for(ctx), payload, source_ip=_client_ip(ctx)
+        )
 
     @_tool("session_resume")
     async def session_resume_tool(
         session_id: SessionIdArg,
-        participant_id: Annotated[str, Field(description=
-            "The participant_id session_join returned. Resuming keeps that identity; joining again"
-            " would make you a second participant."
+        participant_token: Annotated[str, Field(description=
+            "The participant_token session_join returned (not your participant_id). Resuming "
+            "keeps that identity; joining again would make you a second participant."
         )],
         last_acked_seq: Annotated[int | None, Field(description=
             "Highest event seq you already processed; buffered events up to it are not replayed. "
@@ -460,7 +542,7 @@ def _build_fastmcp(
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Re-attach to a session you already joined, keeping the same participant_id.
+        """Re-attach to a session you already joined, keeping the same participant.
 
     Use this after a disconnect rather than joining again, which would
     make you a second participant. Buffered events are replayed; pass
@@ -477,9 +559,10 @@ def _build_fastmcp(
             _handle_for(ctx),
             {
                 "session_id": session_id,
-                "participant_id": participant_id,
+                "participant_token": participant_token,
                 "last_acked_seq": last_acked_seq,
             },
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_leave")
@@ -698,21 +781,96 @@ def _build_fastmcp(
     async def session_delete_tool(
         session_id: SessionIdArg,
         creator_token: Annotated[str, Field(description=
-            "The one-time token session_create returned. There is no other way to delete the "
-            "session, and it cannot be recovered."
+            "The one-time creator token session_create returned (it cannot be recovered), or "
+            "the relay operator's admin token."
         )],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a session permanently, for everyone in it.
 
-    Requires the creator_token returned once by session_create. Every
+    Requires the creator_token returned once by session_create (or the relay admin token). Every
     participant is disconnected with session.ended, and a persisted
     session's stored timeline is removed. Needs no session_join, and
     cannot be undone.
     """
         return await session_delete(
-            deps, {"session_id": session_id, "creator_token": creator_token}
+            deps,
+            {"session_id": session_id, "creator_token": creator_token},
+            source_ip=_client_ip(ctx),
         )
+
+    @_tool("session_mint_join_token")
+    async def session_mint_join_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint a fresh join token and invite link for a session.
+
+    Requires the creator_token (or the relay admin token). The join token
+    is valid for 15 minutes and can be used by several joiners within that
+    time; participants who already joined are unaffected when it expires.
+    Returns join_token, expires_at, invite_url and invite_link.
+    """
+        return await session_mint_join_token(
+            deps, session_id, creator_token,
+            public_base_url=_public_base_url(ctx), source_ip=_client_ip(ctx),
+        )
+
+    @_tool("session_mint_supervisor_token")
+    async def session_mint_supervisor_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint an additional supervisor token for a session.
+
+    Requires the creator_token (or the relay admin token). The token is
+    returned exactly once as supervisor_token, with a token_id you can
+    pass to session_revoke_supervisor_token. A supervisor token cannot
+    mint or revoke tokens.
+    """
+        return await session_mint_supervisor_token(
+            deps, session_id, creator_token, source_ip=_client_ip(ctx)
+        )
+
+    @_tool("session_list_supervisor_tokens")
+    async def session_list_supervisor_tokens_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List a session's supervisor tokens (ids and timestamps, never the secrets).
+
+    Requires the creator_token (or the relay admin token). Each entry has
+    token_id, created_at and revoked_at (null while the token is active).
+    """
+        return {
+            "supervisor_tokens": await session_list_supervisor_tokens(
+                deps, session_id, creator_token, source_ip=_client_ip(ctx)
+            )
+        }
+
+    @_tool("session_revoke_supervisor_token")
+    async def session_revoke_supervisor_token_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        token_id: Annotated[str, Field(description=
+            "The token_id of the supervisor token to revoke, from "
+            "session_mint_supervisor_token, session_create or "
+            "session_list_supervisor_tokens."
+        )],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Revoke a supervisor token so it stops working immediately.
+
+    Requires the creator_token (or the relay admin token). Fails with
+    token_not_found if token_id is unknown. Returns {"revoked": true}.
+    """
+        await session_revoke_supervisor_token(
+            deps, session_id, creator_token, token_id, source_ip=_client_ip(ctx)
+        )
+        return {"revoked": True}
 
     @_tool("session_get_events")
     async def session_get_events_tool(
@@ -739,6 +897,7 @@ def _build_fastmcp(
         order: Annotated[Literal["asc", "desc"], Field(description=
             '"asc" (default) oldest first, or "desc" newest first.'
         )] = "asc",
+        access_token: AccessTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Browse the timeline of a persisted session without bringing it back into RAM.
@@ -747,7 +906,7 @@ def _build_fastmcp(
     "ended"). Page with after_seq / before_seq and limit; order is "asc"
     (default) or "desc". Narrow with kind and participant_id. An
     ephemeral session stores no timeline and returns no_history. Needs no
-    session_join.
+    session_join, but an access_token unless this connection joined the session.
     """
         payload = {
             "session_id": session_id,
@@ -757,8 +916,11 @@ def _build_fastmcp(
             "participant_id": participant_id,
             "limit": limit,
             "order": order,
+            "access_token": access_token,
         }
-        return await session_get_events(deps, payload)
+        return await session_get_events(
+            deps, payload, handle=_optional_handle(ctx), source_ip=_client_ip(ctx)
+        )
 
     return mcp
 
@@ -775,13 +937,15 @@ def build_app() -> Starlette:
     # and session_resume so SDK clients can detect relay restart and
     # invalidate their local seq cursor. See #65.
     relay_epoch = int(time.time())
-    delete_rate_limiter = DeleteRateLimiter()
+    auth_limiter = AuthFailureLimiter()
+    admin_token = os.environ.get("SW_ADMIN_TOKEN", "") or None
     tool_deps = ToolDeps(
         registry,
         relay_epoch=relay_epoch,
         bounds=deps_cfg.bounds,
         metrics=metrics,
-        delete_rate_limiter=delete_rate_limiter,
+        auth_limiter=auth_limiter,
+        admin_token=admin_token,
     )
 
     mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
@@ -805,13 +969,11 @@ def build_app() -> Starlette:
         return JSONResponse({"status": "ready", "version": __version__})
 
     async def info(request: Request) -> JSONResponse:
-        # ``auth_model`` lets SDK clients detect they're talking to the
-        # sub-project #1 deployment (bearer == participant_id, no
-        # rotation / expiry / scope). New SDK versions can surface a
-        # one-shot warning when this value is "shared-bearer-sub-project-1"
-        # so users don't unwittingly assume production-grade auth.
-        # Sub-project #3 (JWT scoped tokens) will return a different
-        # string here.
+        # ``auth_model`` lets SDK clients detect which credentials the relay
+        # issues: "scoped-tokens-v1" means a session is joined with a
+        # short-lived join token, each participant then authenticates with its
+        # own secret participant_token (never its participant_id or the
+        # session id), and supervisors / the creator hold their own tokens.
         #
         # ``relay_epoch`` is the UNIX-seconds startup time. External
         # monitors and SDK clients can poll this; a change means the
@@ -822,7 +984,7 @@ def build_app() -> Starlette:
                 "name": "sessionweave",
                 "version": __version__,
                 "subproject": "#1 (anonymous, transient, in-memory)",
-                "auth_model": "shared-bearer-sub-project-1",
+                "auth_model": "scoped-tokens-v1",
                 "relay_epoch": relay_epoch,
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {
@@ -931,41 +1093,14 @@ def build_app() -> Starlette:
     app.state.handles = handles
     app.state.metrics = metrics
     app.state.tool_deps = tool_deps
-    app.state.delete_rate_limiter = delete_rate_limiter
+    app.state.auth_limiter = auth_limiter
     app.state.state = state
     app.state.firehose = firehose
-    # Optional relay-wide admin token gating the firehose endpoint.
-    # When set, the firehose WS upgrade requires ``?token=<this value>``
-    # — knowing the session_id is no longer sufficient. When unset, the
-    # legacy ``token == session_id`` check remains active so existing
-    # dev clients keep working (with a startup warning).
-    # Operators in multi-tenant production should set this.
-    app.state.firehose_admin_token = os.environ.get("SW_FIREHOSE_ADMIN_TOKEN", "") or None
-    if app.state.firehose_admin_token is None:
-        logging.getLogger(__name__).warning(
-            "SW_FIREHOSE_ADMIN_TOKEN not set; firehose authenticates with "
-            "token==session_id (LEGACY mode). Any session participant can "
-            "subscribe and observe the full event stream. Set the env var "
-            "in production deployments."
-        )
-    # Optional relay-wide admin token gating the supervisor-notes
-    # endpoint. Mirrors the firehose-admin-token pattern: when set, the
-    # supervisor /notes POST requires this token instead of accepting
-    # ``token == session_id``. Knowing the session_id alone is no longer
-    # enough to halt or redirect participants, so an XSS on a session
-    # roster page cannot escalate to "kill all agents".
-    app.state.supervisor_admin_token = (
-        os.environ.get("SW_SUPERVISOR_ADMIN_TOKEN", "") or None
-    )
-    if app.state.supervisor_admin_token is None:
-        logging.getLogger(__name__).warning(
-            "SW_SUPERVISOR_ADMIN_TOKEN not set; supervisor /notes endpoint "
-            "authenticates with token==session_id (LEGACY mode). Any holder "
-            "of the session_id (every session participant inherently) can "
-            "POST supervisor notes targeting any participant, including "
-            "kind=halt. Set the env var in multi-tenant production "
-            "deployments."
-        )
+    # Relay-wide admin token (SW_ADMIN_TOKEN). Unset is a valid, closed
+    # configuration: no admin access and no fallback.
+    app.state.admin_token = admin_token
+    if admin_token is None:
+        logging.getLogger(__name__).info("admin access disabled")
     app.state.supervisor_rate = NoteRateLimiter(
         per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
         per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),

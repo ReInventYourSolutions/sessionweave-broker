@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from sessionweave.access import hash_token as hash_creator_token
 from sessionweave.config import DeploymentDefaults, load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import hash_creator_token
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import ToolDeps, session_create
 
@@ -63,7 +63,7 @@ async def test_create_persisted_ttl_returns_state(deps_with_store, store):
     assert await store.exists(out["session_id"]) is True
     # The stored hash matches the returned plaintext
     sess = await deps_with_store.registry.get_or_raise(out["session_id"])
-    assert sess.creator_token_hash == hash_creator_token(out["creator_token"])
+    assert sess.auth.creator_token_hash == hash_creator_token(out["creator_token"])
 
 
 @pytest.mark.asyncio
@@ -91,3 +91,20 @@ async def test_create_persistence_without_store_raises(deps_no_store):
             "persistence": {"mode": "ttl", "ttl_seconds": 3600},
         })
     assert exc.value.code is ErrorCode.PERSISTENCE_FAILED
+
+
+@pytest.mark.asyncio
+async def test_persisted_create_hands_back_all_credentials(deps_with_store):
+    from sessionweave.access import hash_token
+
+    out = await session_create(
+        deps_with_store,
+        {"persistence": {"mode": "until_deleted"}},
+        public_base_url="https://r.example",
+    )
+    assert out["invite_link"] == f"swvs://r.example/{out['session_id']}?jt={out['join_token']}"
+    assert out["invite_url"] == f"https://r.example/invite/{out['session_id']}?jt={out['join_token']}"
+    assert out["supervisor_token_id"] and out["join_token_expires_at"]
+    auth = await deps_with_store.registry._store.load_auth(out["session_id"])
+    assert auth.match(out["supervisor_token"], 0) is not None
+    assert auth.creator_token_hash == hash_token(out["creator_token"])

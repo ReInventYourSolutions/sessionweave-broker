@@ -50,3 +50,15 @@ async def test_drop_oldest_on_overflow_emits_lag_marker():
         received.append(sub.queue.get_nowait())
     names = [e["name"] for e in received]
     assert "firehose.lagged" in names
+
+
+@pytest.mark.asyncio
+async def test_close_for_signals_only_that_tokens_streams():
+    reg = FirehoseRegistry()
+    a = await reg.subscribe("sid-1", token_id="tok-a")
+    b = await reg.subscribe("sid-1", token_id="tok-b")
+    c = await reg.subscribe("sid-1")
+    other = await reg.subscribe("sid-2", token_id="tok-a")
+    assert await reg.close_for("sid-1", "tok-a") == 1
+    assert a.closed.is_set() and a.close_reason == "supervisor token revoked"
+    assert not b.closed.is_set() and not c.closed.is_set() and not other.closed.is_set()

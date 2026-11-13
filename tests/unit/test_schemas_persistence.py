@@ -84,6 +84,7 @@ def test_session_join_output_persistence_field() -> None:
     out = SessionJoinOutput.model_validate(
         {
             "participant_id": "p_1",
+            "participant_token": "t_1",
             "expires_at": "2026-06-01T00:00:00+00:00",
             "roster": [],
             "config": {},

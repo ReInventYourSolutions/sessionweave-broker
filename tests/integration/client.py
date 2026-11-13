@@ -135,3 +135,29 @@ def _extract_text(result: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"raw": text}
     return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+
+async def create_and_invite(
+    client: Client, args: dict[str, Any] | None = None, **create_args: Any
+) -> tuple[str, str, str]:
+    """``session_create`` over MCP; returns ``(sid, creator_token, join_token)``.
+
+    Joining needs a credential, so every test that joins starts here and
+    passes the join token (or the creator token) to ``session_join``.
+    """
+    out = await client.call_tool("session_create", {**(args or {}), **create_args})
+    return out["session_id"], out["creator_token"], out["join_token"]
+
+
+async def create_and_invite_http(
+    http: httpx2.AsyncClient | Any, **create_json: Any
+) -> tuple[str, str, str]:
+    """REST twin of :func:`create_and_invite` (any httpx-style async client)."""
+    r = await http.post("/v1/sessions", json=dict(create_json))
+    assert r.status_code == 201, r.text
+    body = r.json()
+    return body["session_id"], body["creator_token"], body["join_token"]
+
+
+def bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}

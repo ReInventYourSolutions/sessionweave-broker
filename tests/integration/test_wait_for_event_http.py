@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -32,10 +33,11 @@ async def test_wait_for_event_http_wakes_on_send() -> None:
         r = await c.post("/v1/sessions", json={})
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
-
+        jt = r.json()["join_token"]
         # 2. Join two participants (HTTP join always forces pull mode).
         r = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "waiter", "capabilities": ["listen"]},
         )
         assert r.status_code == 201, r.text
@@ -44,6 +46,7 @@ async def test_wait_for_event_http_wakes_on_send() -> None:
 
         r = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "sender"},
         )
         assert r.status_code == 201, r.text
@@ -95,11 +98,12 @@ async def test_wait_for_event_http_concurrent_waiters_do_not_collide() -> None:
         r = await c.post("/v1/sessions", json={})
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
-
+        jt = r.json()["join_token"]
         # Two listeners + one sender, all pull-mode (HTTP forces it).
         async def join(role: str, capabilities: list[str]) -> tuple[str, str]:
             r = await c.post(
                 f"/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
                 json={"role": role, "capabilities": capabilities},
             )
             assert r.status_code == 201, r.text
@@ -163,9 +167,9 @@ async def test_wait_for_event_http_returns_timed_out() -> None:
         r = await c.post("/v1/sessions", json={})
         assert r.status_code == 201, r.text
         sid = r.json()["session_id"]
-
+        jt = r.json()["join_token"]
         r = await c.post(
-            f"/v1/sessions/{sid}/participants", json={"role": "p"}
+            f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "p"}
         )
         assert r.status_code == 201, r.text
         token = r.json()["participant_token"]
@@ -209,9 +213,9 @@ async def test_wait_releases_in_flight_when_client_times_out() -> None:
             r = await setup.post("/v1/sessions", json={})
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            jt = r.json()["join_token"]
             r = await setup.post(
-                f"/v1/sessions/{sid}/participants", json={"role": "p"}
+                f"/v1/sessions/{sid}/participants", headers=bearer(jt), json={"role": "p"}
             )
             assert r.status_code == 201, r.text
             token = r.json()["participant_token"]

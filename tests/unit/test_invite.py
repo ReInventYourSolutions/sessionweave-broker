@@ -6,26 +6,26 @@ from sessionweave.invite import InviteLink, create_link, parse_link
 
 
 def test_http_relay_emits_swv_scheme() -> None:
-    link = create_link("http://127.0.0.1:8765/mcp", "abc-1234")
-    assert link == "swv://127.0.0.1:8765/abc-1234"
+    link = create_link("http://127.0.0.1:8765/mcp", "abc-1234", "T")
+    assert link == "swv://127.0.0.1:8765/abc-1234?jt=T"
 
 
 def test_https_relay_emits_swvs_scheme_and_strips_default_port() -> None:
-    link = create_link("https://relay.sessionweave.com/mcp", "sid-1")
-    assert link == "swvs://relay.sessionweave.com/sid-1"
+    link = create_link("https://relay.sessionweave.com/mcp", "sid-1", "T")
+    assert link == "swvs://relay.sessionweave.com/sid-1?jt=T"
     # Explicit :443 also gets stripped for tidy hosted-relay links.
-    link2 = create_link("https://relay.sessionweave.com:443/mcp", "sid-2")
-    assert link2 == "swvs://relay.sessionweave.com/sid-2"
+    link2 = create_link("https://relay.sessionweave.com:443/mcp", "sid-2", "T")
+    assert link2 == "swvs://relay.sessionweave.com/sid-2?jt=T"
 
 
 def test_https_relay_keeps_non_default_port() -> None:
-    link = create_link("https://relay.example.com:9443/mcp", "s")
-    assert link == "swvs://relay.example.com:9443/s"
+    link = create_link("https://relay.example.com:9443/mcp", "s", "T")
+    assert link == "swvs://relay.example.com:9443/s?jt=T"
 
 
 def test_http_relay_strips_default_port_80() -> None:
-    link = create_link("http://example.com:80/mcp", "sid")
-    assert link == "swv://example.com/sid"
+    link = create_link("http://example.com:80/mcp", "sid", "T")
+    assert link == "swv://example.com/sid?jt=T"
 
 
 def test_parse_compact_swv_link() -> None:
@@ -48,7 +48,7 @@ def test_parse_compact_swvs_link() -> None:
 
 def test_round_trip_https() -> None:
     relay = "https://relay.sessionweave.com/mcp"
-    link = create_link(relay, "abc-1234")
+    link = create_link(relay, "abc-1234", "T")
     parsed = parse_link(link)
     assert parsed.relay_url == relay
     assert parsed.session_id == "abc-1234"
@@ -56,17 +56,17 @@ def test_round_trip_https() -> None:
 
 def test_create_rejects_blank_session() -> None:
     with pytest.raises(ValueError):
-        create_link("http://h:1/mcp", "")
+        create_link("http://h:1/mcp", "", "T")
 
 
 def test_create_rejects_relay_without_host() -> None:
     with pytest.raises(ValueError):
-        create_link("/mcp", "sid")
+        create_link("/mcp", "sid", "T")
 
 
 def test_create_rejects_unknown_scheme() -> None:
     with pytest.raises(ValueError):
-        create_link("ftp://h:1/mcp", "sid")
+        create_link("ftp://h:1/mcp", "sid", "T")
 
 
 def test_parse_rejects_wrong_scheme() -> None:
@@ -100,16 +100,16 @@ def test_parse_rejects_invalid_fragment() -> None:
 def test_http_invite_url_https():
     from sessionweave.invite import http_invite_url
     assert (
-        http_invite_url("https://relay.sessionweave.com/mcp", "sid-1")
-        == "https://relay.sessionweave.com/invite/sid-1"
+        http_invite_url("https://relay.sessionweave.com/mcp", "sid-1", "T")
+        == "https://relay.sessionweave.com/invite/sid-1?jt=T"
     )
 
 
 def test_http_invite_url_http_with_port():
     from sessionweave.invite import http_invite_url
     assert (
-        http_invite_url("http://127.0.0.1:8765/mcp", "sid-2")
-        == "http://127.0.0.1:8765/invite/sid-2"
+        http_invite_url("http://127.0.0.1:8765/mcp", "sid-2", "T")
+        == "http://127.0.0.1:8765/invite/sid-2?jt=T"
     )
 
 
@@ -118,4 +118,42 @@ def test_http_invite_url_requires_session_id():
 
     from sessionweave.invite import http_invite_url
     with pytest.raises(ValueError):
-        http_invite_url("https://h/mcp", "")
+        http_invite_url("https://h/mcp", "", "T")
+
+
+def test_create_link_carries_join_token() -> None:
+    link = create_link("https://relay.example.com/mcp", "sid-1", "tok_A-b")
+    assert link == "swvs://relay.example.com/sid-1?jt=tok_A-b"
+    link = create_link("http://127.0.0.1:8765/mcp", "sid-1", "t")
+    assert link == "swv://127.0.0.1:8765/sid-1?jt=t"
+
+
+def test_http_invite_url_carries_join_token() -> None:
+    from sessionweave.invite import http_invite_url
+
+    assert (
+        http_invite_url("https://h/mcp", "sid-1", "tok")
+        == "https://h/invite/sid-1?jt=tok"
+    )
+
+
+def test_parse_link_strips_whitespace_and_decodes_jt() -> None:
+    parsed = parse_link(" swvs://h/sid?jt=abc%2D1 \n")
+    assert parsed.join_token == "abc-1"
+    assert parsed.session_id == "sid"
+    assert parsed.relay_url == "https://h/mcp"
+
+
+def test_parse_link_without_jt_has_none() -> None:
+    assert parse_link("swv://h:1/sid").join_token is None
+
+
+def test_link_round_trip_with_jt() -> None:
+    link = create_link("https://relay.sessionweave.com/mcp", "abc", "x_y-z")
+    parsed = parse_link(link)
+    assert (parsed.session_id, parsed.join_token) == ("abc", "x_y-z")
+
+
+def test_create_link_requires_join_token() -> None:
+    with pytest.raises(ValueError):
+        create_link("http://h:1/mcp", "sid", "")

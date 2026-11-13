@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -25,10 +25,10 @@ async def _wait_for(
 async def test_sender_leave_cancels_inflight_command() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
             pb = await b.call_tool(
-                "session_join", {"session_id": sid, "role": "r"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
             )
 
             received_b: list[tuple[str, dict[str, Any]]] = []
@@ -63,10 +63,10 @@ async def test_sender_leave_cancels_inflight_command() -> None:
 async def test_double_respond_returns_already_responded() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
             pb = await b.call_tool(
-                "session_join", {"session_id": sid, "role": "r"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
             )
             send = await a.call_tool(
                 "session_send",
@@ -102,10 +102,10 @@ async def test_double_respond_returns_already_responded() -> None:
 async def test_respond_after_deadline_command_not_found() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
             pb = await b.call_tool(
-                "session_join", {"session_id": sid, "role": "r"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
             )
             send = await a.call_tool(
                 "session_send",
@@ -134,9 +134,9 @@ async def test_respond_after_deadline_command_not_found() -> None:
 async def test_update_self_propagates_participant_updated() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
-            await b.call_tool("session_join", {"session_id": sid, "role": "r"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
+            await b.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "r"})
 
             received_a: list[tuple[str, dict[str, Any]]] = []
             a.on_notification(lambda n, p: received_a.append((n, p)))
@@ -168,10 +168,10 @@ async def test_list_participants_returns_full_roster() -> None:
             sw_client(base) as b,
             sw_client(base) as c,
         ):
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
-            await b.call_tool("session_join", {"session_id": sid, "role": "r"})
-            await c.call_tool("session_join", {"session_id": sid, "role": "r"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
+            await b.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "r"})
+            await c.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "r"})
 
             roster = await a.call_tool("session_list_participants", {})
             roles = [p["role"] for p in roster["roster"]]

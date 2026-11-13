@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
 
 
@@ -28,9 +29,11 @@ async def test_describe_persisted_session_includes_persistence_block(
             )
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            creator = r.json()["creator_token"]
             # Describe
-            r_desc = await c.get(f"{base}/v1/sessions/{sid}")
+            r_desc = await c.get(
+                f"{base}/v1/sessions/{sid}", headers=bearer(creator)
+            )
             assert r_desc.status_code == 200, r_desc.text
             body = r_desc.json()
 
@@ -55,9 +58,11 @@ async def test_describe_ephemeral_session_persistence_null(tmp_path: object) -> 
             r = await c.post(f"{base}/v1/sessions", json={})
             assert r.status_code == 201, r.text
             sid = r.json()["session_id"]
-
+            creator = r.json()["creator_token"]
             # Describe
-            r_desc = await c.get(f"{base}/v1/sessions/{sid}")
+            r_desc = await c.get(
+                f"{base}/v1/sessions/{sid}", headers=bearer(creator)
+            )
             assert r_desc.status_code == 200, r_desc.text
             body = r_desc.json()
 

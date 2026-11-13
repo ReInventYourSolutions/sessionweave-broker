@@ -20,7 +20,7 @@ import asyncio
 import httpx
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -40,18 +40,18 @@ async def test_relay_epoch_is_consistent_across_surfaces() -> None:
 
         async with sw_client(base) as a:
             # 2. Join output carries the same epoch.
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             join_out = await a.call_tool(
-                "session_join", {"session_id": sid, "role": "x"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "x"}
             )
             assert join_out.get("relay_epoch") == info_epoch
-            pid = join_out["participant_id"]
+            ptoken = join_out["participant_token"]
 
         # 3. Resume output carries the same epoch (on a fresh transport).
         async with sw_client(base) as a2:
             resume_out = await a2.call_tool(
                 "session_resume",
-                {"session_id": sid, "participant_id": pid},
+                {"session_id": sid, "participant_token": ptoken},
             )
             assert resume_out.get("relay_epoch") == info_epoch
 

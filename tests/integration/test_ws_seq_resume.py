@@ -26,7 +26,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.integration.client import sw_client
+from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -42,11 +42,12 @@ async def _wait_for(
 
 
 async def _join_and_get_token(
-    base: str, sid: str, role: str = "worker"
+    base: str, sid: str, jt: str, role: str = "worker"
 ) -> tuple[str, str]:
     async with httpx.AsyncClient() as c:
         r = await c.post(
             f"{base}/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": role, "capabilities": ["respond"]},
         )
         r.raise_for_status()
@@ -64,11 +65,12 @@ async def test_ws_frames_carry_monotonic_seq() -> None:
     async with relay_subprocess() as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as c:
-            sid = (
+            _created = (
                 await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
-        pid_b, tok_b = await _join_and_get_token(base, sid, role="worker")
+        pid_b, tok_b = await _join_and_get_token(base, sid, jt, role="worker")
 
         ws_url = (
             f"{base_ws}/v1/sessions/{sid}/participants/me/events?token={tok_b}"
@@ -78,7 +80,7 @@ async def test_ws_frames_carry_monotonic_seq() -> None:
             # relay enqueues three events on B's WS.
             async with sw_client(base) as a:
                 await a.call_tool(
-                    "session_join", {"session_id": sid, "role": "sender"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
                 )
                 for i in range(3):
                     await a.call_tool(
@@ -119,11 +121,12 @@ async def test_ws_reconnect_with_last_acked_seq_skips_acked_events() -> None:
     async with relay_subprocess() as base:
         base_ws = base.replace("http://", "ws://")
         async with httpx.AsyncClient() as c:
-            sid = (
+            _created = (
                 await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
-        pid_b, tok_b = await _join_and_get_token(base, sid)
+        pid_b, tok_b = await _join_and_get_token(base, sid, jt)
 
         # Keep A alive across both WS phases. If A left mid-test, its
         # inflight trackers would be cancelled (sender_gone), at which
@@ -134,7 +137,7 @@ async def test_ws_reconnect_with_last_acked_seq_skips_acked_events() -> None:
         # holds A open throughout.
         async with sw_client(base) as a:
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
 
             # Push 6 events. We'll consume 3 over the first socket,
@@ -246,15 +249,16 @@ async def test_rest_inbox_drain_includes_seq_and_respects_last_acked_seq() -> No
     """
     async with relay_subprocess() as base:
         async with httpx.AsyncClient() as c:
-            sid = (
+            _created = (
                 await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
-            ).json()["session_id"]
+            ).json()
+            sid, jt = _created["session_id"], _created["join_token"]
 
-        _, tok_b = await _join_and_get_token(base, sid)
+        _, tok_b = await _join_and_get_token(base, sid, jt)
 
         async with sw_client(base) as a:
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             for i in range(4):
                 await a.call_tool(
@@ -271,7 +275,7 @@ async def test_rest_inbox_drain_includes_seq_and_respects_last_acked_seq() -> No
             # seqs are strictly monotonic.
             async with httpx.AsyncClient() as c:
                 pid_b = (await c.get(
-                    f"{base}/v1/sessions/{sid}", headers={}
+                    f"{base}/v1/sessions/{sid}", headers=bearer(tok_b)
                 )).json()["roster"]
                 # find B's participant_id
                 target_pid = next(

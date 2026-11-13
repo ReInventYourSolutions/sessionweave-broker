@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from sessionweave.access import AuthFailureLimiter
 from sessionweave.config import DeploymentDefaults, load_deployment_defaults
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
-from sessionweave.persistence_token import DeleteRateLimiter
 from sessionweave.registry import SessionRegistry
 from sessionweave.tools import ToolDeps, session_create, session_delete
 
@@ -31,10 +31,10 @@ async def deps(store):
         defaults=defaults, connections=ConnectionManager(),
         metrics=None, firehose=None, store=store,
     )
-    rl = DeleteRateLimiter(max_failures=5, window_seconds=60.0)
+    rl = AuthFailureLimiter(max_failures=5, window_seconds=60.0)
     return ToolDeps(
         registry=registry, bounds=defaults.bounds, metrics=None,
-        delete_rate_limiter=rl,
+        auth_limiter=rl,
     )
 
 
@@ -75,21 +75,28 @@ async def test_delete_unknown_session_raises_not_found(deps):
 
 
 @pytest.mark.asyncio
-async def test_delete_rate_limiter_blocks_correct_token_after_threshold(deps):
+async def test_delete_throttles_bad_tokens_but_never_a_valid_one(deps):
     created = await session_create(deps, {
         "persistence": {"mode": "ttl", "ttl_seconds": 3600},
     })
     sid = created["session_id"]
     good = created["creator_token"]
-    # 5 bad attempts to trigger ban
     for _ in range(5):
         with pytest.raises(ToolError):
-            await session_delete(deps, {
-                "session_id": sid, "creator_token": "wrong",
-            })
-    # 6th — even with the right token — is rate-limited
+            await session_delete(deps, {"session_id": sid, "creator_token": "wrong"})
+    # 6th bad attempt is throttled
     with pytest.raises(ToolError) as exc:
-        await session_delete(deps, {
-            "session_id": sid, "creator_token": good,
-        })
+        await session_delete(deps, {"session_id": sid, "creator_token": "wrong"})
+    assert exc.value.code is ErrorCode.RATE_LIMITED
+    # the valid token still deletes
+    out = await session_delete(deps, {"session_id": sid, "creator_token": good})
+    assert out["deleted_at"]
+
+
+@pytest.mark.asyncio
+async def test_delete_with_session_id_as_token_denied(deps):
+    created = await session_create(deps, {})
+    sid = created["session_id"]
+    with pytest.raises(ToolError) as exc:
+        await session_delete(deps, {"session_id": sid, "creator_token": sid})
     assert exc.value.code is ErrorCode.PERMISSION_DENIED

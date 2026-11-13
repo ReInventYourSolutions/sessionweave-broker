@@ -14,9 +14,17 @@ Standalone usage:
     python -m sessionweave.poller \
         --relay-url https://relay.sessionweave.com/mcp \
         --session-id <sid> \
+        --participant-token <participant_token> \
         --participant-id <pid> \
         --log /tmp/sw-events.log \
         --interval 3.0
+
+``--participant-token`` is the secret ``session_join`` returned; it is the
+only credential (it may instead be supplied through the
+``SW_PARTICIPANT_TOKEN`` environment variable, which keeps it out of the
+process list). ``--participant-id`` is the public id from the same
+output; it is used ONLY to recognise this participant's own
+``participant.left`` event and is never sent to the relay as a credential.
 
 Exit when ``session.ended`` or a matching ``participant.left`` event
 is observed for the polled participant. Otherwise runs until killed.
@@ -56,7 +64,7 @@ def _unwrap(res: Any) -> Any:
 
 
 async def _drain_once(
-    relay_url: str, session_id: str, participant_id: str
+    relay_url: str, session_id: str, participant_token: str
 ) -> list[dict[str, Any]]:
     async with streamable_http_client(relay_url) as (r, w):
         async with ClientSession(r, w) as session:
@@ -65,7 +73,7 @@ async def _drain_once(
                 name="session_resume",
                 arguments={
                     "session_id": session_id,
-                    "participant_id": participant_id,
+                    "participant_token": participant_token,
                 },
             )
             res = await session.call_tool(
@@ -88,6 +96,7 @@ def _is_terminal(msg: dict[str, Any], own_pid: str) -> bool:
 async def run(
     relay_url: str,
     session_id: str,
+    participant_token: str,
     participant_id: str,
     log_path: Path,
     interval: float,
@@ -107,7 +116,9 @@ async def run(
         )
         while True:
             try:
-                msgs = await _drain_once(relay_url, session_id, participant_id)
+                msgs = await _drain_once(
+                    relay_url, session_id, participant_token
+                )
             except Exception as exc:
                 log_file.write(
                     json.dumps({"ts": _now(), "error": str(exc)}) + "\n"
@@ -136,7 +147,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Full HTTP MCP endpoint of the relay.",
     )
     p.add_argument("--session-id", required=True)
-    p.add_argument("--participant-id", required=True)
+    p.add_argument(
+        "--participant-token",
+        default=os.environ.get("SW_PARTICIPANT_TOKEN"),
+        help="Secret participant_token from session_join (the credential). "
+        "Defaults to $SW_PARTICIPANT_TOKEN.",
+    )
+    p.add_argument(
+        "--participant-id",
+        required=True,
+        help="Public participant_id; used only to spot your own "
+        "participant.left, never sent as a credential.",
+    )
     p.add_argument(
         "--log",
         default="/tmp/sw-events.log",
@@ -148,7 +170,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=3.0,
         help="Seconds between poll cycles (default 3).",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not args.participant_token:
+        p.error("--participant-token (or $SW_PARTICIPANT_TOKEN) is required")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -157,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         run(
             args.relay_url,
             args.session_id,
+            args.participant_token,
             args.participant_id,
             Path(args.log),
             args.interval,

@@ -40,7 +40,6 @@ CONNECTION_BOUND = [
     "session_list_participants",
     "session_respond",
     "session_send",
-    "session_update_purpose",
     "session_update_self",
     "session_wait_for_event",
 ]

@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -53,14 +53,14 @@ async def test_mcp_push_envelope_carries_seq() -> None:
     """
     async with relay_subprocess() as base:
         async with sw_client(base) as a, sw_client(base) as b:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
             pb = await b.call_tool(
                 "session_join",
                 {
-                    "session_id": sid,
+                    "session_id": sid, "join_token": jt,
                     "role": "worker",
                     "capabilities": ["respond"],
                 },
@@ -130,9 +130,9 @@ async def test_mcp_resume_with_last_acked_seq_filters_replay() -> None:
     """
     async with relay_subprocess() as base:
         async with sw_client(base) as a:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             await a.call_tool(
-                "session_join", {"session_id": sid, "role": "sender"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
             )
 
             # B joins, consumes some events via push, captures seq,
@@ -142,7 +142,7 @@ async def test_mcp_resume_with_last_acked_seq_filters_replay() -> None:
                 pb = await b.call_tool(
                     "session_join",
                     {
-                        "session_id": sid,
+                        "session_id": sid, "join_token": jt,
                         "role": "worker",
                         "capabilities": ["respond"],
                     },
@@ -202,7 +202,7 @@ async def test_mcp_resume_with_last_acked_seq_filters_replay() -> None:
                     "session_resume",
                     {
                         "session_id": sid,
-                        "participant_id": pb["participant_id"],
+                        "participant_token": pb["participant_token"],
                         "last_acked_seq": captured_seq,
                     },
                 )

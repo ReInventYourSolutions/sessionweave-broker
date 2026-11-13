@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.integration.client import bearer, create_and_invite_http
 from tests.integration.harness import relay_subprocess
 
 
@@ -37,12 +38,13 @@ async def test_create_join_send_respond_round_trip() -> None:
             json={"purpose": {"kind": "rest-smoke", "instructions": "hi"}},
         )
         assert r.status_code == 201
-        sid = r.json()["session_id"]
+        sid, jt = r.json()["session_id"], r.json()["join_token"]
         assert r.json()["purpose"] == {"kind": "rest-smoke", "instructions": "hi"}
 
         # 2. Two participants join
         sender = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "sender", "capabilities": ["s"]},
         )
         assert sender.status_code == 201
@@ -50,6 +52,7 @@ async def test_create_join_send_respond_round_trip() -> None:
 
         receiver = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "receiver", "capabilities": ["r"]},
         )
         receiver_token = receiver.json()["participant_token"]
@@ -108,9 +111,7 @@ async def test_create_join_send_respond_round_trip() -> None:
 @pytest.mark.asyncio
 async def test_missing_bearer_returns_401() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (
-            await c.post("/v1/sessions", json={})
-        ).json()["session_id"]
+        sid, _creator, _jt = await create_and_invite_http(c)
         r = await c.get(f"/v1/sessions/{sid}/participants")
         assert r.status_code == 401
         assert r.json()["error"]["code"] == "not_in_session"
@@ -120,15 +121,40 @@ async def test_missing_bearer_returns_401() -> None:
 @pytest.mark.asyncio
 async def test_bad_bearer_returns_401() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (
-            await c.post("/v1/sessions", json={})
-        ).json()["session_id"]
+        sid, _creator, _jt = await create_and_invite_http(c)
         r = await c.get(
             f"/v1/sessions/{sid}/participants",
             headers={"Authorization": "Bearer 00000000-0000-0000-0000-000000000000"},
         )
-        # Token unknown to this session → not_in_session.
-        assert r.status_code == 401
+        # Token unknown to this session -> permission_denied.
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "permission_denied"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_session_id_and_participant_id_are_not_bearers() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        sid, _creator, jt = await create_and_invite_http(c)
+        joined = (
+            await c.post(
+                f"/v1/sessions/{sid}/participants",
+                headers=bearer(jt),
+                json={"role": "p"},
+            )
+        ).json()
+        assert joined["participant_token"] != joined["participant_id"]
+        for bad in (sid, joined["participant_id"]):
+            r = await c.get(
+                f"/v1/sessions/{sid}/participants", headers=bearer(bad)
+            )
+            assert r.status_code == 403
+            assert r.json()["error"]["code"] == "permission_denied"
+        ok = await c.get(
+            f"/v1/sessions/{sid}/participants",
+            headers=bearer(joined["participant_token"]),
+        )
+        assert ok.status_code == 200
 
 
 @pytest.mark.integration
@@ -136,7 +162,8 @@ async def test_bad_bearer_returns_401() -> None:
 async def test_describe_unknown_session_returns_404() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
         r = await c.get(
-            "/v1/sessions/00000000-0000-0000-0000-000000000000"
+            "/v1/sessions/00000000-0000-0000-0000-000000000000",
+            headers=bearer("whatever"),
         )
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "session_not_found"
@@ -146,9 +173,10 @@ async def test_describe_unknown_session_returns_404() -> None:
 @pytest.mark.asyncio
 async def test_leave_returns_204() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        sid, _creator, jt = await create_and_invite_http(c)
         join = await c.post(
             f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
             json={"role": "p"},
         )
         token = join.json()["participant_token"]
@@ -162,7 +190,7 @@ async def test_leave_returns_204() -> None:
             f"/v1/sessions/{sid}/participants",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert r2.status_code == 401
+        assert r2.status_code in (401, 403)
 
 
 @pytest.mark.integration
@@ -174,13 +202,17 @@ async def test_leave_with_feedback_propagates_on_participant_left() -> None:
     ``participant.left`` event so other participants can collect it.
     """
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
+        sid, _creator, jt = await create_and_invite_http(c)
         observer = await c.post(
-            f"/v1/sessions/{sid}/participants", json={"role": "observer"}
+            f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
+            json={"role": "observer"},
         )
         ot = observer.json()["participant_token"]
         leaver = await c.post(
-            f"/v1/sessions/{sid}/participants", json={"role": "worker"}
+            f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
+            json={"role": "worker"},
         )
         lt = leaver.json()["participant_token"]
         leaver_pid = leaver.json()["participant_id"]
@@ -219,8 +251,12 @@ async def test_leave_with_feedback_propagates_on_participant_left() -> None:
 @pytest.mark.asyncio
 async def test_leave_feedback_too_large_returns_413() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
-        join = await c.post(f"/v1/sessions/{sid}/participants", json={"role": "p"})
+        sid, _creator, jt = await create_and_invite_http(c)
+        join = await c.post(
+            f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
+            json={"role": "p"},
+        )
         token = join.json()["participant_token"]
         oversize = "x" * 5000  # > 4 KiB cap
         r = await c.request(
@@ -237,23 +273,29 @@ async def test_leave_feedback_too_large_returns_413() -> None:
 @pytest.mark.asyncio
 async def test_update_purpose_round_trip() -> None:
     async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
-        sid = (
-            await c.post(
-                "/v1/sessions",
-                json={"purpose": {"kind": "v1", "step": 1}},
-            )
-        ).json()["session_id"]
-        join = await c.post(
-            f"/v1/sessions/{sid}/participants", json={"role": "host"}
+        sid, creator, jt = await create_and_invite_http(
+            c, purpose={"kind": "v1", "step": 1}
         )
-        token = join.json()["participant_token"]
+        join = await c.post(
+            f"/v1/sessions/{sid}/participants",
+            headers=bearer(jt),
+            json={"role": "host"},
+        )
+        ptoken = join.json()["participant_token"]
+        # A participant may not change the purpose; the creator may.
+        denied = await c.patch(
+            f"/v1/sessions/{sid}/purpose",
+            headers=bearer(ptoken),
+            json={"purpose": {"kind": "v1", "step": 9}},
+        )
+        assert denied.status_code == 403
         r = await c.patch(
             f"/v1/sessions/{sid}/purpose",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=bearer(creator),
             json={"purpose": {"kind": "v1", "step": 2}},
         )
         assert r.status_code == 200
         assert r.json()["purpose"] == {"kind": "v1", "step": 2}
         # describe reflects it
-        d = await c.get(f"/v1/sessions/{sid}")
+        d = await c.get(f"/v1/sessions/{sid}", headers=bearer(ptoken))
         assert d.json()["purpose"] == {"kind": "v1", "step": 2}

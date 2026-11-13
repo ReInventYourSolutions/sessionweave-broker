@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from tests.integration.client import sw_client
+from tests.integration.client import create_and_invite, sw_client
 from tests.integration.harness import relay_subprocess
 
 
@@ -25,11 +25,11 @@ async def _wait_for(
 async def test_specific_to_offline_target_buffers_and_delivers_on_resume() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
             async with sw_client(base) as b:
                 pb = await b.call_tool(
-                    "session_join", {"session_id": sid, "role": "r"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
                 )
             # b is disconnected. Give the relay a moment to notice.
             await asyncio.sleep(0.5)
@@ -55,7 +55,7 @@ async def test_specific_to_offline_target_buffers_and_delivers_on_resume() -> No
                     "session_resume",
                     {
                         "session_id": sid,
-                        "participant_id": pb["participant_id"],
+                        "participant_token": pb["participant_token"],
                     },
                 )
                 await _wait_for(
@@ -71,14 +71,14 @@ async def test_specific_to_offline_target_buffers_and_delivers_on_resume() -> No
 async def test_sender_disconnect_then_resume_sees_buffered_results() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as b:
-            sid = (await b.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(b, {})
             pb = await b.call_tool(
-                "session_join", {"session_id": sid, "role": "r"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
             )
 
             async with sw_client(base) as a:
                 pa = await a.call_tool(
-                    "session_join", {"session_id": sid, "role": "sender"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "sender"}
                 )
                 send = await a.call_tool(
                     "session_send",
@@ -109,7 +109,7 @@ async def test_sender_disconnect_then_resume_sees_buffered_results() -> None:
                     "session_resume",
                     {
                         "session_id": sid,
-                        "participant_id": pa["participant_id"],
+                        "participant_token": pa["participant_token"],
                     },
                 )
                 await _wait_for(
@@ -127,15 +127,15 @@ async def test_receiver_past_grace_evicted() -> None:
         env_overrides={"SW_DEFAULT_OFFLINE_GRACE_SECONDS": "1"}
     ) as base:
         async with sw_client(base) as a:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
-            await a.call_tool("session_join", {"session_id": sid, "role": "s"})
+            sid, _creator, jt = await create_and_invite(a, {})
+            await a.call_tool("session_join", {"session_id": sid, "join_token": jt, "role": "s"})
 
             received_a: list[tuple[str, dict[str, Any]]] = []
             a.on_notification(lambda n, p: received_a.append((n, p)))
 
             async with sw_client(base) as b:
                 await b.call_tool(
-                    "session_join", {"session_id": sid, "role": "r"}
+                    "session_join", {"session_id": sid, "join_token": jt, "role": "r"}
                 )
 
             # b disconnected; wait past grace + tick (~1s grace + 1s tick)
@@ -157,19 +157,19 @@ async def test_receiver_past_grace_evicted() -> None:
 async def test_resume_race_second_wins() -> None:
     async with relay_subprocess() as base:
         async with sw_client(base) as a:
-            sid = (await a.call_tool("session_create", {}))["session_id"]
+            sid, _creator, jt = await create_and_invite(a, {})
             pa = await a.call_tool(
-                "session_join", {"session_id": sid, "role": "x"}
+                "session_join", {"session_id": sid, "join_token": jt, "role": "x"}
             )
         await asyncio.sleep(0.3)
         async with sw_client(base) as r1, sw_client(base) as r2:
             await r1.call_tool(
                 "session_resume",
-                {"session_id": sid, "participant_id": pa["participant_id"]},
+                {"session_id": sid, "participant_token": pa["participant_token"]},
             )
             await r2.call_tool(
                 "session_resume",
-                {"session_id": sid, "participant_id": pa["participant_id"]},
+                {"session_id": sid, "participant_token": pa["participant_token"]},
             )
             roster = await r2.call_tool("session_list_participants", {})
             assert roster["roster"][0]["participant_id"] == pa["participant_id"]

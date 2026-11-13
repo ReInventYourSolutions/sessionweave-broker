@@ -51,7 +51,7 @@ docker run --rm -p 8765:8765 sessionweave:dev
 The relay exposes:
 
 - **REST** — `/v1/sessions`, `/v1/sessions/{sid}/...` — full CRUD over the protocol
-- **WebSocket** — `/v1/sessions/{sid}/participants/me/events?token=<bearer>` — live event stream
+- **WebSocket** — `/v1/sessions/{sid}/participants/me/events?token=<participant_token>` — live event stream
 - **MCP** — `POST /mcp` — Streamable HTTP endpoint with the same tool catalogue
 - `GET /v1/info` — name, version, transports list
 - `GET /` — **docs hub**: a self-serve HTML page indexing everything the broker
@@ -66,14 +66,15 @@ The relay exposes:
 - `GET /healthz` — `200` while serving, `503` once shutdown drain begins
 - `GET /readyz` — `200` once the port is bound
 - `GET /metrics` — Prometheus exposition (text format)
-- **WS firehose** — `/v1/sessions/{sid}/firehose?token=<sid>` — full event stream for non-participants (observers, supervisors)
-- **Supervisor notes** — `POST /v1/sessions/{sid}/supervisor/notes` — broadcast a note / halt / continue / redirect (Bearer = session_id)
-- **End session** — `DELETE /v1/sessions/{sid}` (Bearer = session_id)
-- **GET** `/invite/{sid}` — self-describing **participation brief** (Markdown). Hand the
+- **WS firehose** — `/v1/sessions/{sid}/firehose?token=<supervisor|creator|admin token>` — full event stream for non-participants (observers, supervisors)
+- **Supervisor notes** — `POST /v1/sessions/{sid}/supervisor/notes` — broadcast a note / halt / continue / redirect (Bearer = supervisor, creator or admin token)
+- **End session** — `DELETE /v1/sessions/{sid}` (Bearer = creator or admin token)
+- **GET** `/invite/{sid}?jt=<join_token>` — self-describing **participation brief** (Markdown). Hand the
   directly-fetchable URL `https://<host>/invite/<sid>` to any HTTP agent: it returns the
   session purpose plus the exact non-blocking HTTP recipe to join, exchange, and leave —
   no SDK, MCP, or skill required. `swv://`/`swvs://` remain the compact alias
-  (`swvs://h/sid` ⇄ `https://h/invite/sid`).
+  (`swvs://h/sid?jt=…` ⇄ `https://h/invite/sid?jt=…`). Without a valid `jt` the page
+  answers 403 and reveals nothing about the session.
 
 See the [REST + WS surface](#rest--websocket-surface) section below for the
 endpoint catalogue. The MCP tool catalogue is documented further down.
@@ -210,10 +211,14 @@ The contract is one-for-one with the MCP tools.
 |------|------|---------|
 | `GET` | `/v1/info` | Relay name, version, transports list |
 | `POST` | `/v1/sessions` | Create a session (`purpose`, `config`) |
-| `GET` | `/v1/sessions/{sid}` | Describe a session (read-only) |
-| `PATCH` | `/v1/sessions/{sid}/purpose` | Update the purpose (auth required) |
-| `POST` | `/v1/sessions/{sid}/participants` | Join — returns `participant_id` + `participant_token` |
-| `GET` | `/v1/sessions/{sid}/participants` | Roster (auth required) |
+| `GET` | `/v1/sessions/{sid}` | Describe a session (read-only; any participant, joiner, supervisor, creator or admin token) |
+| `PATCH` | `/v1/sessions/{sid}/purpose` | Update the purpose (creator or admin token) |
+| `POST` | `/v1/sessions/{sid}/participants` | Join with a join, creator or admin token — returns `participant_id` + secret `participant_token` |
+| `GET` | `/v1/sessions/{sid}/participants` | Roster (any credential that may read) |
+| `POST` | `/v1/sessions/{sid}/join-tokens` | Mint a join token (creator or admin) |
+| `POST` / `GET` | `/v1/sessions/{sid}/supervisor-tokens` | Mint / list supervisor tokens (creator or admin) |
+| `DELETE` | `/v1/sessions/{sid}/supervisor-tokens/{token_id}` | Revoke a supervisor token (creator or admin) |
+| `GET` | `/v1/sessions/{sid}/access` | Which role does this Bearer hold in the session |
 | `PATCH` | `/v1/sessions/{sid}/participants/me` | Update self (role / capabilities / metadata) |
 | `DELETE` | `/v1/sessions/{sid}/participants/me` | Leave; optional JSON body with `feedback` |
 | `POST` | `/v1/sessions/{sid}/participants/me/inbox/drain` | Pop buffered events |
@@ -222,10 +227,14 @@ The contract is one-for-one with the MCP tools.
 | `POST` | `/v1/sessions/{sid}/commands/{cid}/responses` | Respond to a command |
 | `WS` | `/v1/sessions/{sid}/participants/me/events?token=…` | Live event stream |
 
-Auth (sub-project #1): the bearer token IS the `participant_id` returned
-on join. Send as `Authorization: Bearer <participant_id>` on every
-authenticated route, or as `?token=…` on the WS upgrade. Sub-project #3
-will swap this for a JWT without changing the surface.
+Auth: `POST /v1/sessions` returns the `invite_url` / `invite_link` (carrying a
+15-minute, multi-use join token `jt`), a `creator_token` and a
+`supervisor_token`. Joining needs one of the join token, the creator token or
+the relay admin token (`SW_ADMIN_TOKEN`) as `Authorization: Bearer …`. The join
+returns a secret `participant_token`, distinct from `participant_id`; send it as
+`Authorization: Bearer <participant_token>` on every participant route, or as
+`?token=…` on the WS upgrade. The session id and the `participant_id` are
+identifiers, never credentials.
 
 REST joiners are pull-mode by definition; pair with the WS endpoint for
 push delivery, or poll `inbox/drain`. For turn-based agents that can't
@@ -240,9 +249,12 @@ object `{"name": "<event>", "payload": {...}}` matching the
 RELAY=https://relay.sessionweave.com
 
 # Create + join + send + drain
-SID=$(curl -sS -X POST "$RELAY/v1/sessions" -H 'content-type: application/json' \
-  -d '{"purpose":{"kind":"smoke"}}' | jq -r .session_id)
+CREATED=$(curl -sS -X POST "$RELAY/v1/sessions" -H 'content-type: application/json' \
+  -d '{"purpose":{"kind":"smoke"}}')
+SID=$(echo "$CREATED" | jq -r .session_id)
+JT=$(echo "$CREATED" | jq -r .join_token)
 TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
+  -H "authorization: Bearer $JT" \
   -H 'content-type: application/json' -d '{"role":"observer"}' | jq -r .participant_token)
 curl -sS -X POST "$RELAY/v1/sessions/$SID/commands" \
   -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
@@ -276,11 +288,12 @@ themselves. Recommended shape (per skill v0.11.0+):
 
 | tool | purpose |
 |---|---|
-| `session_create` | Create a session; returns `session_id`, effective config, and any `purpose` you passed in. |
-| `session_describe` | Read-only snapshot: `{config, purpose, roster}` without allocating a participant. Pre-flight for invite-link recipients. |
-| `session_update_purpose` | Replace the session's `purpose` (or clear it) and broadcast `session.purpose_updated` to other participants. |
-| `session_join` | Bind the calling MCP connection to a new participant. Optional `delivery_mode = "push"` (default) or `"pull"` chooses how server events reach you. |
-| `session_resume` | Re-bind a fresh MCP connection to an existing `participant_id`. Echoes `purpose` back. |
+| `session_create` | Create a session; returns `session_id`, effective config, any `purpose` you passed in, the invite link, the first `join_token`, a `creator_token` and a `supervisor_token`. |
+| `session_describe` | Read-only snapshot: `{config, purpose, roster}` without allocating a participant. Takes an `access_token` unless the connection is already a participant of that session. |
+| `session_update_purpose` | Replace the session's `purpose` (or clear it; `creator_token` required) and broadcast `session.purpose_updated` to other participants. |
+| `session_mint_join_token`, `session_mint_supervisor_token`, `session_list_supervisor_tokens`, `session_revoke_supervisor_token` | Manage access (creator or admin token). |
+| `session_join` | Needs `join_token` (or the creator / admin token). Binds the calling MCP connection to a new participant and returns its secret `participant_token`. Optional `delivery_mode = "push"` (default) or `"pull"` chooses how server events reach you. |
+| `session_resume` | Re-bind a fresh MCP connection to an existing participant, authenticated by its `participant_token`. Echoes `purpose` back. |
 | `session_leave` | Leave the session (broadcast to others). |
 | `session_update_self` | Replace fields on the caller's participant; broadcast. |
 | `session_list_participants` | Snapshot of the roster. |
@@ -361,51 +374,49 @@ sub-project #2.
 
 ## Threat model (sub-project #1)
 
-The current deployment is the **anonymous, transient, in-memory** slice.
-That means a few specific things are NOT in the threat model and operators
-should know about them before exposing the relay to multi-tenant traffic.
-``GET /v1/info`` advertises the model via the
-``"auth_model": "shared-bearer-sub-project-1"`` field so SDK clients can
-warn.
+Sessions are **transient and in-memory** unless persistence is requested, and
+access is controlled by scoped tokens. ``GET /v1/info`` advertises the model via
+``"auth_model": "scoped-tokens-v1"``.
 
-What the bearer-token model actually is:
+What each credential is:
 
-- ``participant_token == participant_id``. There is no separation between
-  identity and credential, no expiry, no rotation, no per-action scope.
-- Anyone who learns a participant_id can call any endpoint as that
-  participant until the session ends (idle TTL, supervisor end, server
-  shutdown).
+- **Join token** — 256-bit, valid 15 minutes, multi-use within that window,
+  carried by the invite link (``?jt=``). It lets its holder read the session and
+  join it; expiry never affects participants already joined.
+- **Participant token** — a secret returned once by the join, distinct from the
+  ``participant_id`` (an identifier that authenticates nothing). It is the only
+  credential for participant routes, the events WebSocket and
+  ``session_resume``.
+- **Creator token** — returned once at create: delete the session, change its
+  purpose, mint join and supervisor tokens, join, read, supervise.
+- **Supervisor token** — observe (firehose) and post supervisor notes; revocable
+  individually by the creator.
+- **Admin token** — the relay-wide ``SW_ADMIN_TOKEN``. Unset means no admin access.
+- The session id is **never** a credential on any path.
+
+Only SHA-256 digests of tokens are stored (RAM and SQLite); comparisons are
+constant-time. Failed-token attempts are throttled per (session id, source IP);
+a valid token is never throttled.
+
+Remaining notes for operators:
+
 - ``ConnectionManager.bind`` is intentionally **last-resume-wins**: a
-  second client presenting the same ``participant_id`` displaces the
-  first without notification. This is a useful reconnect primitive when
-  the holder is the original client, and a session-hijack primitive
-  when someone else has stolen the token.
+  second client presenting the same ``participant_token`` displaces the
+  first without notification. A leaked participant token is therefore a
+  session-hijack primitive for that participant until the session ends.
 
 Concrete leak channels operators must defend against:
 
 | Channel | Mitigation |
 |---|---|
 | HTTP access logs that record bearer headers | Strip ``Authorization`` at the reverse proxy (Caddy) or the relay's log formatter. |
-| WebSocket URLs that include ``?token=<participant_id>`` in the Network tab of any browser | Don't share screenshots / videos of DevTools; use a private-mode browser for live-session demos. |
+| WebSocket URLs / invite URLs that carry ``?token=`` or ``?jt=`` | The relay redacts these values in its own access logs; verify any front-of-relay proxy, and don't share screenshots of DevTools. |
 | TLS-terminating proxies that log query strings (CDN, WAF) | Caddy doesn't by default; verify any front-of-relay proxy. |
 | Prometheus labels in a previous build had per-participant cardinality | Locked down: see #58 (structural test guard). |
-| ``supervisor.note`` posted by anyone with the session_id | Set ``SW_SUPERVISOR_ADMIN_TOKEN`` (#59) to require a separate admin secret. |
-| ``firehose`` open to any session participant | Set ``SW_FIREHOSE_ADMIN_TOKEN`` (#57) to require an admin secret. |
 
-What is **explicitly NOT in scope** for sub-project #1:
-
-- Token rotation, expiry, or revocation.
-- Per-action scope (e.g. "can send commands but not subscribe to
-  firehose").
-- Concurrent-bind protection beyond the existing
-  ``last-resume-wins``.
-- Single-use invite tokens (the invite link — really the session id it
-  carries, in either the ``https://<host>/invite/<sid>`` or compact
-  ``swv://`` form — is itself a bearer: anyone with it can
-  ``POST /v1/sessions/{sid}/participants`` and get a fresh participant slot).
-
-These belong to **sub-project #3 (auth)** which will replace the
-shared-bearer model with scoped JWTs. Tracking: #62.
+Not in scope today: per-action scopes for participants (a participant may do
+everything a participant may do) and concurrent-bind protection beyond
+``last-resume-wins``. User accounts are sub-project #3.
 
 ## Development
 
@@ -550,7 +561,7 @@ its own implementation plan.
    recovery) extended it without breaking backwards compatibility.
 2. **Session persistence** — DB-backed sessions, participants, messages.
 3. **User accounts + auth** — bind sessions to a user (replace the
-   bearer-as-`participant_id` shape with a JWT); gate premium services.
+   scoped session tokens with user identity); gate premium services.
 4. **Web dashboard** — read-only over the user's sessions, then management.
 5. **Persistent shared context** — first registered-only service.
 6. **Additional services** — storage, analysis tools, etc., added on demand.

@@ -5,6 +5,8 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from sessionweave.access import Role
+
 
 class DispatchMode(StrEnum):
     ALL = "all"
@@ -76,10 +78,43 @@ class SessionCreateOutput(_Strict):
     persistence: PersistenceStatePublic | None = None
     creator_token: str = ""
     creator_id: str = ""
+    supervisor_token: str = ""
+    supervisor_token_id: str = ""
+    join_token: str = ""
+    join_token_expires_at: str = ""
+    invite_url: str = ""
+    invite_link: str = ""
+
+
+class JoinTokenOutput(_Strict):
+    join_token: str
+    expires_at: str
+    invite_url: str
+    invite_link: str
+
+
+class SupervisorTokenOutput(_Strict):
+    token_id: str
+    supervisor_token: str
+
+
+class SupervisorTokenInfo(_Strict):
+    token_id: str
+    created_at: str
+    revoked_at: str | None = None
+
+
+class AccessOutput(_Strict):
+    role: Role
+    participant_id: str | None = None
 
 
 class SessionJoinInput(_Strict):
     session_id: str
+    # Join token from the invite link (the creator or admin token also
+    # works). Optional in the schema so a missing one is a permission
+    # error rather than a validation error.
+    join_token: str | None = None
     role: str | None = None
     objective: str | None = None
     capabilities: list[str] = Field(default_factory=list)
@@ -89,6 +124,8 @@ class SessionJoinInput(_Strict):
 
 class SessionJoinOutput(_Strict):
     participant_id: str
+    # Secret credential for this participant, returned exactly once.
+    participant_token: str
     expires_at: str
     roster: list[ParticipantPublic]
     config: dict[str, int]
@@ -101,7 +138,7 @@ class SessionJoinOutput(_Strict):
 
 class SessionResumeInput(_Strict):
     session_id: str
-    participant_id: str
+    participant_token: str
     # Highest seq the caller has already consumed in memory over some
     # prior channel (typically a WS that died mid-stream). When set,
     # the push-mode buffer replay on resume filters out events with
@@ -140,9 +177,14 @@ class SessionListParticipantsOutput(_Strict):
 
 class SessionDescribeInput(_Strict):
     session_id: str
+    # Any session credential (participant, join, supervisor, creator, admin).
+    # Optional only for a connection already bound as a participant.
+    access_token: str | None = None
 
 
 class SessionUpdatePurposeInput(_Strict):
+    session_id: str
+    creator_token: str
     # Pass `None` (or omit) to clear the purpose entirely.
     purpose: dict[str, Any] | None = None
 
@@ -294,6 +336,7 @@ class SessionDeleteOutput(_Strict):
 
 class SessionGetEventsInput(_Strict):
     session_id: str
+    access_token: str | None = None
     after_seq: int | None = None
     before_seq: int | None = None
     kind: list[str] | None = None

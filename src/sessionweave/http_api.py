@@ -4,10 +4,11 @@ Mirrors the MCP tool catalogue under ``/v1/...`` so a non-MCP client
 (plain HTTP, language SDKs, agents whose runtime hasn't refreshed its
 MCP catalogue yet) can drive the same backend.
 
-Auth shape (sub-project #1): the Bearer token IS the participant_id.
-Sub-project #3 will swap that for a JWT. The token is returned by
-``POST /v1/sessions/{sid}/participants`` (alongside ``participant_id``)
-and required on every authenticated route.
+Auth shape: every authenticated route takes ``Authorization: Bearer
+<token>``. Joining (``POST /v1/sessions/{sid}/participants``) needs a join
+token (or the creator/admin token) and returns the participant's secret
+``participant_token``, which is the Bearer for every later participant
+route. The participant_id is an identifier, never a credential.
 
 HTTP is request/response — there is no persistent transport for push.
 HTTP-joined participants therefore always operate in pull mode and
@@ -24,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from sessionweave.access import participant_id_for_token
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
@@ -35,7 +37,6 @@ from sessionweave.tools import (
     session_get_events,
     session_join,
     session_leave,
-    session_list_participants,
     session_respond,
     session_send,
     session_update_purpose,
@@ -87,6 +88,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.SESSION_NOT_FOUND: 404,
     ErrorCode.PARTICIPANT_NOT_FOUND: 404,
     ErrorCode.COMMAND_NOT_FOUND: 404,
+    ErrorCode.TOKEN_NOT_FOUND: 404,
     ErrorCode.NOT_IN_SESSION: 401,
     ErrorCode.ALREADY_IN_SESSION: 409,
     ErrorCode.SESSION_FULL: 409,
@@ -97,6 +99,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
     ErrorCode.TOO_MANY_WAITS: 429,
+    ErrorCode.RATE_LIMITED: 429,
     ErrorCode.INVALID_DISPATCH_FILTERS: 422,
     ErrorCode.INVALID_TARGETS: 422,
     ErrorCode.INVALID_CONFIG: 422,
@@ -143,22 +146,22 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
 
 
 async def _bind_participant(
-    deps: ToolDeps, session_id: str, participant_id: str
+    deps: ToolDeps, session_id: str, token: str, *, source_ip: str = ""
 ) -> HTTPParticipantHandle:
-    """Validate the Bearer token then create + bind a fresh
+    """Resolve the secret participant token then create + bind a fresh
     ``HTTPParticipantHandle`` to that pair for the duration of one tool
     call. The caller MUST pass the returned handle to
     ``_unbind_participant`` in a ``finally`` block.
 
-    Raises ``ToolError(NOT_IN_SESSION)`` if the token doesn't correspond
-    to an active participant of the named session — that's how unknown
-    or stale Bearer tokens get rejected uniformly.
+    Raises ``ToolError(NOT_IN_SESSION)`` if the token isn't a participant
+    token of the named session (a participant_id, join, supervisor or
+    creator token all land here) — that's how unknown or stale Bearer
+    tokens get rejected uniformly.
     """
     sess = await deps.registry.get_or_raise(session_id)
-    if participant_id not in sess._participants:
-        raise ToolError(
-            ErrorCode.NOT_IN_SESSION, "unknown or stale participant token"
-        )
+    participant_id = participant_id_for_token(
+        sess, token, limiter=deps.auth_limiter, source_ip=source_ip
+    )
     handle = HTTPParticipantHandle()
     deps.registry.connections.bind(handle, session_id, participant_id)
     return handle
@@ -197,7 +200,7 @@ async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         body = await _read_json_body(request)
-        out = await session_create(deps, body)
+        out = await session_create(deps, body, public_base_url=_public_base_url(request))
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -227,19 +230,61 @@ def _effective_upgrades(request: Request, base: str) -> Any:
     )
 
 
+_INVITE_EXPIRED_PAGE = (
+    "# Invite link not valid\n\n"
+    "This invite link is missing its join token or has expired. "
+    "Ask the session creator for a new invite link.\n"
+)
+
+_INVITE_NOT_FOUND_PAGE = (
+    "# Session not found\n\n"
+    "This invite link points to a session that does not exist on this relay "
+    "(it may have ended or been deleted). Ask the session creator for a new "
+    "invite link.\n"
+)
+
+_INVITE_RATE_LIMITED_PAGE = (
+    "# Too many invalid invite links\n\n"
+    "Too many invalid tokens were tried for this session from your address. "
+    "Wait a minute, then open the invite link again exactly as you received it.\n"
+)
+
+
 async def invite_brief(request: Request) -> Response:
-    sid = request.path_params["sid"]
-    try:
-        info = await session_describe(_deps(request), {"session_id": sid})
-    except ToolError as exc:
-        return _error_response(exc)
+    from sessionweave.access import require, resolve_principal
     from sessionweave.brief import render_brief
+
+    sid = request.path_params["sid"]
+    deps = _deps(request)
+    jt = (request.query_params.get("jt") or "").strip()
+    try:
+        principal = await resolve_principal(
+            deps, sid, jt, source_ip=_request_source_ip(request)
+        )
+        require(principal, "joiner", "participant", "supervisor", "creator", "admin")
+        purpose = (await deps.registry.get_or_raise(sid)).purpose
+    except ToolError as exc:
+        pages = {
+            ErrorCode.PERMISSION_DENIED: (_INVITE_EXPIRED_PAGE, 403),
+            ErrorCode.SESSION_NOT_FOUND: (_INVITE_NOT_FOUND_PAGE, 404),
+            ErrorCode.RATE_LIMITED: (_INVITE_RATE_LIMITED_PAGE, 429),
+        }
+        if exc.code in pages:
+            page, status_code = pages[exc.code]
+            return Response(
+                page,
+                status_code=status_code,
+                media_type="text/markdown; charset=utf-8",
+            )
+        return _error_response(exc)
     base = _public_base_url(request)
     md = render_brief(
         base_url=base,
         session_id=sid,
-        purpose=info.get("purpose"),
+        purpose=purpose,
         upgrades=_effective_upgrades(request, base),
+        # Only a join token is meant to be shared; never echo a stronger credential.
+        join_token=jt if principal.role == "joiner" else "<join_token>",
     )
     return Response(md, media_type="text/markdown; charset=utf-8")
 
@@ -362,25 +407,28 @@ async def landing(request: Request) -> HTMLResponse:
 async def get_session(request: Request) -> JSONResponse:
     sid = request.path_params["sid"]
     try:
-        out = await session_describe(_deps(request), {"session_id": sid})
+        out = await session_describe(
+            _deps(request),
+            {"session_id": sid, "access_token": _require_bearer(request)},
+            source_ip=_request_source_ip(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
     return JSONResponse(out)
 
 
 async def patch_session_purpose(request: Request) -> JSONResponse:
+    """Replace or clear the purpose. Bearer is the creator token (or admin)."""
     sid = request.path_params["sid"]
     deps = _deps(request)
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
-        try:
-            out = await session_update_purpose(
-                deps, handle, {"purpose": body.get("purpose")}
-            )
-        finally:
-            _unbind_participant(deps.registry.connections, handle)
+        out = await session_update_purpose(
+            deps,
+            {"session_id": sid, "creator_token": token, "purpose": body.get("purpose")},
+            source_ip=_request_source_ip(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -389,39 +437,42 @@ async def patch_session_purpose(request: Request) -> JSONResponse:
 
 
 async def post_participants(request: Request) -> JSONResponse:
-    """Join — body shape mirrors session_join. Returns participant_id; the
-    caller MUST keep that as the Bearer token for subsequent calls."""
+    """Join — body shape mirrors session_join. The Bearer is a join token
+    (or the creator/admin token). Returns participant_id and the secret
+    participant_token, which the caller MUST keep as the Bearer token for
+    subsequent calls."""
     sid = request.path_params["sid"]
     deps = _deps(request)
     # session_join itself binds the handle to the new participant; we
     # provide a fresh per-request handle and release it before returning.
     handle = HTTPParticipantHandle()
     try:
+        token = _require_bearer(request)
         body = await _read_json_body(request)
-        body = {**body, "session_id": sid}
+        body = {**body, "session_id": sid, "join_token": token}
         # Force pull delivery — HTTP has no push transport.
         body["delivery_mode"] = "pull"
-        out = await session_join(deps, handle, body)
+        out = await session_join(
+            deps, handle, body, source_ip=_request_source_ip(request)
+        )
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
         return _validation_error(exc)
     finally:
         _unbind_participant(deps.registry.connections, handle)
-    response = {**out, "participant_token": out["participant_id"]}
-    return JSONResponse(response, status_code=201)
+    return JSONResponse(out, status_code=201)
 
 
 async def get_participants(request: Request) -> JSONResponse:
+    from sessionweave import tools
+
     sid = request.path_params["sid"]
-    deps = _deps(request)
     try:
-        token = _require_bearer(request)
-        handle = await _bind_participant(deps, sid, token)
-        try:
-            out = await session_list_participants(deps, handle)
-        finally:
-            _unbind_participant(deps.registry.connections, handle)
+        out = await tools.session_roster(
+            _deps(request), sid, _require_bearer(request),
+            source_ip=_request_source_ip(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
     return JSONResponse(out)
@@ -433,7 +484,9 @@ async def patch_self(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_update_self(deps, handle, body)
         finally:
@@ -458,7 +511,9 @@ async def delete_self(request: Request) -> Response:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             await session_leave(deps, handle, body if body else None)
         finally:
@@ -488,7 +543,9 @@ async def post_inbox_drain(request: Request) -> JSONResponse:
             last_acked_seq = None
     try:
         token = _require_bearer(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_check_inbox(
                 deps, handle, last_acked_seq=last_acked_seq
@@ -539,7 +596,9 @@ async def post_inbox_wait(request: Request) -> JSONResponse:
         # session_id is mandatory in the MCP schema but path-derived here;
         # populate from the path for parity with the other endpoints.
         body = {**body, "session_id": sid}
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             # Race the wait against a disconnect watcher: whichever
             # finishes first wins. If the watcher fires it cancels the
@@ -612,7 +671,9 @@ async def post_commands(request: Request) -> JSONResponse:
     try:
         token = _require_bearer(request)
         body = await _read_json_body(request)
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             out = await session_send(deps, handle, body)
         finally:
@@ -632,7 +693,9 @@ async def post_command_response(request: Request) -> JSONResponse:
         token = _require_bearer(request)
         body = await _read_json_body(request)
         body = {**body, "command_id": cid}
-        handle = await _bind_participant(deps, sid, token)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
         try:
             await session_respond(deps, handle, body)
         finally:
@@ -645,61 +708,29 @@ async def post_command_response(request: Request) -> JSONResponse:
 
 
 async def _supervisor_notes_handler(request: Request) -> JSONResponse:
+    from sessionweave.access import require, resolve_principal
+
     sid = request.path_params["sid"]
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
-    # Four authentication modes (priority order):
-    #   1. admin-token mode (``SW_SUPERVISOR_ADMIN_TOKEN`` set): token ==
-    #      admin_token → relay-wide override.
-    #   2. in-session participant: token matches the participant_id of an
-    #      active participant in THIS session → accept. Lets an SDK caller
-    #      broadcast supervisor notes (e.g. kind=note target=all "session
-    #      summary") without requiring the admin token. An orchestrator/
-    #      supervisor role can also issue kind=halt targeting peers — that's
-    #      the intended power-of-an-in-session-role model.
-    #   3. per-session creator: token matches the session's creator_token
-    #      (when persistence + creator_token are set at create). Symmetric
-    #      with the firehose WS auth (events_ws.py) so the cockpit's
-    #      creator-role surface has matching supervisor power on both
-    #      transports.
-    #   4. legacy: admin token unset AND token == sid. Local-dev cockpit
-    #      backwards-compat (startup logger warns operators to set the env
-    #      var in prod).
-    registry = _deps(request).registry
-    session = registry.get(sid)
+    deps = _deps(request)
+    session = deps.registry.get(sid)
     if session is None:
         return JSONResponse({"error": "not_found"}, status_code=404)
-
-    import hmac as _hmac
-
-    from sessionweave.persistence_token import verify_creator_token
-
-    admin_token = getattr(request.app.state, "supervisor_admin_token", None)
-    accepted = False
-    # Constant-time comparison on the admin_token path; falling back to
-    # plain `==` would let a local attacker recover the admin token via
-    # timing side-channel on this hot endpoint.
-    if admin_token is not None and _hmac.compare_digest(token, admin_token):
-        accepted = True
-    elif token in session._participants:
-        # participant_id is a uuid4 lookup — dict membership is O(1) and
-        # already constant-time for any fixed key size.
-        accepted = True
-    elif session.creator_token_hash is not None and verify_creator_token(
-        token, session.creator_token_hash
-    ):
-        accepted = True
-    elif admin_token is None and _hmac.compare_digest(token, sid):
-        accepted = True
-    if not accepted:
+    source_ip = _request_source_ip(request)
+    try:
+        principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
+        require(principal, "supervisor", "creator", "admin")
+    except ToolError as exc:
+        if exc.code is ErrorCode.SESSION_NOT_FOUND:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        if exc.code is ErrorCode.RATE_LIMITED:
+            return JSONResponse({"error": "rate_limited"}, status_code=429)
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     limiter = request.app.state.supervisor_rate
-    source_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if not source_ip and request.client is not None:
-        source_ip = request.client.host or ""
     if not limiter.try_acquire(sid, source_ip):
         return JSONResponse({"error": "rate_limited"}, status_code=429)
 
@@ -774,7 +805,10 @@ async def _get_session_events_handler(request: Request) -> Response:
     }
     deps = _deps(request)
     try:
-        result = await session_get_events(deps, payload)
+        payload["access_token"] = _require_bearer(request)
+        result = await session_get_events(
+            deps, payload, source_ip=_request_source_ip(request)
+        )
     except ToolError as e:
         return JSONResponse(
             {"error": e.code.value, "message": e.message},
@@ -783,14 +817,18 @@ async def _get_session_events_handler(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
-async def _delete_session_handler(request: Request) -> Response:
-    """End a session. Accepts the per-session creator_token or the
-    relay-wide SW_SUPERVISOR_ADMIN_TOKEN as Bearer."""
-    import asyncio as _asyncio
-    import hmac as _hmac
+def _request_source_ip(request: Request) -> str:
+    # Trusted client IP only: uvicorn (proxy_headers + forwarded_allow_ips)
+    # already rewrites request.client from X-Forwarded-For for trusted
+    # proxies. Never read the header here: it is attacker-controlled.
+    return (request.client.host if request.client is not None else "") or ""
 
+
+async def _delete_session_handler(request: Request) -> Response:
+    """End a session. Accepts the session creator token or the relay-wide
+    SW_ADMIN_TOKEN as Bearer."""
+    from sessionweave.access import require, resolve_principal
     from sessionweave.errors import ErrorCode, ToolError
-    from sessionweave.persistence_token import verify_creator_token
 
     sid = request.path_params["sid"]
     auth = request.headers.get("authorization", "")
@@ -798,55 +836,90 @@ async def _delete_session_handler(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
 
-    state = request.app.state
     deps = _deps(request)
-    rl = deps.delete_rate_limiter
-    if rl is not None and rl.is_banned(sid):
-        await _asyncio.sleep(0.5)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="rate_limited").inc()
-            except Exception:
-                pass
-        return JSONResponse({"error": "permission_denied"}, status_code=403)
-
     try:
-        sess = await deps.registry.get_or_raise(sid)
+        principal = await resolve_principal(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
+        require(principal, "creator", "admin")
     except ToolError as e:
         if e.code is ErrorCode.SESSION_NOT_FOUND:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        raise
+        if e.code in (ErrorCode.PERMISSION_DENIED, ErrorCode.RATE_LIMITED):
+            if deps.metrics is not None:
+                try:
+                    deps.metrics.session_delete_failed_total.labels(
+                        reason="rate_limited"
+                        if e.code is ErrorCode.RATE_LIMITED
+                        else "invalid_token"
+                    ).inc()
+                except Exception:
+                    pass
+        return _error_response(e)
 
-    reason: str | None = None
-    if sess.creator_token_hash is not None and verify_creator_token(
-        token, sess.creator_token_hash
-    ):
-        reason = "host_deleted"
-    else:
-        admin = getattr(state, "supervisor_admin_token", None)
-        if admin is not None and _hmac.compare_digest(token, admin):
-            reason = "admin_deleted"
-
-    if reason is None:
-        if rl is not None:
-            rl.record_failure(sid)
-        if deps.metrics is not None:
-            try:
-                deps.metrics.session_delete_failed_total.labels(
-                    reason="invalid_token").inc()
-            except Exception:
-                pass
-        # Uniform 0.5 s tax matches the rate-limited path so callers
-        # can't distinguish "rate-limited" from "invalid token" via
-        # response latency. See session_delete in tools.py for rationale.
-        await _asyncio.sleep(0.5)
-        return JSONResponse({"error": "permission_denied"}, status_code=403)
-
+    reason = "admin_deleted" if principal.role == "admin" else "host_deleted"
     deleted_at = await deps.registry.delete(sid, reason=reason)
-    if rl is not None:
-        rl.reset(sid)
     return JSONResponse({"deleted_at": deleted_at}, status_code=200)
+
+
+async def _run_credential_call(request: Request, call: Any, status: int = 200) -> Response:
+    """Run a tools.session_* credential call; map ToolError to the error body."""
+    try:
+        out = await call(
+            _deps(request),
+            request.path_params["sid"],
+            _bearer(request) or "",
+            source_ip=_request_source_ip(request),
+        )
+    except ToolError as exc:
+        return _error_response(exc)
+    if status == 204:
+        return Response(status_code=204)
+    return JSONResponse(out, status_code=status)
+
+
+async def _mint_join_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    base = _public_base_url(request)
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_mint_join_token(
+            deps, sid, token, public_base_url=base, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 201)
+
+
+async def _mint_supervisor_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_mint_supervisor_token, 201)
+
+
+async def _list_supervisor_tokens_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_list_supervisor_tokens)
+
+
+async def _revoke_supervisor_token_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    token_id = request.path_params["token_id"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        await tools.session_revoke_supervisor_token(
+            deps, sid, token, token_id, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 204)
+
+
+async def _access_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    return await _run_credential_call(request, tools.session_access)
 
 
 # ---------- routing ----------
@@ -912,6 +985,26 @@ def routes() -> list[Route]:
             "/v1/sessions/{sid}/commands/{cid}/responses",
             post_command_response,
             methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/join-tokens",
+            _mint_join_token_handler, methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens",
+            _mint_supervisor_token_handler, methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens",
+            _list_supervisor_tokens_handler, methods=["GET"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor-tokens/{token_id}",
+            _revoke_supervisor_token_handler, methods=["DELETE"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/access",
+            _access_handler, methods=["GET"],
         ),
         Route(
             "/v1/sessions/{sid}/supervisor/notes",
