@@ -414,6 +414,7 @@ components:
                 - invalid_delivery_mode
                 - wait_already_in_flight
                 - participant_evicted
+                - participant_paused
                 - too_many_waits
                 - client_disconnect
             message:
@@ -751,7 +752,12 @@ paths:
             Unknown kinds return 400.
           - ``target`` must equal ``"all"`` or a participant_id
             currently in the session roster.
-          - Per-(session, source-ip) rate limit applies.
+          - Per-(session, source-ip) rate limit applies (shared with the
+            ``session_post_order`` MCP tool).
+          - Only the addressed participants change state and receive the
+            ``supervisor.note`` event: ``halt`` pauses them, ``continue`` and
+            ``redirect`` make them active again, ``note`` changes nothing.
+          - The note is persisted in the session timeline (``GET /events``).
       security:
         - bearerAuth: []
       requestBody:
@@ -778,10 +784,14 @@ paths:
                   target: { type: string }
                   message: { type: string, nullable: true }
                   ts_ms: { type: integer }
+                  affected:
+                    type: array
+                    items: { type: string }
+                    description: participant_ids whose supervision_state changed
         '400': { description: Malformed request }
         '401': { description: Missing bearer }
         '403': { description: permission_denied (not a supervisor, creator or admin token) }
-        '404': { description: Session not found }
+        '404': { description: Session not found, or participant_not_found for an unknown target }
         '429': { description: Rate-limited }
 
   /v1/sessions/{sid}/join-tokens:
@@ -1183,6 +1193,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SendCommandResponse' }
+        '409':
+          description: >-
+            participant_paused — a specific target is paused by the supervisor,
+            or every role / capability match is. Paused participants are never
+            matched by role or capability.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '413':
           description: payload_too_large
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

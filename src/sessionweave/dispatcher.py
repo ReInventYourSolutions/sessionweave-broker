@@ -41,14 +41,32 @@ def decide_dispatch(
     picker: RoundRobinPicker,
 ) -> DispatchDecision:
     if dispatch is DispatchMode.SPECIFIC:
-        return _specific(roster, target.participant_ids or [])
+        decision = _specific(roster, target.participant_ids or [])
+        if any(_is_paused(roster[pid]) for pid in decision.recipients):
+            raise _paused_error()
+        return decision
+    if dispatch not in (DispatchMode.ALL, DispatchMode.ANY):
+        raise ToolError(ErrorCode.INVALID_TARGETS, f"unknown dispatch={dispatch}")
+    # Paused participants are never matched by role / capability. A match
+    # set made only of paused participants is refused rather than closed as
+    # ``no_recipients``: the sender must learn that the supervisor stopped
+    # them, not that nobody fits.
+    matched = _filter_role_capability(roster, sender_id, target)
+    active = [pid for pid in matched if not _is_paused(roster[pid])]
+    if matched and not active:
+        raise _paused_error()
     if dispatch is DispatchMode.ALL:
-        return DispatchDecision(_filter_role_capability(roster, sender_id, target))
-    if dispatch is DispatchMode.ANY:
-        candidates = _filter_role_capability(roster, sender_id, target, online_only=True)
-        chosen = picker.pick(candidates)
-        return DispatchDecision([chosen] if chosen else [])
-    raise ToolError(ErrorCode.INVALID_TARGETS, f"unknown dispatch={dispatch}")
+        return DispatchDecision(active)
+    chosen = picker.pick([pid for pid in active if roster[pid].online])
+    return DispatchDecision([chosen] if chosen else [])
+
+
+def _is_paused(p: Participant) -> bool:
+    return p.supervision_state == "paused"
+
+
+def _paused_error() -> ToolError:
+    return ToolError(ErrorCode.PARTICIPANT_PAUSED, "participant is paused by the supervisor")
 
 
 def _specific(
@@ -69,7 +87,6 @@ def _filter_role_capability(
     roster: Mapping[str, Participant],
     sender_id: str,
     target: Target,
-    online_only: bool = False,
 ) -> list[str]:
     out: list[str] = []
     for pid, p in roster.items():
@@ -78,8 +95,6 @@ def _filter_role_capability(
         if target.role is not None and p.role != target.role:
             continue
         if target.capability is not None and target.capability not in p.capabilities:
-            continue
-        if online_only and not p.online:
             continue
         out.append(pid)
     return out

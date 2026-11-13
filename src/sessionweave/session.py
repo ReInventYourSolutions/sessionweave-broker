@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from sessionweave.connections import ConnectionHandle
@@ -34,7 +34,7 @@ from sessionweave.schemas import (
     SessionSendOutput,
     Target,
 )
-from sessionweave.supervisor import NoteRecord
+from sessionweave.supervisor import NoteRecord, SupervisorNote, next_state
 
 logger = logging.getLogger(__name__)
 
@@ -531,6 +531,78 @@ class Session:
             )
             self._mirror_firehose("participant.updated", updated_payload)
             return p.to_public()
+
+    async def post_order(self, note: SupervisorNote) -> dict[str, Any]:
+        """Apply a supervisor order to its addressed participants and deliver it.
+
+        Only the addressed participants change state and receive the
+        ``supervisor.note`` event — there is no cascade. The state records
+        what was ordered, not proof of compliance. Returns the note payload
+        plus ``affected``: the participants whose state changed.
+        """
+        async with self.lock:
+            if note.target == "all":
+                targets = list(self._participants)
+            elif note.target in self._participants:
+                targets = [note.target]
+            else:
+                raise ToolError(
+                    ErrorCode.PARTICIPANT_NOT_FOUND,
+                    f"target {note.target!r} is not a participant of this session",
+                )
+            previous: dict[str, Literal["active", "paused"]] = {}
+            for pid in targets:
+                p = self._participants[pid]
+                state = cast(
+                    'Literal["active", "paused"]',
+                    next_state(note.kind, p.supervision_state),
+                )
+                if state != p.supervision_state:
+                    previous[pid] = p.supervision_state
+                    p.supervision_state = state
+            affected = list(previous)
+            self.bump_activity()
+            try:
+                if self._store is not None:
+                    for pid in affected:
+                        p = self._participants[pid]
+                        await self._store.upsert_participant(
+                            self.session_id, pid, self._participant_snapshot(p),
+                            last_seen_seq=p.last_acked_seq,
+                            joined_at=int(p.joined_at.timestamp() * 1000),
+                        )
+                payload: dict[str, Any] = {
+                    "note_id": note.note_id,
+                    "kind": note.kind,
+                    "target": note.target,
+                    "message": note.message,
+                    "ts_ms": note.ts_ms,
+                }
+                await self._dispatch_event(
+                    kind="supervisor.note", payload=payload, recipients=targets
+                )
+            except Exception:
+                # Nothing was delivered: put the ordered state back so RAM
+                # does not claim an order nobody received.
+                for pid, state in previous.items():
+                    self._participants[pid].supervision_state = state
+                raise
+            self._notes[note.note_id] = NoteRecord(
+                note.note_id, note.kind, note.target, note.ts_ms
+            )
+            self._mirror_firehose("supervisor.note", payload)
+            for pid in affected:
+                updated_payload = {
+                    "participant": self._participants[pid].to_public().model_dump()
+                }
+                others = [o for o in self._participants if o != pid]
+                await self._dispatch_event(
+                    kind="participant.updated",
+                    payload=updated_payload,
+                    recipients=others,
+                )
+                self._mirror_firehose("participant.updated", updated_payload)
+            return {**payload, "affected": affected}
 
     async def update_purpose(
         self,

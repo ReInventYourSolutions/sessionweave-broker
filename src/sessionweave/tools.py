@@ -48,6 +48,11 @@ from sessionweave.schemas import (
     SupervisorTokenOutput,
 )
 from sessionweave.session import Session
+from sessionweave.supervisor import (
+    NoteRateLimiter,
+    SupervisorRequestError,
+    parse_supervisor_request,
+)
 
 if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
@@ -576,6 +581,32 @@ async def session_revoke_supervisor_token(
 ) -> None:
     sess = await _resolve_manager(deps, session_id, token, source_ip)
     await sess.revoke_supervisor_token(token_id)
+
+
+async def session_post_order(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    body: dict[str, Any],
+    *,
+    limiter: NoteRateLimiter,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Post a supervisor order: the MCP twin of ``POST .../supervisor/notes``.
+
+    Same gate (supervisor, creator or admin token) and the same per-(session,
+    source ip) rate limit as the HTTP route.
+    """
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    require(principal, "supervisor", "creator", "admin")
+    if not limiter.try_acquire(session_id, source_ip):
+        raise ToolError(ErrorCode.RATE_LIMITED, "too many supervisor orders; retry later")
+    try:
+        note = parse_supervisor_request(body)
+    except SupervisorRequestError as exc:
+        raise ToolError(ErrorCode.INVALID_REQUEST, str(exc)) from None
+    sess = await deps.registry.get_or_raise(session_id)
+    return await sess.post_order(note)
 
 
 async def session_access(

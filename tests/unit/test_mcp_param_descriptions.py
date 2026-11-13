@@ -45,6 +45,7 @@ REQUIRED = {
     "session_mint_supervisor_token": ["creator_token", "session_id"],
     "session_list_supervisor_tokens": ["creator_token", "session_id"],
     "session_revoke_supervisor_token": ["creator_token", "session_id", "token_id"],
+    "session_post_order": ["kind", "session_id", "target", "token"],
 }
 
 # String parameters with a closed set of values.
@@ -53,6 +54,7 @@ ENUMS = {
     ("session_join", "delivery_mode"): {"push", "pull"},
     ("session_respond", "status"): {"ok", "error"},
     ("session_get_events", "order"): {"asc", "desc"},
+    ("session_post_order", "kind"): {"note", "halt", "continue", "redirect"},
 }
 
 MIN_CHARS = 15

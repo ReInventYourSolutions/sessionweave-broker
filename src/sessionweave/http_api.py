@@ -96,6 +96,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.INVALID_DELIVERY_MODE: 409,
     ErrorCode.WAIT_ALREADY_IN_FLIGHT: 409,
     ErrorCode.PARTICIPANT_EVICTED: 409,
+    ErrorCode.PARTICIPANT_PAUSED: 409,
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
     ErrorCode.TOO_MANY_WAITS: 429,
@@ -107,6 +108,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.NO_HISTORY: 409,
     ErrorCode.PERSISTENCE_FAILED: 503,
     ErrorCode.PERSISTENCE_CORRUPTED: 500,
+    ErrorCode.INVALID_REQUEST: 400,
 }
 
 
@@ -716,18 +718,20 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
     deps = _deps(request)
-    session = deps.registry.get(sid)
-    if session is None:
-        return JSONResponse({"error": "not_found"}, status_code=404)
     source_ip = _request_source_ip(request)
     try:
         principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
         require(principal, "supervisor", "creator", "admin")
+        # A cold persisted session is hydrated, so an order always reaches
+        # the live roster rather than answering 404.
+        session = await deps.registry.get_or_raise(sid)
     except ToolError as exc:
         if exc.code is ErrorCode.SESSION_NOT_FOUND:
             return JSONResponse({"error": "not_found"}, status_code=404)
         if exc.code is ErrorCode.RATE_LIMITED:
             return JSONResponse({"error": "rate_limited"}, status_code=429)
+        if exc.code in (ErrorCode.PERSISTENCE_FAILED, ErrorCode.PERSISTENCE_CORRUPTED):
+            return _error_response(exc)
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     limiter = request.app.state.supervisor_rate
@@ -744,41 +748,19 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     except SupervisorRequestError as e:
         return JSONResponse({"error": "invalid_request", "detail": str(e)}, status_code=400)
 
-    payload = {
-        "note_id": note.note_id,
-        "kind": note.kind,
-        "target": note.target,
-        "message": note.message,
-        "ts_ms": note.ts_ms,
-    }
-
-    # Fan out to firehose subscribers (lock-free by design: firehose is a
-    # separate publish path and never touches participant state).
-    firehose = request.app.state.firehose
-    await firehose.publish(sid, {"name": "supervisor.note", "payload": payload})
-
-    # Fan out to participants under session.lock — _deliver_or_buffer touches
-    # _participants / _subscribers / _buffers, and the invariant across the
-    # rest of session.py is that those are only accessed while the lock is
-    # held. If target is a participant id that is not in the session, return
-    # 404 instead of a silent success.
-    async with session.lock:
-        if note.target == "all":
-            targets = list(session._participants.keys())
-        elif note.target in session._participants:
-            targets = [note.target]
-        else:
+    # Session.post_order applies the state change, records and persists the
+    # note, delivers it to the addressed participants and mirrors it to the
+    # firehose (exactly once).
+    try:
+        out = await session.post_order(note)
+    except ToolError as exc:
+        if exc.code is ErrorCode.PARTICIPANT_NOT_FOUND:
             return JSONResponse(
-                {
-                    "error": "participant_not_found",
-                    "detail": f"target {note.target!r} is not a participant of this session",
-                },
+                {"error": "participant_not_found", "detail": exc.message},
                 status_code=404,
             )
-        for pid in targets:
-            session._deliver_or_buffer(pid, "supervisor.note", payload)
-
-    return JSONResponse(payload, status_code=200)
+        return _error_response(exc)
+    return JSONResponse(out, status_code=200)
 
 
 async def _get_session_events_handler(request: Request) -> Response:
