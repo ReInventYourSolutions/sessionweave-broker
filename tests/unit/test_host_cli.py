@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -63,7 +64,7 @@ def test_spawn_poller_passes_token_via_env_not_participant_id_credential(
 ) -> None:
     from sessionweave import host_cli
 
-    captured: dict = {}
+    captured: dict[str, Any] = {}
 
     class P:
         pid = 42
@@ -73,7 +74,7 @@ def test_spawn_poller_passes_token_via_env_not_participant_id_credential(
         captured["env"] = kw.get("env")
         return P()
 
-    monkeypatch.setattr(host_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
     pid = host_cli._spawn_poller("http://x/mcp", "sid", "TOK", "PID", tmp_path / "l.log", 1.0)
     assert pid == 42
     assert "TOK" not in captured["cmd"]

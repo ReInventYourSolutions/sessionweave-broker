@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sessionweave.invite import InviteLink
 from sessionweave.launch import _human_summary
 
@@ -76,7 +78,7 @@ def test_missing_join_token_exits_3(capsys) -> None:
 def test_describe_uses_access_token(monkeypatch, capsys) -> None:
     from sessionweave import launch
 
-    seen: dict = {}
+    seen: dict[str, Any] = {}
 
     async def fake_describe(relay_url: str, session_id: str, join_token: str):
         seen["args"] = (relay_url, session_id, join_token)

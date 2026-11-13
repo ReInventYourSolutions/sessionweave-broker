@@ -139,7 +139,9 @@ def test_invite_brief_echoes_only_a_join_token(client: TestClient, role: str) ->
     sid, tokens = _session(client)
     r = client.get(f"/invite/{sid}", params={"jt": tokens[role]})
     assert r.status_code == 200
-    assert tokens[role] not in r.text
+    token = tokens[role]
+    assert token is not None
+    assert token not in r.text
     assert "Bearer <join_token>" in r.text
 
 

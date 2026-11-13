@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -17,17 +18,18 @@ from tests.integration.harness import relay_subprocess
 ADMIN = "notes-admin-secret-cafebabe"
 
 
-async def _create(c: httpx.AsyncClient, base: str, **body) -> dict:
+async def _create(c: httpx.AsyncClient, base: str, **body: Any) -> dict[str, Any]:
     r = await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}, **body})
     assert r.status_code == 201, r.text
-    return r.json()
+    out: dict[str, Any] = r.json()
+    return out
 
 
 def _h(token: str) -> dict[str, str]:
     return {"authorization": f"Bearer {token}"}
 
 
-def _note(**over):
+def _note(**over: Any) -> dict[str, Any]:
     return {"kind": "note", "target": "all", "message": "m", **over}
 
 

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
+from sessionweave import poller
 from sessionweave.poller import _is_terminal
 
 
@@ -29,13 +34,6 @@ def test_not_terminal_on_command_received() -> None:
         {"name": "command.received", "payload": {"command_id": "x"}}, "pid"
     )
 
-
-import json
-from pathlib import Path
-
-import pytest
-
-from sessionweave import poller
 
 
 def test_args_take_participant_token_and_id() -> None:

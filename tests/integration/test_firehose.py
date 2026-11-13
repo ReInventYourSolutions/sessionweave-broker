@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -17,14 +18,15 @@ from tests.integration.harness import relay_subprocess
 ADMIN = "test-admin-secret-d3b07384"
 
 
-async def _create(base: str) -> dict:
+async def _create(base: str) -> dict[str, Any]:
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
     assert r.status_code == 201, r.text
-    return r.json()
+    out: dict[str, Any] = r.json()
+    return out
 
 
-async def _join(base: str, made: dict) -> None:
+async def _join(base: str, made: dict[str, Any]) -> None:
     async with httpx.AsyncClient() as c:
         r = await c.post(
             f"{base}/v1/sessions/{made['session_id']}/participants",

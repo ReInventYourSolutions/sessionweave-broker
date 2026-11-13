@@ -5,6 +5,8 @@ Supervisor, participant and join tokens and the session id are refused.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 
@@ -17,10 +19,11 @@ def _h(token: str) -> dict[str, str]:
     return {"authorization": f"Bearer {token}"}
 
 
-async def _create(c: httpx.AsyncClient, base: str) -> dict:
+async def _create(c: httpx.AsyncClient, base: str) -> dict[str, Any]:
     r = await c.post(f"{base}/v1/sessions", json={"purpose": {"kind": "smoke"}})
     assert r.status_code == 201, r.text
-    return r.json()
+    out: dict[str, Any] = r.json()
+    return out
 
 
 @pytest.mark.integration

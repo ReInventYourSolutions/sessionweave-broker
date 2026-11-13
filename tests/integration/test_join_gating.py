@@ -6,6 +6,8 @@ connections.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -29,10 +31,11 @@ def client(monkeypatch: pytest.MonkeyPatch):
         yield c
 
 
-def _create(c: TestClient) -> dict:
+def _create(c: TestClient) -> dict[str, Any]:
     r = c.post("/v1/sessions", json={})
     assert r.status_code == 201, r.text
-    return r.json()
+    out: dict[str, Any] = r.json()
+    return out
 
 
 def _join(c: TestClient, sid: str, token: str | None):
@@ -195,6 +198,7 @@ async def test_mcp_layer_expired_join_token_message_and_no_plaintext_in_ram(
         deps, FakeHandle(), {"session_id": sid, "join_token": created["join_token"]}
     )
     sess = registry.get(sid)
+    assert sess is not None
     assert sess._participants[joined["participant_id"]].issued_token is None
     assert joined["participant_token"]
 

@@ -20,6 +20,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import PersistenceConfig
+from sessionweave.session import Session
 from sessionweave.tools import ToolDeps
 
 ADMIN = "relay-admin-secret"
@@ -32,6 +33,12 @@ async def store(tmp_path: Path):
     await s.init(pool_size=2)
     yield s
     await s.close()
+
+
+def _hot(deps: ToolDeps, sid: str) -> Session:
+    sess = deps.registry.get(sid)
+    assert sess is not None
+    return sess
 
 
 def _deps(store, *, admin_token=ADMIN, limiter=None) -> ToolDeps:
@@ -57,7 +64,7 @@ async def _session(deps: ToolDeps, **kw) -> tuple[str, str]:
 async def test_resolves_each_role_on_hot_session(store) -> None:
     deps = _deps(store)
     sid, creator = await _session(deps)
-    auth = deps.registry.get(sid).auth
+    auth = _hot(deps, sid).auth
     now = int(time.time() * 1000)
     join, _ = auth.mint_join(now)
     sup, _ = auth.mint_supervisor(now)
@@ -117,7 +124,7 @@ async def test_missing_token_denied(store) -> None:
 async def test_expired_join_token_message(store) -> None:
     deps = _deps(store)
     sid, _ = await _session(deps)
-    tok, _ = deps.registry.get(sid).auth.mint_join(0)  # expired long ago
+    tok, _ = _hot(deps, sid).auth.mint_join(0)  # expired long ago
     with pytest.raises(ToolError) as exc:
         await resolve_principal(deps, sid, tok)
     assert exc.value.code is ErrorCode.PERMISSION_DENIED
@@ -212,8 +219,9 @@ async def test_invalid_participant_tokens_are_throttled_valid_one_never(store) -
 
     deps = _deps(store, limiter=AuthFailureLimiter(max_failures=2))
     sid, _ = await _session(deps)
-    p = await deps.registry.get(sid).join(FakeHandle(), role="worker")
+    p = await _hot(deps, sid).join(FakeHandle(), role="worker")
     ptoken = p.issued_token
+    assert ptoken is not None
     route = Route("/v1/sessions/{sid}/participants/me", patch_self, methods=["PATCH"])
     app = Starlette(routes=[route])
     app.state.tool_deps = deps
