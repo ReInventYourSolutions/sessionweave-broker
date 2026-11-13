@@ -61,6 +61,8 @@ class SessionSnapshot:
     # PK). For sessions that never recorded any event this is 0.
     max_event_seq: int
     tokens: list[IssuedToken] = field(default_factory=list)
+    # Payloads of persisted ``supervisor.note`` events (note registry).
+    notes: list[dict[str, Any]] = field(default_factory=list)
 
 
 class PersistenceStore:
@@ -422,6 +424,14 @@ class PersistenceStore:
             _max_row = await cur.fetchone()
             assert _max_row is not None
             (max_event_seq,) = _max_row
+        notes: list[dict[str, Any]] = []
+        async with conn.execute(
+            "SELECT payload_json FROM events WHERE session_id = ?"
+            " AND kind = 'supervisor.note' ORDER BY seq",
+            (sid,),
+        ) as cur:
+            async for (payload_json,) in cur:
+                notes.append(_json.loads(payload_json))
         return SessionSnapshot(
             session_id=sid,
             config_json=srow[0], purpose_json=srow[1],
@@ -433,6 +443,7 @@ class PersistenceStore:
             participants=participants, inflight=inflight, buffered=buffered,
             max_event_seq=int(max_event_seq or 0),
             tokens=await self.load_tokens(sid),
+            notes=notes,
         )
 
     # ----- session credentials -----

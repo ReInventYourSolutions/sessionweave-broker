@@ -165,6 +165,7 @@ components:
           additionalProperties: true
         joined_at: { type: string, format: date-time }
         online: { type: boolean }
+        supervision_state: { type: string, enum: [active, paused] }
 
     Session:
       type: object

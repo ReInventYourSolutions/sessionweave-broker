@@ -34,6 +34,7 @@ from sessionweave.schemas import (
     SessionSendOutput,
     Target,
 )
+from sessionweave.supervisor import NoteRecord
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ class Session:
         "_inflight",
         "_last_activity_at",
         "_metrics",
+        "_notes",
         "_on_deadline_shortened",
         "_participants",
         "_persistence_mode",
@@ -174,6 +176,7 @@ class Session:
         self._store = store
         self._persistence_mode = persistence_mode
         self._event_seq: int = 0
+        self._notes: dict[str, NoteRecord] = {}
         self.auth: SessionAuth = SessionAuth(None)
 
     # --- hydration ---
@@ -227,6 +230,7 @@ class Session:
                 next_seq=p.get("last_seen_seq", 0),
                 last_acked_seq=p.get("last_seen_seq", 0),
                 token_hash=token_hash,
+                supervision_state=s.get("supervision_state", "active"),
             )
             if token_hash:
                 sess.auth.register_participant(p["participant_id"], token_hash)
@@ -241,6 +245,10 @@ class Session:
             # participant.
             metrics.participants_active.labels(online="false").inc(
                 len(sess._participants)
+            )
+        for n in snap.notes:
+            sess._notes[n["note_id"]] = NoteRecord(
+                n["note_id"], n["kind"], n["target"], n["ts_ms"]
             )
         # Inflight
         for cid, tracker_d in snap.inflight.items():
@@ -362,6 +370,7 @@ class Session:
                     "delivery_mode": p.delivery_mode,
                     "online": p.online,
                     "token_hash": p.token_hash.hex(),
+                    "supervision_state": p.supervision_state,
                 }
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
                 await self._store.upsert_participant(

@@ -57,6 +57,9 @@ class Participant:
     # returns so the caller can hand it back once. Never persisted or
     # serialised (``to_public`` does not read it).
     issued_token: str | None = None
+    # What was last ordered by a supervisor (``active`` | ``paused``); not proof
+    # of compliance. Persisted in the participant snapshot.
+    supervision_state: str = "active"
 
     @staticmethod
     def create(
@@ -85,6 +88,7 @@ class Participant:
             metadata=dict(self.metadata),
             joined_at=_isoformat(self.joined_at),
             online=self.online,
+            supervision_state=self.supervision_state,  # type: ignore[arg-type]
         )
 
 
