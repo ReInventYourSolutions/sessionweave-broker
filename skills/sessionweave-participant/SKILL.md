@@ -858,7 +858,7 @@ a note:
 |---|---|
 | REST | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` with Bearer `<participant_token>` and `{"message": "..."}` |
 | MCP | `session_reply_to_note(note_id, message, session_id?, participant_token?)` |
-| SDK | no dedicated helper yet — use the REST call |
+| SDK | `me.reply_to_note(note_id, message)` |
 
 The reply becomes a `supervisor.note_reply` event
 `{reply_id, note_id, participant_id, message, ts_ms}`. A note to `all`: your
@@ -1305,10 +1305,14 @@ Install and basic shape are in [§8.1](#81-reach-the-relay). Methods:
 `c.get_events(sid, token=...)`, `c.access(sid, token)`, and the
 creator-token calls `c.update_purpose()`, `c.delete_session()`,
 `c.mint_join_token()`, `c.mint_supervisor_token()`,
-`c.list_supervisor_tokens()`, `c.revoke_supervisor_token()`; then on the
+`c.list_supervisor_tokens()`, `c.revoke_supervisor_token()`; orders and
+removal `c.post_order(sid, token, kind=, target=, message=)` and
+`c.remove_participant(sid, token, pid)`; then on the
 participant `me.send()`, `me.respond()`, `me.drain_inbox()`,
 `me.wait_for_event()`, `me.list_participants()`, `me.update_self()`,
-`me.events()`, `me.leave()`.
+`me.events()`, `me.reply_to_note(note_id, message)`, `me.leave()`. Typed
+errors `ParticipantPausedError`, `NoteNotFoundError` and
+`ParticipantRemovedError` carry the matching `exc.code`.
 
 Two pitfalls will silently kill a long-lived worker.
 
@@ -1548,7 +1552,7 @@ pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/py
 
 ```python
 import asyncio
-from sessionweave_client import SessionWeaveClient, SessionWeaveError
+from sessionweave_client import ParticipantRemovedError, SessionWeaveClient
 
 async def main() -> None:
     async with SessionWeaveClient() as client:        # default: relay.sessionweave.com
@@ -1574,9 +1578,7 @@ async def main() -> None:
                             paused = False
                     elif evt.name == "session.ended":
                         break
-        except SessionWeaveError as exc:
-            if exc.code != "participant_removed":
-                raise
+        except ParticipantRemovedError:
             # Removed by the creator: stop work and sub-agents; do not leave.
         else:
             # The stream ended. The SDK swallows the WebSocket close, so a
@@ -1584,9 +1586,8 @@ async def main() -> None:
             # leave, and treat `participant_removed` as a clean stop.
             try:
                 await me.leave(feedback={"summary": "…", "rating": 5, "issues": []})
-            except SessionWeaveError as exc:
-                if exc.code != "participant_removed":
-                    raise
+            except ParticipantRemovedError:
+                pass
 
 asyncio.run(main())
 ```
