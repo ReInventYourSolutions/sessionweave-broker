@@ -471,7 +471,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.16.0" }
+                  version: { type: string, example: "0.29.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
