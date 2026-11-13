@@ -34,11 +34,32 @@ def _purpose_block(purpose: dict[str, Any] | None) -> str:
     elif purpose.get("available_roles"):
         roles = ", ".join(f"`{r}`" for r in purpose["available_roles"])
         lines.append(f"- available roles: {roles} — pick one.")
+    caps = purpose.get("your_capabilities")
+    if caps:
+        lines.append(
+            "- your capabilities: " + ", ".join(f"`{c}`" for c in caps)
+        )
     if purpose.get("instructions"):
         lines.append(f"- instructions: {purpose['instructions']}")
     if not lines:
         lines = ["```json", json.dumps(purpose, indent=2, ensure_ascii=False), "```"]
     return "\n".join(lines)
+
+
+def _join_body(purpose: dict[str, Any] | None) -> str:
+    """The join request body the brief shows, taken from the purpose.
+
+    A fixed example role contradicted purposes that name a role, and agents
+    reading the page literally joined with the wrong one.
+    """
+    purpose = purpose or {}
+    role = purpose.get("your_role")
+    if not role:
+        roles = purpose.get("available_roles") or []
+        role = roles[0] if len(roles) == 1 else "<role the purpose asks for>"
+    caps = purpose.get("your_capabilities")
+    body = {"role": role, "capabilities": list(caps) if isinstance(caps, list) else []}
+    return json.dumps(body, ensure_ascii=False)
 
 
 def _upgrades_block(upgrades: BriefUpgrades) -> str:
@@ -79,6 +100,7 @@ def render_brief(
     base = base_url.rstrip("/")
     sid = session_id
     jt = join_token
+    join_body = _join_body(purpose).replace("'", "'\\''")
     return f"""\
 # You've been invited to a SessionWeave session
 
@@ -111,12 +133,13 @@ you re-call it on your next turn. This keeps you responsive.
    curl -sS {base}/v1/sessions/{sid} \\
      -H 'authorization: Bearer {jt}'
    ```
-2. **Join** — save the `participant_token` from the response.
+2. **Join** with the role and capabilities the purpose above asks for — save the
+   `participant_token` from the response.
    ```
    curl -sS -X POST {base}/v1/sessions/{sid}/participants \\
      -H 'authorization: Bearer {jt}' \\
      -H 'content-type: application/json' \\
-     -d '{{"role":"worker","capabilities":["respond"]}}'
+     -d '{join_body}'
    ```
 3. **Wait for events (long-poll, non-blocking)** — re-call each turn.
    ```
@@ -127,12 +150,18 @@ you re-call it on your next turn. This keeps you responsive.
    → `{{"messages":[{{"name":"command.received","payload":{{...}}}}],"timed_out":false}}`.
    Act on each message `name`: `command.received`, `result.received`, `supervisor.note`,
    `command.completed`, `session.ended`.
+   Keep `timeout_seconds` (and your client's read timeout) below your runtime's
+   per-command time limit — e.g. at most 90 under a 120-second shell limit. If a call is
+   cut off, the relay keeps that wait open until its timeout and the next call gets
+   `wait_already_in_flight` (409): wait that long, or read what is pending with
+   `POST {base}/v1/sessions/{sid}/participants/me/inbox/drain`.
 4. **Respond to a command** (server role):
    ```
    curl -sS -X POST {base}/v1/sessions/{sid}/commands/<command_id>/responses \\
      -H 'authorization: Bearer <participant_token>' \\
      -H 'content-type: application/json' -d '{{"status":"ok","payload":{{}}}}'
    ```
+   Whatever the purpose asks you to answer goes inside `payload`.
    **or Dispatch a command** (client role):
    ```
    curl -sS -X POST {base}/v1/sessions/{sid}/commands \\
@@ -146,6 +175,7 @@ you re-call it on your next turn. This keeps you responsive.
      -H 'authorization: Bearer <participant_token>' \\
      -H 'content-type: application/json' -d '{{"feedback":{{"summary":"...","rating":5}}}}'
    ```
+   → `204 No Content` (empty body) when you have left.
 
 ## Go further (optional)
 {_upgrades_block(upgrades)}
