@@ -459,16 +459,21 @@ class Session:
         """Remove one participant on the creator's (or admin's) order.
 
         The target first receives a ``halt`` supervisor note through the
-        ordinary order path, then leaves: its token, connection binding,
-        buffer and subscribers go (an events WebSocket closes with 4410
-        ``removed``), the commands it sent are cancelled, its departure is
-        written to disk before this returns, and the others receive a
-        persisted ``participant.left`` with reason ``removed``. Every
-        still-valid join token of the session is invalidated. Only the
+        ordinary order path. Then the access cut-off is written to disk —
+        every still-valid join token of the session expires and the
+        participant's row is marked left — before anything in RAM changes,
+        so a failed write leaves the participant in place and the call can
+        be retried. Only then is it dropped from RAM: its token (remembered
+        for an hour as removed, so its next call gets
+        ``participant_removed``), connection binding, buffer and subscribers
+        go (an events WebSocket closes with 4410 ``removed``) and the
+        commands it sent are cancelled. The others finally receive a
+        persisted ``participant.left`` with reason ``removed``. Only the
         addressed participant is affected: sub-agents never join.
         """
         async with self.lock:
-            if participant_id not in self._participants:
+            target = self._participants.get(participant_id)
+            if target is None:
                 raise ToolError(
                     ErrorCode.PARTICIPANT_NOT_FOUND,
                     f"{participant_id!r} is not a participant of this session",
@@ -477,25 +482,39 @@ class Session:
                 note_id=f"sn-{uuid.uuid4().hex[:12]}", kind="halt",
                 target=participant_id, message=REMOVED_HALT_MESSAGE, ts_ms=_now_ms(),
             ))
-            self._drop_participant(participant_id)
-            self._close_subscribers(participant_id, reason="removed")
             now_ms = _now_ms()
+            to_expire = self.auth.valid_join_tokens(now_ms)
             if self._store is not None:
+                if to_expire:
+                    await self._store.expire_tokens(
+                        self.session_id, [t.token_id for t in to_expire], now_ms
+                    )
                 await self._store.soft_delete_participant(
                     self.session_id, participant_id, left_at=now_ms
                 )
-            payload: dict[str, Any] = {"participant_id": participant_id, "reason": "removed"}
-            await self._dispatch_event(
-                kind="participant.left", payload=payload,
-                recipients=list(self._participants),
-            )
-            self._mirror_firehose("participant.left", payload)
+            # Disk holds the cut-off; RAM follows and nothing below can fail
+            # before the participant is gone.
             invalidated = self.auth.invalidate_join_tokens(now_ms)
-            if self._store is not None and invalidated:
-                await self._store.expire_tokens(
-                    self.session_id, [t.token_id for t in invalidated], now_ms
-                )
+            self.auth.tombstone_participant(target.token_hash, now_ms)
+            self._drop_participant(participant_id)
+            self._close_subscribers(participant_id, reason="removed")
             self.bump_activity()
+            payload: dict[str, Any] = {"participant_id": participant_id, "reason": "removed"}
+            others = list(self._participants)
+            try:
+                await self._dispatch_event(
+                    kind="participant.left", payload=payload, recipients=others,
+                )
+            except Exception:
+                # The removal is done and durable; only its timeline entry
+                # is missing. Peers still learn of it, unpersisted.
+                logger.exception(
+                    "participant.left after removing %s could not be persisted",
+                    participant_id,
+                )
+                for pid in others:
+                    self._deliver_or_buffer(pid, "participant.left", payload)
+            self._mirror_firehose("participant.left", payload)
             return {"removed": [participant_id], "join_tokens_invalidated": len(invalidated)}
 
     @staticmethod
@@ -2008,7 +2027,7 @@ class Session:
         for _pid, subs in list(self._subscribers.items()):
             for cb in list(subs):
                 try:
-                    cb("__evicted__", {}, 0)
+                    cb("__evicted__", {"reason": reason}, 0)
                 except Exception:
                     pass
         self._subscribers.clear()

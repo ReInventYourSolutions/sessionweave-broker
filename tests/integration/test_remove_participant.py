@@ -19,8 +19,10 @@ import pytest
 import pytest_asyncio
 import websockets
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
+from sessionweave import access
 from sessionweave.access import (
     _now_ms,
     generate_token,
@@ -137,7 +139,7 @@ async def test_removed_token_and_connection_no_longer_resolve(
 
     with pytest.raises(ToolError) as exc:
         participant_id_for_token(sess, token)
-    assert exc.value.code is ErrorCode.NOT_IN_SESSION
+    assert exc.value.code is ErrorCode.PARTICIPANT_REMOVED
     assert sess._connections.session_for(ha) is None
 
 
@@ -323,7 +325,8 @@ async def test_http_remove_closes_the_events_ws_with_4410_after_the_halt() -> No
             f"{base}/v1/sessions/{sid}/participants/me/inbox/drain",
             headers=bearer(a["participant_token"]),
         )
-        assert r.json()["error"]["code"] == "not_in_session", r.text
+        assert r.status_code == 403, r.text
+        assert r.json()["error"]["code"] == "participant_removed", r.text
 
         # B saw the cancellation and the removal; nobody halted B.
         r = await c.post(
@@ -380,3 +383,198 @@ async def test_mcp_remove_participant_unbinds_the_removed_connection() -> None:
 
             with pytest.raises(RuntimeError, match="not_in_session"):
                 await agent.call_tool("session_list_participants", {})
+
+
+# ---------- fix round 1: write ordering ----------
+
+
+@pytest.mark.asyncio
+async def test_failed_soft_delete_changes_nothing_and_a_retry_completes(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sess = await _session(_registry(store))
+    (a, _), (_, hb), _ = await _three(sess)
+    jt, _ = await sess.mint_join_token()
+    real = PersistenceStore.soft_delete_participant
+
+    async def broken(self: PersistenceStore, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(PersistenceStore, "soft_delete_participant", broken)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await sess.remove_participant(a.participant_id)
+
+    assert a.participant_id in _states(sess)
+    assert a.issued_token is not None
+    assert participant_id_for_token(sess, a.issued_token) == a.participant_id
+    principal = sess.auth.match(jt, _now_ms())
+    assert principal is not None and principal.role == "joiner"
+    assert "participant.left" not in [n for n, _ in hb.sent]
+
+    monkeypatch.setattr(PersistenceStore, "soft_delete_participant", real)
+    out = await sess.remove_participant(a.participant_id)
+
+    assert out == {"removed": [a.participant_id], "join_tokens_invalidated": 1}
+    assert a.participant_id not in _states(sess)
+    assert sess.auth.match(jt, _now_ms()) is None
+    hydrated = await _registry(store).get_or_raise(sess.session_id)
+    assert a.participant_id not in _states(hydrated)
+
+
+@pytest.mark.asyncio
+async def test_failed_left_event_write_still_removes(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sess = await _session(_registry(store))
+    (a, _), (_, hb), _ = await _three(sess)
+    jt, _ = await sess.mint_join_token()
+    real_dispatch = Session._dispatch_event
+
+    async def flaky(self: Session, **kwargs: Any) -> None:
+        if kwargs["kind"] == "participant.left":
+            raise RuntimeError("disk full")
+        await real_dispatch(self, **kwargs)
+
+    monkeypatch.setattr(Session, "_dispatch_event", flaky)
+    out = await sess.remove_participant(a.participant_id)
+
+    assert out == {"removed": [a.participant_id], "join_tokens_invalidated": 1}
+    assert a.participant_id not in _states(sess)
+    assert sess.auth.match(jt, _now_ms()) is None
+    left = [p for n, p in hb.sent if n == "participant.left"]
+    assert left == [{"participant_id": a.participant_id, "reason": "removed"}]
+    hydrated = await _registry(store).get_or_raise(sess.session_id)
+    assert a.participant_id not in _states(hydrated)
+
+
+# ---------- fix round 1: removal tombstone ----------
+
+REMOVED_MESSAGE = (
+    "you were removed from this session by its creator — "
+    "stop your work and your sub-agents"
+)
+
+
+def _removed_pull_participant(client: TestClient) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    made = client.post("/v1/sessions", json={}).json()
+    sid, jt = made["session_id"], made["join_token"]
+    target = client.post(
+        f"/v1/sessions/{sid}/participants", json={"role": "w", "delivery_mode": "pull"},
+        headers=bearer(jt),
+    ).json()
+    other = client.post(
+        f"/v1/sessions/{sid}/participants", json={"role": "w"}, headers=bearer(jt),
+    ).json()
+    r = client.delete(
+        f"/v1/sessions/{sid}/participants/{target['participant_id']}",
+        headers=bearer(made["creator_token"]),
+    )
+    assert r.status_code == 200, r.text
+    return sid, target, other
+
+
+def _assert_removed(r: httpx.Response) -> None:
+    assert r.status_code == 403, r.text
+    assert r.json()["error"] == {"code": "participant_removed", "message": REMOVED_MESSAGE}
+
+
+def test_removed_pull_participant_is_told_on_its_next_call(client: TestClient) -> None:
+    sid, target, other = _removed_pull_participant(client)
+    h = bearer(target["participant_token"])
+
+    _assert_removed(client.post(f"/v1/sessions/{sid}/participants/me/inbox/drain", headers=h))
+    _assert_removed(client.post(
+        f"/v1/sessions/{sid}/participants/me/inbox/wait", headers=h,
+        json={"timeout_seconds": 1},
+    ))
+    _assert_removed(client.post(
+        f"/v1/sessions/{sid}/commands", headers=h,
+        json={"dispatch": "specific",
+              "target": {"participant_ids": [other["participant_id"]]},
+              "payload": {"n": 1}},
+    ))
+    # A reader endpoint resolving the token as an identity says the same.
+    _assert_removed(client.get(f"/v1/sessions/{sid}/participants", headers=h))
+    with pytest.raises(WebSocketDisconnect) as closed, client.websocket_connect(
+        f"/v1/sessions/{sid}/participants/me/events?token={target['participant_token']}"
+    ) as ws:
+        ws.receive_json()
+    assert (closed.value.code, closed.value.reason) == (4410, "removed")
+
+
+def test_removal_tombstone_expires_after_an_hour(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, target, _ = _removed_pull_participant(client)
+    real = access._now_ms()
+    monkeypatch.setattr(access, "_now_ms", lambda: real + 3_600_001)
+
+    r = client.post(
+        f"/v1/sessions/{sid}/participants/me/inbox/drain",
+        headers=bearer(target["participant_token"]),
+    )
+    assert r.status_code == 401, r.text
+    assert r.json()["error"]["code"] == "not_in_session"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_mcp_explicit_identity_of_a_removed_participant_is_refused() -> None:
+    async with relay_subprocess() as base:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            made = (await c.post(f"{base}/v1/sessions", json={})).json()
+            sid = made["session_id"]
+            target = await _join(c, base, sid, made["join_token"], "worker")
+            r = await c.delete(
+                f"{base}/v1/sessions/{sid}/participants/{target['participant_id']}",
+                headers=bearer(made["creator_token"]),
+            )
+            assert r.status_code == 200, r.text
+
+        async with sw_client(base) as mcp:
+            with pytest.raises(RuntimeError, match="participant_removed"):
+                await mcp.call_tool("session_check_inbox", {
+                    "session_id": sid, "participant_token": target["participant_token"],
+                })
+            with pytest.raises(RuntimeError, match="participant_removed"):
+                await mcp.call_tool("session_resume", {
+                    "session_id": sid, "participant_token": target["participant_token"],
+                })
+
+
+# ---------- fix round 1: leave / session end close the events WS ----------
+
+
+def _ws_participant(client: TestClient) -> tuple[dict[str, Any], dict[str, Any]]:
+    made = client.post("/v1/sessions", json={}).json()
+    joined = client.post(
+        f"/v1/sessions/{made['session_id']}/participants", json={"role": "w"},
+        headers=bearer(made["join_token"]),
+    ).json()
+    return made, joined
+
+
+def test_leave_closes_the_events_ws_normally(client: TestClient) -> None:
+    made, joined = _ws_participant(client)
+    sid = made["session_id"]
+    with pytest.raises(WebSocketDisconnect) as closed, client.websocket_connect(
+        f"/v1/sessions/{sid}/participants/me/events?token={joined['participant_token']}"
+    ) as ws:
+        r = client.delete(
+            f"/v1/sessions/{sid}/participants/me", headers=bearer(joined["participant_token"])
+        )
+        assert r.status_code == 204, r.text
+        ws.receive_json()
+    assert (closed.value.code, closed.value.reason) == (1000, "left")
+
+
+def test_session_end_closes_the_events_ws_with_its_reason(client: TestClient) -> None:
+    made, joined = _ws_participant(client)
+    sid = made["session_id"]
+    with pytest.raises(WebSocketDisconnect) as closed, client.websocket_connect(
+        f"/v1/sessions/{sid}/participants/me/events?token={joined['participant_token']}"
+    ) as ws:
+        r = client.delete(f"/v1/sessions/{sid}", headers=bearer(made["creator_token"]))
+        assert r.status_code == 200, r.text
+        ws.receive_json()
+    assert (closed.value.code, closed.value.reason) == (1000, "host_deleted")

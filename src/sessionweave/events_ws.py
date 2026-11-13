@@ -88,6 +88,8 @@ async def events_ws(websocket: WebSocket) -> None:
     except ToolError as exc:
         if exc.code is ErrorCode.RATE_LIMITED:
             await websocket.close(code=_CLOSE_RATE_LIMITED, reason="rate_limited")
+        elif exc.code is ErrorCode.PARTICIPANT_REMOVED:
+            await websocket.close(code=_CLOSE_REMOVED, reason="removed")
         else:
             await websocket.close(code=_CLOSE_NOT_IN_SESSION, reason="not_in_session")
         return

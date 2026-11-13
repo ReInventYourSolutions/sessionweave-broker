@@ -99,6 +99,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.WAIT_ALREADY_IN_FLIGHT: 409,
     ErrorCode.PARTICIPANT_EVICTED: 409,
     ErrorCode.PARTICIPANT_PAUSED: 409,
+    ErrorCode.PARTICIPANT_REMOVED: 403,
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
     ErrorCode.TOO_MANY_WAITS: 429,

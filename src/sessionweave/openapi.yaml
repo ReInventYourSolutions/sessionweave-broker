@@ -415,6 +415,7 @@ components:
                 - wait_already_in_flight
                 - participant_evicted
                 - participant_paused
+                - participant_removed
                 - too_many_waits
                 - client_disconnect
             message:
@@ -1053,14 +1054,26 @@ paths:
       description: |
         Bearer: the creator token or the admin token; a supervisor token is
         refused. The agent first receives a `supervisor.note` of kind `halt`
-        (message `removed by the session creator`), then leaves: its token
-        stops working, its open events WebSocket closes with code 4410
-        (reason `removed`), the commands it sent are cancelled, and the other
-        participants and the firehose receive `participant.left` with reason
-        `removed`. Every still-valid join token of the session is
-        invalidated (joining with one answers "join link expired"). Only the
-        addressed participant is affected. The removal is written to disk
-        before the response.
+        (message `removed by the session creator`); as with any halt, the
+        other participants and the firehose then see `participant.updated`
+        with `supervision_state: paused` for it (unless it was already
+        paused). It then leaves: its open events WebSocket closes with code
+        4410 (reason `removed`), the commands it sent are cancelled, and the
+        other participants and the firehose receive `participant.left` with
+        reason `removed`. Every still-valid join token of the session is
+        invalidated: joining with one answers "join link expired" (after a
+        relay restart such a link reads as an invalid token instead, like
+        any expired link). Only the addressed participant is affected. The
+        join-token cut-off and the removal are written to disk before the
+        response; if that write fails nothing has changed and the call can
+        be retried.
+
+        For one hour (in memory; not across a relay restart, where it is a
+        plain `not_in_session`) any call made with the removed participant's
+        token — REST, MCP with an explicit `participant_token`, resume, inbox
+        drain / wait, events WebSocket (closed 4410) — answers 403
+        `participant_removed` with the message "you were removed from this
+        session by its creator — stop your work and your sub-agents".
       security:
         - bearerAuth: []
       responses:

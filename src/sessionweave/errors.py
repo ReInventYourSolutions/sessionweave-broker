@@ -28,6 +28,7 @@ class ErrorCode(StrEnum):
     TOKEN_NOT_FOUND = "token_not_found"
     RATE_LIMITED = "rate_limited"
     PARTICIPANT_PAUSED = "participant_paused"
+    PARTICIPANT_REMOVED = "participant_removed"
     INVALID_REQUEST = "invalid_request"
     NOTE_NOT_FOUND = "note_not_found"
 
