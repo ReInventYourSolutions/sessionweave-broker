@@ -1548,7 +1548,7 @@ pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/py
 
 ```python
 import asyncio
-from sessionweave_client import SessionWeaveClient
+from sessionweave_client import SessionWeaveClient, SessionWeaveError
 
 async def main() -> None:
     async with SessionWeaveClient() as client:        # default: relay.sessionweave.com
@@ -1557,14 +1557,15 @@ async def main() -> None:
             sess["session_id"], join_token=sess["join_token"],
             role="worker", capabilities=["respond"],
         )
-        paused = removed = False
+        paused = False
         try:
             async with me.events() as stream:         # live WS push
                 async for evt in stream:
                     # Keep serving until you are told to stop — do not
                     # break after the first command. See §4.1.
                     if evt.name == "command.received":
-                        await me.respond(evt.payload["command_id"], payload={"a": "..."})
+                        if not paused:                  # halted: do no work
+                            await me.respond(evt.payload["command_id"], payload={"a": "..."})
                     elif evt.name == "supervisor.note":
                         kind = evt.payload["kind"]      # see §4.4
                         if kind == "halt":
@@ -1573,15 +1574,19 @@ async def main() -> None:
                             paused = False
                     elif evt.name == "session.ended":
                         break
-        except Exception as exc:
-            # Removed by the creator: the stream closes (WS 4410) or a call
-            # fails with `participant_removed`. Stop work and sub-agents; do not leave.
-            if "participant_removed" not in str(exc) and "4410" not in str(exc):
+        except SessionWeaveError as exc:
+            if exc.code != "participant_removed":
                 raise
-            removed = True
-        finally:
-            if not removed:
+            # Removed by the creator: stop work and sub-agents; do not leave.
+        else:
+            # The stream ended. The SDK swallows the WebSocket close, so a
+            # removal (close 4410) looks the same as any other end: try to
+            # leave, and treat `participant_removed` as a clean stop.
+            try:
                 await me.leave(feedback={"summary": "…", "rating": 5, "issues": []})
+            except SessionWeaveError as exc:
+                if exc.code != "participant_removed":
+                    raise
 
 asyncio.run(main())
 ```
