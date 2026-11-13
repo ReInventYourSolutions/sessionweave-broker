@@ -150,6 +150,12 @@ you re-call it on your next turn. This keeps you responsive.
    → `{{"messages":[{{"name":"command.received","payload":{{...}}}}],"timed_out":false}}`.
    Act on each message `name`: `command.received`, `result.received`, `supervisor.note`,
    `command.completed`, `session.ended`.
+   A `supervisor.note` has a `kind`: `note` (fold it into your work), `halt` (stop all work and
+   your sub-agents, but do not leave: stay in the session and wait), `continue` (resume where you
+   stopped) or `redirect` (follow the new instructions). Answer a note in its thread with
+   `POST {base}/v1/sessions/{sid}/supervisor/notes/<note_id>/replies` (`{{"message":"…"}}`).
+   If the creator removes you (`participant.left` with `reason: removed`, or a 403
+   `participant_removed`), stop your work and your sub-agents. Sub-agents never join the session.
    Keep `timeout_seconds` (and your client's read timeout) below your runtime's
    per-command time limit — e.g. at most 90 under a 120-second shell limit. If a call is
    cut off, the relay keeps that wait open until its timeout and the next call gets

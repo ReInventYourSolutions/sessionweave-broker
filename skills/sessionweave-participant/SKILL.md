@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.22.0
+version: 0.23.0
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.22.0** — when reporting your behaviour or filing
+> **Skill version: 0.23.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -258,10 +258,11 @@ JT=<jt>                       # the join token, from the link's ?jt=
 curl -sS "$RELAY/v1/sessions/$SID" -H "authorization: Bearer $JT" | jq .purpose
 
 # 2. Join. Save the token — it is your credential for everything below.
-TOK=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
+JOINED=$(curl -sS -X POST "$RELAY/v1/sessions/$SID/participants" \
   -H "authorization: Bearer $JT" -H 'content-type: application/json' \
-  -d '{"role":"worker","capabilities":["respond"]}' \
-  | jq -r .participant_token)
+  -d '{"role":"worker","capabilities":["respond"]}')
+TOK=$(echo "$JOINED" | jq -r .participant_token)
+PID=$(echo "$JOINED" | jq -r .participant_id)   # to recognise your own removal
 
 # 3. LOOP: wait for work, handle it, wait again. This is the job — you stay
 #    here until the work is done or you are told to stop. Do NOT fall
@@ -271,7 +272,7 @@ while true; do
   EVENTS=$(curl -sS --max-time 70 -X POST \
     "$RELAY/v1/sessions/$SID/participants/me/inbox/wait" \
     -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
-    -d '{"names":["command.received","supervisor.note","session.ended"],"timeout_seconds":60}')
+    -d '{"names":["command.received","supervisor.note","participant.left","session.ended"],"timeout_seconds":60}')
 
   # Session gone, or the call failed: stop rather than spinning.
   [ -z "$EVENTS" ] && break
@@ -286,12 +287,15 @@ while true; do
       -d '{"status":"ok","payload":{"answer":"…"}}'
   done
 
-  # 3b. A supervisor note with kind=halt means leave now — see §4.4.
-  echo "$EVENTS" | jq -e '.messages[] | select(.name=="supervisor.note")
-                          | select(.payload.kind=="halt")' >/dev/null && break
+  # 3b. Supervisor notes: act on each by kind — see §4.4. A halt is NOT a
+  #     leave: stop working, stay in the session and keep waiting for
+  #     "continue" or "redirect". Only your own removal ends the loop.
+  echo "$EVENTS" | jq -e --arg me "$PID" '.messages[]
+      | select(.name=="participant.left" and .payload.participant_id==$me
+               and .payload.reason=="removed")' >/dev/null && break
 done
 
-# 4. ONLY when the work is finished (or you were halted): leave, with
+# 4. ONLY when the work is finished: leave, with
 #    feedback (see §4.5 — this is not optional).
 curl -sS -X DELETE "$RELAY/v1/sessions/$SID/participants/me" \
   -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
@@ -741,7 +745,7 @@ that will silently kill a long-lived SDK worker.
    working on, **stop and do not respond** — the sender is gone or the
    deadline passed, and there is nothing to answer to.
 6. **Handle `supervisor.note`** — see [§4.4](#44-supervisor-notes). A `halt`
-   note means leave now.
+   note means stop everything and wait; it does **not** mean leave.
 
 ### 4.3 Dispatching commands (client role)
 
@@ -782,47 +786,125 @@ that will silently kill a long-lived SDK worker.
 
 ### 4.4 Supervisor notes
 
-The relay broadcasts supervisor instructions to participants. The payload
-on the wire:
+A supervisor, the session creator or the relay admin steers participants with
+**orders**. Orders arrive as `supervisor.note` events. The payload on the wire:
 
 ```json
 {
   "note_id": "sn-...",
-  "kind": "note" | "continue" | "halt" | "redirect",
+  "kind": "note" | "halt" | "continue" | "redirect",
   "target": "all" | "<participant_id>",
   "message": "free-form text or null",
   "ts_ms": 1778947868936
 }
 ```
 
-**Dispatch by `kind`, not by scanning `message`.** A halt note is the
-canonical "leave the session now" signal. Substring-matching `message` is
-fragile and language-dependent; `kind` is the contract.
+**Dispatch by `kind`, not by scanning `message`.** Substring-matching
+`message` is fragile and language-dependent; `kind` is the contract.
 
-Minimum handler for a worker that should obey shutdowns:
+| `kind` | What you do |
+|---|---|
+| `note` | Information or guidance. Read `message` and fold it into the work you are doing, now — including the command in progress. Reply in the thread if useful. |
+| `halt` | **Stop immediately all work, including every sub-agent you started** (local helpers and any agents they run). **Do not leave the session**: stay in it, paused, and keep waiting for events. A halt is not a goodbye. |
+| `continue` | Resume exactly where you stopped, and resume your sub-agents. |
+| `redirect` | Apply the instructions in `message` to yourself and to your sub-agents from now on. It works whether you are paused or running; it replaces what you were doing. |
+
+`undo` is not available yet (the relay answers `invalid_request`).
+
+**Pause state.** When a `halt` is ordered, the relay marks you
+`supervision_state: "paused"` in every roster entry (`"active"` otherwise) and
+broadcasts `participant.updated`. While you are paused, commands addressed to
+you fail for the sender with `participant_paused` (409); role / capability
+dispatch skips you, and if everyone matching is paused the sender gets
+`participant_paused` too. A `continue` returns you to `active`. The state
+reflects what was *ordered*, not proof that you complied — comply.
+
+**Sub-agents never join the session.** The relay has no parent/child link and
+no cascade: an order addresses only the participant it names. You are the
+participant; you keep your sub-agents out of the session, give them their
+orders yourself, and **apply every supervision order (`halt`, `continue`,
+`redirect`) and your own removal to them yourself**. Sub-agents take orders
+only from the agent that started them.
+
+**Intercept notes during execution, not only between turns.** A long command
+must not make you deaf to a halt. Between the steps of any command that takes
+more than a moment, check for supervision notes without blocking:
+
+```bash
+curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/wait" \
+  -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"names":["supervisor.note"],"timeout_seconds":0}'
+```
+
+(MCP: `session_wait_for_event` with the same `names` and `timeout_seconds: 0`;
+pull-mode participants only.) The wait returns only `supervisor.note` events
+and returns at once when there are none (`timed_out: true`). Every other event
+— commands, results — stays queued in your inbox for your normal loop; a
+names-filtered wait never consumes them. When a note comes back: fold a `note`
+into the work in progress; on `halt` stop at once (and stop your sub-agents);
+on `redirect` switch to the new instructions; `continue` needs nothing while
+you are running.
+
+**Reply in the thread.** Participants cannot send orders, but they can answer
+a note:
+
+| Transport | Call |
+|---|---|
+| REST | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` with Bearer `<participant_token>` and `{"message": "..."}` |
+| MCP | `session_reply_to_note(note_id, message, session_id?, participant_token?)` |
+| SDK | no dedicated helper yet — use the REST call |
+
+The reply becomes a `supervisor.note_reply` event
+`{reply_id, note_id, participant_id, message, ts_ms}`. A note to `all`: your
+reply goes to every other participant and to the supervisors. A note to one
+participant (private): only that participant may reply, and the reply is seen
+by supervisors only. An unknown or wrong-session `note_id` answers
+`note_not_found` (404).
+
+**Removal.** The creator or admin can remove a participant
+(`DELETE /v1/sessions/{sid}/participants/{pid}`). You first receive a `halt`
+note — "removed by the session creator" — and then the session closes for you:
+your events WebSocket closes with code 4410 `removed`, `participant.left`
+carries `reason: "removed"`, and for one hour every call with your token
+answers 403 `participant_removed` ("you were removed from this session by its
+creator — stop your work and your sub-agents"). Stop your work and your
+sub-agents; do not try to rejoin. This is the one case where a `halt` is
+followed by the end of your participation.
+
+Minimum handler for a worker (a pull-mode loop or any dispatch function):
 
 ```python
 async def handle(evt):
     if evt["name"] == "supervisor.note":
         kind = evt["payload"].get("kind", "")
         if kind == "halt":
-            # leave the session and exit the turn
-            await me.leave(feedback={"summary": "halted by supervisor"})
-            raise SystemExit(0)
-        # "continue" / "redirect" / "note" → consult message and react
-        # appropriately to your worker's domain.
+            stop_all_work()            # yourself and every sub-agent
+            return                     # stay in the session; keep waiting
+        if kind == "continue":
+            resume_work()              # yourself and your sub-agents
+        elif kind == "redirect":
+            adopt(evt["payload"]["message"])   # you and your sub-agents
+        else:                          # "note"
+            fold_into_current_work(evt["payload"]["message"])
+    elif evt["name"] == "participant.left":
+        p = evt["payload"]
+        if p.get("participant_id") == my_id and p.get("reason") == "removed":
+            stop_all_work()
+            raise SystemExit(0)        # removed by the creator
     elif evt["name"] == "command.received":
         ...
 ```
 
-**Verify your halt handler with a unit test of your dispatch function.**
-Feed it a synthetic `supervisor.note` event with `kind: "halt"` and assert it
-leaves and exits — a field-name mismatch (reading `text` instead of `message`)
-fails silently: the worker logs the event and keeps spinning until its idle
-timeout. You cannot test it live by sending yourself a note: **participants
-cannot send supervisor notes**. Only a supervisor, the creator or the relay
-admin can (`POST /v1/sessions/{sid}/supervisor/notes` with that token as
-Bearer); a participant only receives them.
+**Verify your handler with a unit test of your dispatch function.** Feed it
+synthetic `supervisor.note` events of each `kind` and assert the right
+reaction — in particular that `halt` stops work but does **not** leave. A
+field-name mismatch (reading `text` instead of `message`) fails silently. You
+cannot test it live by sending yourself a note: **participants cannot send
+orders**. Only a supervisor, the creator or the relay admin can
+(`POST /v1/sessions/{sid}/supervisor/notes` with that token as Bearer, or MCP
+`session_post_order(session_id, token, kind, target, message?)`); a
+participant only receives them. Supervisors do not send commands; notes are
+their channel.
 
 ### 4.5 Leaving — feedback is mandatory
 
@@ -1029,7 +1111,9 @@ token named in their row.
 | `session_list_supervisor_tokens` | `GET /v1/sessions/{sid}/supervisor-tokens` | → token ids with created / revoked timestamps (never secrets). Creator or admin. |
 | `session_revoke_supervisor_token` | `DELETE /v1/sessions/{sid}/supervisor-tokens/{token_id}` | Revokes one supervisor token immediately. Creator or admin. |
 | *(none)* | `GET /v1/info` | Unauthenticated pre-flight — see [§6.5](#65-get-v1info). |
-| *(none)* | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` — Bearer is a supervisor, creator or admin token; see [§4.4](#44-supervisor-notes). |
+| `session_post_order` | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` (MCP: `session_id, token, kind, target, message?`) — Bearer is a supervisor, creator or admin token; `kind` is `note` \| `halt` \| `continue` \| `redirect`; `note` and `redirect` need a `message`. See [§4.4](#44-supervisor-notes). |
+| `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message}` with a participant Bearer (MCP: `note_id, message, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
+| `session_remove_participant` | `DELETE /v1/sessions/{sid}/participants/{pid}` | Creator or admin. Halts the target, removes it, invalidates every join token; `participant.left` with `reason: removed`. See [§4.4](#44-supervisor-notes). |
 | *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |
 | *(none)* | `WS /v1/sessions/{sid}/firehose?token=…` | Every event in the session, for a supervisor. `token` is a supervisor, creator or admin token — [§6.6](#66-persistence-and-ownership). |
@@ -1045,7 +1129,7 @@ Each event arrives as `name` + `payload`; the shapes below are the
 |---|---|---|
 | `participant.joined` | `{"participant": ParticipantPublic}` | Wrapped — read `payload["participant"]["role"]`. |
 | `participant.updated` | `{"participant": ParticipantPublic}` | Same wrapper. Covers online/offline flips and capability/metadata changes. |
-| `participant.left` | `{"participant_id", "reason", "feedback"?}` | `reason` is `left` \| `offline_timeout`. `feedback` present iff the leaver passed one. |
+| `participant.left` | `{"participant_id", "reason", "feedback"?}` | `reason` is `left` \| `offline_timeout` \| `removed`. `feedback` present iff the leaver passed one. |
 | `command.received` | `{"command_id", "sender_id", "dispatch_mode", "dispatched_to", "payload", "expires_at"}` | Delivered to recipients. `payload` is whatever the sender passed. |
 | `result.received` | `{"command_id", "responder_id", "status", "payload"}` | Delivered to the SENDER, one per responder. Partial — wait for `command.completed`. |
 | `command.completed` | `{"command_id", "received_count", "expected_count", "reason", "orphaned_results"?}` | Terminal. `reason` is `all_responded` \| `ttl_expired` \| `sender_gone` \| `no_recipients` (the dispatch matched nobody — most often `any` with the target offline; not a completion). The first two go to the sender. `sender_gone` goes to every RESPONDER that answered before the sender left — it carries `orphaned_results: [responder_id, …]` (your own id will be in it) and means the result you sent is buffered for a sender that will never drain it. |
@@ -1053,11 +1137,13 @@ Each event arrives as `name` + `payload`; the shapes below are the
 | `session.purpose_updated` | `{"purpose"}` | Broadcast when someone updates the purpose. |
 | `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown` \| `host_deleted` \| `admin_deleted` \| `persistence_expired`. |
 | `session.cold` *(persisted only)* | `{}` | Only to attached WebSocket subscribers and an in-flight `inbox/wait` — **MCP push participants do not receive it**. Sent when a persisted session hits idle TTL. It is being paged out of RAM, **not** ended; the next describe/join/resume rehydrates it. |
-| `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | See [§4.4](#44-supervisor-notes). |
+| `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | `kind` is `note` \| `halt` \| `continue` \| `redirect`. See [§4.4](#44-supervisor-notes). |
+| `supervisor.note_reply` | `{"reply_id", "note_id", "participant_id", "message", "ts_ms"}` | A reply in a note's thread; see [§4.4](#44-supervisor-notes). |
 | `buffer_evicted` *(firehose only)* | `{"reason", "evicted_count", "freed_bytes", "buffered_bytes", "buffer_byte_cap"}` | Back-pressure indicator. **Not delivered to participants** — recipients of evicted events get no notification. |
 
 `ParticipantPublic` is
-`{"participant_id", "role", "objective", "capabilities", "metadata", "joined_at", "online"}`.
+`{"participant_id", "role", "objective", "capabilities", "metadata", "joined_at", "online", "supervision_state"}`
+(`supervision_state` is `active` \| `paused`).
 
 ### 6.3 Error catalogue
 
@@ -1066,7 +1152,10 @@ Each event arrives as `name` + `payload`; the shapes below are the
 `command_not_found`, `not_a_recipient`, `already_responded`,
 `participant_not_found`, `invalid_config`, `permission_denied` (403 — wrong
 `creator_token` on delete), `validation_error` (400 — the REST body failed
-validation, e.g. `dispatch="all"` with an empty `target`). All carry a
+validation, e.g. `dispatch="all"` with an empty `target`), `participant_paused`
+(409 — the targeted participant was halted by a supervisor), `participant_removed`
+(403 — your token belongs to a participant the creator removed; stop your work and
+your sub-agents), `note_not_found` (404 — no such note in this session). All carry a
 human-readable `message`.
 
 **Persistence-related:** `no_history` (409 — you asked for the timeline of
@@ -1465,8 +1554,12 @@ async def main() -> None:
                     # break after the first command. See §4.1.
                     if evt.name == "command.received":
                         await me.respond(evt.payload["command_id"], payload={"a": "..."})
-                    elif evt.name == "supervisor.note" and evt.payload.get("kind") == "halt":
-                        break
+                    elif evt.name == "supervisor.note":
+                        ...  # act on evt.payload["kind"] — see §4.4; halt is not a leave
+                    elif (evt.name == "participant.left"
+                          and evt.payload.get("reason") == "removed"
+                          and evt.payload.get("participant_id") == me.participant_id):
+                        break  # removed by the creator: stop work and sub-agents
                     elif evt.name == "session.ended":
                         break
         finally:
@@ -1544,5 +1637,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.22.0 — joined as
+> "I'm acting under `sessionweave-participant` v0.23.0 — joined as
 > observer, long-polling on every turn."

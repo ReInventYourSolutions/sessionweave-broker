@@ -27,7 +27,11 @@ output; it is used ONLY to recognise this participant's own
 ``participant.left`` event and is never sent to the relay as a credential.
 
 Exit when ``session.ended`` or a matching ``participant.left`` event
-is observed for the polled participant. Otherwise runs until killed.
+is observed for the polled participant (this includes ``reason: removed``,
+the creator removed you), or when the relay answers ``participant_removed``.
+A ``supervisor.note`` of kind ``halt`` is NOT terminal: a halted participant
+stays in the session, paused, and waits for ``continue`` or ``redirect``.
+Otherwise runs until killed.
 """
 from __future__ import annotations
 
@@ -123,6 +127,12 @@ async def run(
                 log_file.write(
                     json.dumps({"ts": _now(), "error": str(exc)}) + "\n"
                 )
+                if "participant_removed" in str(exc):
+                    log_file.write(
+                        json.dumps({"ts": _now(), "event": "poller-stop"})
+                        + "\n"
+                    )
+                    return 0
                 msgs = []
             terminal = False
             for m in msgs:

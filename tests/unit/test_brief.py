@@ -90,3 +90,10 @@ def test_brief_states_runtime_limit_payload_and_leave_status():
     assert "inbox/drain" in out
     assert "goes inside `payload`" in out
     assert "204 No Content" in out
+
+
+def test_brief_describes_halt_without_leaving_and_note_replies():
+    out = _render({"kind": "demo"})
+    assert "do not leave" in out
+    assert "/supervisor/notes/<note_id>/replies" in out
+    assert "participant_removed" in out

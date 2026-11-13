@@ -21,6 +21,41 @@ def test_terminal_on_own_left() -> None:
     )
 
 
+def test_terminal_on_own_removal() -> None:
+    own = "abc-123"
+    assert _is_terminal(
+        {
+            "name": "participant.left",
+            "payload": {"participant_id": own, "reason": "removed"},
+        },
+        own,
+    )
+
+
+def test_not_terminal_on_halt_note() -> None:
+    assert not _is_terminal(
+        {
+            "name": "supervisor.note",
+            "payload": {"kind": "halt", "target": "all", "message": None},
+        },
+        "pid",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_stops_on_participant_removed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_drain(relay_url: str, session_id: str, participant_token: str):
+        raise RuntimeError("participant_removed: you were removed")
+
+    monkeypatch.setattr(poller, "_drain_once", fake_drain)
+    log = tmp_path / "ev.log"
+    rc = await poller.run("http://x/mcp", "sid", "TOK", "pid", log, 0.01)
+    assert rc == 0
+    assert "poller-stop" in log.read_text()
+
+
 def test_not_terminal_on_other_left() -> None:
     own = "abc-123"
     assert not _is_terminal(
