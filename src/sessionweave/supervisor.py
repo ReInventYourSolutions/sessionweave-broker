@@ -6,8 +6,9 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 
-_VALID_KINDS: set[str] = {"note", "halt", "continue", "redirect"}
+ORDER_KINDS: frozenset[str] = frozenset({"note", "halt", "continue", "redirect"})
 _MAX_MESSAGE_BYTES = 2048
+_MESSAGE_REQUIRED = frozenset({"note", "redirect"})
 
 
 class SupervisorRequestError(ValueError):
@@ -23,13 +24,32 @@ class SupervisorNote:
     ts_ms: int
 
 
+@dataclass(frozen=True)
+class NoteRecord:
+    note_id: str
+    kind: str
+    target: str
+    ts_ms: int
+
+
+def next_state(kind: str, current: str) -> str:
+    """Supervision state after an order: what was ordered, not proof of compliance."""
+    if kind == "halt":
+        return "paused"
+    if kind in ("continue", "redirect"):
+        return "active"
+    return current
+
+
 def parse_supervisor_request(body: object) -> SupervisorNote:
     if not isinstance(body, dict):
         raise SupervisorRequestError("body must be an object")
 
     kind = body.get("kind")
-    if kind not in _VALID_KINDS:
-        raise SupervisorRequestError(f"kind must be one of {sorted(_VALID_KINDS)}, got {kind!r}")
+    if kind == "undo":
+        raise SupervisorRequestError("kind 'undo' is not available yet")
+    if kind not in ORDER_KINDS:
+        raise SupervisorRequestError(f"kind must be one of {sorted(ORDER_KINDS)}, got {kind!r}")
 
     target = body.get("target")
     if not isinstance(target, str) or not target:
@@ -43,6 +63,9 @@ def parse_supervisor_request(body: object) -> SupervisorNote:
             raise SupervisorRequestError(
                 f"message exceeds {_MAX_MESSAGE_BYTES} bytes"
             )
+
+    if kind in _MESSAGE_REQUIRED and not message:
+        raise SupervisorRequestError(f"message is required for kind {kind!r}")
 
     return SupervisorNote(
         note_id=f"sn-{uuid.uuid4().hex[:12]}",
