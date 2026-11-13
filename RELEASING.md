@@ -17,6 +17,10 @@ shape / event names / bearer model listed in `FAKE_RELAY_FIDELITY.md`:
 - WS `/v1/sessions/{sid}/participants/me/events` frame shape `{"name","payload"}`
 - wake event names: `supervisor.note`, `command.received`, `result.received`,
   `command.completed`, `command.cancelled`, `session.ended`
+- supervision: `supervisor.note` kinds `note|halt|continue|redirect` (payload
+  `{note_id, kind, target, message, ts_ms}`), the new event `supervisor.note_reply`, the
+  `participant_paused` 409, the events-WS close code **4410** (reason `removed`) and the 403
+  `participant_removed` error
 - the bearer model (join needs a join/creator token; `participant_token` is a secret distinct from `participant_id` and authenticates every participant route)
 
 then, in the companion repo: update `Runner/tests/_fakerelay.py` to match and bump
