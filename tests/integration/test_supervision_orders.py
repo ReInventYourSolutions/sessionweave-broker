@@ -201,13 +201,71 @@ async def test_each_order_reaches_the_firehose_exactly_once(
     sub = await firehose.subscribe(sess.session_id)
 
     await sess.post_order(_order("halt", a.participant_id))
-    await asyncio.sleep(0.05)
+    await asyncio.gather(*sess._firehose_tasks)
 
     names = []
     while not sub.queue.empty():
         names.append(sub.queue.get_nowait()["name"])
     assert names.count("supervisor.note") == 1
     assert names.count("participant.updated") == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_order_write_leaves_ram_and_disk_unchanged(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The paused rows and the note commit together or not at all.
+
+    The failure is injected on the transaction's last statement, after the
+    note event and the participant rows were written, so the rollback has
+    to undo both.
+    """
+    sess = await _session(_registry(store))
+    a, ha, b, hb = await _two(sess)
+    conn = store._write_conn
+    assert conn is not None
+    real_execute = conn.execute
+    armed = {"on": True}
+
+    def failing_execute(sql: str, *args: Any, **kwargs: Any) -> Any:
+        if armed["on"] and sql.startswith("UPDATE sessions SET last_activity_at"):
+            raise RuntimeError("disk full")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "execute", failing_execute)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await sess.post_order(_order("halt", "all"))
+    armed["on"] = False
+
+    assert set(_states(sess).values()) == {"active"}
+    assert sess._notes == {}
+    assert "supervisor.note" not in _names(ha) + _names(hb)
+    hydrated = await _registry(store).get_or_raise(sess.session_id)
+    assert _states(hydrated) == {a.participant_id: "active", b.participant_id: "active"}
+    assert hydrated._notes == {}
+    page = await store.fetch_events(sid=sess.session_id, kinds=["supervisor.note"])
+    assert page.events == []
+
+
+@pytest.mark.asyncio
+async def test_failed_roster_notice_does_not_fail_an_applied_order(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sess = await _session(_registry(store))
+    a, ha, _, _ = await _two(sess)
+    real_dispatch = Session._dispatch_event
+
+    async def flaky_dispatch(self: Session, **kwargs: Any) -> None:
+        if kwargs["kind"] == "participant.updated":
+            raise RuntimeError("disk full")
+        await real_dispatch(self, **kwargs)
+
+    monkeypatch.setattr(Session, "_dispatch_event", flaky_dispatch)
+    out = await sess.post_order(_order("halt", a.participant_id))
+
+    assert out["affected"] == [a.participant_id]
+    assert _states(sess)[a.participant_id] == "paused"
+    assert "supervisor.note" in _names(ha)
 
 
 # ---------- paused-aware dispatch ----------
@@ -250,6 +308,24 @@ async def test_role_dispatch_to_only_paused_participants_is_refused(
             )
         assert exc.value.code is ErrorCode.PARTICIPANT_PAUSED, mode
         assert exc.value.message == "participant is paused by the supervisor"
+
+
+@pytest.mark.asyncio
+async def test_any_with_only_paused_online_and_an_active_offline_match_has_no_recipients(
+    store: PersistenceStore,
+) -> None:
+    """Paused is reported only when every match is paused; presence does not count."""
+    sess = await _session(_registry(store))
+    a, _, b, _ = await _two(sess)
+    lead = await _sender(sess)
+    await sess.post_order(_order("halt", a.participant_id))
+    sess._participants[b.participant_id].online = False
+
+    out = await sess.send(
+        sender_id=lead.participant_id, dispatch=DispatchMode.ANY,
+        target=Target(role="worker"), payload={"do": "it"},
+    )
+    assert out.delivered_to == []
 
 
 @pytest.mark.asyncio

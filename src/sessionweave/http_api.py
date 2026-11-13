@@ -754,11 +754,6 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     try:
         out = await session.post_order(note)
     except ToolError as exc:
-        if exc.code is ErrorCode.PARTICIPANT_NOT_FOUND:
-            return JSONResponse(
-                {"error": "participant_not_found", "detail": exc.message},
-                status_code=404,
-            )
         return _error_response(exc)
     return JSONResponse(out, status_code=200)
 

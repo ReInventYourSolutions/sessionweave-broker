@@ -98,7 +98,7 @@ async def test_post_note_unknown_participant_returns_404():
                 json={"kind": "halt", "target": "p-does-not-exist"},
             )
         assert r.status_code == 404
-        assert r.json()["error"] == "participant_not_found"
+        assert r.json()["error"]["code"] == "participant_not_found"
 
 
 @pytest.mark.integration

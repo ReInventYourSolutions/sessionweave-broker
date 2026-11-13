@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -28,6 +28,7 @@ from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.models import CommandTracker, Participant
 from sessionweave.notifications import BufferOverflow, NotificationBuffer
+from sessionweave.persistence import ParticipantUpsert
 from sessionweave.schemas import (
     DispatchMode,
     ParticipantPublic,
@@ -553,40 +554,42 @@ class Session:
             previous: dict[str, Literal["active", "paused"]] = {}
             for pid in targets:
                 p = self._participants[pid]
-                state = cast(
-                    'Literal["active", "paused"]',
-                    next_state(note.kind, p.supervision_state),
-                )
+                state = next_state(note.kind, p.supervision_state)
                 if state != p.supervision_state:
                     previous[pid] = p.supervision_state
                     p.supervision_state = state
             affected = list(previous)
-            self.bump_activity()
+            payload: dict[str, Any] = {
+                "note_id": note.note_id,
+                "kind": note.kind,
+                "target": note.target,
+                "message": note.message,
+                "ts_ms": note.ts_ms,
+            }
+            # The changed participant rows commit in the same transaction as
+            # the note event: the disk never shows a paused participant
+            # without the order that paused it.
+            upserts = [
+                ParticipantUpsert(
+                    participant_id=pid,
+                    snapshot=self._participant_snapshot(self._participants[pid]),
+                    last_seen_seq=self._participants[pid].last_acked_seq,
+                    joined_at=int(self._participants[pid].joined_at.timestamp() * 1000),
+                )
+                for pid in affected
+            ]
             try:
-                if self._store is not None:
-                    for pid in affected:
-                        p = self._participants[pid]
-                        await self._store.upsert_participant(
-                            self.session_id, pid, self._participant_snapshot(p),
-                            last_seen_seq=p.last_acked_seq,
-                            joined_at=int(p.joined_at.timestamp() * 1000),
-                        )
-                payload: dict[str, Any] = {
-                    "note_id": note.note_id,
-                    "kind": note.kind,
-                    "target": note.target,
-                    "message": note.message,
-                    "ts_ms": note.ts_ms,
-                }
                 await self._dispatch_event(
-                    kind="supervisor.note", payload=payload, recipients=targets
+                    kind="supervisor.note", payload=payload, recipients=targets,
+                    participant_upserts=upserts,
                 )
             except Exception:
-                # Nothing was delivered: put the ordered state back so RAM
-                # does not claim an order nobody received.
-                for pid, state in previous.items():
-                    self._participants[pid].supervision_state = state
+                # Nothing was persisted or delivered: put the previous state
+                # back so RAM does not claim an order nobody received.
+                for pid, old_state in previous.items():
+                    self._participants[pid].supervision_state = old_state
                 raise
+            self.bump_activity()
             self._notes[note.note_id] = NoteRecord(
                 note.note_id, note.kind, note.target, note.ts_ms
             )
@@ -596,11 +599,23 @@ class Session:
                     "participant": self._participants[pid].to_public().model_dump()
                 }
                 others = [o for o in self._participants if o != pid]
-                await self._dispatch_event(
-                    kind="participant.updated",
-                    payload=updated_payload,
-                    recipients=others,
-                )
+                try:
+                    await self._dispatch_event(
+                        kind="participant.updated",
+                        payload=updated_payload,
+                        recipients=others,
+                    )
+                except Exception:
+                    # The order is already applied, persisted and delivered.
+                    # Failing the call now would invite the supervisor to post
+                    # the same order twice, so the roster notice is logged and
+                    # dropped; the roster itself (and any later describe)
+                    # already shows the new state.
+                    logger.exception(
+                        "participant.updated after order %s failed for %s",
+                        note.note_id, pid,
+                    )
+                    continue
                 self._mirror_firehose("participant.updated", updated_payload)
             return {**payload, "affected": affected}
 
@@ -1387,6 +1402,7 @@ class Session:
         recipients: list[str],
         inflight_upsert: tuple[str, dict[str, Any]] | None = None,
         inflight_complete: str | None = None,
+        participant_upserts: Sequence[ParticipantUpsert] = (),
     ) -> None:
         """Single durability + delivery primitive used by mutators with a store.
 
@@ -1419,6 +1435,7 @@ class Session:
                 inflight_upsert=inflight_upsert,
                 inflight_complete=inflight_complete,
                 buffered_pids=tuple(buffered_pids),
+                participant_upserts=participant_upserts,
             )
 
         for pid in recipients:

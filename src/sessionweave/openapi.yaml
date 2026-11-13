@@ -1197,7 +1197,11 @@ paths:
           description: >-
             participant_paused — a specific target is paused by the supervisor,
             or every role / capability match is. Paused participants are never
-            matched by role or capability.
+            matched by role or capability. Presence does not count here: an
+            ``any`` dispatch whose only online matches are paused, while an
+            active match is offline, is not refused — it closes with
+            ``command.completed`` reason ``no_recipients``, like any ``any``
+            that finds nobody online.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '413':
           description: payload_too_large

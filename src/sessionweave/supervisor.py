@@ -5,6 +5,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from typing import Literal
 
 ORDER_KINDS: frozenset[str] = frozenset({"note", "halt", "continue", "redirect"})
 _MAX_MESSAGE_BYTES = 2048
@@ -32,7 +33,9 @@ class NoteRecord:
     ts_ms: int
 
 
-def next_state(kind: str, current: str) -> str:
+def next_state(
+    kind: str, current: Literal["active", "paused"]
+) -> Literal["active", "paused"]:
     """Supervision state after an order: what was ordered, not proof of compliance."""
     if kind == "halt":
         return "paused"
