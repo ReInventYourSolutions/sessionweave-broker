@@ -73,3 +73,22 @@ async def test_hydrate_restores_paused_state_and_notes(store: PersistenceStore) 
     assert hydrated._notes == {
         "sn-abc": NoteRecord("sn-abc", "halt", paused.participant_id, 1234)
     }
+
+
+@pytest.mark.asyncio
+async def test_update_self_keeps_paused_state_across_hydrate(store: PersistenceStore) -> None:
+    reg = _registry(store)
+    sid, _, _, _, _ = await reg.create(
+        overrides={}, purpose=None,
+        persistence=PersistenceConfig(mode="ttl", ttl_seconds=3600),
+        creator_token_hash=hash_token(generate_token()),
+    )
+    sess = await reg.get_or_raise(sid)
+    p = await sess.join(FakeHandle(), role="a", capabilities=[])
+    p.supervision_state = "paused"
+    await sess.update_self(p.participant_id, role="renamed")
+
+    hydrated = await _registry(store).get_or_raise(sid)
+    (entry,) = hydrated.roster_snapshot()
+    assert entry.role == "renamed"
+    assert entry.supervision_state == "paused"

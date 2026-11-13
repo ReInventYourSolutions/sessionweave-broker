@@ -362,16 +362,7 @@ class Session:
             if self._metrics is not None:
                 self._metrics.participants_active.labels(online="true").inc()
             if self._store is not None:
-                snapshot = {
-                    "role": p.role,
-                    "objective": p.objective,
-                    "capabilities": list(p.capabilities),
-                    "metadata": dict(p.metadata),
-                    "delivery_mode": p.delivery_mode,
-                    "online": p.online,
-                    "token_hash": p.token_hash.hex(),
-                    "supervision_state": p.supervision_state,
-                }
+                snapshot = self._participant_snapshot(p)
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
                 await self._store.upsert_participant(
                     self.session_id, p.participant_id, snapshot,
@@ -488,6 +479,20 @@ class Session:
                 f"feedback {size} bytes exceeds 4 KiB cap",
             )
 
+    @staticmethod
+    def _participant_snapshot(p: Participant) -> dict[str, Any]:
+        """The one persisted shape of a participant; every writer uses it."""
+        return {
+            "role": p.role,
+            "objective": p.objective,
+            "capabilities": list(p.capabilities),
+            "metadata": dict(p.metadata),
+            "delivery_mode": p.delivery_mode,
+            "online": p.online,
+            "token_hash": p.token_hash.hex(),
+            "supervision_state": p.supervision_state,
+        }
+
     async def update_self(
         self,
         participant_id: str,
@@ -511,15 +516,7 @@ class Session:
                 p.metadata = dict(metadata)
             self.bump_activity()
             if self._store is not None:
-                snapshot = {
-                    "role": p.role,
-                    "objective": p.objective,
-                    "capabilities": list(p.capabilities),
-                    "metadata": dict(p.metadata),
-                    "delivery_mode": p.delivery_mode,
-                    "online": p.online,
-                    "token_hash": p.token_hash.hex(),
-                }
+                snapshot = self._participant_snapshot(p)
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
                 await self._store.upsert_participant(
                     self.session_id, participant_id, snapshot,

@@ -4,7 +4,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sessionweave.schemas import DispatchMode, ParticipantPublic
 
@@ -59,7 +59,7 @@ class Participant:
     issued_token: str | None = None
     # What was last ordered by a supervisor (``active`` | ``paused``); not proof
     # of compliance. Persisted in the participant snapshot.
-    supervision_state: str = "active"
+    supervision_state: Literal["active", "paused"] = "active"
 
     @staticmethod
     def create(
@@ -88,7 +88,7 @@ class Participant:
             metadata=dict(self.metadata),
             joined_at=_isoformat(self.joined_at),
             online=self.online,
-            supervision_state=self.supervision_state,  # type: ignore[arg-type]
+            supervision_state=self.supervision_state,
         )
 
 
