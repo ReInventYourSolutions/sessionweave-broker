@@ -54,6 +54,10 @@ _CLOSE_NOT_IN_SESSION = 4401
 _CLOSE_SESSION_NOT_FOUND = 4404
 _CLOSE_TOKEN_REVOKED = 4403
 _CLOSE_RATE_LIMITED = 4429
+# The participant was removed by the session creator / admin (HTTP 410 Gone).
+_CLOSE_REMOVED = 4410
+# Sentinel Session hands a departed participant's subscribers.
+_EVICTED = "__evicted__"
 
 
 async def events_ws(websocket: WebSocket) -> None:
@@ -108,12 +112,32 @@ async def events_ws(websocket: WebSocket) -> None:
         maxsize=_QUEUE_MAX
     )
 
+    # Set when the session drops this participant (leave or removal):
+    # the socket flushes what is already queued, then closes.
+    evicted = asyncio.Event()
+    evicted_reason: str = ""
+
     def callback(name: str, payload: dict[str, Any], seq: int) -> None:
         # Invoked from inside Session._deliver_or_buffer while the
         # session lock is held. put_nowait is sync and safe on the same
         # event loop. If the queue is full we raise: Session catches and
         # falls back to the buffer.
+        nonlocal evicted_reason
+        if name == _EVICTED:
+            evicted_reason = str(payload.get("reason") or "evicted")
+            evicted.set()
+            return
         queue.put_nowait((name, payload, seq))
+
+    async def _send(name: str, payload: dict[str, Any], seq: int) -> None:
+        try:
+            await websocket.send_json({"name": name, "payload": payload, "seq": seq})
+        except WebSocketDisconnect:
+            undelivered.append((name, payload, seq))
+            raise
+        else:
+            if seq > highest_acked_seq:
+                unacked[seq] = (name, payload)
 
     # Items the callback handed us but the socket failed to deliver
     # before disconnect. detach_subscriber pushes them back onto the
@@ -181,30 +205,32 @@ async def events_ws(websocket: WebSocket) -> None:
         pid, callback, last_acked_seq=last_acked_seq
     )
     closer: asyncio.Task[None] | None = None
+    gone: asyncio.Task[bool] | None = None
     try:
         for item in backlog:
-            name = item["name"]
-            payload = item["payload"]
-            seq = item.get("seq", 0)
-            try:
-                await websocket.send_json(
-                    {"name": name, "payload": payload, "seq": seq}
-                )
-            except WebSocketDisconnect:
-                undelivered.append((name, payload, seq))
-                raise
-            else:
-                if seq > highest_acked_seq:
-                    unacked[seq] = (name, payload)
+            await _send(item["name"], item["payload"], item.get("seq", 0))
 
         closer = asyncio.create_task(_watch_close())
+        gone = asyncio.create_task(evicted.wait())
         while True:
             getter: asyncio.Task[tuple[str, dict[str, Any], int]] = asyncio.create_task(
                 queue.get()
             )
             done, _pending = await asyncio.wait(
-                {getter, closer}, return_when=asyncio.FIRST_COMPLETED
+                {getter, closer, gone}, return_when=asyncio.FIRST_COMPLETED
             )
+            if gone in done and getter not in done and closer not in done:
+                # The participant left or was removed. Everything queued
+                # before that (e.g. the halt note of a removal) is sent,
+                # then the socket closes.
+                getter.cancel()
+                while not queue.empty():
+                    await _send(*queue.get_nowait())
+                if evicted_reason == "removed":
+                    await websocket.close(code=_CLOSE_REMOVED, reason="removed")
+                else:
+                    await websocket.close(code=1000, reason=evicted_reason)
+                break
             if closer in done:
                 # Peer closed — abandon the in-flight getter and exit. If
                 # an event happened to land in the queue between the
@@ -216,21 +242,14 @@ async def events_ws(websocket: WebSocket) -> None:
             if closer.done():
                 undelivered.append((name, payload, seq))
                 break
-            try:
-                await websocket.send_json(
-                    {"name": name, "payload": payload, "seq": seq}
-                )
-            except WebSocketDisconnect:
-                undelivered.append((name, payload, seq))
-                raise
-            else:
-                if seq > highest_acked_seq:
-                    unacked[seq] = (name, payload)
+            await _send(name, payload, seq)
     except WebSocketDisconnect:
         pass
     except Exception:
         log.exception("WebSocket events handler crashed for session=%s pid=%s", sid, pid)
     finally:
+        if gone is not None and not gone.done():
+            gone.cancel()
         if closer is not None and not closer.done():
             closer.cancel()
             try:

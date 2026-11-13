@@ -54,6 +54,7 @@ from sessionweave.tools import (
     session_mint_join_token,
     session_mint_supervisor_token,
     session_post_order,
+    session_remove_participant,
     session_reply_to_note,
     session_respond,
     session_resume,
@@ -912,6 +913,30 @@ def _build_fastmcp(
             deps, session_id, creator_token, token_id, source_ip=_client_ip(ctx)
         )
         return {"revoked": True}
+
+    @_tool("session_remove_participant")
+    async def session_remove_participant_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        participant_id: Annotated[str, Field(description=
+            "The participant_id of the agent to remove, as shown in the roster."
+        )],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove one agent from a session.
+
+    Requires the creator_token (or the relay admin token); a supervisor
+    token is refused. The agent first receives a halt order, then leaves
+    the session: its token stops working and the others see
+    participant.left with reason removed. Every still-valid join token of
+    the session is invalidated, so mint a new one to invite again. Only
+    the named participant is affected. Fails with participant_not_found
+    for an unknown participant_id. Returns removed (the removed ids) and
+    join_tokens_invalidated.
+    """
+        return await session_remove_participant(
+            deps, session_id, creator_token, participant_id, source_ip=_client_ip(ctx)
+        )
 
     @_tool("session_post_order")
     async def session_post_order_tool(

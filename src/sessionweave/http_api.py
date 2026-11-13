@@ -916,6 +916,19 @@ async def _revoke_supervisor_token_handler(request: Request) -> Response:
     return await _run_credential_call(request, call, 204)
 
 
+async def _remove_participant_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    participant_id = request.path_params["pid"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_remove_participant(
+            deps, sid, token, participant_id, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -964,6 +977,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/participants/me",
             delete_self,
+            methods=["DELETE"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/participants/{pid}",
+            _remove_participant_handler,
             methods=["DELETE"],
         ),
         Route(

@@ -363,10 +363,13 @@ class PersistenceStore:
 
     async def soft_delete_participant(self, sid: str, pid: str, left_at: int) -> None:
         assert self._write_conn is not None
-        await self._write_conn.execute(
-            "UPDATE participants SET left_at = ? WHERE session_id = ? AND participant_id = ?",
-            (left_at, sid, pid),
-        )
+        # Under the lock like the token writes: a concurrent transaction's
+        # ROLLBACK on the shared write connection must not undo a departure.
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "UPDATE participants SET left_at = ? WHERE session_id = ? AND participant_id = ?",
+                (left_at, sid, pid),
+            )
 
     async def ack_participant(self, sid: str, pid: str, last_seen_seq: int) -> None:
         assert self._write_conn is not None
@@ -499,6 +502,20 @@ class PersistenceStore:
                 "UPDATE session_tokens SET revoked_at = ?"
                 " WHERE session_id = ? AND token_id = ?",
                 (revoked_at_ms, sid, token_id),
+            )
+
+    async def expire_tokens(
+        self, sid: str, token_ids: Sequence[str], expires_at_ms: int
+    ) -> None:
+        """Set ``expires_at`` of the given tokens (join-token invalidation)."""
+        assert self._write_conn is not None
+        if not token_ids:
+            return
+        async with self._write_tx_lock:
+            await self._write_conn.executemany(
+                "UPDATE session_tokens SET expires_at = ?"
+                " WHERE session_id = ? AND token_id = ?",
+                [(expires_at_ms, sid, tid) for tid in token_ids],
             )
 
     async def load_tokens(self, sid: str) -> list[IssuedToken]:

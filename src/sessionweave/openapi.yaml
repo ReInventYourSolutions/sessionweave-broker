@@ -1043,6 +1043,41 @@ paths:
           description: payload_too_large (feedback over 4 KiB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
+  /v1/sessions/{sid}/participants/{pid}:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: pid, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [participants]
+      summary: Remove an agent from the session (creator or admin)
+      description: |
+        Bearer: the creator token or the admin token; a supervisor token is
+        refused. The agent first receives a `supervisor.note` of kind `halt`
+        (message `removed by the session creator`), then leaves: its token
+        stops working, its open events WebSocket closes with code 4410
+        (reason `removed`), the commands it sent are cancelled, and the other
+        participants and the firehose receive `participant.left` with reason
+        `removed`. Every still-valid join token of the session is
+        invalidated (joining with one answers "join link expired"). Only the
+        addressed participant is affected. The removal is written to disk
+        before the response.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: array, items: { type: string } }
+                  join_tokens_invalidated: { type: integer }
+        '403': { description: permission_denied (not the creator or admin token) }
+        '404':
+          description: session_not_found or participant_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
   /v1/sessions/{sid}/participants/me/inbox/drain:
     parameters:
       - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }

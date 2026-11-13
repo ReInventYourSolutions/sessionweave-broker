@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
 _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
+# The halt note a participant receives just before the creator removes it.
+REMOVED_HALT_MESSAGE = "removed by the session creator"
 
 
 def _utcnow() -> datetime:
@@ -433,28 +435,10 @@ class Session:
         if feedback is not None:
             self._enforce_feedback_size(feedback)
         async with self.lock:
-            p = self._participants.pop(participant_id, None)
-            if p is None:
+            if self._drop_participant(participant_id) is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
-            self.auth.forget_participant(participant_id)
-            handle = p.connection_ref
-            if handle is not None:
-                # handle is a ConnectionHandle (set by join/resume)
-                self._connections.unbind(handle)  # type: ignore[arg-type]
-            self._discard_buffer(self._buffers.pop(participant_id, None))
             self.bump_activity()
-            if self._metrics is not None:
-                online_label = "true" if p.online else "false"
-                self._metrics.participants_active.labels(online=online_label).dec()
-            self._cancel_inflight_for_sender(participant_id, reason="sender_gone")
-            # Wake any wait_for_event coroutine so it can raise PARTICIPANT_EVICTED.
-            subs = self._subscribers.pop(participant_id, None)
-            if subs:
-                for cb in list(subs):
-                    try:
-                        cb("__evicted__", {}, 0)
-                    except Exception:
-                        pass
+            self._close_subscribers(participant_id, reason="left")
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
             if feedback is not None:
                 payload["feedback"] = feedback
@@ -470,6 +454,49 @@ class Session:
                 recipients=others,
             )
             self._mirror_firehose("participant.left", payload)
+
+    async def remove_participant(self, participant_id: str) -> dict[str, Any]:
+        """Remove one participant on the creator's (or admin's) order.
+
+        The target first receives a ``halt`` supervisor note through the
+        ordinary order path, then leaves: its token, connection binding,
+        buffer and subscribers go (an events WebSocket closes with 4410
+        ``removed``), the commands it sent are cancelled, its departure is
+        written to disk before this returns, and the others receive a
+        persisted ``participant.left`` with reason ``removed``. Every
+        still-valid join token of the session is invalidated. Only the
+        addressed participant is affected: sub-agents never join.
+        """
+        async with self.lock:
+            if participant_id not in self._participants:
+                raise ToolError(
+                    ErrorCode.PARTICIPANT_NOT_FOUND,
+                    f"{participant_id!r} is not a participant of this session",
+                )
+            await self._apply_order(SupervisorNote(
+                note_id=f"sn-{uuid.uuid4().hex[:12]}", kind="halt",
+                target=participant_id, message=REMOVED_HALT_MESSAGE, ts_ms=_now_ms(),
+            ))
+            self._drop_participant(participant_id)
+            self._close_subscribers(participant_id, reason="removed")
+            now_ms = _now_ms()
+            if self._store is not None:
+                await self._store.soft_delete_participant(
+                    self.session_id, participant_id, left_at=now_ms
+                )
+            payload: dict[str, Any] = {"participant_id": participant_id, "reason": "removed"}
+            await self._dispatch_event(
+                kind="participant.left", payload=payload,
+                recipients=list(self._participants),
+            )
+            self._mirror_firehose("participant.left", payload)
+            invalidated = self.auth.invalidate_join_tokens(now_ms)
+            if self._store is not None and invalidated:
+                await self._store.expire_tokens(
+                    self.session_id, [t.token_id for t in invalidated], now_ms
+                )
+            self.bump_activity()
+            return {"removed": [participant_id], "join_tokens_invalidated": len(invalidated)}
 
     @staticmethod
     def _enforce_feedback_size(feedback: dict[str, Any]) -> None:
@@ -542,82 +569,86 @@ class Session:
         plus ``affected``: the participants whose state changed.
         """
         async with self.lock:
-            if note.target == "all":
-                targets = list(self._participants)
-            elif note.target in self._participants:
-                targets = [note.target]
-            else:
-                raise ToolError(
-                    ErrorCode.PARTICIPANT_NOT_FOUND,
-                    f"target {note.target!r} is not a participant of this session",
-                )
-            previous: dict[str, Literal["active", "paused"]] = {}
-            for pid in targets:
-                p = self._participants[pid]
-                state = next_state(note.kind, p.supervision_state)
-                if state != p.supervision_state:
-                    previous[pid] = p.supervision_state
-                    p.supervision_state = state
-            affected = list(previous)
-            payload: dict[str, Any] = {
-                "note_id": note.note_id,
-                "kind": note.kind,
-                "target": note.target,
-                "message": note.message,
-                "ts_ms": note.ts_ms,
+            return await self._apply_order(note)
+
+    async def _apply_order(self, note: SupervisorNote) -> dict[str, Any]:
+        """``post_order`` without the lock: the caller holds ``self.lock``."""
+        if note.target == "all":
+            targets = list(self._participants)
+        elif note.target in self._participants:
+            targets = [note.target]
+        else:
+            raise ToolError(
+                ErrorCode.PARTICIPANT_NOT_FOUND,
+                f"target {note.target!r} is not a participant of this session",
+            )
+        previous: dict[str, Literal["active", "paused"]] = {}
+        for pid in targets:
+            p = self._participants[pid]
+            state = next_state(note.kind, p.supervision_state)
+            if state != p.supervision_state:
+                previous[pid] = p.supervision_state
+                p.supervision_state = state
+        affected = list(previous)
+        payload: dict[str, Any] = {
+            "note_id": note.note_id,
+            "kind": note.kind,
+            "target": note.target,
+            "message": note.message,
+            "ts_ms": note.ts_ms,
+        }
+        # The changed participant rows commit in the same transaction as
+        # the note event: the disk never shows a paused participant
+        # without the order that paused it.
+        upserts = [
+            ParticipantUpsert(
+                participant_id=pid,
+                snapshot=self._participant_snapshot(self._participants[pid]),
+                last_seen_seq=self._participants[pid].last_acked_seq,
+                joined_at=int(self._participants[pid].joined_at.timestamp() * 1000),
+            )
+            for pid in affected
+        ]
+        try:
+            await self._dispatch_event(
+                kind="supervisor.note", payload=payload, recipients=targets,
+                participant_upserts=upserts,
+            )
+        except Exception:
+            # Nothing was persisted or delivered: put the previous state
+            # back so RAM does not claim an order nobody received.
+            for pid, old_state in previous.items():
+                self._participants[pid].supervision_state = old_state
+            raise
+        self.bump_activity()
+        self._notes[note.note_id] = NoteRecord(
+            note.note_id, note.kind, note.target, note.ts_ms
+        )
+        self._mirror_firehose("supervisor.note", payload)
+        for pid in affected:
+            updated_payload = {
+                "participant": self._participants[pid].to_public().model_dump()
             }
-            # The changed participant rows commit in the same transaction as
-            # the note event: the disk never shows a paused participant
-            # without the order that paused it.
-            upserts = [
-                ParticipantUpsert(
-                    participant_id=pid,
-                    snapshot=self._participant_snapshot(self._participants[pid]),
-                    last_seen_seq=self._participants[pid].last_acked_seq,
-                    joined_at=int(self._participants[pid].joined_at.timestamp() * 1000),
-                )
-                for pid in affected
-            ]
+            others = [o for o in self._participants if o != pid]
             try:
                 await self._dispatch_event(
-                    kind="supervisor.note", payload=payload, recipients=targets,
-                    participant_upserts=upserts,
+                    kind="participant.updated",
+                    payload=updated_payload,
+                    recipients=others,
                 )
             except Exception:
-                # Nothing was persisted or delivered: put the previous state
-                # back so RAM does not claim an order nobody received.
-                for pid, old_state in previous.items():
-                    self._participants[pid].supervision_state = old_state
-                raise
-            self.bump_activity()
-            self._notes[note.note_id] = NoteRecord(
-                note.note_id, note.kind, note.target, note.ts_ms
-            )
-            self._mirror_firehose("supervisor.note", payload)
-            for pid in affected:
-                updated_payload = {
-                    "participant": self._participants[pid].to_public().model_dump()
-                }
-                others = [o for o in self._participants if o != pid]
-                try:
-                    await self._dispatch_event(
-                        kind="participant.updated",
-                        payload=updated_payload,
-                        recipients=others,
-                    )
-                except Exception:
-                    # The order is already applied, persisted and delivered.
-                    # Failing the call now would invite the supervisor to post
-                    # the same order twice, so the roster notice is logged and
-                    # dropped; the roster itself (and any later describe)
-                    # already shows the new state.
-                    logger.exception(
-                        "participant.updated after order %s failed for %s",
-                        note.note_id, pid,
-                    )
-                    continue
-                self._mirror_firehose("participant.updated", updated_payload)
-            return {**payload, "affected": affected}
+                # The order is already applied, persisted and delivered.
+                # Failing the call now would invite the supervisor to post
+                # the same order twice, so the roster notice is logged and
+                # dropped; the roster itself (and any later describe)
+                # already shows the new state.
+                logger.exception(
+                    "participant.updated after order %s failed for %s",
+                    note.note_id, pid,
+                )
+                continue
+            self._mirror_firehose("participant.updated", updated_payload)
+        return {**payload, "affected": affected}
 
     async def reply_to_note(
         self, participant_id: str, note_id: str, message: str
@@ -1754,17 +1785,45 @@ class Session:
             if self._metrics is not None:
                 self._metrics.command_cancelled_total.labels(reason=reason).inc()
 
-    def _evict(self, pid: str, reason: str) -> None:
+    def _drop_participant(self, pid: str) -> Participant | None:
+        """Take a participant out of the session's RAM state.
+
+        Shared by leave, eviction and removal: the roster entry, its token,
+        its connection binding, its buffer and its gauge go, and the
+        commands it sent are cancelled as ``sender_gone``. The caller
+        records the departure on disk and announces it. Returns ``None``
+        when ``pid`` is not a participant.
+        """
         p = self._participants.pop(pid, None)
         if p is None:
-            return
+            return None
         self.auth.forget_participant(pid)
-        self._persist_left(pid)
+        if p.connection_ref is not None:
+            # connection_ref is a ConnectionHandle (set by join/resume)
+            self._connections.unbind(p.connection_ref)  # type: ignore[arg-type]
         self._discard_buffer(self._buffers.pop(pid, None))
         if self._metrics is not None:
             online_label = "true" if p.online else "false"
             self._metrics.participants_active.labels(online=online_label).dec()
         self._cancel_inflight_for_sender(pid, reason="sender_gone")
+        return p
+
+    def _close_subscribers(self, pid: str, *, reason: str) -> None:
+        """Hand every live subscriber of a departed participant the
+        ``__evicted__`` sentinel (payload ``{"reason": reason}``):
+        ``wait_for_event`` raises PARTICIPANT_EVICTED and the events
+        WebSocket closes (code 4410 when ``reason`` is ``removed``).
+        """
+        for cb in self._subscribers.pop(pid, None) or ():
+            try:
+                cb("__evicted__", {"reason": reason}, 0)
+            except Exception:
+                pass
+
+    def _evict(self, pid: str, reason: str) -> None:
+        if self._drop_participant(pid) is None:
+            return
+        self._persist_left(pid)
         self._notify_others(
             exclude_pid=pid,
             name="participant.left",

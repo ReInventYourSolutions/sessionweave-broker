@@ -118,6 +118,19 @@ class SessionAuth:
                 return issued
         raise KeyError(token_id)
 
+    def invalidate_join_tokens(self, now_ms: int) -> list[IssuedToken]:
+        """Expire every still-valid join token now; return the ones changed.
+
+        An invalidated link then gets the same "join link expired" answer
+        as one that ran out on its own.
+        """
+        changed: list[IssuedToken] = []
+        for t in self._issued.values():
+            if t.kind == "join" and t.expires_at_ms is not None and now_ms < t.expires_at_ms:
+                t.expires_at_ms = now_ms
+                changed.append(t)
+        return changed
+
     def supervisor_revoked(self, token_id: str) -> bool:
         return any(
             t.kind == "supervisor" and t.token_id == token_id and t.revoked_at_ms is not None

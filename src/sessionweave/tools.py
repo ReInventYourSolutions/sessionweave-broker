@@ -598,6 +598,19 @@ async def session_revoke_supervisor_token(
     await sess.revoke_supervisor_token(token_id)
 
 
+async def session_remove_participant(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    participant_id: str,
+    *,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Remove one participant: creator or admin token only."""
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    return await sess.remove_participant(participant_id)
+
+
 async def session_post_order(
     deps: ToolDeps,
     session_id: str,

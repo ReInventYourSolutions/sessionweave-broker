@@ -69,7 +69,7 @@ def tools() -> dict[str, Tool]:
 
 def test_the_server_advertises_every_tool(tools: dict[str, Tool]) -> None:
     """Guards the fixture itself — an empty list would make the rest vacuous."""
-    assert len(tools) == 20, sorted(tools)
+    assert len(tools) == 21, sorted(tools)
 
 
 def test_every_tool_has_a_description(tools: dict[str, Tool]) -> None:
