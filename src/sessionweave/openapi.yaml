@@ -794,6 +794,48 @@ paths:
         '404': { description: Session not found, or participant_not_found for an unknown target }
         '429': { description: Rate-limited }
 
+  /v1/sessions/{sid}/supervisor/notes/{note_id}/replies:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: note_id, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Reply in a supervisor note's thread
+      description: |
+        Participant Bearer token. The thread is flat: reply to the note, not to
+        a reply. A note sent to ``all`` is answered in the open (every other
+        participant and the firehose receive ``supervisor.note_reply``). A note
+        sent to one participant may be answered only by that participant, and
+        only the firehose receives the reply. The reply is persisted in the
+        session timeline (``GET /events``).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, minLength: 1, maxLength: 2048 }
+      responses:
+        '201':
+          description: Reply delivered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply_id: { type: string }
+                  note_id: { type: string }
+                  participant_id: { type: string }
+                  message: { type: string }
+                  ts_ms: { type: integer }
+        '400': { description: Empty or oversized message }
+        '401': { description: Missing or invalid participant token }
+        '403': { description: permission_denied (private note addressed to another participant) }
+        '404': { description: note_not_found }
+
   /v1/sessions/{sid}/join-tokens:
     parameters:
       - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }

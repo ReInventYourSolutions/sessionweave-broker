@@ -29,6 +29,7 @@ class ErrorCode(StrEnum):
     RATE_LIMITED = "rate_limited"
     PARTICIPANT_PAUSED = "participant_paused"
     INVALID_REQUEST = "invalid_request"
+    NOTE_NOT_FOUND = "note_not_found"
 
 
 @dataclass(slots=True)

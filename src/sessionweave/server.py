@@ -54,6 +54,7 @@ from sessionweave.tools import (
     session_mint_join_token,
     session_mint_supervisor_token,
     session_post_order,
+    session_reply_to_note,
     session_respond,
     session_resume,
     session_revoke_supervisor_token,
@@ -787,6 +788,34 @@ def _build_fastmcp(
             return await session_respond(
                 deps, h,
                 {"command_id": command_id, "payload": payload, "status": status},
+            )
+
+    @_tool("session_reply_to_note")
+    async def session_reply_to_note_tool(
+        note_id: Annotated[str, Field(description=
+            "The note_id from the supervisor.note event you are answering."
+        )],
+        message: Annotated[str, Field(description=
+            "Your reply, non-empty, at most 2048 bytes."
+        )],
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Reply in the thread under a supervisor note.
+
+    note_id comes from the supervisor.note event that delivered the note.
+    A note sent to all is answered in the open: every other participant and
+    the supervision holders see the reply. A note sent to you alone can only
+    be answered by you, and only supervision holders see the reply. The
+    thread is flat: reply to the note, not to another reply. Requires
+    session_join on this connection first. Returns reply_id, note_id,
+    participant_id, message and ts_ms.
+    """
+        assert ctx is not None
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_reply_to_note(
+                deps, h, {"note_id": note_id, "message": message}
             )
 
     @_tool("session_delete")

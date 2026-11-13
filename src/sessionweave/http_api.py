@@ -37,6 +37,7 @@ from sessionweave.tools import (
     session_get_events,
     session_join,
     session_leave,
+    session_reply_to_note,
     session_respond,
     session_send,
     session_update_purpose,
@@ -89,6 +90,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.PARTICIPANT_NOT_FOUND: 404,
     ErrorCode.COMMAND_NOT_FOUND: 404,
     ErrorCode.TOKEN_NOT_FOUND: 404,
+    ErrorCode.NOTE_NOT_FOUND: 404,
     ErrorCode.NOT_IN_SESSION: 401,
     ErrorCode.ALREADY_IN_SESSION: 409,
     ErrorCode.SESSION_FULL: 409,
@@ -758,6 +760,27 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     return JSONResponse(out, status_code=200)
 
 
+async def post_note_reply(request: Request) -> JSONResponse:
+    sid = request.path_params["sid"]
+    note_id = request.path_params["note_id"]
+    deps = _deps(request)
+    try:
+        token = _require_bearer(request)
+        body = await _read_json_body(request)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
+        try:
+            out = await session_reply_to_note(
+                deps, handle, {"note_id": note_id, "message": body.get("message")}
+            )
+        finally:
+            _unbind_participant(deps.registry.connections, handle)
+    except ToolError as exc:
+        return _error_response(exc)
+    return JSONResponse(out, status_code=201)
+
+
 async def _get_session_events_handler(request: Request) -> Response:
     """Browse the timeline of a persisted session without hydrating."""
     sid = request.path_params["sid"]
@@ -986,6 +1009,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/supervisor/notes",
             _supervisor_notes_handler,
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor/notes/{note_id}/replies",
+            post_note_reply,
             methods=["POST"],
         ),
     ]

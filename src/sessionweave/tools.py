@@ -498,6 +498,21 @@ async def session_respond(
     return {}
 
 
+async def session_reply_to_note(
+    deps: ToolDeps,
+    handle: ConnectionHandle,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Reply in a supervisor note's thread (participant-bound)."""
+    sess, pid = await _session_for_handle(deps, handle)
+    note_id, message = payload.get("note_id"), payload.get("message")
+    if not isinstance(note_id, str) or not note_id:
+        raise ToolError(ErrorCode.INVALID_REQUEST, "note_id must be a non-empty string")
+    if not isinstance(message, str):
+        raise ToolError(ErrorCode.INVALID_REQUEST, "message must be a string")
+    return await sess.reply_to_note(pid, note_id, message)
+
+
 async def session_delete(
     deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
 ) -> dict[str, Any]:

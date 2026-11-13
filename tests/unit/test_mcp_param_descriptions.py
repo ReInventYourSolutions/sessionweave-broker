@@ -46,6 +46,7 @@ REQUIRED = {
     "session_list_supervisor_tokens": ["creator_token", "session_id"],
     "session_revoke_supervisor_token": ["creator_token", "session_id", "token_id"],
     "session_post_order": ["kind", "session_id", "target", "token"],
+    "session_reply_to_note": ["message", "note_id"],
 }
 
 # String parameters with a closed set of values.

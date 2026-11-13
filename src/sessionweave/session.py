@@ -619,6 +619,51 @@ class Session:
                 self._mirror_firehose("participant.updated", updated_payload)
             return {**payload, "affected": affected}
 
+    async def reply_to_note(
+        self, participant_id: str, note_id: str, message: str
+    ) -> dict[str, Any]:
+        """Post a reply in the flat thread under a supervisor note.
+
+        A note to ``all`` is answered in the open: every participant except
+        the replier receives it, plus the firehose. A note to one participant
+        may be answered only by that participant, and the reply goes to the
+        firehose alone. The reply is persisted either way.
+        """
+        if not message or len(message.encode("utf-8")) > 2048:
+            raise ToolError(
+                ErrorCode.INVALID_REQUEST,
+                "message must be non-empty and at most 2048 bytes",
+            )
+        async with self.lock:
+            if participant_id not in self._participants:
+                raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            note = self._notes.get(note_id)
+            if note is None:
+                raise ToolError(ErrorCode.NOTE_NOT_FOUND, f"no note {note_id!r} in this session")
+            if note.target != "all" and note.target != participant_id:
+                raise ToolError(
+                    ErrorCode.PERMISSION_DENIED,
+                    "this note was sent to another participant",
+                )
+            payload: dict[str, Any] = {
+                "reply_id": f"nr-{uuid.uuid4().hex[:12]}",
+                "note_id": note_id,
+                "participant_id": participant_id,
+                "message": message,
+                "ts_ms": int(time.time() * 1000),
+            }
+            recipients = (
+                [p for p in self._participants if p != participant_id]
+                if note.target == "all"
+                else []
+            )
+            await self._dispatch_event(
+                kind="supervisor.note_reply", payload=payload, recipients=recipients
+            )
+            self.bump_activity()
+            self._mirror_firehose("supervisor.note_reply", payload)
+            return payload
+
     async def update_purpose(
         self,
         requester_id: str | None,
