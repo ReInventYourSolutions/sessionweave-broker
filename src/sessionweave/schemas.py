@@ -240,7 +240,7 @@ class SessionSendInput(_Strict):
     # dispatch's response (no duplicate event, no new tracker). Required
     # for retry-safe semantics on persisted sessions; otherwise the relay
     # generates a fresh uuid4 server-side.
-    command_id: str | None = None
+    command_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
     @model_validator(mode="after")
     def _validate_target(self) -> SessionSendInput:

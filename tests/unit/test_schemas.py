@@ -132,3 +132,18 @@ def test_session_wait_for_event_output_requires_effective_timeout() -> None:
     # caught at runtime by Pydantic, not at type-check time by mypy.
     with pytest.raises(ValidationError):
         SessionWaitForEventOutput.model_validate({"messages": [], "timed_out": True})
+
+
+@pytest.mark.parametrize("bad", ["a b", "x\ny", "q'; rm -rf /", "a" * 65, ""])
+def test_session_send_command_id_rejects_unsafe(bad: str) -> None:
+    with pytest.raises(ValidationError):
+        SessionSendInput(
+            dispatch=DispatchMode.ALL, target=Target(role="r"), payload={}, command_id=bad,
+        )
+
+
+def test_session_send_command_id_accepts_safe_and_none() -> None:
+    for ok in (None, "cmd-1_A", "a" * 64):
+        SessionSendInput(
+            dispatch=DispatchMode.ALL, target=Target(role="r"), payload={}, command_id=ok,
+        )
