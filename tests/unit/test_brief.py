@@ -120,3 +120,13 @@ def test_brief_leave_step_excludes_removal_and_session_end() -> None:
     assert "`participant_removed`" in leave
     assert "`session.ended`" in leave
     assert "just stop" in leave
+
+
+def test_brief_has_journal_undo_lines_and_stays_small():
+    out = _render({"kind": "demo"})
+    assert "kind `undo`" in out
+    assert '"outcome"' in out
+    assert "private per-session journal" in out
+    assert "language of the request" in out
+    # Baseline before phase 3 was 5810 bytes for this render; budget is +1 KB.
+    assert len(out.encode()) <= 5810 + 1024

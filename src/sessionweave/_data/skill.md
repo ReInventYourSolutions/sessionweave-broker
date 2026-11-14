@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.23.0
+version: 0.24.0
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.23.0** — when reporting your behaviour or filing
+> **Skill version: 0.24.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -33,6 +33,10 @@ SessionWeave is for *agent-to-agent* work.
 | Something failed, or your connection dropped | [§5 When things go wrong](#5-when-things-go-wrong) |
 | You are looking up a payload, an error code, or a limit | [§6 Reference](#6-reference) |
 | You are configuring a runtime for the first time | [§8 Setup](#8-setup--do-once) |
+
+**Read only what your role needs** (this file is large; open sections on demand):
+worker/implementer → §2.5, §4.2, §4.4, §4.6 · client/host → §3, §4.3, §4.4, §4.6 ·
+reconnecting → §5 · looking up a field or error → §6 · other transports → §7.1–7.3.
 
 ### Default relay
 
@@ -814,8 +818,7 @@ A supervisor, the session creator or the relay admin steers participants with
 | `halt` | **Stop immediately all work, including every sub-agent you started** (local helpers and any agents they run). **Do not leave the session**: stay in it, paused, and keep waiting for events. A halt is not a goodbye. |
 | `continue` | Resume exactly where you stopped, and resume your sub-agents. |
 | `redirect` | Apply the instructions in `message` to yourself and to your sub-agents from now on. It works whether you are paused or running; it replaces what you were doing. |
-
-`undo` is not available yet (the relay answers `invalid_request`).
+| `undo` | Stop like `halt` (and stop sub-agents), then revert what `message` names, using your journal — see [§4.6](#46-working-lean-journal-cache-undo). Reply with an `outcome`, then stay paused until `continue` / `redirect`. |
 
 **Pause state.** When a `halt` is ordered, the relay marks you
 `supervision_state: "paused"` in every roster entry (`"active"` otherwise) and
@@ -990,6 +993,38 @@ diagnose later.
 
 If you are the host, drain `participant.left` events at the end and either
 log the feedback or surface it to the operator.
+
+### 4.6 Working lean: journal, cache, undo
+
+**Token budget.** Using SessionWeave must cost no more tokens than working
+without it: read the invite brief, open skill sections only on demand, and wait
+through the Runner or long waits — never poll frequently.
+
+**Private session directory** `$SW_SESSION_DIR` (the Runner sets it), else
+`.sessionweave/<session_id>/` in your working dir. Never share it. Delete it
+when your participation ends (session end, removal, leave).
+- `journal.jsonl` — append one JSON line **before** each change you make to the
+  world (files, commands with effects, sub-agent actions too):
+  `{"ts_ms":…,"trigger":{"command_id":…|"note_id":…},"op":"write_file","target":"path","reverse":<what undoes it>}`.
+  `reverse` = the previous content (`null` if the file did not exist), or the
+  inverse command, or `"irreversible"` with a reason (sent mail, pushed commit).
+- `cache/` — your own notes: conclusions, summaries of files/pages already read,
+  decisions with their facts, expensive lookup results. Check it before
+  re-reading or re-reasoning; update or drop entries your later changes
+  invalidate.
+
+**Compact language.** For reasoning, cache, journal and messages to other agents
+use terse English with abbreviations if unambiguous. Anything addressed to a
+person (final answer, replies to a supervisor) keeps the original request's
+language, format and detail.
+
+**`undo` (supervisor note, `message` says what).** Stop work and sub-agents; read
+the journal for the matching trigger(s); reverse entries **newest first**; touch
+nothing others did (if a file changed since your write, report it instead of
+overwriting); append the reversals to the journal. Reply in the note thread with
+a human `message` plus `outcome`:
+`{"message":"…","outcome":{"status":"done|partial|impossible","undone":["…"],"not_reversible":["…"]}}`
+(SDK: `reply_to_note(note_id, message, outcome=…)`). Then stay paused.
 
 ## 5. When things go wrong
 
@@ -1682,5 +1717,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.23.0 — joined as
+> "I'm acting under `sessionweave-participant` v0.24.0 — joined as
 > observer, long-polling on every turn."
