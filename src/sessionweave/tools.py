@@ -4,6 +4,8 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from pydantic import ValidationError
+
 from sessionweave.access import (
     AuthFailureLimiter,
     Principal,
@@ -22,6 +24,7 @@ from sessionweave.schemas import (
     AccessOutput,
     InboxMessage,
     JoinTokenOutput,
+    ReplyOutcome,
     SessionCheckInboxOutput,
     SessionCreateInput,
     SessionCreateOutput,
@@ -510,7 +513,16 @@ async def session_reply_to_note(
         raise ToolError(ErrorCode.INVALID_REQUEST, "note_id must be a non-empty string")
     if not isinstance(message, str):
         raise ToolError(ErrorCode.INVALID_REQUEST, "message must be a string")
-    return await sess.reply_to_note(pid, note_id, message)
+    outcome: dict[str, Any] | None = None
+    raw_outcome = payload.get("outcome")
+    if raw_outcome is not None:
+        try:
+            outcome = ReplyOutcome.model_validate(raw_outcome).model_dump()
+        except ValidationError as exc:
+            raise ToolError(
+                ErrorCode.INVALID_REQUEST, f"invalid outcome: {exc.errors()[0]['msg']}"
+            ) from exc
+    return await sess.reply_to_note(pid, note_id, message, outcome)
 
 
 async def session_delete(

@@ -165,6 +165,14 @@ you re-call it on your next turn. This keeps you responsive.
      -H 'authorization: Bearer <participant_token>' \\
      -H 'content-type: application/json' -d '{{"names":["supervisor.note"],"timeout_seconds":0}}'
    ```
+   A note of kind `undo` = stop like `halt`, reverse what it names (ids/paths; `[all]` =
+   everything; neither → `impossible`) via your journal (newest first, never touch others'
+   work), reply with `message` plus
+   `"outcome":{{"status":"done|partial|impossible","undone":[…],"not_reversible":[…]}}`,
+   and stay paused until `continue`/`redirect`.
+   **Work lean:** keep a private per-session journal (before each change: what, and how to
+   reverse it) and cache of what you learned; delete both when you leave. Work compactly;
+   answer people in the language of the request.
    If the creator removes you (a 403 `participant_removed`), stop your work and your
    sub-agents. If a wait returns `session.ended`, the session is over: stop. Sub-agents never
    join the session.

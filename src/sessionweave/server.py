@@ -39,6 +39,7 @@ from sessionweave.mcp_adapter import (
 from sessionweave.metrics import METRICS_CONTENT_TYPE, Metrics
 from sessionweave.persistence import PersistenceStore
 from sessionweave.registry import SessionRegistry
+from sessionweave.schemas import ReplyOutcome
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
@@ -799,6 +800,11 @@ def _build_fastmcp(
         message: Annotated[str, Field(description=
             "Your reply, non-empty, at most 2048 bytes."
         )],
+        outcome: Annotated[ReplyOutcome | None, Field(description=
+            "Optional structured result, used when answering an undo order: status "
+            "(done, partial or impossible), undone (what was reverted) and "
+            "not_reversible (what could not be). The message stays required."
+        )] = None,
         session_id: OptSessionIdArg = None,
         participant_token: ParticipantTokenArg = None,
         ctx: Context | None = None,
@@ -811,12 +817,17 @@ def _build_fastmcp(
     be answered by you, and only supervision holders see the reply. The
     thread is flat: reply to the note, not to another reply. Requires
     session_join on this connection first. Returns reply_id, note_id,
-    participant_id, message and ts_ms.
+    participant_id, message and ts_ms (plus outcome when given).
     """
         assert ctx is not None
         async with _participant(ctx, session_id, participant_token) as h:
             return await session_reply_to_note(
-                deps, h, {"note_id": note_id, "message": message}
+                deps, h,
+                {
+                    "note_id": note_id,
+                    "message": message,
+                    "outcome": outcome.model_dump() if outcome is not None else None,
+                },
             )
 
     @_tool("session_delete")
@@ -945,17 +956,19 @@ def _build_fastmcp(
             "A supervisor_token, the creator_token, or the relay admin token. "
             "A participant or join token is refused with permission_denied."
         )],
-        kind: Annotated[Literal["note", "halt", "continue", "redirect"], Field(description=
+        kind: Annotated[Literal["note", "halt", "continue", "redirect", "undo"], Field(description=
             "note: guidance for the work in progress (state unchanged). "
             "halt: stop all work now and wait, paused. continue: resume where "
-            "stopped. redirect: follow the new instructions in message from now on."
+            "stopped. redirect: follow the new instructions in message from now on. "
+            "undo: stop, revert what message says (or everything you did) using your "
+            "journal, report the result, and stay paused until continue or redirect."
         )],
         target: Annotated[str, Field(description=
             "'all' for every participant, or one participant_id."
         )],
         message: Annotated[str | None, Field(description=
-            "The order's text, at most 2048 bytes. Required for note and "
-            "redirect; optional for halt and continue."
+            "The order's text, at most 2048 bytes. Required for note, "
+            "redirect and undo; optional for halt and continue."
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -963,7 +976,7 @@ def _build_fastmcp(
 
     Requires a supervisor_token, the creator_token or the relay admin token;
     participants receive orders, they do not send them. kind is one of note,
-    halt, continue, redirect. halt pauses the addressed participants: they
+    halt, continue, redirect, undo. halt and undo pause the addressed participants: they
     stay in the session but commands to them are refused with
     participant_paused until a continue or redirect. Only the addressed
     participants are affected. Rate-limited per session and source address.

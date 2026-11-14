@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from sessionweave.access import Role
 
@@ -16,6 +23,18 @@ class DispatchMode(StrEnum):
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ReplyOutcome(_Strict):
+    """Structured result of an order, carried by a supervisor note reply."""
+
+    status: Literal["done", "partial", "impossible"]
+    undone: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=64
+    )
+    not_reversible: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=64
+    )
 
 
 class ParticipantPublic(_Strict):
@@ -240,7 +259,7 @@ class SessionSendInput(_Strict):
     # dispatch's response (no duplicate event, no new tracker). Required
     # for retry-safe semantics on persisted sessions; otherwise the relay
     # generates a fresh uuid4 server-side.
-    command_id: str | None = None
+    command_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
     @model_validator(mode="after")
     def _validate_target(self) -> SessionSendInput:

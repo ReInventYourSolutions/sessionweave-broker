@@ -773,7 +773,11 @@ async def post_note_reply(request: Request) -> JSONResponse:
         )
         try:
             out = await session_reply_to_note(
-                deps, handle, {"note_id": note_id, "message": body.get("message")}
+                deps, handle, {
+                    "note_id": note_id,
+                    "message": body.get("message"),
+                    "outcome": body.get("outcome"),
+                },
             )
         finally:
             _unbind_participant(deps.registry.connections, handle)

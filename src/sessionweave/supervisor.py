@@ -7,9 +7,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
-ORDER_KINDS: frozenset[str] = frozenset({"note", "halt", "continue", "redirect"})
+ORDER_KINDS: frozenset[str] = frozenset({"note", "halt", "continue", "redirect", "undo"})
 _MAX_MESSAGE_BYTES = 2048
-_MESSAGE_REQUIRED = frozenset({"note", "redirect"})
+_MESSAGE_REQUIRED = frozenset({"note", "redirect", "undo"})
 
 
 class SupervisorRequestError(ValueError):
@@ -37,7 +37,7 @@ def next_state(
     kind: str, current: Literal["active", "paused"]
 ) -> Literal["active", "paused"]:
     """Supervision state after an order: what was ordered, not proof of compliance."""
-    if kind == "halt":
+    if kind in ("halt", "undo"):
         return "paused"
     if kind in ("continue", "redirect"):
         return "active"
@@ -49,8 +49,6 @@ def parse_supervisor_request(body: object) -> SupervisorNote:
         raise SupervisorRequestError("body must be an object")
 
     kind = body.get("kind")
-    if kind == "undo":
-        raise SupervisorRequestError("kind 'undo' is not available yet")
     if kind not in ORDER_KINDS:
         raise SupervisorRequestError(f"kind must be one of {sorted(ORDER_KINDS)}, got {kind!r}")
 

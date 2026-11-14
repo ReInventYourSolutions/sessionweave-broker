@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.29.0"
+  version: "0.30.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -471,7 +471,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.29.0" }
+                  version: { type: string, example: "0.30.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -744,7 +744,7 @@ paths:
       - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
     post:
       tags: [sessions]
-      summary: Post a supervisor note / halt / continue / redirect
+      summary: Post a supervisor note / halt / continue / redirect / undo
       description: |
         Bearer: a supervisor token, the creator token or the admin token
         (``SW_ADMIN_TOKEN``). A participant token is not accepted: participants
@@ -753,14 +753,15 @@ paths:
 
         Server-side invariants (all modes):
           - ``kind`` is restricted to the documented enum
-            (``note`` / ``halt`` / ``continue`` / ``redirect``).
+            (``note`` / ``halt`` / ``continue`` / ``redirect`` / ``undo``).
+            ``message`` is required for ``note``, ``redirect`` and ``undo``.
             Unknown kinds return 400.
           - ``target`` must equal ``"all"`` or a participant_id
             currently in the session roster.
           - Per-(session, source-ip) rate limit applies (shared with the
             ``session_post_order`` MCP tool).
           - Only the addressed participants change state and receive the
-            ``supervisor.note`` event: ``halt`` pauses them, ``continue`` and
+            ``supervisor.note`` event: ``halt`` and ``undo`` pause them, ``continue`` and
             ``redirect`` make them active again, ``note`` changes nothing.
           - The note is persisted in the session timeline (``GET /events``).
       security:
@@ -773,7 +774,7 @@ paths:
               type: object
               required: [kind, target]
               properties:
-                kind: { type: string, enum: [note, halt, continue, redirect] }
+                kind: { type: string, enum: [note, halt, continue, redirect, undo] }
                 target: { type: string, description: "'all' or a participant_id" }
                 message: { type: string, maxLength: 2048 }
       responses:
@@ -825,6 +826,15 @@ paths:
               required: [message]
               properties:
                 message: { type: string, minLength: 1, maxLength: 2048 }
+                outcome:
+                  type: object
+                  description: Optional structured result of an order (used for ``undo``).
+                  required: [status]
+                  additionalProperties: false
+                  properties:
+                    status: { type: string, enum: [done, partial, impossible] }
+                    undone: { type: array, items: { type: string } }
+                    not_reversible: { type: array, items: { type: string } }
       responses:
         '201':
           description: Reply delivered
@@ -839,7 +849,8 @@ paths:
                   participant_id: { type: string }
                   message: { type: string }
                   ts_ms: { type: integer }
-        '400': { description: Empty or oversized message }
+                  outcome: { type: object, description: "Echoed when the request carried one" }
+        '400': { description: Empty or oversized message, or invalid outcome }
         '401': { description: Missing or invalid participant token }
         '403': { description: permission_denied (private note addressed to another participant) }
         '404': { description: note_not_found }

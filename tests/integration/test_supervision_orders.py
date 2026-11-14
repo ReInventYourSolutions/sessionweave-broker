@@ -108,6 +108,22 @@ async def test_halt_pauses_only_the_target_and_only_it_receives_the_note(
 
 
 @pytest.mark.asyncio
+async def test_undo_pauses_the_target_and_delivers_the_note(
+    store: PersistenceStore,
+) -> None:
+    sess = await _session(_registry(store))
+    a, ha, b, hb = await _two(sess)
+
+    out = await sess.post_order(_order("undo", a.participant_id, "revert the migration"))
+
+    assert out["affected"] == [a.participant_id] and out["kind"] == "undo"
+    assert _states(sess) == {a.participant_id: "paused", b.participant_id: "active"}
+    notes = [p for n, p in ha.sent if n == "supervisor.note"]
+    assert notes[-1]["kind"] == "undo" and notes[-1]["message"] == "revert the migration"
+    assert "supervisor.note" not in _names(hb)
+
+
+@pytest.mark.asyncio
 async def test_continue_resumes_a_paused_target(store: PersistenceStore) -> None:
     sess = await _session(_registry(store))
     a, _, _, _ = await _two(sess)
