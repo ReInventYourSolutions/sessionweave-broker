@@ -32,6 +32,16 @@ JOIN_TOKEN_EXPIRED_GRACE_MS: int = 3_600_000
 
 _SWEEP_EVERY = 256
 
+# A removed participant's token is remembered this long (RAM only), so its
+# next call is told it was removed instead of getting a generic
+# not_in_session — the only way a pull-mode or offline agent learns of it.
+REMOVED_TOMBSTONE_MS: int = 3_600_000
+
+PARTICIPANT_REMOVED_MESSAGE = (
+    "you were removed from this session by its creator \u2014 "
+    "stop your work and your sub-agents"
+)
+
 Role = Literal["admin", "creator", "supervisor", "participant", "joiner"]
 
 
@@ -76,6 +86,8 @@ class SessionAuth:
         self._creator_hash = creator_token_hash
         self._issued: dict[bytes, IssuedToken] = {}
         self._participants: dict[bytes, str] = {}
+        # Token digest of a removed participant -> tombstone expiry (ms).
+        self._removed: dict[bytes, int] = {}
 
     @property
     def creator_token_hash(self) -> bytes | None:
@@ -118,6 +130,24 @@ class SessionAuth:
                 return issued
         raise KeyError(token_id)
 
+    def valid_join_tokens(self, now_ms: int) -> list[IssuedToken]:
+        """The join tokens that still admit a joiner at ``now_ms``."""
+        return [
+            t for t in self._issued.values()
+            if t.kind == "join" and t.expires_at_ms is not None and now_ms < t.expires_at_ms
+        ]
+
+    def invalidate_join_tokens(self, now_ms: int) -> list[IssuedToken]:
+        """Expire every still-valid join token now; return the ones changed.
+
+        An invalidated link then gets the same "join link expired" answer
+        as one that ran out on its own.
+        """
+        changed = self.valid_join_tokens(now_ms)
+        for t in changed:
+            t.expires_at_ms = now_ms
+        return changed
+
     def supervisor_revoked(self, token_id: str) -> bool:
         return any(
             t.kind == "supervisor" and t.token_id == token_id and t.revoked_at_ms is not None
@@ -133,6 +163,20 @@ class SessionAuth:
     def forget_participant(self, participant_id: str) -> None:
         for h in [h for h, pid in self._participants.items() if pid == participant_id]:
             del self._participants[h]
+
+    def tombstone_participant(self, token_hash: bytes, now_ms: int) -> None:
+        """Remember a removed participant's token for ``REMOVED_TOMBSTONE_MS``."""
+        self._prune_removed(now_ms)
+        self._removed[token_hash] = now_ms + REMOVED_TOMBSTONE_MS
+
+    def was_removed(self, token: str, now_ms: int) -> bool:
+        """Whether ``token`` belonged to a participant removed within the hour."""
+        self._prune_removed(now_ms)
+        return hash_token(token) in self._removed
+
+    def _prune_removed(self, now_ms: int) -> None:
+        for digest in [d for d, exp in self._removed.items() if exp <= now_ms]:
+            del self._removed[digest]
 
     def restore(self, tokens: Iterable[IssuedToken]) -> None:
         for t in tokens:
@@ -269,6 +313,8 @@ async def resolve_principal(
     if principal is not None:
         return principal
 
+    if auth.was_removed(token, now_ms):
+        raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)
     limiter = deps.auth_limiter
     if limiter.is_throttled(sid, source_ip):
         raise ToolError(ErrorCode.RATE_LIMITED, "too many invalid tokens; retry later")
@@ -300,14 +346,19 @@ def participant_id_for_token(
 
     Only a participant token qualifies: a participant_id, session id, join,
     supervisor or creator token is NOT_IN_SESSION, as is a token whose
-    participant has since been removed. With a ``limiter``, each failure is
+    participant has since left. The token of a participant the creator
+    removed within the last hour is PARTICIPANT_REMOVED instead (not counted
+    as a failure). With a ``limiter``, each failure is
     counted per (sid, source_ip) like any other invalid token; once
     throttled, invalid tokens get RATE_LIMITED, while a valid participant
     token is never refused.
     """
-    principal = sess.auth.match(token, _now_ms()) if token else None
+    now_ms = _now_ms()
+    principal = sess.auth.match(token, now_ms) if token else None
     pid = principal.participant_id if principal is not None else None
     if principal is None or principal.role != "participant" or pid not in sess._participants:
+        if token and sess.auth.was_removed(token, now_ms):
+            raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)
         if limiter is not None:
             sid = sess.session_id
             if limiter.is_throttled(sid, source_ip):

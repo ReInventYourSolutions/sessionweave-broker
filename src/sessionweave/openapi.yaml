@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.28.0"
+  version: "0.29.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -165,6 +165,7 @@ components:
           additionalProperties: true
         joined_at: { type: string, format: date-time }
         online: { type: boolean }
+        supervision_state: { type: string, enum: [active, paused] }
 
     Session:
       type: object
@@ -413,6 +414,8 @@ components:
                 - invalid_delivery_mode
                 - wait_already_in_flight
                 - participant_evicted
+                - participant_paused
+                - participant_removed
                 - too_many_waits
                 - client_disconnect
             message:
@@ -468,7 +471,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.16.0" }
+                  version: { type: string, example: "0.29.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -661,7 +664,11 @@ paths:
     get:
       tags: [sessions]
       summary: "Browse the timeline of a persisted session"
-      description: "Bearer: a participant, join, supervisor, creator or admin token."
+      description: >-
+        Bearer: a participant, join, supervisor, creator or admin token.
+        Participant and join tokens do not see private supervisor notes
+        (``target`` other than ``all``) or their replies, except a
+        participant's own.
       security:
         - bearerAuth: []
       parameters:
@@ -750,7 +757,12 @@ paths:
             Unknown kinds return 400.
           - ``target`` must equal ``"all"`` or a participant_id
             currently in the session roster.
-          - Per-(session, source-ip) rate limit applies.
+          - Per-(session, source-ip) rate limit applies (shared with the
+            ``session_post_order`` MCP tool).
+          - Only the addressed participants change state and receive the
+            ``supervisor.note`` event: ``halt`` pauses them, ``continue`` and
+            ``redirect`` make them active again, ``note`` changes nothing.
+          - The note is persisted in the session timeline (``GET /events``).
       security:
         - bearerAuth: []
       requestBody:
@@ -777,11 +789,60 @@ paths:
                   target: { type: string }
                   message: { type: string, nullable: true }
                   ts_ms: { type: integer }
+                  affected:
+                    type: array
+                    items: { type: string }
+                    description: participant_ids whose supervision_state changed
         '400': { description: Malformed request }
         '401': { description: Missing bearer }
         '403': { description: permission_denied (not a supervisor, creator or admin token) }
-        '404': { description: Session not found }
+        '404': { description: Session not found, or participant_not_found for an unknown target }
         '429': { description: Rate-limited }
+
+  /v1/sessions/{sid}/supervisor/notes/{note_id}/replies:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: note_id, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Reply in a supervisor note's thread
+      description: |
+        Participant Bearer token. The thread is flat: reply to the note, not to
+        a reply. A note sent to ``all`` is answered in the open (every other
+        participant and the firehose receive ``supervisor.note_reply``). A note
+        sent to one participant may be answered only by that participant, and
+        only the firehose receives the reply. The reply is persisted in the
+        session timeline (``GET /events``) and carries the note's ``target``;
+        history shows a private note and its replies only to supervision
+        holders and the addressed participant.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, minLength: 1, maxLength: 2048 }
+      responses:
+        '201':
+          description: Reply delivered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply_id: { type: string }
+                  note_id: { type: string }
+                  target: { type: string, description: "The note's target: ``all`` or a participant id" }
+                  participant_id: { type: string }
+                  message: { type: string }
+                  ts_ms: { type: integer }
+        '400': { description: Empty or oversized message }
+        '401': { description: Missing or invalid participant token }
+        '403': { description: permission_denied (private note addressed to another participant) }
+        '404': { description: note_not_found }
 
   /v1/sessions/{sid}/join-tokens:
     parameters:
@@ -990,6 +1051,53 @@ paths:
           description: payload_too_large (feedback over 4 KiB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
+  /v1/sessions/{sid}/participants/{pid}:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: pid, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [participants]
+      summary: Remove an agent from the session (creator or admin)
+      description: |
+        Bearer: the creator token or the admin token; a supervisor token is
+        refused. The agent first receives a `supervisor.note` of kind `halt`
+        (message `removed by the session creator`); as with any halt, the
+        other participants and the firehose then see `participant.updated`
+        with `supervision_state: paused` for it (unless it was already
+        paused). It then leaves: its open events WebSocket closes with code
+        4410 (reason `removed`), the commands it sent are cancelled, and the
+        other participants and the firehose receive `participant.left` with
+        reason `removed`. Every still-valid join token of the session is
+        invalidated: joining with one answers "join link expired" (after a
+        relay restart such a link reads as an invalid token instead, like
+        any expired link). Only the addressed participant is affected. The
+        join-token cut-off and the removal are written to disk before the
+        response; if that write fails nothing has changed and the call can
+        be retried.
+
+        For one hour (in memory; not across a relay restart, where it is a
+        plain `not_in_session`) any call made with the removed participant's
+        token — REST, MCP with an explicit `participant_token`, resume, inbox
+        drain / wait, events WebSocket (closed 4410) — answers 403
+        `participant_removed` with the message "you were removed from this
+        session by its creator — stop your work and your sub-agents".
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: array, items: { type: string } }
+                  join_tokens_invalidated: { type: integer }
+        '403': { description: permission_denied (not the creator or admin token) }
+        '404':
+          description: session_not_found or participant_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
   /v1/sessions/{sid}/participants/me/inbox/drain:
     parameters:
       - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
@@ -1054,6 +1162,15 @@ paths:
         Set your HTTP client's read timeout to at least
         `timeout_seconds + a few seconds of slack` to avoid this
         signal turning into per-call churn.
+
+        **Session end and removal.** If the session ends while you wait
+        (deleted by its creator, expired), the wait returns the terminal
+        `session.ended` event, whatever `names` asked for: stop, do not
+        leave. If the creator removes you while you wait, the events queued
+        before the removal (the `halt` note) are returned; your next call
+        answers `403 participant_removed`. `participant_evicted` (409) means you
+        were evicted (offline timeout, full buffer) or left through another
+        channel mid-wait.
       security:
         - bearerAuth: []
       requestBody:
@@ -1077,7 +1194,7 @@ paths:
           description: session_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted
+          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted (evicted, or you left through another channel)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: too_many_waits — relay concurrent-wait cap exceeded
@@ -1182,6 +1299,16 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SendCommandResponse' }
+        '409':
+          description: >-
+            participant_paused — a specific target is paused by the supervisor,
+            or every role / capability match is. Paused participants are never
+            matched by role or capability. Presence does not count here: an
+            ``any`` dispatch whose only online matches are paused, while an
+            active match is offline, is not refused — it closes with
+            ``command.completed`` reason ``no_recipients``, like any ``any``
+            that finds nobody online.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '413':
           description: payload_too_large
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

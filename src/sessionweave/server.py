@@ -53,6 +53,9 @@ from sessionweave.tools import (
     session_list_supervisor_tokens,
     session_mint_join_token,
     session_mint_supervisor_token,
+    session_post_order,
+    session_remove_participant,
+    session_reply_to_note,
     session_respond,
     session_resume,
     session_revoke_supervisor_token,
@@ -275,12 +278,23 @@ PurposeArg = Annotated[dict[str, Any] | None, Field(
                 "delivery_mode. 16 KiB cap.")]
 
 
+def _note_rate_limiter() -> NoteRateLimiter:
+    return NoteRateLimiter(
+        per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
+        per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),
+    )
+
+
 def _build_fastmcp(
     deps: ToolDeps,
     handles: HandleRegistry,
     connections: ConnectionManager | None = None,
     registry: SessionRegistry | None = None,
+    note_limiter: NoteRateLimiter | None = None,
 ) -> MCPServer:
+    # Shared with the HTTP notes route (``app.state.supervisor_rate``) so both
+    # surfaces draw on one per-(session, source ip) budget.
+    order_limiter = note_limiter if note_limiter is not None else _note_rate_limiter()
     mcp = MCPServer(
         "sessionweave",
         instructions=_SERVER_INSTRUCTIONS,
@@ -777,6 +791,34 @@ def _build_fastmcp(
                 {"command_id": command_id, "payload": payload, "status": status},
             )
 
+    @_tool("session_reply_to_note")
+    async def session_reply_to_note_tool(
+        note_id: Annotated[str, Field(description=
+            "The note_id from the supervisor.note event you are answering."
+        )],
+        message: Annotated[str, Field(description=
+            "Your reply, non-empty, at most 2048 bytes."
+        )],
+        session_id: OptSessionIdArg = None,
+        participant_token: ParticipantTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Reply in the thread under a supervisor note.
+
+    note_id comes from the supervisor.note event that delivered the note.
+    A note sent to all is answered in the open: every other participant and
+    the supervision holders see the reply. A note sent to you alone can only
+    be answered by you, and only supervision holders see the reply. The
+    thread is flat: reply to the note, not to another reply. Requires
+    session_join on this connection first. Returns reply_id, note_id,
+    participant_id, message and ts_ms.
+    """
+        assert ctx is not None
+        async with _participant(ctx, session_id, participant_token) as h:
+            return await session_reply_to_note(
+                deps, h, {"note_id": note_id, "message": message}
+            )
+
     @_tool("session_delete")
     async def session_delete_tool(
         session_id: SessionIdArg,
@@ -872,6 +914,70 @@ def _build_fastmcp(
         )
         return {"revoked": True}
 
+    @_tool("session_remove_participant")
+    async def session_remove_participant_tool(
+        session_id: SessionIdArg,
+        creator_token: ManagerTokenArg,
+        participant_id: Annotated[str, Field(description=
+            "The participant_id of the agent to remove, as shown in the roster."
+        )],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove one agent from a session.
+
+    Requires the creator_token (or the relay admin token); a supervisor
+    token is refused. The agent first receives a halt order, then leaves
+    the session: its token stops working and the others see
+    participant.left with reason removed. Every still-valid join token of
+    the session is invalidated, so mint a new one to invite again. Only
+    the named participant is affected. Fails with participant_not_found
+    for an unknown participant_id. Returns removed (the removed ids) and
+    join_tokens_invalidated.
+    """
+        return await session_remove_participant(
+            deps, session_id, creator_token, participant_id, source_ip=_client_ip(ctx)
+        )
+
+    @_tool("session_post_order")
+    async def session_post_order_tool(
+        session_id: SessionIdArg,
+        token: Annotated[str, Field(description=
+            "A supervisor_token, the creator_token, or the relay admin token. "
+            "A participant or join token is refused with permission_denied."
+        )],
+        kind: Annotated[Literal["note", "halt", "continue", "redirect"], Field(description=
+            "note: guidance for the work in progress (state unchanged). "
+            "halt: stop all work now and wait, paused. continue: resume where "
+            "stopped. redirect: follow the new instructions in message from now on."
+        )],
+        target: Annotated[str, Field(description=
+            "'all' for every participant, or one participant_id."
+        )],
+        message: Annotated[str | None, Field(description=
+            "The order's text, at most 2048 bytes. Required for note and "
+            "redirect; optional for halt and continue."
+        )] = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Send a supervisor order to one participant or to all of them.
+
+    Requires a supervisor_token, the creator_token or the relay admin token;
+    participants receive orders, they do not send them. kind is one of note,
+    halt, continue, redirect. halt pauses the addressed participants: they
+    stay in the session but commands to them are refused with
+    participant_paused until a continue or redirect. Only the addressed
+    participants are affected. Rate-limited per session and source address.
+    Returns note_id, kind, target, message, ts_ms and affected (the
+    participants whose supervision state changed).
+    """
+        body: dict[str, Any] = {"kind": kind, "target": target}
+        if message is not None:
+            body["message"] = message
+        return await session_post_order(
+            deps, session_id, token, body,
+            limiter=order_limiter, source_ip=_client_ip(ctx),
+        )
+
     @_tool("session_get_events")
     async def session_get_events_tool(
         session_id: Annotated[str, Field(description=
@@ -948,7 +1054,11 @@ def build_app() -> Starlette:
         admin_token=admin_token,
     )
 
-    mcp = _build_fastmcp(tool_deps, handles, connections=connections, registry=registry)
+    note_limiter = _note_rate_limiter()
+    mcp = _build_fastmcp(
+        tool_deps, handles, connections=connections, registry=registry,
+        note_limiter=note_limiter,
+    )
     mcp_app = mcp.streamable_http_app(
         transport_security=_transport_security(),
         session_idle_timeout=_mcp_session_idle_timeout(),
@@ -1101,10 +1211,7 @@ def build_app() -> Starlette:
     app.state.admin_token = admin_token
     if admin_token is None:
         logging.getLogger(__name__).info("admin access disabled")
-    app.state.supervisor_rate = NoteRateLimiter(
-        per_minute=_env_int("SW_SUPERVISOR_NOTES_PER_MINUTE", 30, lo=1, hi=10_000),
-        per_hour=_env_int("SW_SUPERVISOR_NOTES_PER_HOUR", 200, lo=1, hi=1_000_000),
-    )
+    app.state.supervisor_rate = note_limiter
     app.state.public_base_url = os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/") or None
     app.state.brief_upgrades = BriefUpgrades(
         skill_url=os.environ.get("SW_SKILL_URL", ""),

@@ -10,12 +10,32 @@ from __future__ import annotations
 import asyncio
 import importlib.resources as ir
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
 
 from sessionweave.access import IssuedToken, SessionAuth
+
+_UPSERT_PARTICIPANT_SQL = (
+    "INSERT INTO participants (session_id, participant_id, snapshot_json,"
+    " last_seen_seq, joined_at, left_at) VALUES (?, ?, ?, ?, ?, NULL)"
+    " ON CONFLICT(session_id, participant_id) DO UPDATE SET"
+    " snapshot_json = excluded.snapshot_json,"
+    " last_seen_seq = excluded.last_seen_seq,"
+    " left_at = NULL"
+)
+
+
+@dataclass(slots=True, frozen=True)
+class ParticipantUpsert:
+    """A participant row written inside ``persist_event_atomic``'s transaction."""
+
+    participant_id: str
+    snapshot: dict[str, Any]
+    last_seen_seq: int
+    joined_at: int  # unix ms
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,6 +81,8 @@ class SessionSnapshot:
     # PK). For sessions that never recorded any event this is 0.
     max_event_seq: int
     tokens: list[IssuedToken] = field(default_factory=list)
+    # Payloads of persisted ``supervisor.note`` events (note registry).
+    notes: list[dict[str, Any]] = field(default_factory=list)
 
 
 class PersistenceStore:
@@ -209,7 +231,14 @@ class PersistenceStore:
         inflight_upsert: tuple[str, dict[str, Any]] | None = None,
         inflight_complete: str | None = None,
         buffered_pids: tuple[str, ...] | list[str] = (),
+        participant_upserts: Sequence[ParticipantUpsert] = (),
     ) -> None:
+        """Write one event and its side records in a single transaction.
+
+        ``participant_upserts`` lets a state change caused by the event (a
+        supervisor order pausing a participant) commit or roll back together
+        with it, so the disk never holds a state without its cause.
+        """
         import json as _json
         assert self._write_conn is not None
         async with self._write_tx_lock:
@@ -220,6 +249,13 @@ class PersistenceStore:
                     " VALUES (?, ?, ?, ?, ?)",
                     (sid, seq, kind, _json.dumps(payload, separators=(",", ":")), ts),
                 )
+                for up in participant_upserts:
+                    await self._write_conn.execute(
+                        _UPSERT_PARTICIPANT_SQL,
+                        (sid, up.participant_id,
+                         _json.dumps(up.snapshot, separators=(",", ":")),
+                         up.last_seen_seq, up.joined_at),
+                    )
                 if inflight_upsert is not None:
                     cid, tracker = inflight_upsert
                     await self._write_conn.execute(
@@ -320,22 +356,20 @@ class PersistenceStore:
         import json as _json
         assert self._write_conn is not None
         await self._write_conn.execute(
-            "INSERT INTO participants (session_id, participant_id, snapshot_json,"
-            " last_seen_seq, joined_at, left_at) VALUES (?, ?, ?, ?, ?, NULL)"
-            " ON CONFLICT(session_id, participant_id) DO UPDATE SET"
-            " snapshot_json = excluded.snapshot_json,"
-            " last_seen_seq = excluded.last_seen_seq,"
-            " left_at = NULL",
+            _UPSERT_PARTICIPANT_SQL,
             (sid, pid, _json.dumps(snapshot, separators=(",", ":")),
              last_seen_seq, joined_at),
         )
 
     async def soft_delete_participant(self, sid: str, pid: str, left_at: int) -> None:
         assert self._write_conn is not None
-        await self._write_conn.execute(
-            "UPDATE participants SET left_at = ? WHERE session_id = ? AND participant_id = ?",
-            (left_at, sid, pid),
-        )
+        # Under the lock like the token writes: a concurrent transaction's
+        # ROLLBACK on the shared write connection must not undo a departure.
+        async with self._write_tx_lock:
+            await self._write_conn.execute(
+                "UPDATE participants SET left_at = ? WHERE session_id = ? AND participant_id = ?",
+                (left_at, sid, pid),
+            )
 
     async def ack_participant(self, sid: str, pid: str, last_seen_seq: int) -> None:
         assert self._write_conn is not None
@@ -422,6 +456,14 @@ class PersistenceStore:
             _max_row = await cur.fetchone()
             assert _max_row is not None
             (max_event_seq,) = _max_row
+        notes: list[dict[str, Any]] = []
+        async with conn.execute(
+            "SELECT payload_json FROM events WHERE session_id = ?"
+            " AND kind = 'supervisor.note' ORDER BY seq",
+            (sid,),
+        ) as cur:
+            async for (payload_json,) in cur:
+                notes.append(_json.loads(payload_json))
         return SessionSnapshot(
             session_id=sid,
             config_json=srow[0], purpose_json=srow[1],
@@ -433,6 +475,7 @@ class PersistenceStore:
             participants=participants, inflight=inflight, buffered=buffered,
             max_event_seq=int(max_event_seq or 0),
             tokens=await self.load_tokens(sid),
+            notes=notes,
         )
 
     # ----- session credentials -----
@@ -459,6 +502,20 @@ class PersistenceStore:
                 "UPDATE session_tokens SET revoked_at = ?"
                 " WHERE session_id = ? AND token_id = ?",
                 (revoked_at_ms, sid, token_id),
+            )
+
+    async def expire_tokens(
+        self, sid: str, token_ids: Sequence[str], expires_at_ms: int
+    ) -> None:
+        """Set ``expires_at`` of the given tokens (join-token invalidation)."""
+        assert self._write_conn is not None
+        if not token_ids:
+            return
+        async with self._write_tx_lock:
+            await self._write_conn.executemany(
+                "UPDATE session_tokens SET expires_at = ?"
+                " WHERE session_id = ? AND token_id = ?",
+                [(expires_at_ms, sid, tid) for tid in token_ids],
             )
 
     async def load_tokens(self, sid: str) -> list[IssuedToken]:

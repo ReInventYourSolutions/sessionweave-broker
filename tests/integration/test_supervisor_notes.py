@@ -1,4 +1,8 @@
-"""POST /v1/sessions/{sid}/supervisor/notes broadcasts supervisor events.
+"""POST /v1/sessions/{sid}/supervisor/notes posts a supervisor order.
+
+The route delegates to ``Session.post_order`` (state changes, delivery,
+persistence and firehose are covered in ``test_supervision_orders.py``); these
+tests pin the HTTP surface: auth, rate limit, validation and response shape.
 
 Allowed callers: supervisor token, creator token, relay admin token. Participants,
 join tokens and the session id are refused.
@@ -94,7 +98,7 @@ async def test_post_note_unknown_participant_returns_404():
                 json={"kind": "halt", "target": "p-does-not-exist"},
             )
         assert r.status_code == 404
-        assert r.json()["error"] == "participant_not_found"
+        assert r.json()["error"]["code"] == "participant_not_found"
 
 
 @pytest.mark.integration
@@ -144,6 +148,8 @@ async def test_post_note_accepted_for_supervisor_creator_admin() -> None:
                 )
                 assert r.status_code == 200, (who, r.text)
                 assert r.json()["message"] == "ok"
+                # A note changes no participant's state.
+                assert r.json()["affected"] == []
 
 
 @pytest.mark.integration
@@ -191,3 +197,18 @@ async def test_revoked_supervisor_token_refused() -> None:
                 headers=_h(made["supervisor_token"]), json=_note(),
             )
             assert r.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_undo_is_not_available_yet() -> None:
+    async with relay_subprocess() as base:
+        async with httpx.AsyncClient() as c:
+            made = await _create(c, base)
+            r = await c.post(
+                f"{base}/v1/sessions/{made['session_id']}/supervisor/notes",
+                headers=_h(made["supervisor_token"]),
+                json={"kind": "undo", "target": "all"},
+            )
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_request"

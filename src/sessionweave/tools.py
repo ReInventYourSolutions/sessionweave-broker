@@ -48,6 +48,11 @@ from sessionweave.schemas import (
     SupervisorTokenOutput,
 )
 from sessionweave.session import Session
+from sessionweave.supervisor import (
+    NoteRateLimiter,
+    SupervisorRequestError,
+    parse_supervisor_request,
+)
 
 if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
@@ -493,6 +498,21 @@ async def session_respond(
     return {}
 
 
+async def session_reply_to_note(
+    deps: ToolDeps,
+    handle: ConnectionHandle,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Reply in a supervisor note's thread (participant-bound)."""
+    sess, pid = await _session_for_handle(deps, handle)
+    note_id, message = payload.get("note_id"), payload.get("message")
+    if not isinstance(note_id, str) or not note_id:
+        raise ToolError(ErrorCode.INVALID_REQUEST, "note_id must be a non-empty string")
+    if not isinstance(message, str):
+        raise ToolError(ErrorCode.INVALID_REQUEST, "message must be a string")
+    return await sess.reply_to_note(pid, note_id, message)
+
+
 async def session_delete(
     deps: ToolDeps, payload: dict[str, Any], *, source_ip: str = ""
 ) -> dict[str, Any]:
@@ -578,6 +598,45 @@ async def session_revoke_supervisor_token(
     await sess.revoke_supervisor_token(token_id)
 
 
+async def session_remove_participant(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    participant_id: str,
+    *,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Remove one participant: creator or admin token only."""
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    return await sess.remove_participant(participant_id)
+
+
+async def session_post_order(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    body: dict[str, Any],
+    *,
+    limiter: NoteRateLimiter,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Post a supervisor order: the MCP twin of ``POST .../supervisor/notes``.
+
+    Same gate (supervisor, creator or admin token) and the same per-(session,
+    source ip) rate limit as the HTTP route.
+    """
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    require(principal, "supervisor", "creator", "admin")
+    if not limiter.try_acquire(session_id, source_ip):
+        raise ToolError(ErrorCode.RATE_LIMITED, "too many supervisor orders; retry later")
+    try:
+        note = parse_supervisor_request(body)
+    except SupervisorRequestError as exc:
+        raise ToolError(ErrorCode.INVALID_REQUEST, str(exc)) from None
+    sess = await deps.registry.get_or_raise(session_id)
+    return await sess.post_order(note)
+
+
 async def session_access(
     deps: ToolDeps, session_id: str, token: str | None, *, source_ip: str = ""
 ) -> dict[str, Any]:
@@ -595,6 +654,23 @@ def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
             pass
 
 
+_THREAD_KINDS = frozenset({"supervisor.note", "supervisor.note_reply"})
+
+
+def _visible_to(event: dict[str, Any], participant_id: str | None) -> bool:
+    """Whether a participant (or joiner, ``None``) may read ``event`` in history.
+
+    A private note and its replies belong to supervision holders and the
+    addressed participant; everyone else sees only threads sent to ``all``.
+    ``next_cursor`` is left as computed on the unfiltered page, so paging
+    never stalls on a run of hidden events.
+    """
+    if event.get("kind") not in _THREAD_KINDS:
+        return True
+    target = (event.get("payload") or {}).get("target", "all")
+    return target == "all" or (participant_id is not None and target == participant_id)
+
+
 async def session_get_events(
     deps: ToolDeps,
     payload: dict[str, Any],
@@ -606,7 +682,7 @@ async def session_get_events(
     sid = inp.session_id
     # Cold and ended sessions are authenticated from their stored hashes
     # without being loaded into RAM.
-    await _resolve_reader(
+    principal = await _resolve_reader(
         deps, sid, inp.access_token, handle, source_ip=source_ip, hydrate=False
     )
     state: Literal["hot", "cold", "ended"]
@@ -646,15 +722,20 @@ async def session_get_events(
         limit=inp.limit,
         order=inp.order,
     )
+    events = page.events
+    if principal.role in ("participant", "joiner"):
+        events = [
+            e for e in events if _visible_to(e, principal.participant_id)
+        ]
     if deps.metrics is not None:
         try:
             deps.metrics.events_browse_total.labels(session_state=state).inc()
-            deps.metrics.events_browse_returned_total.inc(len(page.events))
+            deps.metrics.events_browse_returned_total.inc(len(events))
         except Exception:
             pass
     return SessionGetEventsOutput(
         session_id=sid,
-        events=page.events,
+        events=events,
         next_cursor=page.next_cursor,
         has_more=page.has_more,
         session_state=state,

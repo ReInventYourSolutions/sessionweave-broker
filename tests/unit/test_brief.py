@@ -90,3 +90,33 @@ def test_brief_states_runtime_limit_payload_and_leave_status():
     assert "inbox/drain" in out
     assert "goes inside `payload`" in out
     assert "204 No Content" in out
+
+
+def test_brief_describes_halt_without_leaving_and_note_replies():
+    out = _render({"kind": "demo"})
+    assert "do not leave" in out
+    assert "/supervisor/notes/<note_id>/replies" in out
+    assert "participant_removed" in out
+
+
+def test_brief_carries_the_mid_execution_note_check() -> None:
+    """The non-blocking note check is in the brief itself, not only the skill."""
+    out = _render({"kind": "demo"})
+    assert f"{BASE}/v1/sessions/{SID}/participants/me/inbox/wait" in out
+    assert '{"names":["supervisor.note"],"timeout_seconds":0}' in out
+    assert "other events stay queued" in out
+
+
+def test_brief_keeps_note_replies_to_what_is_needed() -> None:
+    out = _render({"kind": "demo"})
+    assert "Do not reply to `halt`, `continue` or `redirect` just to acknowledge" in out
+    assert "Always reply to a private note" in out
+    assert "reaches every participant" in out
+
+
+def test_brief_leave_step_excludes_removal_and_session_end() -> None:
+    out = _render({"kind": "demo"})
+    leave = out[out.index("**Leave**"):]
+    assert "`participant_removed`" in leave
+    assert "`session.ended`" in leave
+    assert "just stop" in leave

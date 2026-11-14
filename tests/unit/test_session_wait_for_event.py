@@ -285,27 +285,66 @@ async def test_wait_for_event_increments_metrics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_raises_evicted_when_session_ended_mid_wait() -> None:
-    """If the session is ended (by supervisor or TTL eviction) while a
-    wait_for_event coroutine is in flight, that coroutine must wake with
-    PARTICIPANT_EVICTED rather than silently timing out on the full
-    budget. Mirrors the leave-mid-wait test but exercises the
-    broadcast_session_ended path instead.
+async def test_wait_returns_session_ended_when_session_ends_mid_wait() -> None:
+    """A waiter blocked when the session ends (deleted by its creator, TTL
+    eviction) wakes with the terminal ``session.ended`` event as the wait's
+    result, whatever its names filter, instead of an eviction error.
     """
     s = Session("s", SessionConfig(), ConnectionManager())
     h = FakeHandle()
     p = await s.join(h, role=None, capabilities=[], delivery_mode="pull")
 
     waiter = asyncio.create_task(
-        s.wait_for_event(p.participant_id, names=None, timeout_seconds=5.0)
+        s.wait_for_event(p.participant_id, names=["command.received"], timeout_seconds=5.0)
     )
     await asyncio.sleep(0.02)
-    # Simulate supervisor-triggered session end.
     s.broadcast_session_ended(reason="deleted_by_test")
+
+    result = await waiter
+    assert result.timed_out is False
+    assert result.messages == [
+        {"name": "session.ended", "payload": {"reason": "deleted_by_test"}, "seq": 0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_removal_mid_wait_returns_the_queued_halt_then_removed() -> None:
+    """The halt queued before the removal sentinel is delivered as the
+    wait's result; the removal is never reported as ``participant_evicted``.
+    """
+    from sessionweave.access import generate_token, hash_token
+
+    s = Session("s", SessionConfig(), ConnectionManager())
+    s.auth._creator_hash = hash_token(generate_token())
+    p = await s.join(FakeHandle(), role=None, capabilities=[], delivery_mode="pull")
+
+    waiter = asyncio.create_task(
+        s.wait_for_event(p.participant_id, names=["supervisor.note"], timeout_seconds=5.0)
+    )
+    await asyncio.sleep(0.02)
+    await s.remove_participant(p.participant_id)
+
+    result = await waiter
+    assert result.timed_out is False
+    assert [(m["name"], m["payload"]["kind"]) for m in result.messages] == [
+        ("supervisor.note", "halt")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_removal_mid_wait_without_a_match_raises_removed() -> None:
+    s = Session("s", SessionConfig(), ConnectionManager())
+    p = await s.join(FakeHandle(), role=None, capabilities=[], delivery_mode="pull")
+
+    waiter = asyncio.create_task(
+        s.wait_for_event(p.participant_id, names=["command.received"], timeout_seconds=5.0)
+    )
+    await asyncio.sleep(0.02)
+    await s.remove_participant(p.participant_id)
 
     with pytest.raises(ToolError) as excinfo:
         await waiter
-    assert excinfo.value.code is ErrorCode.PARTICIPANT_EVICTED
+    assert excinfo.value.code is ErrorCode.PARTICIPANT_REMOVED
 
 
 @pytest.mark.asyncio

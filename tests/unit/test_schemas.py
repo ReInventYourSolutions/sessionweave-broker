@@ -25,6 +25,7 @@ def test_participant_public_minimal() -> None:
         metadata={},
         joined_at="2026-05-06T10:00:00Z",
         online=True,
+        supervision_state="active",
     )
     assert p.online is True
 

@@ -37,6 +37,7 @@ from sessionweave.tools import (
     session_get_events,
     session_join,
     session_leave,
+    session_reply_to_note,
     session_respond,
     session_send,
     session_update_purpose,
@@ -89,6 +90,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.PARTICIPANT_NOT_FOUND: 404,
     ErrorCode.COMMAND_NOT_FOUND: 404,
     ErrorCode.TOKEN_NOT_FOUND: 404,
+    ErrorCode.NOTE_NOT_FOUND: 404,
     ErrorCode.NOT_IN_SESSION: 401,
     ErrorCode.ALREADY_IN_SESSION: 409,
     ErrorCode.SESSION_FULL: 409,
@@ -96,6 +98,8 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.INVALID_DELIVERY_MODE: 409,
     ErrorCode.WAIT_ALREADY_IN_FLIGHT: 409,
     ErrorCode.PARTICIPANT_EVICTED: 409,
+    ErrorCode.PARTICIPANT_PAUSED: 409,
+    ErrorCode.PARTICIPANT_REMOVED: 403,
     ErrorCode.NOT_A_RECIPIENT: 403,
     ErrorCode.PAYLOAD_TOO_LARGE: 413,
     ErrorCode.TOO_MANY_WAITS: 429,
@@ -107,6 +111,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.NO_HISTORY: 409,
     ErrorCode.PERSISTENCE_FAILED: 503,
     ErrorCode.PERSISTENCE_CORRUPTED: 500,
+    ErrorCode.INVALID_REQUEST: 400,
 }
 
 
@@ -716,18 +721,20 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     token = auth[7:].strip()
     deps = _deps(request)
-    session = deps.registry.get(sid)
-    if session is None:
-        return JSONResponse({"error": "not_found"}, status_code=404)
     source_ip = _request_source_ip(request)
     try:
         principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
         require(principal, "supervisor", "creator", "admin")
+        # A cold persisted session is hydrated, so an order always reaches
+        # the live roster rather than answering 404.
+        session = await deps.registry.get_or_raise(sid)
     except ToolError as exc:
         if exc.code is ErrorCode.SESSION_NOT_FOUND:
             return JSONResponse({"error": "not_found"}, status_code=404)
         if exc.code is ErrorCode.RATE_LIMITED:
             return JSONResponse({"error": "rate_limited"}, status_code=429)
+        if exc.code in (ErrorCode.PERSISTENCE_FAILED, ErrorCode.PERSISTENCE_CORRUPTED):
+            return _error_response(exc)
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     limiter = request.app.state.supervisor_rate
@@ -744,41 +751,35 @@ async def _supervisor_notes_handler(request: Request) -> JSONResponse:
     except SupervisorRequestError as e:
         return JSONResponse({"error": "invalid_request", "detail": str(e)}, status_code=400)
 
-    payload = {
-        "note_id": note.note_id,
-        "kind": note.kind,
-        "target": note.target,
-        "message": note.message,
-        "ts_ms": note.ts_ms,
-    }
+    # Session.post_order applies the state change, records and persists the
+    # note, delivers it to the addressed participants and mirrors it to the
+    # firehose (exactly once).
+    try:
+        out = await session.post_order(note)
+    except ToolError as exc:
+        return _error_response(exc)
+    return JSONResponse(out, status_code=200)
 
-    # Fan out to firehose subscribers (lock-free by design: firehose is a
-    # separate publish path and never touches participant state).
-    firehose = request.app.state.firehose
-    await firehose.publish(sid, {"name": "supervisor.note", "payload": payload})
 
-    # Fan out to participants under session.lock — _deliver_or_buffer touches
-    # _participants / _subscribers / _buffers, and the invariant across the
-    # rest of session.py is that those are only accessed while the lock is
-    # held. If target is a participant id that is not in the session, return
-    # 404 instead of a silent success.
-    async with session.lock:
-        if note.target == "all":
-            targets = list(session._participants.keys())
-        elif note.target in session._participants:
-            targets = [note.target]
-        else:
-            return JSONResponse(
-                {
-                    "error": "participant_not_found",
-                    "detail": f"target {note.target!r} is not a participant of this session",
-                },
-                status_code=404,
+async def post_note_reply(request: Request) -> JSONResponse:
+    sid = request.path_params["sid"]
+    note_id = request.path_params["note_id"]
+    deps = _deps(request)
+    try:
+        token = _require_bearer(request)
+        body = await _read_json_body(request)
+        handle = await _bind_participant(
+            deps, sid, token, source_ip=_request_source_ip(request)
+        )
+        try:
+            out = await session_reply_to_note(
+                deps, handle, {"note_id": note_id, "message": body.get("message")}
             )
-        for pid in targets:
-            session._deliver_or_buffer(pid, "supervisor.note", payload)
-
-    return JSONResponse(payload, status_code=200)
+        finally:
+            _unbind_participant(deps.registry.connections, handle)
+    except ToolError as exc:
+        return _error_response(exc)
+    return JSONResponse(out, status_code=201)
 
 
 async def _get_session_events_handler(request: Request) -> Response:
@@ -916,6 +917,19 @@ async def _revoke_supervisor_token_handler(request: Request) -> Response:
     return await _run_credential_call(request, call, 204)
 
 
+async def _remove_participant_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    participant_id = request.path_params["pid"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_remove_participant(
+            deps, sid, token, participant_id, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -967,6 +981,11 @@ def routes() -> list[Route]:
             methods=["DELETE"],
         ),
         Route(
+            "/v1/sessions/{sid}/participants/{pid}",
+            _remove_participant_handler,
+            methods=["DELETE"],
+        ),
+        Route(
             "/v1/sessions/{sid}/participants/me/inbox/drain",
             post_inbox_drain,
             methods=["POST"],
@@ -1009,6 +1028,11 @@ def routes() -> list[Route]:
         Route(
             "/v1/sessions/{sid}/supervisor/notes",
             _supervisor_notes_handler,
+            methods=["POST"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/supervisor/notes/{note_id}/replies",
+            post_note_reply,
             methods=["POST"],
         ),
     ]

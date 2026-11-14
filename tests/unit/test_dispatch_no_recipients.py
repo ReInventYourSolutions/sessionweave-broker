@@ -1,7 +1,7 @@
 """A dispatch that reaches nobody must not report that everybody answered.
 
 `dispatch="any"` picks one match **among the online participants**
-(`dispatcher.py`, `online_only=True`); `dispatch="all"` does not filter on
+(`dispatcher.decide_dispatch`); `dispatch="all"` does not filter on
 presence. A turn-based counterparty is offline between its turns, so it is
 invisible to every `any` — and the sender was told
 `command.completed{received_count: 0, reason: "all_responded"}`.

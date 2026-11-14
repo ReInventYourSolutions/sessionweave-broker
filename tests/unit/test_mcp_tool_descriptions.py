@@ -40,6 +40,7 @@ CONNECTION_BOUND = {
     "session_check_inbox",
     "session_leave",
     "session_list_participants",
+    "session_reply_to_note",
     "session_respond",
     "session_send",
     "session_update_purpose",
@@ -54,6 +55,7 @@ ENUM_VALUES = {
     "session_join": ["push", "pull"],
     "session_respond": ["ok", "error"],
     "session_get_events": ["asc", "desc"],
+    "session_post_order": ["note", "halt", "continue", "redirect"],
 }
 
 MIN_DESCRIPTION_CHARS = 40
@@ -67,7 +69,7 @@ def tools() -> dict[str, Tool]:
 
 def test_the_server_advertises_every_tool(tools: dict[str, Tool]) -> None:
     """Guards the fixture itself — an empty list would make the rest vacuous."""
-    assert len(tools) == 18, sorted(tools)
+    assert len(tools) == 21, sorted(tools)
 
 
 def test_every_tool_has_a_description(tools: dict[str, Tool]) -> None:

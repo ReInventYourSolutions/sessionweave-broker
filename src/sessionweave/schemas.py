@@ -26,6 +26,7 @@ class ParticipantPublic(_Strict):
     metadata: dict[str, Any]
     joined_at: str
     online: bool
+    supervision_state: Literal["active", "paused"]
 
 
 class Target(_Strict):

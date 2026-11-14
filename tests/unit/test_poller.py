@@ -21,6 +21,70 @@ def test_terminal_on_own_left() -> None:
     )
 
 
+def test_not_terminal_on_halt_note() -> None:
+    assert not _is_terminal(
+        {
+            "name": "supervisor.note",
+            "payload": {"kind": "halt", "target": "all", "message": None},
+        },
+        "pid",
+    )
+
+
+class _Content:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Result:
+    def __init__(self, text: str, is_error: bool) -> None:
+        self.isError = is_error
+        self.content = [_Content(text)]
+        self.structured_content = None
+
+
+class _FakeSession:
+    def __init__(self, *_: object) -> None:
+        pass
+
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def initialize(self) -> None:
+        return None
+
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> _Result:
+        if name == "session_resume":
+            return _Result("participant_removed: you were removed", True)
+        return _Result("{}", False)
+
+
+class _FakeTransport:
+    def __init__(self, _url: str) -> None:
+        pass
+
+    async def __aenter__(self) -> tuple[None, None]:
+        return (None, None)
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_run_stops_on_participant_removed_is_error_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(poller, "ClientSession", _FakeSession)
+    monkeypatch.setattr(poller, "streamable_http_client", _FakeTransport)
+    log = tmp_path / "ev.log"
+    rc = await poller.run("http://x/mcp", "sid", "TOK", "pid", log, 0.01)
+    assert rc == 0
+    assert "poller-stop" in log.read_text()
+
+
 def test_not_terminal_on_other_left() -> None:
     own = "abc-123"
     assert not _is_terminal(
