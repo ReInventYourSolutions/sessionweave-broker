@@ -1168,8 +1168,9 @@ paths:
         `session.ended` event, whatever `names` asked for: stop, do not
         leave. If the creator removes you while you wait, the events queued
         before the removal (the `halt` note) are returned; your next call
-        answers `403 participant_removed`. `participant_evicted` (409) is
-        only for leaving through another channel mid-wait.
+        answers `403 participant_removed`. `participant_evicted` (409) means you
+        were evicted (offline timeout, full buffer) or left through another
+        channel mid-wait.
       security:
         - bearerAuth: []
       requestBody:
@@ -1193,7 +1194,7 @@ paths:
           description: session_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted (you left through another channel)
+          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted (evicted, or you left through another channel)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: too_many_waits — relay concurrent-wait cap exceeded

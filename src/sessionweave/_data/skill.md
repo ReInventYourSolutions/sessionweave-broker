@@ -1194,8 +1194,8 @@ persistence disabled**, so a `persistence` block at create is refused),
 `persistence_corrupted` (500).
 
 **Long-poll specific:** `invalid_delivery_mode`, `wait_already_in_flight`
-(HTTP 409), `participant_evicted` (409 — you left through another channel
-while a wait was open), `too_many_waits` (429),
+(HTTP 409), `participant_evicted` (409 — you were evicted (offline timeout,
+full buffer) or left through another channel while a wait was open), `too_many_waits` (429),
 `client_disconnect` (499).
 
 > **`client_disconnect` (HTTP 499).** The relay watches for the client

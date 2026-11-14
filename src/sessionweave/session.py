@@ -1871,8 +1871,10 @@ class Session:
     def _close_subscribers(self, pid: str, *, reason: str) -> None:
         """Hand every live subscriber of a departed participant the
         ``__evicted__`` sentinel (payload ``{"reason": reason}``):
-        ``wait_for_event`` raises PARTICIPANT_EVICTED and the events
-        WebSocket closes (code 4410 when ``reason`` is ``removed``).
+        ``wait_for_event`` returns the events already matched first, then
+        raises PARTICIPANT_REMOVED when ``reason`` is ``removed`` and
+        PARTICIPANT_EVICTED otherwise, and the events WebSocket closes
+        (code 4410 when ``reason`` is ``removed``).
         """
         for cb in self._subscribers.pop(pid, None) or ():
             try:
