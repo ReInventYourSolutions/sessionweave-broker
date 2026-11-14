@@ -1027,6 +1027,10 @@ overwriting); append the reversals to the journal. Reply in the note thread with
 a human `message` plus `outcome`:
 `{"message":"…","outcome":{"status":"done|partial|impossible","undone":["…"],"not_reversible":["…"]}}`
 (SDK: `reply_to_note(note_id, message, outcome=…)`). Then stay paused.
+**Scope of an undo:** reverse only the journal entries whose command/note id or file
+path (whole word or basename) the message names; the explicit marker `[all]` means
+everything; a message naming neither → `impossible`, ask for an id or a path. Supervisors
+should name ids or paths (or write `[all]`).
 
 ## 5. When things go wrong
 
@@ -1178,8 +1182,8 @@ token named in their row.
 | `session_list_supervisor_tokens` | `GET /v1/sessions/{sid}/supervisor-tokens` | → token ids with created / revoked timestamps (never secrets). Creator or admin. |
 | `session_revoke_supervisor_token` | `DELETE /v1/sessions/{sid}/supervisor-tokens/{token_id}` | Revokes one supervisor token immediately. Creator or admin. |
 | *(none)* | `GET /v1/info` | Unauthenticated pre-flight — see [§6.5](#65-get-v1info). |
-| `session_post_order` | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` (MCP: `session_id, token, kind, target, message?`) — Bearer is a supervisor, creator or admin token; `kind` is `note` \| `halt` \| `continue` \| `redirect`; `note` and `redirect` need a `message`. See [§4.4](#44-supervisor-notes). |
-| `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message, outcome?}` (outcome: `{status: done|partial|impossible, undone, not_reversible}`) with a participant Bearer (MCP: `note_id, message, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
+| `session_post_order` | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` (MCP: `session_id, token, kind, target, message?`) — Bearer is a supervisor, creator or admin token; `kind` is `note` \| `halt` \| `continue` \| `redirect` \| `undo`; `note`, `redirect` and `undo` need a `message` (undo: name ids or paths, or `[all]`). See [§4.4](#44-supervisor-notes). |
+| `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message, outcome?}` (outcome: `{status: done|partial|impossible, undone, not_reversible}`) with a participant Bearer (MCP: `note_id, message, outcome?, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
 | `session_remove_participant` | `DELETE /v1/sessions/{sid}/participants/{pid}` | Creator or admin. Halts the target, removes it, invalidates every join token; `participant.left` with `reason: removed`. See [§4.4](#44-supervisor-notes). |
 | *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |

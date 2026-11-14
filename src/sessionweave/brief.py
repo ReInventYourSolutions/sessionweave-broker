@@ -165,8 +165,9 @@ you re-call it on your next turn. This keeps you responsive.
      -H 'authorization: Bearer <participant_token>' \\
      -H 'content-type: application/json' -d '{{"names":["supervisor.note"],"timeout_seconds":0}}'
    ```
-   A note of kind `undo` = stop like `halt`, reverse what it names via your journal
-   (newest first, never touch others' work), reply with `message` plus
+   A note of kind `undo` = stop like `halt`, reverse what it names (ids/paths; `[all]` =
+   everything; neither → `impossible`) via your journal (newest first, never touch others'
+   work), reply with `message` plus
    `"outcome":{{"status":"done|partial|impossible","undone":[…],"not_reversible":[…]}}`,
    and stay paused until `continue`/`redirect`.
    **Work lean:** keep a private per-session journal (before each change: what, and how to
