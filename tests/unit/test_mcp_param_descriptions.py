@@ -56,7 +56,7 @@ ENUMS = {
     ("session_join", "delivery_mode"): {"push", "pull"},
     ("session_respond", "status"): {"ok", "error"},
     ("session_get_events", "order"): {"asc", "desc"},
-    ("session_post_order", "kind"): {"note", "halt", "continue", "redirect"},
+    ("session_post_order", "kind"): {"note", "halt", "continue", "redirect", "undo"},
 }
 
 MIN_CHARS = 15

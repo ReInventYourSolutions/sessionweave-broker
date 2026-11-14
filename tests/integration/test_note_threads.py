@@ -142,6 +142,38 @@ async def test_unknown_note_and_bad_messages_are_refused(store: PersistenceStore
         assert exc.value.code is ErrorCode.INVALID_REQUEST
 
 
+_OUTCOME = {"status": "partial", "undone": ["a.txt"], "not_reversible": ["sent email"]}
+
+
+@pytest.mark.asyncio
+async def test_undo_reply_carries_outcome_and_stays_private(store: PersistenceStore) -> None:
+    sess, _, sub, a, ha, _b, hb = await _setup(store)
+    note = SupervisorNote(
+        note_id="sn-undo01", kind="undo", target=a.participant_id,
+        message="undo it", ts_ms=1_700_000_000_000,
+    )
+    await sess.post_order(note)
+    ha.sent.clear()
+    hb.sent.clear()
+    await asyncio.gather(*sess._firehose_tasks)
+    _drain(sub)
+
+    out = await sess.reply_to_note(a.participant_id, "sn-undo01", "reverted", outcome=_OUTCOME)
+
+    assert out["outcome"] == _OUTCOME
+    assert _replies(ha) == [] and _replies(hb) == []
+    await asyncio.gather(*sess._firehose_tasks)
+    assert _drain(sub) == ["supervisor.note_reply"]
+
+
+@pytest.mark.asyncio
+async def test_reply_without_outcome_has_no_outcome_key(store: PersistenceStore) -> None:
+    sess, _, _, a, _, _, _ = await _setup(store)
+    await sess.post_order(_note("all"))
+    out = await sess.reply_to_note(a.participant_id, "sn-all", "ok")
+    assert "outcome" not in out
+
+
 @pytest.mark.asyncio
 async def test_a_broadcast_thread_outlives_whoever_left(store: PersistenceStore) -> None:
     sess, _, _, a, _, b, hb = await _setup(store)
@@ -247,6 +279,27 @@ async def test_http_replies_and_history(tmp_path: Path) -> None:
             assert missing.json()["error"]["code"] == "note_not_found"
             empty = await c.post(url, headers=bearer(ta), json={"message": ""})
             assert empty.status_code == 400, empty.text
+            good = await c.post(
+                url, headers=bearer(ta), json={"message": "undone", "outcome": _OUTCOME}
+            )
+            assert good.status_code == 201, good.text
+            assert good.json()["outcome"] == _OUTCOME
+            for bad in (
+                {"status": "maybe", "undone": [], "not_reversible": []},
+                {"status": "done", "undone": "a.txt"},
+                {"status": "done", "extra": 1},
+                {"status": "done", "undone": ["x"] * 65},
+                {"status": "done", "not_reversible": ["y" * 257]},
+            ):
+                r = await c.post(url, headers=bearer(ta), json={"message": "x", "outcome": bad})
+                assert r.status_code == 400, r.text
+                assert r.json()["error"]["code"] == "invalid_request"
+            minimal = await c.post(
+                url, headers=bearer(ta), json={"message": "m", "outcome": {"status": "done"}}
+            )
+            assert minimal.json()["outcome"] == {
+                "status": "done", "undone": [], "not_reversible": [],
+            }
             unauth = await c.post(url, json={"message": "x"})
             assert unauth.status_code == 401
 
@@ -270,6 +323,7 @@ async def test_http_replies_and_history(tmp_path: Path) -> None:
                 got = [(e["kind"], e["payload"]["message"]) for e in ev.json()["events"]]
                 assert got == [
                     ("supervisor.note", "status?"), ("supervisor.note_reply", "fine"),
+                    ("supervisor.note_reply", "undone"), ("supervisor.note_reply", "m"),
                 ]
 
 

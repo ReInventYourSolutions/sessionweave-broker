@@ -13,7 +13,7 @@ from sessionweave.supervisor import (
 
 
 def test_order_kinds():
-    assert ORDER_KINDS == frozenset({"note", "halt", "continue", "redirect"})
+    assert ORDER_KINDS == frozenset({"note", "halt", "continue", "redirect", "undo"})
 
 
 def test_note_without_message_rejected():
@@ -40,9 +40,20 @@ def test_halt_continue_message_optional(kind):
     assert order.message is None
 
 
-def test_undo_not_available_yet():
-    with pytest.raises(SupervisorRequestError, match="not available yet"):
-        parse_supervisor_request({"kind": "undo", "target": "all"})
+@pytest.mark.parametrize("message", [None, "", "   "])
+def test_undo_requires_a_message(message):
+    body = {"kind": "undo", "target": "all"}
+    if message is not None:
+        body["message"] = message
+    with pytest.raises(SupervisorRequestError, match="message is required"):
+        parse_supervisor_request(body)
+
+
+def test_undo_with_message_parses():
+    order = parse_supervisor_request(
+        {"kind": "undo", "target": "p1", "message": "revert the migration"}
+    )
+    assert (order.kind, order.message) == ("undo", "revert the migration")
 
 
 def test_note_record_fields():
@@ -54,6 +65,8 @@ def test_note_record_fields():
     ("kind", "current", "expected"),
     [
         ("halt", "active", "paused"),
+        ("undo", "active", "paused"),
+        ("undo", "paused", "paused"),
         ("halt", "paused", "paused"),
         ("continue", "paused", "active"),
         ("continue", "active", "active"),

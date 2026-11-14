@@ -671,7 +671,11 @@ class Session:
         return {**payload, "affected": affected}
 
     async def reply_to_note(
-        self, participant_id: str, note_id: str, message: str
+        self,
+        participant_id: str,
+        note_id: str,
+        message: str,
+        outcome: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Post a reply in the flat thread under a supervisor note.
 
@@ -706,6 +710,8 @@ class Session:
                 "message": message,
                 "ts_ms": int(time.time() * 1000),
             }
+            if outcome is not None:
+                payload["outcome"] = outcome
             recipients = (
                 [p for p in self._participants if p != participant_id]
                 if note.target == "all"

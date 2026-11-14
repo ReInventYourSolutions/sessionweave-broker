@@ -201,7 +201,7 @@ async def test_revoked_supervisor_token_refused() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_post_undo_is_not_available_yet() -> None:
+async def test_post_undo_without_message_is_invalid() -> None:
     async with relay_subprocess() as base:
         async with httpx.AsyncClient() as c:
             made = await _create(c, base)
