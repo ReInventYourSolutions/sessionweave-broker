@@ -35,6 +35,7 @@ SessionWeave is for *agent-to-agent* work.
 | You are configuring a runtime for the first time | [§8 Setup](#8-setup--do-once) |
 
 **Read only what your role needs** (this file is large; open sections on demand):
+all roles → §2.6/§4.1 (stay reachable), §4.5 (leaving: feedback is mandatory) ·
 worker/implementer → §2.5, §4.2, §4.4, §4.6 · client/host → §3, §4.3, §4.4, §4.6 ·
 reconnecting → §5 · looking up a field or error → §6 · other transports → §7.1–7.3.
 
@@ -866,9 +867,9 @@ orders, but they can answer a note. Every reply costs the readers tokens, so:
 
 | Transport | Call |
 |---|---|
-| REST | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` with Bearer `<participant_token>` and `{"message": "..."}` |
+| REST | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` with Bearer `<participant_token>` and `{"message": "...", "outcome"?: {status: done|partial|impossible, undone, not_reversible}}` |
 | MCP | `session_reply_to_note(note_id, message, session_id?, participant_token?)` |
-| SDK | `me.reply_to_note(note_id, message)` |
+| SDK | `me.reply_to_note(note_id, message, *, outcome=None)` |
 
 The reply becomes a `supervisor.note_reply` event
 `{reply_id, note_id, target, participant_id, message, ts_ms}` (`target` is the
@@ -1001,7 +1002,8 @@ without it: read the invite brief, open skill sections only on demand, and wait
 through the Runner or long waits — never poll frequently.
 
 **Private session directory** `$SW_SESSION_DIR` (the Runner sets it), else
-`.sessionweave/<session_id>/` in your working dir. Never share it. Delete it
+`.sessionweave/<session_id>/` in your working dir (if `SW_SESSION_DIR` is unset,
+create it yourself: mode 0700, empty `journal.jsonl`, `cache/`). Never share it. Delete it
 when your participation ends (session end, removal, leave).
 - `journal.jsonl` — append one JSON line **before** each change you make to the
   world (files, commands with effects, sub-agent actions too):
@@ -1177,7 +1179,7 @@ token named in their row.
 | `session_revoke_supervisor_token` | `DELETE /v1/sessions/{sid}/supervisor-tokens/{token_id}` | Revokes one supervisor token immediately. Creator or admin. |
 | *(none)* | `GET /v1/info` | Unauthenticated pre-flight — see [§6.5](#65-get-v1info). |
 | `session_post_order` | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` (MCP: `session_id, token, kind, target, message?`) — Bearer is a supervisor, creator or admin token; `kind` is `note` \| `halt` \| `continue` \| `redirect`; `note` and `redirect` need a `message`. See [§4.4](#44-supervisor-notes). |
-| `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message}` with a participant Bearer (MCP: `note_id, message, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
+| `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message, outcome?}` (outcome: `{status: done|partial|impossible, undone, not_reversible}`) with a participant Bearer (MCP: `note_id, message, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
 | `session_remove_participant` | `DELETE /v1/sessions/{sid}/participants/{pid}` | Creator or admin. Halts the target, removes it, invalidates every join token; `participant.left` with `reason: removed`. See [§4.4](#44-supervisor-notes). |
 | *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |
@@ -1366,7 +1368,7 @@ removal `c.post_order(sid, token, kind=, target=, message=)` and
 `c.remove_participant(sid, token, pid)`; then on the
 participant `me.send()`, `me.respond()`, `me.drain_inbox()`,
 `me.wait_for_event()`, `me.list_participants()`, `me.update_self()`,
-`me.events()`, `me.reply_to_note(note_id, message)`, `me.leave()`. Typed
+`me.events()`, `me.reply_to_note(note_id, message, *, outcome=None)`, `me.leave()`. Typed
 errors `ParticipantPausedError`, `NoteNotFoundError` and
 `ParticipantRemovedError` carry the matching `exc.code`.
 
