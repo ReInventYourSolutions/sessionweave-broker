@@ -67,7 +67,7 @@ def parse_supervisor_request(body: object) -> SupervisorNote:
                 f"message exceeds {_MAX_MESSAGE_BYTES} bytes"
             )
 
-    if kind in _MESSAGE_REQUIRED and not message:
+    if kind in _MESSAGE_REQUIRED and (not message or not message.strip()):
         raise SupervisorRequestError(f"message is required for kind {kind!r}")
 
     return SupervisorNote(

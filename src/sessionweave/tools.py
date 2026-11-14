@@ -654,6 +654,23 @@ def _count_delete_failure(deps: ToolDeps, reason: str) -> None:
             pass
 
 
+_THREAD_KINDS = frozenset({"supervisor.note", "supervisor.note_reply"})
+
+
+def _visible_to(event: dict[str, Any], participant_id: str | None) -> bool:
+    """Whether a participant (or joiner, ``None``) may read ``event`` in history.
+
+    A private note and its replies belong to supervision holders and the
+    addressed participant; everyone else sees only threads sent to ``all``.
+    ``next_cursor`` is left as computed on the unfiltered page, so paging
+    never stalls on a run of hidden events.
+    """
+    if event.get("kind") not in _THREAD_KINDS:
+        return True
+    target = (event.get("payload") or {}).get("target", "all")
+    return target == "all" or (participant_id is not None and target == participant_id)
+
+
 async def session_get_events(
     deps: ToolDeps,
     payload: dict[str, Any],
@@ -665,7 +682,7 @@ async def session_get_events(
     sid = inp.session_id
     # Cold and ended sessions are authenticated from their stored hashes
     # without being loaded into RAM.
-    await _resolve_reader(
+    principal = await _resolve_reader(
         deps, sid, inp.access_token, handle, source_ip=source_ip, hydrate=False
     )
     state: Literal["hot", "cold", "ended"]
@@ -705,15 +722,20 @@ async def session_get_events(
         limit=inp.limit,
         order=inp.order,
     )
+    events = page.events
+    if principal.role in ("participant", "joiner"):
+        events = [
+            e for e in events if _visible_to(e, principal.participant_id)
+        ]
     if deps.metrics is not None:
         try:
             deps.metrics.events_browse_total.labels(session_state=state).inc()
-            deps.metrics.events_browse_returned_total.inc(len(page.events))
+            deps.metrics.events_browse_returned_total.inc(len(events))
         except Exception:
             pass
     return SessionGetEventsOutput(
         session_id=sid,
-        events=page.events,
+        events=events,
         next_cursor=page.next_cursor,
         has_more=page.has_more,
         session_state=state,

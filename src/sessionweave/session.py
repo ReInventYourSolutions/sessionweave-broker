@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from sessionweave.persistence import PersistenceStore, SessionSnapshot
 
 from sessionweave.access import (
+    PARTICIPANT_REMOVED_MESSAGE,
     IssuedToken,
     SessionAuth,
     generate_token,
@@ -698,6 +699,9 @@ class Session:
             payload: dict[str, Any] = {
                 "reply_id": f"nr-{uuid.uuid4().hex[:12]}",
                 "note_id": note_id,
+                # The note's target travels with the reply so history can
+                # keep a private thread private without the note at hand.
+                "target": note.target,
                 "participant_id": participant_id,
                 "message": message,
                 "ts_ms": int(time.time() * 1000),
@@ -937,12 +941,54 @@ class Session:
                     )
 
                 # Phase 3: block until queue delivers an event or budget expires.
-                def check_sentinel(name: str) -> None:
+                pending: list[tuple[str, dict[str, Any], int]] = []
+
+                def take(name: str, payload: dict[str, Any], seq: int) -> bool:
+                    """Sort one queued event; True when it is the sentinel."""
                     if name == "__evicted__":
-                        raise ToolError(
-                            ErrorCode.PARTICIPANT_EVICTED,
-                            "participant left during wait",
+                        return True
+                    if is_match(name):
+                        matching.append({"name": name, "payload": payload, "seq": seq})
+                    else:
+                        pending.append((name, payload, seq))
+                    return False
+
+                def end_of_wait(sentinel: dict[str, Any]) -> WaitForEventResult:
+                    """The caller is gone: say why, without losing what came first.
+
+                    A session that ended answers with its terminal
+                    ``session.ended`` event, whatever the filter. Events
+                    matched before the sentinel (the halt queued by a
+                    removal) are returned; the next call then meets the
+                    removed-token tombstone. A removal is never reported as
+                    an eviction.
+                    """
+                    nonlocal outcome
+                    reason = str(sentinel.get("reason") or "")
+                    if sentinel.get("session_ended"):
+                        outcome = "event"
+                        return WaitForEventResult(
+                            messages=[*matching, {
+                                "name": "session.ended",
+                                "payload": {"reason": reason}, "seq": 0,
+                            }],
+                            timed_out=False,
+                            effective_timeout_seconds=effective_timeout,
                         )
+                    if matching:
+                        outcome = "event"
+                        return WaitForEventResult(
+                            messages=matching,
+                            timed_out=False,
+                            effective_timeout_seconds=effective_timeout,
+                        )
+                    if reason == "removed":
+                        raise ToolError(
+                            ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE
+                        )
+                    raise ToolError(
+                        ErrorCode.PARTICIPANT_EVICTED, "participant left during wait"
+                    )
 
                 while True:
                     remaining = deadline - loop.time()
@@ -964,39 +1010,34 @@ class Session:
                             timed_out=True,
                             effective_timeout_seconds=effective_timeout,
                         )
-                    check_sentinel(name)
-
-                    if is_match(name):
-                        matching.append({"name": name, "payload": payload, "seq": seq})
-                    else:
-                        await self.requeue_to_buffer(
-                            participant_id, [(name, payload, seq)]
-                        )
-
-                    while True:
+                    sentinel = payload if take(name, payload, seq) else None
+                    while sentinel is None:
                         try:
                             name, payload, seq = queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
-                        check_sentinel(name)
-                        if is_match(name):
-                            matching.append({"name": name, "payload": payload, "seq": seq})
-                        else:
-                            await self.requeue_to_buffer(
-                                participant_id, [(name, payload, seq)]
-                            )
+                        if take(name, payload, seq):
+                            sentinel = payload
+                    if sentinel is not None:
+                        # The caller's buffer is gone: nothing to re-buffer.
+                        return end_of_wait(sentinel)
+                    if pending:
+                        await self.requeue_to_buffer(participant_id, list(pending))
+                        pending.clear()
 
                     if matching:
                         outcome = "event"
                         return WaitForEventResult(
-                        messages=matching,
-                        timed_out=False,
-                        effective_timeout_seconds=effective_timeout,
-                    )
+                            messages=matching,
+                            timed_out=False,
+                            effective_timeout_seconds=effective_timeout,
+                        )
                     # else: spurious wake on non-matching event(s), keep
                     # waiting on the same wall-clock budget.
             except ToolError as exc:
-                if exc.code is ErrorCode.PARTICIPANT_EVICTED:
+                if exc.code in (
+                    ErrorCode.PARTICIPANT_EVICTED, ErrorCode.PARTICIPANT_REMOVED
+                ):
                     outcome = "evicted"
                 else:
                     outcome = "error"
@@ -2020,14 +2061,14 @@ class Session:
         self._active_waits = 0
 
     def broadcast_session_ended(self, *, reason: str) -> None:
-        # Wake any wait_for_event coroutines so they raise PARTICIPANT_EVICTED
+        # Wake any wait_for_event coroutines so they return ``session.ended``
         # rather than silently timing out on their full budget while the session
         # disappears under them. Must fire BEFORE _participants is cleared so the
         # sentinel handler's membership check sees the right state.
         for _pid, subs in list(self._subscribers.items()):
             for cb in list(subs):
                 try:
-                    cb("__evicted__", {"reason": reason}, 0)
+                    cb("__evicted__", {"reason": reason, "session_ended": True}, 0)
                 except Exception:
                     pass
         self._subscribers.clear()

@@ -252,3 +252,75 @@ async def test_wait_releases_in_flight_when_client_times_out() -> None:
             body = r.json()
             assert body["timed_out"] is True
             assert body["messages"] == []
+
+
+async def _pull_participant(c: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any]]:
+    made = (await c.post("/v1/sessions", json={})).json()
+    r = await c.post(
+        f"/v1/sessions/{made['session_id']}/participants",
+        headers=bearer(made["join_token"]), json={"role": "worker"},
+    )
+    assert r.status_code == 201, r.text
+    return made, r.json()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_waiter_learns_the_session_ended_when_it_is_deleted() -> None:
+    """A REST pull participant blocked in inbox/wait while the creator
+    deletes the session receives ``session.ended`` as the wait's result."""
+    async with relay_subprocess() as base, httpx.AsyncClient(
+        base_url=base, timeout=15.0
+    ) as c:
+        made, me = await _pull_participant(c)
+        sid = made["session_id"]
+        wait = asyncio.create_task(c.post(
+            f"/v1/sessions/{sid}/participants/me/inbox/wait",
+            headers=bearer(me["participant_token"]),
+            json={"names": ["command.received"], "timeout_seconds": 10},
+        ))
+        await asyncio.sleep(0.3)
+        d = await c.delete(f"/v1/sessions/{sid}", headers=bearer(made["creator_token"]))
+        assert d.status_code in (200, 204), d.text
+
+        r = await asyncio.wait_for(wait, 5)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["timed_out"] is False
+        assert [m["name"] for m in body["messages"]] == ["session.ended"]
+        assert body["messages"][0]["payload"]["reason"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_removal_during_a_wait_returns_the_halt_then_removed() -> None:
+    """The halt queued by a removal is the wait's result; the next call
+    answers ``participant_removed`` (never ``participant_evicted``)."""
+    async with relay_subprocess() as base, httpx.AsyncClient(
+        base_url=base, timeout=15.0
+    ) as c:
+        made, me = await _pull_participant(c)
+        sid, h = made["session_id"], bearer(me["participant_token"])
+        wait = asyncio.create_task(c.post(
+            f"/v1/sessions/{sid}/participants/me/inbox/wait", headers=h,
+            json={"timeout_seconds": 10},
+        ))
+        await asyncio.sleep(0.3)
+        rm = await c.delete(
+            f"/v1/sessions/{sid}/participants/{me['participant_id']}",
+            headers=bearer(made["creator_token"]),
+        )
+        assert rm.status_code == 200, rm.text
+
+        r = await asyncio.wait_for(wait, 5)
+        assert r.status_code == 200, r.text
+        msgs = r.json()["messages"]
+        assert [(m["name"], m["payload"]["kind"]) for m in msgs] == [
+            ("supervisor.note", "halt")
+        ]
+        again = await c.post(
+            f"/v1/sessions/{sid}/participants/me/inbox/wait", headers=h,
+            json={"timeout_seconds": 1},
+        )
+        assert again.status_code == 403, again.text
+        assert again.json()["error"]["code"] == "participant_removed"

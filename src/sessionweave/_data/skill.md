@@ -810,7 +810,7 @@ A supervisor, the session creator or the relay admin steers participants with
 
 | `kind` | What you do |
 |---|---|
-| `note` | Information or guidance. Read `message` and fold it into the work you are doing, now — including the command in progress. Reply in the thread if useful. |
+| `note` | Information or guidance. Read `message` and fold it into the work you are doing, now — including the command in progress. Reply in the thread when the rules below call for it. |
 | `halt` | **Stop immediately all work, including every sub-agent you started** (local helpers and any agents they run). **Do not leave the session**: stay in it, paused, and keep waiting for events. A halt is not a goodbye. |
 | `continue` | Resume exactly where you stopped, and resume your sub-agents. |
 | `redirect` | Apply the instructions in `message` to yourself and to your sub-agents from now on. It works whether you are paused or running; it replaces what you were doing. |
@@ -851,8 +851,15 @@ into the work in progress; on `halt` stop at once (and stop your sub-agents);
 on `redirect` switch to the new instructions; `continue` needs nothing while
 you are running.
 
-**Reply in the thread.** Participants cannot send orders, but they can answer
-a note:
+**Reply in the thread — only when it is needed.** Participants cannot send
+orders, but they can answer a note. Every reply costs the readers tokens, so:
+
+- Do not reply to `halt`, `continue` or `redirect` just to acknowledge them —
+  complying is the answer.
+- Always reply to a private note (one whose `target` is your participant id).
+- Reply to a note sent to `all` only when you have something the supervisor or
+  the other participants need: a question, a blocker, a result. A broadcast
+  reply reaches every participant.
 
 | Transport | Call |
 |---|---|
@@ -861,10 +868,12 @@ a note:
 | SDK | `me.reply_to_note(note_id, message)` |
 
 The reply becomes a `supervisor.note_reply` event
-`{reply_id, note_id, participant_id, message, ts_ms}`. A note to `all`: your
-reply goes to every other participant and to the supervisors. A note to one
-participant (private): only that participant may reply, and the reply is seen
-by supervisors only. An unknown or wrong-session `note_id` answers
+`{reply_id, note_id, target, participant_id, message, ts_ms}` (`target` is the
+note's). A note to `all`: your reply goes to every other participant and to the
+supervisors. A note to one participant (private): only that participant may
+reply, and the reply is seen by supervisors only — the session history
+(`GET /events`) shows a private note and its replies only to supervision
+holders and to the participant it was sent to. An unknown or wrong-session `note_id` answers
 `note_not_found` (404).
 
 **Removal.** The creator or admin can remove a participant
@@ -877,8 +886,15 @@ creator — stop your work and your sub-agents"). You never receive your own
 `participant.left`: that event (`reason: "removed"`) is what the *other*
 participants and the supervisors see. Stop your work and your sub-agents on
 the 4410 close or on the first `participant_removed` error, whichever comes
-first; do not try to rejoin. This is the one case where a `halt` is
-followed by the end of your participation.
+first; do not try to rejoin and do not leave (you already are out). If you
+are blocked in a pull-mode wait when you are removed, the wait returns the
+`halt` and your next call answers `participant_removed`. This is the one case
+where a `halt` is followed by the end of your participation.
+
+**Session end.** When the session ends (its creator deleted it, or it
+expired) you receive `session.ended`; a wait in progress returns `session.ended`
+as its result, whatever `names` it asked for. Stop: the session is gone, and
+leaving is neither possible nor needed.
 
 Minimum handler for a worker (a pull-mode loop or any dispatch function):
 
@@ -917,6 +933,10 @@ participant only receives them. Supervisors do not send commands; notes are
 their channel.
 
 ### 4.5 Leaving — feedback is mandatory
+
+**Except when you were removed** (`participant_removed`, or the events
+WebSocket closed with 4410) **or the session ended** (`session.ended`): then
+just stop — leaving is impossible and not needed.
 
 Before you leave, ALWAYS attach a short structured exit report, so the host
 can see how the session went from your side without instrumenting you. The
@@ -1148,7 +1168,7 @@ Each event arrives as `name` + `payload`; the shapes below are the
 | `session.ended` | `{"reason"}` | Terminal, all participants. `reason` is `idle_ttl` \| `server_shutdown` \| `host_deleted` \| `admin_deleted` \| `persistence_expired`. |
 | `session.cold` *(persisted only)* | `{}` | Only to attached WebSocket subscribers and an in-flight `inbox/wait` — **MCP push participants do not receive it**. Sent when a persisted session hits idle TTL. It is being paged out of RAM, **not** ended; the next describe/join/resume rehydrates it. |
 | `supervisor.note` | `{"note_id", "kind", "target", "message", "ts_ms"}` | `kind` is `note` \| `halt` \| `continue` \| `redirect`. See [§4.4](#44-supervisor-notes). |
-| `supervisor.note_reply` | `{"reply_id", "note_id", "participant_id", "message", "ts_ms"}` | A reply in a note's thread; see [§4.4](#44-supervisor-notes). |
+| `supervisor.note_reply` | `{"reply_id", "note_id", "target", "participant_id", "message", "ts_ms"}` | A reply in a note's thread; see [§4.4](#44-supervisor-notes). |
 | `buffer_evicted` *(firehose only)* | `{"reason", "evicted_count", "freed_bytes", "buffered_bytes", "buffer_byte_cap"}` | Back-pressure indicator. **Not delivered to participants** — recipients of evicted events get no notification. |
 
 `ParticipantPublic` is
@@ -1174,7 +1194,8 @@ persistence disabled**, so a `persistence` block at create is refused),
 `persistence_corrupted` (500).
 
 **Long-poll specific:** `invalid_delivery_mode`, `wait_already_in_flight`
-(HTTP 409), `participant_evicted` (409), `too_many_waits` (429),
+(HTTP 409), `participant_evicted` (409 — you left through another channel
+while a wait was open), `too_many_waits` (429),
 `client_disconnect` (499).
 
 > **`client_disconnect` (HTTP 499).** The relay watches for the client

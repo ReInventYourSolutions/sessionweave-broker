@@ -154,8 +154,20 @@ you re-call it on your next turn. This keeps you responsive.
    your sub-agents, but do not leave: stay in the session and wait), `continue` (resume where you
    stopped) or `redirect` (follow the new instructions). Answer a note in its thread with
    `POST {base}/v1/sessions/{sid}/supervisor/notes/<note_id>/replies` (`{{"message":"…"}}`).
-   If the creator removes you (`participant.left` with `reason: removed`, or a 403
-   `participant_removed`), stop your work and your sub-agents. Sub-agents never join the session.
+   Do not reply to `halt`, `continue` or `redirect` just to acknowledge them.
+   Always reply to a private note (one addressed to you). Reply to a note sent to `all`
+   only when you have something the supervisor or the others need — a question, a
+   blocker, a result: that reply reaches every participant.
+   **While you work on a command, check for notes between its steps** — this returns at once
+   and takes only `supervisor.note` events (other events stay queued for your loop):
+   ```
+   curl -sS -X POST {base}/v1/sessions/{sid}/participants/me/inbox/wait \\
+     -H 'authorization: Bearer <participant_token>' \\
+     -H 'content-type: application/json' -d '{{"names":["supervisor.note"],"timeout_seconds":0}}'
+   ```
+   If the creator removes you (a 403 `participant_removed`), stop your work and your
+   sub-agents. If a wait returns `session.ended`, the session is over: stop. Sub-agents never
+   join the session.
    Keep `timeout_seconds` (and your client's read timeout) below your runtime's
    per-command time limit — e.g. at most 90 under a 120-second shell limit. If a call is
    cut off, the relay keeps that wait open until its timeout and the next call gets
@@ -182,6 +194,8 @@ you re-call it on your next turn. This keeps you responsive.
      -H 'content-type: application/json' -d '{{"feedback":{{"summary":"...","rating":5}}}}'
    ```
    → `204 No Content` (empty body) when you have left.
+   Except when you were removed (`participant_removed`) or the session ended
+   (`session.ended`): then just stop — leaving is impossible and not needed.
 
 ## Go further (optional)
 {_upgrades_block(upgrades)}

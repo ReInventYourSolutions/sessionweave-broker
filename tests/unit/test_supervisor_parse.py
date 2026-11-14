@@ -26,6 +26,13 @@ def test_redirect_with_empty_message_rejected():
         parse_supervisor_request({"kind": "redirect", "target": "all", "message": ""})
 
 
+@pytest.mark.parametrize("kind", ["note", "redirect"])
+@pytest.mark.parametrize("blank", [" ", "  \n\t "])
+def test_whitespace_only_message_rejected_like_empty(kind, blank):
+    with pytest.raises(SupervisorRequestError, match="message is required"):
+        parse_supervisor_request({"kind": kind, "target": "all", "message": blank})
+
+
 @pytest.mark.parametrize("kind", ["halt", "continue"])
 def test_halt_continue_message_optional(kind):
     order = parse_supervisor_request({"kind": kind, "target": "all"})

@@ -664,7 +664,11 @@ paths:
     get:
       tags: [sessions]
       summary: "Browse the timeline of a persisted session"
-      description: "Bearer: a participant, join, supervisor, creator or admin token."
+      description: >-
+        Bearer: a participant, join, supervisor, creator or admin token.
+        Participant and join tokens do not see private supervisor notes
+        (``target`` other than ``all``) or their replies, except a
+        participant's own.
       security:
         - bearerAuth: []
       parameters:
@@ -807,7 +811,9 @@ paths:
         participant and the firehose receive ``supervisor.note_reply``). A note
         sent to one participant may be answered only by that participant, and
         only the firehose receives the reply. The reply is persisted in the
-        session timeline (``GET /events``).
+        session timeline (``GET /events``) and carries the note's ``target``;
+        history shows a private note and its replies only to supervision
+        holders and the addressed participant.
       security:
         - bearerAuth: []
       requestBody:
@@ -829,6 +835,7 @@ paths:
                 properties:
                   reply_id: { type: string }
                   note_id: { type: string }
+                  target: { type: string, description: "The note's target: ``all`` or a participant id" }
                   participant_id: { type: string }
                   message: { type: string }
                   ts_ms: { type: integer }
@@ -1155,6 +1162,14 @@ paths:
         Set your HTTP client's read timeout to at least
         `timeout_seconds + a few seconds of slack` to avoid this
         signal turning into per-call churn.
+
+        **Session end and removal.** If the session ends while you wait
+        (deleted by its creator, expired), the wait returns the terminal
+        `session.ended` event, whatever `names` asked for: stop, do not
+        leave. If the creator removes you while you wait, the events queued
+        before the removal (the `halt` note) are returned; your next call
+        answers `403 participant_removed`. `participant_evicted` (409) is
+        only for leaving through another channel mid-wait.
       security:
         - bearerAuth: []
       requestBody:
@@ -1178,7 +1193,7 @@ paths:
           description: session_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted
+          description: invalid_delivery_mode | wait_already_in_flight | participant_evicted (you left through another channel)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: too_many_waits — relay concurrent-wait cap exceeded

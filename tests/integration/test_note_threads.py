@@ -154,6 +154,49 @@ async def test_a_broadcast_thread_outlives_whoever_left(store: PersistenceStore)
     assert out["participant_id"] == b.participant_id
 
 
+@pytest.mark.asyncio
+async def test_private_threads_stay_private_in_cold_history(
+    store: PersistenceStore,
+) -> None:
+    """History of a session not in RAM filters private threads too."""
+    from sessionweave import tools
+
+    firehose = FirehoseRegistry()
+    reg = SessionRegistry(
+        defaults=load_deployment_defaults({}), connections=ConnectionManager(),
+        metrics=None, firehose=firehose, store=store,
+    )
+    creator = generate_token()
+    sid, _, _, _, _ = await reg.create(
+        overrides={}, purpose=None,
+        persistence=PersistenceConfig(mode="ttl", ttl_seconds=3600),
+        creator_token_hash=hash_token(creator),
+    )
+    sess = await reg.get_or_raise(sid)
+    a = await sess.join(FakeHandle(), role="worker", capabilities=[])
+    b = await sess.join(FakeHandle(), role="worker", capabilities=[])
+    await sess.post_order(_note("all"))
+    await sess.post_order(_note(a.participant_id))
+    await sess.reply_to_note(a.participant_id, "sn-all", "open answer")
+    await sess.reply_to_note(a.participant_id, "sn-" + a.participant_id[-6:], "secret")
+    await asyncio.gather(*sess._firehose_tasks)
+    reg._sessions.pop(sid)  # cold: answered from disk only
+
+    async def messages(token: str | None) -> list[str]:
+        out = await tools.session_get_events(
+            tools.ToolDeps(reg),
+            {"session_id": sid, "access_token": token,
+             "kind": ["supervisor.note", "supervisor.note_reply"]},
+        )
+        assert out["session_state"] == "cold"
+        return [e["payload"]["message"] for e in out["events"]]
+
+    everything = ["how is it going?", "how is it going?", "open answer", "secret"]
+    assert await messages(creator) == everything
+    assert await messages(a.issued_token) == everything
+    assert await messages(b.issued_token) == ["how is it going?", "open answer"]
+
+
 # ---------- over the wire ----------
 
 
@@ -207,13 +250,27 @@ async def test_http_replies_and_history(tmp_path: Path) -> None:
             unauth = await c.post(url, json={"message": "x"})
             assert unauth.status_code == 401
 
-            ev = await c.get(
-                f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
-                params={"kind": "supervisor.note_reply"},
-            )
-            assert ev.status_code == 200, ev.text
-            (reply,) = ev.json()["events"]
-            assert reply["payload"]["message"] == "fine"
+            # A private thread is for supervision holders and the addressee:
+            # the join token and the other participant see neither the note
+            # nor the reply in history.
+            kinds = {"kind": "supervisor.note,supervisor.note_reply"}
+            for outsider in (jt, tb):
+                ev = await c.get(
+                    f"{base}/v1/sessions/{sid}/events", headers=bearer(outsider),
+                    params=kinds,
+                )
+                assert ev.status_code == 200, ev.text
+                assert ev.json()["events"] == []
+            for insider in (sup, ta):
+                ev = await c.get(
+                    f"{base}/v1/sessions/{sid}/events", headers=bearer(insider),
+                    params=kinds,
+                )
+                assert ev.status_code == 200, ev.text
+                got = [(e["kind"], e["payload"]["message"]) for e in ev.json()["events"]]
+                assert got == [
+                    ("supervisor.note", "status?"), ("supervisor.note_reply", "fine"),
+                ]
 
 
 @pytest.mark.integration

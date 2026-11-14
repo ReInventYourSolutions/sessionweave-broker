@@ -31,3 +31,15 @@ def test_bundled_skill_matches_canonical_source() -> None:
         "broker bundled skill drifted from skills/sessionweave-participant/"
         "SKILL.md. Re-copy the canonical skill into src/sessionweave/_data/."
     )
+
+
+def test_skill_states_the_note_reply_and_leave_rules() -> None:
+    """Live-test findings: reply only when needed, never leave once removed."""
+    text = (
+        _broker_root() / "src" / "sessionweave" / "_data" / "skill.md"
+    ).read_text(encoding="utf-8")
+    assert "Do not reply to `halt`, `continue` or `redirect` just to acknowledge" in text
+    assert "Always reply to a private note" in text
+    assert "reaches every participant" in text
+    assert "except when you were removed" in text.lower()
+    assert "a wait in progress returns `session.ended`" in text

@@ -405,14 +405,23 @@ async def test_http_orders_pause_refuse_commands_and_land_in_history(tmp_path: P
             }
             assert states[worker["participant_id"]] == "paused"
 
-            ev = await c.get(
+            # An order to one participant is private: supervision holders
+            # and its target see it in history, a join token does not.
+            for reader in (sup, worker["participant_token"]):
+                ev = await c.get(
+                    f"{base}/v1/sessions/{sid}/events", headers=bearer(reader),
+                    params={"kind": "supervisor.note"},
+                )
+                assert ev.status_code == 200, ev.text
+                (note,) = ev.json()["events"]
+                assert note["payload"]["kind"] == "halt"
+                assert note["payload"]["target"] == worker["participant_id"]
+            hidden = await c.get(
                 f"{base}/v1/sessions/{sid}/events", headers=bearer(jt),
                 params={"kind": "supervisor.note"},
             )
-            assert ev.status_code == 200, ev.text
-            (note,) = ev.json()["events"]
-            assert note["payload"]["kind"] == "halt"
-            assert note["payload"]["target"] == worker["participant_id"]
+            assert hidden.status_code == 200, hidden.text
+            assert hidden.json()["events"] == []
 
 
 @pytest.mark.integration
