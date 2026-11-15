@@ -26,8 +26,8 @@ async def test_oversized_bodies_are_413_on_api_and_mcp() -> None:
             assert r.status_code == 413
 
             async def chunks() -> AsyncIterator[bytes]:
-                for _ in range(10):
-                    yield b" " * 300
+                for _ in range(2):
+                    yield b" " * 600
 
             r = await c.post("/v1/sessions", content=chunks(),
                              headers={"content-type": "application/json"})
