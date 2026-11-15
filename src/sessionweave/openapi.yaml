@@ -75,8 +75,10 @@ components:
         A secret token scoped to one session: the participant token returned
         by `POST /v1/sessions/{sid}/participants`, or a join, supervisor or
         creator token returned by `POST /v1/sessions`, or the relay admin
-        token. Each operation states which of these it accepts. The session
-        id and the `participant_id` are never accepted.
+        token. On a session with an owner account, a usable token of that
+        account (see `accountAuth`) is accepted wherever the creator token is.
+        Each operation states which of these it accepts. The session id and
+        the `participant_id` are never accepted.
 
   schemas:
     Purpose:
@@ -596,14 +598,33 @@ paths:
                       firehose: { type: boolean }
                       supervisor_notes: { type: boolean }
                       session_delete: { type: boolean }
+                  session_creation:
+                    type: string
+                    enum: [open, account]
+                    description: |
+                      Who may create sessions. `open`: anyone (an optional
+                      account or admin token makes the caller the owner).
+                      `account`: `POST /v1/sessions` needs an account token (or
+                      the admin token); otherwise 401 `account_token_required`.
 
   /v1/sessions:
     post:
       tags: [sessions]
       summary: Create a session
       description: |
-        Unauthenticated. The response carries every credential for the new
-        session, each in plaintext exactly once (only digests are stored).
+        Authentication depends on `session_creation` in `GET /v1/info`. With
+        `open` a Bearer is optional: an account token makes that account the
+        session's owner, the admin token may set `owner_account_id`. With
+        `account` the Bearer is required (an account token, or the admin
+        token). A missing token is 401 `account_token_required`; an unknown,
+        revoked, expired or inactive account token is 401
+        `invalid_account_token`. The response carries every credential for
+        the new session, each in plaintext exactly once (only digests are
+        stored).
+      security:
+        - {}
+        - accountAuth: []
+        - adminAuth: []
       requestBody:
         content:
           application/json:
@@ -616,6 +637,13 @@ paths:
                   $ref: '#/components/schemas/SessionConfig'
                 persistence:
                   $ref: '#/components/schemas/PersistenceConfig'
+                owner_account_id:
+                  type: string
+                  nullable: true
+                  description: |
+                    Admin token only: create the session owned by this
+                    account. If that account is not `active` the session
+                    starts suspended. Any other caller gets 403.
                 creator_id:
                   type: string
                   nullable: true
@@ -672,6 +700,10 @@ paths:
                   invite_link:
                     type: string
                     description: "`swv(s)://host/<sid>?jt=<join_token>`"
+                  owner_account_id:
+                    type: string
+                    nullable: true
+                    description: Id of the owning account, or null for an unowned session.
                   creator_id:
                     type: string
                     description: |
@@ -682,6 +714,31 @@ paths:
                       by X" without exposing the creator_token.
         '400':
           description: validation_error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: account_token_required (no Bearer on an `account` relay) or invalid_account_token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: permission_denied (`owner_account_id` without the admin token)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: account_not_found (unknown `owner_account_id`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: rate_limited (too many invalid account tokens from this source IP)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: accounts_unavailable (an account token was sent but the relay has no persistence DB)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -727,8 +784,8 @@ paths:
       summary: End a session
       description: |
         Delete a session. Authorization: Bearer accepts either the
-        per-session creator_token (returned at session_create) OR the
-        relay-wide SW_ADMIN_TOKEN. Distinct ended_reason
+        per-session creator_token (returned at session_create), the token of
+        the owning account, OR the relay-wide SW_ADMIN_TOKEN. Distinct ended_reason
         values: host_deleted (creator_token) vs admin_deleted (admin).
       security:
         - bearerAuth: []
@@ -816,7 +873,7 @@ paths:
     patch:
       tags: [sessions]
       summary: Update the session's `purpose` (broadcasts session.purpose_updated)
-      description: "Bearer: the creator token or the admin token. A participant may not change the purpose."
+      description: "Bearer: the creator token, the owning account's token or the admin token. A participant may not change the purpose."
       security:
         - bearerAuth: []
       requestBody:
@@ -839,8 +896,8 @@ paths:
       tags: [sessions]
       summary: Post a supervisor note / halt / continue / redirect / undo
       description: |
-        Bearer: a supervisor token, the creator token or the admin token
-        (``SW_ADMIN_TOKEN``). A participant token is not accepted: participants
+        Bearer: a supervisor token, the creator token, the owning account's
+        token or the admin token (``SW_ADMIN_TOKEN``). A participant token is not accepted: participants
         receive supervisor notes, they do not send them. The session id is
         never a credential.
 
@@ -891,6 +948,7 @@ paths:
         '401': { description: Missing bearer }
         '403': { description: permission_denied (not a supervisor, creator or admin token) }
         '404': { description: Session not found, or participant_not_found for an unknown target }
+        '409': { description: "session_suspended (the owner account is disabled)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '429': { description: Rate-limited }
 
   /v1/sessions/{sid}/supervisor/notes/{note_id}/replies:
@@ -955,7 +1013,8 @@ paths:
       tags: [sessions]
       summary: Mint a fresh join token
       description: |
-        Bearer: the creator token or the admin token. The new token is valid
+        Bearer: the creator token, the owning account's token or the admin
+        token. The new token is valid
         for 15 minutes and multi-use within that window; earlier join tokens
         keep their own expiry. The plaintext is returned once.
       security:
@@ -975,6 +1034,7 @@ paths:
         '401': { description: Missing bearer }
         '403': { description: permission_denied }
         '404': { description: session_not_found }
+        '409': { description: "session_suspended (the owner account is disabled)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '429': { description: Too many invalid tokens from this source IP for this session }
 
   /v1/sessions/{sid}/supervisor-tokens:
@@ -983,7 +1043,7 @@ paths:
     post:
       tags: [sessions]
       summary: Mint an additional supervisor token
-      description: "Bearer: the creator token or the admin token. The plaintext is returned once."
+      description: "Bearer: the creator token, the owning account's token or the admin token. The plaintext is returned once."
       security:
         - bearerAuth: []
       responses:
@@ -1002,7 +1062,7 @@ paths:
     get:
       tags: [sessions]
       summary: List supervisor tokens (ids and timestamps only, never secrets)
-      description: "Bearer: the creator token or the admin token."
+      description: "Bearer: the creator token, the owning account's token or the admin token."
       security:
         - bearerAuth: []
       responses:
@@ -1029,7 +1089,7 @@ paths:
     delete:
       tags: [sessions]
       summary: Revoke a supervisor token
-      description: "Bearer: the creator token or the admin token. Revocation is immediate: firehose streams opened with this token are closed (WebSocket close code 4403, reason `supervisor token revoked`)."
+      description: "Bearer: the creator token, the owning account's token or the admin token. Revocation is immediate: firehose streams opened with this token are closed (WebSocket close code 4403, reason `supervisor token revoked`)."
       security:
         - bearerAuth: []
       responses:
@@ -1072,7 +1132,7 @@ paths:
       tags: [participants]
       summary: Join a session
       description: |
-        Bearer is a join token (or the creator/admin token). The response's
+        Bearer is a join token (or the creator, owning-account or admin token). The response's
         `participant_token` is the secret Bearer for all later participant
         routes; `participant_id` is an identifier only and authenticates nothing.
       security:
@@ -1097,7 +1157,7 @@ paths:
           description: session_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
-          description: session_full
+          description: session_full | session_suspended (the owner account is disabled)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     get:
       tags: [participants]
@@ -1163,7 +1223,8 @@ paths:
       tags: [participants]
       summary: Remove an agent from the session (creator or admin)
       description: |
-        Bearer: the creator token or the admin token; a supervisor token is
+        Bearer: the creator token, the owning account's token or the admin
+        token; a supervisor token is
         refused. The agent first receives a `supervisor.note` of kind `halt`
         (message `removed by the session creator`); as with any halt, the
         other participants and the firehose then see `participant.updated`
@@ -1351,7 +1412,10 @@ paths:
           browsers can't set custom headers on a WebSocket upgrade.
 
           Accepted: a supervisor token or the creator token of *this*
-          session, or the relay-wide admin token (``SW_ADMIN_TOKEN``). The
+          session (also the owning account's token), or the relay-wide admin
+          token (``SW_ADMIN_TOKEN``). A stream opened with an account token is
+          closed (code 4403) when that token is revoked or its account is
+          disabled or deleted. The
           session id is never a credential, and neither is a participant
           token (a participant sees its own stream on ``/events``).
           Verified against stored SHA-256 digests.
@@ -1405,6 +1469,7 @@ paths:
               schema: { $ref: '#/components/schemas/SendCommandResponse' }
         '409':
           description: >-
+            session_suspended (the owner account is disabled), or
             participant_paused — a specific target is paused by the supervisor,
             or every role / capability match is. Paused participants are never
             matched by role or capability. Presence does not count here: an
@@ -1472,6 +1537,9 @@ paths:
         '403':
           description: permission_denied (not the admin token)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1496,6 +1564,9 @@ paths:
         '403':
           description: permission_denied (not the admin token)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1519,6 +1590,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
@@ -1567,6 +1641,9 @@ paths:
         '409':
           description: account_name_taken
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1596,6 +1673,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
@@ -1630,6 +1710,9 @@ paths:
         '404':
           description: account_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1653,6 +1736,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: account_not_found / token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
@@ -1696,6 +1782,9 @@ paths:
         '401':
           description: invalid_account_token
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1718,6 +1807,9 @@ paths:
         '401':
           description: invalid_account_token
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
@@ -1738,6 +1830,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
           description: token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
@@ -1764,6 +1859,9 @@ paths:
                     items: { $ref: '#/components/schemas/OwnedSession' }
         '401':
           description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
