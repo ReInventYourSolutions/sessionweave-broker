@@ -1,3 +1,4 @@
+import asyncio
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -80,3 +81,32 @@ def test_ram_session_not_idle_expired_while_suspended() -> None:
     assert sess.is_idle_expired(at=far) is True
     sess.suspended = True
     assert sess.is_idle_expired(at=far) is False
+
+
+@pytest.mark.asyncio
+async def test_tick_returns_for_suspended_ram_session_past_idle_ttl() -> None:
+    reg = SessionRegistry(
+        defaults=load_deployment_defaults({}), connections=ConnectionManager(),
+        metrics=None, firehose=None, store=None,
+    )
+    sid, *_ = await reg.create(overrides={}, purpose=None)
+    sess = await reg.get_or_raise(sid)
+    sess.suspended = True
+    far = datetime.now(UTC) + timedelta(days=2)
+    await asyncio.wait_for(asyncio.to_thread(reg.tick, now=far), timeout=5)
+    assert reg.get(sid) is sess
+
+
+@pytest.mark.asyncio
+async def test_tick_keeps_hydrated_suspended_session_hot(store: PersistenceStore) -> None:
+    sid = await _create(_registry(store))
+    now = int(time.time() * 1000)
+    await store.update_last_activity(sid, now - 10 * 24 * 3600 * 1000)
+    await store.set_suspended(sid, True)
+    reg = _registry(store)
+    sess = await reg.get_or_raise(sid)
+    far = datetime.now(UTC) + timedelta(days=2)
+    await asyncio.wait_for(asyncio.to_thread(reg.tick, now=far), timeout=5)
+    assert reg.get(sid) is sess
+    snap = await store.load_session(sid)
+    assert snap is not None and snap.ended_at is None

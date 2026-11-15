@@ -93,6 +93,9 @@ class WaitForEventResult:
     effective_timeout_seconds: float = 0.0
 
 
+_NO_DEADLINE = datetime(9999, 12, 31, tzinfo=UTC)
+
+
 class Session:
     """Single-session state machine. All public methods acquire `self.lock`
     so per-session operations are linearizable.
@@ -319,20 +322,22 @@ class Session:
         scanning every entry every tick.
 
         Includes:
-          * idle TTL expiry
+          * idle TTL expiry (not while suspended)
           * any inflight command tracker's TTL deadline
           * the offline-grace deadline of any offline participant
 
         The returned datetime is always timezone-aware (UTC).
         """
-        candidates: list[datetime] = [self.expires_at()]
+        # A suspended session never idle-expires, so its (stale) idle deadline
+        # must not drive the heap: it would be due on every tick, forever.
+        candidates: list[datetime] = [] if self.suspended else [self.expires_at()]
         for tracker in self._inflight.values():
             candidates.append(tracker.deadline)
         grace = timedelta(seconds=self.config.offline_grace_seconds)
         for p in self._participants.values():
             if not p.online and p.last_online_at is not None:
                 candidates.append(p.last_online_at + grace)
-        return min(candidates)
+        return min(candidates) if candidates else _NO_DEADLINE
 
     # --- activity tracking ---
 
