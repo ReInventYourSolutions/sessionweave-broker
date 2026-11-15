@@ -23,7 +23,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
-from sessionweave.access import AuthFailureLimiter
+from sessionweave.access import AuthFailureLimiter, admin_matches
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -1178,7 +1178,7 @@ def build_app() -> Starlette:
             auth = request.headers.get("authorization", "")
             if not auth.lower().startswith("bearer "):
                 return Response("unauthorized", status_code=401)
-            if auth[7:].strip() != metrics_token:
+            if not admin_matches(auth[7:].strip(), metrics_token):
                 return Response("forbidden", status_code=403)
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 
