@@ -354,6 +354,7 @@ async def session_describe(
         purpose=sess.purpose,
         roster=sess.roster_snapshot(),
         persistence=_persistence_public_for(sess),
+        suspended=sess.suspended,
     ).model_dump()
 
 

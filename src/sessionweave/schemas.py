@@ -225,6 +225,7 @@ class SessionDescribeOutput(_Strict):
     purpose: dict[str, Any] | None = None
     roster: list[ParticipantPublic]
     persistence: PersistenceStatePublic | None = None
+    suspended: bool = False
 
 
 class InboxMessage(_Strict):

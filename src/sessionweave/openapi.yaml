@@ -622,6 +622,9 @@ paths:
                   persistence:
                     $ref: '#/components/schemas/PersistenceStatePublic'
                     nullable: true
+                  suspended:
+                    type: boolean
+                    description: True while the owning account is disabled.
         '401': { description: Missing bearer }
         '403': { description: permission_denied (invalid, expired or wrong-role token) }
         '404':

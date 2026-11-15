@@ -430,6 +430,40 @@ class SessionRegistry:
                 pass
         return _isoformat(_utcnow())
 
+    async def owned_session_ids(self, account_id: str) -> list[str]:
+        """Live sessions owned by the account: hot in RAM plus persisted."""
+        ids = [
+            sid for sid, sess in self._sessions.items()
+            if sess.auth.owner_account_id == account_id
+        ]
+        if self._store is not None:
+            ids += [s for s in await self._store.find_owned(account_id) if s not in ids]
+        return ids
+
+    async def suspend_owned(self, account_id: str) -> int:
+        sids = await self.owned_session_ids(account_id)
+        for sid in sids:
+            await (await self.get_or_raise(sid)).suspend()
+        return len(sids)
+
+    async def resume_owned(self, account_id: str) -> int:
+        sids = await self.owned_session_ids(account_id)
+        for sid in sids:
+            await (await self.get_or_raise(sid)).unsuspend()
+        return len(sids)
+
+    async def delete_owned(self, account_id: str) -> int:
+        """Delete every session the account owns, ended ones included."""
+        sids = await self.owned_session_ids(account_id)
+        for sid in sids:
+            await self.delete(sid, reason="account_deleted")
+        removed = len(sids)
+        if self._store is not None:
+            for sid in await self._store.find_owned_all(account_id):
+                await self._store.delete_session(sid)
+                removed += 1
+        return removed
+
     async def sweep_expired_once(self, *, now_ms: int, safety_seconds: int) -> int:
         """One pass over the store: purge sessions whose persistence has expired.
 
