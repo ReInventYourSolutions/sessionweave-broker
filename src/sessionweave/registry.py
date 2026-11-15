@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import heapq
 import json
+import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -15,6 +17,8 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.session import MAX_PURPOSE_BYTES, Session
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sessionweave.persistence import PersistenceStore
@@ -106,6 +110,7 @@ class SessionRegistry:
         persistence: PersistenceConfig | None = None,
         creator_token_hash: bytes | None = None,
         relay_epoch: int = 0,
+        owner_account_id: str | None = None,
     ) -> tuple[str, str, dict[str, int], dict[str, Any] | None, PersistenceStatePublic | None]:
         from sessionweave.schemas import PersistenceStatePublic
 
@@ -148,6 +153,7 @@ class SessionRegistry:
                     created_at=created_at_ms,
                     last_activity_at=created_at_ms,
                     relay_epoch_at_create=relay_epoch,
+                    owner_account_id=owner_account_id,
                 )
                 try:
                     await self._store.save_session_metadata(meta)
@@ -170,7 +176,7 @@ class SessionRegistry:
                 store=self._store if persistence is not None else None,
                 persistence_mode=persistence.mode if persistence is not None else None,
             )
-            sess.auth = SessionAuth(creator_token_hash)
+            sess.auth = SessionAuth(creator_token_hash, owner_account_id)
             self._sessions[sid] = sess
             self._schedule(sess)
             if self._metrics is not None:
@@ -427,6 +433,102 @@ class SessionRegistry:
             except Exception:
                 pass
         return _isoformat(_utcnow())
+
+    async def owned_session_ids(self, account_id: str) -> list[str]:
+        """Live sessions owned by the account: hot in RAM plus persisted."""
+        ids = [
+            sid for sid, sess in self._sessions.items()
+            if sess.auth.owner_account_id == account_id
+        ]
+        if self._store is not None:
+            ids += [s for s in await self._store.find_owned(account_id) if s not in ids]
+        return ids
+
+    async def owned_session_summaries(self, account_id: str) -> list[dict[str, Any]]:
+        """``{session_id, suspended, persisted, purpose}`` per live owned session.
+
+        Hot sessions come from RAM; persisted sessions that are not in RAM
+        (cold) are read from the store. No session appears twice.
+        """
+        out: list[dict[str, Any]] = []
+        hot: set[str] = set()
+        for sid, sess in list(self._sessions.items()):
+            if sess.auth.owner_account_id == account_id:
+                hot.add(sid)
+                out.append({
+                    "session_id": sid,
+                    "suspended": sess.suspended,
+                    "persisted": sess.persisted,
+                    "purpose": sess.purpose,
+                })
+        if self._store is not None:
+            for sid, suspended, purpose_json in await self._store.owned_summaries(account_id):
+                if sid not in hot:
+                    try:
+                        purpose = json.loads(purpose_json) if purpose_json else None
+                    except ValueError:
+                        purpose = None  # corrupt stored purpose: list the session anyway
+                    out.append({
+                        "session_id": sid,
+                        "suspended": suspended,
+                        "persisted": True,
+                        "purpose": purpose,
+                    })
+        return out
+
+    async def _for_each_owned(
+        self, account_id: str, what: str, action: Callable[[str], Awaitable[None]]
+    ) -> int:
+        """Run ``action`` on each owned session; one failure never aborts the rest.
+
+        A session that vanished meanwhile counts as done. Other failures are
+        logged and, after every session was tried, raised as one error.
+        """
+        sids = await self.owned_session_ids(account_id)
+        done = failed = 0
+        for sid in sids:
+            try:
+                await action(sid)
+            except ToolError as e:
+                if e.code != ErrorCode.SESSION_NOT_FOUND:
+                    logger.exception("%s failed for session %s", what, sid)
+                    failed += 1
+                    continue
+            except Exception:
+                logger.exception("%s failed for session %s", what, sid)
+                failed += 1
+                continue
+            done += 1
+        if failed:
+            raise ToolError(
+                ErrorCode.PERSISTENCE_FAILED,
+                f"{what} failed for {failed} of {len(sids)} sessions",
+            )
+        return done
+
+    async def suspend_owned(self, account_id: str) -> int:
+        async def act(sid: str) -> None:
+            await (await self.get_or_raise(sid)).suspend()
+
+        return await self._for_each_owned(account_id, "suspend", act)
+
+    async def resume_owned(self, account_id: str) -> int:
+        async def act(sid: str) -> None:
+            await (await self.get_or_raise(sid)).unsuspend()
+
+        return await self._for_each_owned(account_id, "resume", act)
+
+    async def delete_owned(self, account_id: str) -> int:
+        """Delete every session the account owns, ended ones included."""
+        async def act(sid: str) -> None:
+            await self.delete(sid, reason="account_deleted")
+
+        removed = await self._for_each_owned(account_id, "delete", act)
+        if self._store is not None:
+            for sid in await self._store.find_owned_all(account_id):
+                await self._store.delete_session(sid)
+                removed += 1
+        return removed
 
     async def sweep_expired_once(self, *, now_ms: int, safety_seconds: int) -> int:
         """One pass over the store: purge sessions whose persistence has expired.

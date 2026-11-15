@@ -44,6 +44,17 @@ def next_state(
     return current
 
 
+def new_note(kind: str, target: str, message: str | None) -> SupervisorNote:
+    """A broker-originated order with a fresh note id and the current time."""
+    return SupervisorNote(
+        note_id=f"sn-{uuid.uuid4().hex[:12]}",
+        kind=kind,
+        target=target,
+        message=message,
+        ts_ms=int(time.time() * 1000),
+    )
+
+
 def parse_supervisor_request(body: object) -> SupervisorNote:
     if not isinstance(body, dict):
         raise SupervisorRequestError("body must be an object")
@@ -68,13 +79,7 @@ def parse_supervisor_request(body: object) -> SupervisorNote:
     if kind in _MESSAGE_REQUIRED and (not message or not message.strip()):
         raise SupervisorRequestError(f"message is required for kind {kind!r}")
 
-    return SupervisorNote(
-        note_id=f"sn-{uuid.uuid4().hex[:12]}",
-        kind=kind,
-        target=target,
-        message=message,
-        ts_ms=int(time.time() * 1000),
-    )
+    return new_note(kind, target, message)
 
 
 class NoteRateLimiter:

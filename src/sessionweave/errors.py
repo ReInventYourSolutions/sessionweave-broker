@@ -31,6 +31,12 @@ class ErrorCode(StrEnum):
     PARTICIPANT_REMOVED = "participant_removed"
     INVALID_REQUEST = "invalid_request"
     NOTE_NOT_FOUND = "note_not_found"
+    ACCOUNT_TOKEN_REQUIRED = "account_token_required"
+    INVALID_ACCOUNT_TOKEN = "invalid_account_token"
+    ACCOUNT_NOT_FOUND = "account_not_found"
+    ACCOUNT_NAME_TAKEN = "account_name_taken"
+    ACCOUNTS_UNAVAILABLE = "accounts_unavailable"
+    SESSION_SUSPENDED = "session_suspended"
 
 
 @dataclass(slots=True)

@@ -49,6 +49,7 @@ class SessionMetadata:
     created_at: int  # unix ms
     last_activity_at: int  # unix ms
     relay_epoch_at_create: int
+    owner_account_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -71,6 +72,8 @@ class SessionSnapshot:
     ended_at: int | None
     ended_reason: str | None
     relay_epoch_at_create: int
+    owner_account_id: str | None
+    suspended: bool
     participants: list[dict[str, Any]]
     inflight: dict[str, dict[str, Any]]
     buffered: list[dict[str, Any]]
@@ -167,16 +170,53 @@ class PersistenceStore:
             " session_id, config_json, purpose_json, creator_token_hash,"
             " persistence_mode, persistence_ttl_seconds,"
             " created_at, last_activity_at,"
-            " ended_at, ended_reason, relay_epoch_at_create"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            " ended_at, ended_reason, relay_epoch_at_create, owner_account_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
             (
                 meta.session_id, meta.config_json, meta.purpose_json,
                 meta.creator_token_hash, meta.persistence_mode,
                 meta.persistence_ttl_seconds,
                 meta.created_at, meta.last_activity_at,
-                meta.relay_epoch_at_create,
+                meta.relay_epoch_at_create, meta.owner_account_id,
             ),
         )
+
+    async def set_suspended(self, sid: str, suspended: bool) -> None:
+        assert self._write_conn is not None
+        await self._write_conn.execute(
+            "UPDATE sessions SET suspended = ? WHERE session_id = ?",
+            (1 if suspended else 0, sid),
+        )
+
+    async def find_owned(self, account_id: str) -> list[str]:
+        """Live (not ended) sessions owned by the account."""
+        return await self._owned(account_id, include_ended=False)
+
+    async def find_owned_all(self, account_id: str) -> list[str]:
+        """All sessions owned by the account, ended ones included."""
+        return await self._owned(account_id, include_ended=True)
+
+    async def _owned(self, account_id: str, *, include_ended: bool) -> list[str]:
+        if not self._read_pool:
+            return []
+        sql = "SELECT session_id FROM sessions WHERE owner_account_id = ?"
+        if not include_ended:
+            sql += " AND ended_at IS NULL"
+        async with self._read_pool[0].execute(sql + " ORDER BY created_at", (account_id,)) as cur:
+            return [sid async for (sid,) in cur]
+
+    async def owned_summaries(
+        self, account_id: str
+    ) -> list[tuple[str, bool, str | None]]:
+        """(session_id, suspended, purpose_json) of the account's live sessions."""
+        if not self._read_pool:
+            return []
+        async with self._read_pool[0].execute(
+            "SELECT session_id, suspended, purpose_json FROM sessions"
+            " WHERE owner_account_id = ? AND ended_at IS NULL ORDER BY created_at",
+            (account_id,),
+        ) as cur:
+            return [(sid, bool(susp), purpose) async for sid, susp, purpose in cur]
 
     async def exists(self, sid: str) -> bool:
         if not self._read_pool:
@@ -406,7 +446,8 @@ class PersistenceStore:
         async with conn.execute(
             "SELECT config_json, purpose_json, creator_token_hash, persistence_mode,"
             " persistence_ttl_seconds, created_at, last_activity_at, ended_at,"
-            " ended_reason, relay_epoch_at_create FROM sessions WHERE session_id = ?",
+            " ended_reason, relay_epoch_at_create, owner_account_id, suspended"
+            " FROM sessions WHERE session_id = ?",
             (sid,),
         ) as cur:
             srow = await cur.fetchone()
@@ -472,6 +513,7 @@ class PersistenceStore:
             created_at=srow[5], last_activity_at=srow[6],
             ended_at=srow[7], ended_reason=srow[8],
             relay_epoch_at_create=srow[9],
+            owner_account_id=srow[10], suspended=bool(srow[11]),
             participants=participants, inflight=inflight, buffered=buffered,
             max_event_seq=int(max_event_seq or 0),
             tokens=await self.load_tokens(sid),
@@ -550,12 +592,13 @@ class PersistenceStore:
             return None
         conn = self._read_pool[0]
         async with conn.execute(
-            "SELECT creator_token_hash FROM sessions WHERE session_id = ?", (sid,)
+            "SELECT creator_token_hash, owner_account_id FROM sessions"
+            " WHERE session_id = ?", (sid,)
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
-        auth = SessionAuth(bytes(row[0]))
+        auth = SessionAuth(bytes(row[0]), row[1])
         auth.restore(await self.load_tokens(sid))
         async with conn.execute(
             "SELECT participant_id, snapshot_json FROM participants"
@@ -577,7 +620,7 @@ class PersistenceStore:
         sids: list[str] = []
         async with self._read_pool[0].execute(
             "SELECT session_id FROM sessions"
-            " WHERE ended_at IS NULL AND ("
+            " WHERE ended_at IS NULL AND suspended = 0 AND ("
             "  (persistence_mode = 'ttl'"
             "   AND last_activity_at + persistence_ttl_seconds * 1000 < ?)"
             "  OR (persistence_mode = 'until_deleted'"
@@ -597,7 +640,7 @@ class PersistenceStore:
         sids: list[str] = []
         async with self._read_pool[0].execute(
             "SELECT session_id FROM sessions"
-            " WHERE ended_at IS NULL AND last_activity_at < ? LIMIT ?",
+            " WHERE ended_at IS NULL AND suspended = 0 AND last_activity_at < ? LIMIT ?",
             (now_ms - threshold_ms, batch),
         ) as cur:
             async for (sid,) in cur:

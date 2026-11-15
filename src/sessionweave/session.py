@@ -36,7 +36,7 @@ from sessionweave.schemas import (
     SessionSendOutput,
     Target,
 )
-from sessionweave.supervisor import NoteRecord, SupervisorNote, next_state
+from sessionweave.supervisor import NoteRecord, SupervisorNote, new_note, next_state
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,9 @@ class WaitForEventResult:
     effective_timeout_seconds: float = 0.0
 
 
+_NO_DEADLINE = datetime(9999, 12, 31, tzinfo=UTC)
+
+
 class Session:
     """Single-session state machine. All public methods acquire `self.lock`
     so per-session operations are linearizable.
@@ -125,6 +128,7 @@ class Session:
         "lock",
         "purpose",
         "session_id",
+        "suspended",
     )
 
     def __init__(
@@ -142,6 +146,9 @@ class Session:
         now = _utcnow()
         self.session_id = session_id
         self.config = config
+        # Set while the owning account is disabled; the session is frozen,
+        # not ended, and the idle reaper leaves it alone.
+        self.suspended: bool = False
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
@@ -215,8 +222,9 @@ class Session:
             store=store,
             persistence_mode=snap.persistence_mode,
         )
-        sess.auth = SessionAuth(snap.creator_token_hash)
+        sess.auth = SessionAuth(snap.creator_token_hash, snap.owner_account_id)
         sess.auth.restore(snap.tokens)
+        sess.suspended = snap.suspended
         # Participants (only active — left_at NULL)
         for p in snap.participants:
             s = p["snapshot"]
@@ -296,6 +304,8 @@ class Session:
         return self._last_activity_at + timedelta(seconds=self.config.idle_ttl_seconds)
 
     def is_idle_expired(self, *, at: datetime | None = None) -> bool:
+        if self.suspended:
+            return False
         now = at or _utcnow()
         return now >= self.expires_at()
 
@@ -312,20 +322,76 @@ class Session:
         scanning every entry every tick.
 
         Includes:
-          * idle TTL expiry
+          * idle TTL expiry (not while suspended)
           * any inflight command tracker's TTL deadline
           * the offline-grace deadline of any offline participant
 
         The returned datetime is always timezone-aware (UTC).
         """
-        candidates: list[datetime] = [self.expires_at()]
+        # A suspended session never idle-expires, so its (stale) idle deadline
+        # must not drive the heap: it would be due on every tick, forever.
+        candidates: list[datetime] = [] if self.suspended else [self.expires_at()]
         for tracker in self._inflight.values():
             candidates.append(tracker.deadline)
         grace = timedelta(seconds=self.config.offline_grace_seconds)
         for p in self._participants.values():
             if not p.online and p.last_online_at is not None:
                 candidates.append(p.last_online_at + grace)
-        return min(candidates)
+        return min(candidates) if candidates else _NO_DEADLINE
+
+    # --- account suspension ---
+
+    def _ensure_not_suspended(self) -> None:
+        if self.suspended:
+            raise ToolError(
+                ErrorCode.SESSION_SUSPENDED,
+                "session suspended: its owner account is disabled",
+            )
+
+    @property
+    def persisted(self) -> bool:
+        """True when this session is stored (persistence enabled for it)."""
+        return self._store is not None and self._persistence_mode is not None
+
+    async def suspend(self) -> None:
+        """Freeze the session: its owner account is disabled. Idempotent.
+
+        Participants are halted; joins, commands, external orders and join
+        tokens are refused until ``unsuspend``. Reads and waits stay allowed.
+        """
+        async with self.lock:
+            if not self.suspended:
+                # Persist first: a failed write leaves RAM untouched so a retry works.
+                if self._store is not None:
+                    await self._store.set_suspended(self.session_id, True)
+                self.suspended = True
+            # Fail closed: the session stays suspended even if the halt cannot be
+            # delivered. While suspended nobody can join or post orders, so a
+            # participant that is not paused means the halt is still owed (also
+            # after a restart); the next suspend() re-sends it.
+            if any(p.supervision_state != "paused" for p in self._participants.values()):
+                await self._apply_order(
+                    new_note("halt", "all", "owner account disabled")
+                )
+
+    async def unsuspend(self) -> None:
+        """Lift the suspension and restart the idle TTL. Idempotent.
+
+        Sends no order: halted participants stay paused until a supervisor,
+        the creator or the owner posts ``continue``. (``resume`` is the
+        participant reconnect operation.)
+        """
+        async with self.lock:
+            if not self.suspended:
+                return
+            if self._store is not None:
+                await self._store.update_last_activity(self.session_id, _now_ms())
+                await self._store.set_suspended(self.session_id, False)
+            self.suspended = False
+            self.bump_activity()
+            # While suspended the heap entry sat at the "no deadline" sentinel.
+            if self._on_deadline_shortened is not None:
+                self._on_deadline_shortened(self)
 
     # --- activity tracking ---
 
@@ -345,6 +411,7 @@ class Session:
         delivery_mode: str = "push",
     ) -> Participant:
         async with self.lock:
+            self._ensure_not_suspended()
             if len(self._participants) >= self.config.max_participants:
                 raise ToolError(ErrorCode.SESSION_FULL, "max participants reached")
             p = Participant.create(
@@ -384,6 +451,7 @@ class Session:
 
     async def mint_join_token(self) -> tuple[str, IssuedToken]:
         async with self.lock:
+            self._ensure_not_suspended()
             token, issued = self.auth.mint_join(_now_ms())
             if self._store is not None:
                 await self._store.save_token(self.session_id, issued)
@@ -479,10 +547,9 @@ class Session:
                     ErrorCode.PARTICIPANT_NOT_FOUND,
                     f"{participant_id!r} is not a participant of this session",
                 )
-            await self._apply_order(SupervisorNote(
-                note_id=f"sn-{uuid.uuid4().hex[:12]}", kind="halt",
-                target=participant_id, message=REMOVED_HALT_MESSAGE, ts_ms=_now_ms(),
-            ))
+            await self._apply_order(
+                new_note("halt", participant_id, REMOVED_HALT_MESSAGE)
+            )
             now_ms = _now_ms()
             to_expire = self.auth.valid_join_tokens(now_ms)
             if self._store is not None:
@@ -589,6 +656,7 @@ class Session:
         plus ``affected``: the participants whose state changed.
         """
         async with self.lock:
+            self._ensure_not_suspended()
             return await self._apply_order(note)
 
     async def _apply_order(self, note: SupervisorNote) -> dict[str, Any]:
@@ -1276,6 +1344,7 @@ class Session:
         command_id: str | None = None,
     ) -> SessionSendOutput:
         async with self.lock:
+            self._ensure_not_suspended()
             if sender_id not in self._participants:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "sender not in session")
             # Idempotent retry: a caller-supplied command_id that already

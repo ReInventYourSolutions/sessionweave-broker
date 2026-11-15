@@ -353,6 +353,51 @@ See [`.env.example`](.env.example) for the full, annotated list of environment
 variables (binding, auth tokens, the `/invite` brief upgrade URLs, persistence, and
 the per-session config bounds) with their defaults — copy it to `.env` for manual setup.
 
+## Public brokers: accounts
+
+A public broker can require an **account token** to create sessions.
+
+Environment (all three are required together):
+
+- `SW_SESSION_CREATION=account` (default `open`: anyone may create sessions)
+- `SW_PERSISTENCE_DB_PATH` (accounts live in the persistence DB)
+- `SW_ADMIN_TOKEN` (the only way to create accounts)
+
+Administer accounts with the `sessionweave-accounts` CLI (`--url` or `SW_URL`,
+`--admin-token` or `SW_ADMIN_TOKEN`; it prints JSON, and a non-2xx answer exits 1):
+
+```bash
+sessionweave-accounts create alice --contact alice@example.com
+sessionweave-accounts token-create ACC_ID --label laptop --expires-at 2027-01-01T00:00:00Z
+sessionweave-accounts list
+sessionweave-accounts disable ACC_ID      # suspend its sessions
+sessionweave-accounts enable ACC_ID       # lift the suspension (does not continue them)
+sessionweave-accounts token-revoke ACC_ID TOKEN_ID
+sessionweave-accounts delete ACC_ID --yes
+```
+
+The token (`swa_...`) is shown once, at mint time. Send it as
+`Authorization: Bearer <token>`:
+
+- **REST:** on `POST /v1/sessions`, and on the session management routes (the
+  owning account's token acts as the session creator).
+- **MCP:** as a header in `.mcp.json`; `GET /connect.mcp.json` returns the snippet
+  with `"headers": {"Authorization": "Bearer ${SW_ACCOUNT_TOKEN}"}` in account mode.
+  `sessionweave-host` sends `SW_ACCOUNT_TOKEN` the same way.
+- **SDK / Runner:** pass the token wherever they take a creator bearer.
+
+An account can inspect itself with `GET /v1/me`, `GET /v1/me/sessions` and mint or
+revoke its own tokens under `/v1/me/tokens` (see [`openapi.yaml`](src/sessionweave/openapi.yaml)).
+
+**Disable vs delete.** *Disabling* an account stops its tokens at once and
+suspends its sessions: participants receive a halt, and joins, commands and
+orders are refused until you enable it again. Enabling lifts the suspension
+only: the sessions stay halted until you (or a supervisor) post `continue`.
+*Deleting*
+removes the account, its tokens and all its sessions for good. Both are safe to
+repeat if a session failed to update (the broker answers 503
+`persistence_failed`).
+
 ## Architecture (sub-project #1)
 
 Four in-process modules, no external dependencies:

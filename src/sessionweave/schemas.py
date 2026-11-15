@@ -88,6 +88,8 @@ class SessionCreateInput(_Strict):
     # locally for display; relay-side enforcement (creator-only ops bound
     # to a user identity) is a future change once relay auth lands.
     creator_id: str | None = None
+    # Admin-only: create the session on behalf of this account.
+    owner_account_id: str | None = None
 
 
 class SessionCreateOutput(_Strict):
@@ -104,6 +106,7 @@ class SessionCreateOutput(_Strict):
     join_token_expires_at: str = ""
     invite_url: str = ""
     invite_link: str = ""
+    owner_account_id: str | None = None
 
 
 class JoinTokenOutput(_Strict):
@@ -222,6 +225,7 @@ class SessionDescribeOutput(_Strict):
     purpose: dict[str, Any] | None = None
     roster: list[ParticipantPublic]
     persistence: PersistenceStatePublic | None = None
+    suspended: bool = False
 
 
 class InboxMessage(_Strict):

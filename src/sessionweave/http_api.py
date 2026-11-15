@@ -112,6 +112,12 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.PERSISTENCE_FAILED: 503,
     ErrorCode.PERSISTENCE_CORRUPTED: 500,
     ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.ACCOUNT_TOKEN_REQUIRED: 401,
+    ErrorCode.INVALID_ACCOUNT_TOKEN: 401,
+    ErrorCode.ACCOUNT_NOT_FOUND: 404,
+    ErrorCode.ACCOUNT_NAME_TAKEN: 409,
+    ErrorCode.ACCOUNTS_UNAVAILABLE: 503,
+    ErrorCode.SESSION_SUSPENDED: 409,
 }
 
 
@@ -205,7 +211,13 @@ async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         body = await _read_json_body(request)
-        out = await session_create(deps, body, public_base_url=_public_base_url(request))
+        out = await session_create(
+            deps,
+            body,
+            public_base_url=_public_base_url(request),
+            bearer=_bearer(request),
+            source_ip=_request_source_ip(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
@@ -322,7 +334,10 @@ async def serve_mcp_snippet(request: Request) -> JSONResponse:
     """A ready-to-paste ``.mcp.json`` registration snippet for this broker."""
     from sessionweave.skill_serve import render_mcp_snippet
 
-    return JSONResponse(render_mcp_snippet(_public_base_url(request)))
+    account_mode = _deps(request).session_creation == "account"
+    return JSONResponse(
+        render_mcp_snippet(_public_base_url(request), account_mode=account_mode)
+    )
 
 
 async def serve_api_docs(request: Request) -> HTMLResponse:
@@ -945,7 +960,10 @@ async def _access_handler(request: Request) -> Response:
 
 def routes() -> list[Route]:
     """Return the list of `/v1/...` routes to mount on the main app."""
+    from sessionweave import accounts_api
+
     return [
+        *accounts_api.routes(),
         Route("/", landing, methods=["GET"]),
         Route("/skill.md", serve_skill, methods=["GET"]),
         Route("/connect.mcp.json", serve_mcp_snippet, methods=["GET"]),

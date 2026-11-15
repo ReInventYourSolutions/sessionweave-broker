@@ -39,6 +39,10 @@ Output is a JSON object on stdout:
 
 All tokens are shown once, here only.
 
+On a broker that requires an account token to create sessions, set
+``SW_ACCOUNT_TOKEN`` in the environment; it is sent as
+``Authorization: Bearer <token>`` on the MCP connection.
+
 Exit codes:
   0  — session created and joined; poller (if any) spawned.
   2  — usage / argument error.
@@ -49,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -57,6 +62,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -78,6 +84,20 @@ def _unwrap(res: Any) -> dict[str, Any]:
     return {"result": sc}
 
 
+def _http_client() -> httpx2.AsyncClient | None:
+    """An HTTP client sending ``SW_ACCOUNT_TOKEN`` as Bearer, if that is set.
+
+    Needed on brokers that require an account token to create sessions.
+    """
+    token = os.environ.get("SW_ACCOUNT_TOKEN")
+    if not token:
+        return None
+    return httpx2.AsyncClient(
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=httpx2.Timeout(30, read=300),
+    )
+
+
 async def _create_and_join(
     relay_url: str,
     purpose: dict[str, Any] | None,
@@ -86,7 +106,13 @@ async def _create_and_join(
     my_metadata: dict[str, Any],
     delivery_mode: str,
 ) -> tuple[dict[str, Any], str, str]:
-    async with streamable_http_client(relay_url) as (r, w):
+    http_client = _http_client()
+    async with contextlib.AsyncExitStack() as stack:
+        if http_client is not None:
+            await stack.enter_async_context(http_client)
+        r, w = await stack.enter_async_context(
+            streamable_http_client(relay_url, http_client=http_client)
+        )
         async with ClientSession(r, w) as session:
             await session.initialize()
             create_args: dict[str, Any] = {}
@@ -199,7 +225,10 @@ def _hand_back(
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="sessionweave-host")
+    p = argparse.ArgumentParser(
+        prog="sessionweave-host",
+        epilog="Env: SW_ACCOUNT_TOKEN is sent as the Bearer token (account-mode brokers).",
+    )
     p.add_argument(
         "--relay-url",
         default=os.environ.get("SW_URL", "https://relay.sessionweave.com/mcp"),

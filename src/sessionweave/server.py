@@ -23,6 +23,7 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter
+from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
@@ -261,15 +262,17 @@ ParticipantTokenArg = Annotated[str | None, Field(
                 "opens a new connection per call. Otherwise leave unset. It "
                 "is a credential: keep it secret.")]
 
-ManagerTokenArg = Annotated[str, Field(
+ManagerTokenArg = Annotated[str | None, Field(
     description="The one-time creator_token session_create returned (it cannot "
-                "be recovered), or the relay operator's admin token.")]
+                "be recovered), the token of the account that owns the session, "
+                "or the relay operator's admin token. May be omitted when it "
+                "arrives as the MCP Authorization: Bearer header.")]
 
 AccessTokenArg = Annotated[str | None, Field(
     description="Any credential that may read the session: the join token "
                 "from the invite link, your participant_token, a "
-                "supervisor_token, the creator_token, or the relay admin "
-                "token. Not needed if you already joined on this same "
+                "supervisor_token, the creator_token, the owning account's "
+                "token, or the relay admin token. Not needed if you already joined on this same "
                 "connection. It is a credential: keep it secret.")]
 
 PurposeArg = Annotated[dict[str, Any] | None, Field(
@@ -324,6 +327,18 @@ def _build_fastmcp(
     def _client_ip(ctx: Context | None) -> str:
         client = getattr(_request_of(ctx), "client", None)
         return getattr(client, "host", "") or ""
+
+    def _bearer_of(ctx: Context | None) -> str | None:
+        """Bearer token of the MCP HTTP request's Authorization header, if any."""
+        headers = getattr(_request_of(ctx), "headers", None)
+        auth = (headers.get("authorization") if headers is not None else "") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[len("bearer "):].strip() or None
+        return None
+
+    def _creator_cred(explicit: str | None, ctx: Context | None) -> str:
+        """The creator-level credential: explicit argument, else Bearer header."""
+        return explicit or _bearer_of(ctx) or ""
 
     def _public_base_url(ctx: Context | None) -> str | None:
         """Configured public base URL, else the MCP HTTP request's own base URL."""
@@ -412,6 +427,11 @@ def _build_fastmcp(
             '"ttl_seconds": N} or {"mode": "until_deleted"} to persist to disk. Refused with '
             'persistence_failed if this relay has persistence disabled.'
         )] = None,
+        account_token: Annotated[str | None, Field(description=
+            'Account API token authorising session creation. Used only when the MCP HTTP '
+            'request carries no Authorization: Bearer header. Required on relays running in '
+            'account mode; omit on open relays.'
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Open a new session; returns session_id, invite_link and the one-time tokens.
@@ -436,6 +456,8 @@ def _build_fastmcp(
             deps,
             {"config": config, "purpose": purpose, "persistence": persistence},
             public_base_url=_public_base_url(ctx),
+            bearer=_bearer_of(ctx) or account_token or None,
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_describe")
@@ -461,19 +483,24 @@ def _build_fastmcp(
     @_tool("session_update_purpose")
     async def session_update_purpose_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
         purpose: PurposeArg = None,
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Replace the purpose of a session, or clear it.
 
     Pass no purpose to clear. Requires the creator_token (or the relay
-    admin token); participants cannot change the purpose. Broadcasts
+    admin token, or the owning account's token, also accepted from the MCP
+    Authorization: Bearer header); participants cannot change the purpose. Broadcasts
     session.purpose_updated to the participants. Needs no session_join.
     """
         return await session_update_purpose(
             deps,
-            {"session_id": session_id, "creator_token": creator_token, "purpose": purpose},
+            {
+                "session_id": session_id,
+                "creator_token": _creator_cred(creator_token, ctx),
+                "purpose": purpose,
+            },
             source_ip=_client_ip(ctx),
         )
 
@@ -833,110 +860,119 @@ def _build_fastmcp(
     @_tool("session_delete")
     async def session_delete_tool(
         session_id: SessionIdArg,
-        creator_token: Annotated[str, Field(description=
-            "The one-time creator token session_create returned (it cannot be recovered), or "
-            "the relay operator's admin token."
-        )],
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a session permanently, for everyone in it.
 
-    Requires the creator_token returned once by session_create (or the relay admin token). Every
+    Requires the creator_token returned once by session_create (or the relay
+    admin token, or the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Every
     participant is disconnected with session.ended, and a persisted
     session's stored timeline is removed. Needs no session_join, and
     cannot be undone.
     """
         return await session_delete(
             deps,
-            {"session_id": session_id, "creator_token": creator_token},
+            {"session_id": session_id, "creator_token": _creator_cred(creator_token, ctx)},
             source_ip=_client_ip(ctx),
         )
 
     @_tool("session_mint_join_token")
     async def session_mint_join_token_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Mint a fresh join token and invite link for a session.
 
-    Requires the creator_token (or the relay admin token). The join token
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). The join token
     is valid for 15 minutes and can be used by several joiners within that
     time; participants who already joined are unaffected when it expires.
     Returns join_token, expires_at, invite_url and invite_link.
     """
         return await session_mint_join_token(
-            deps, session_id, creator_token,
+            deps, session_id, _creator_cred(creator_token, ctx),
             public_base_url=_public_base_url(ctx), source_ip=_client_ip(ctx),
         )
 
     @_tool("session_mint_supervisor_token")
     async def session_mint_supervisor_token_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Mint an additional supervisor token for a session.
 
-    Requires the creator_token (or the relay admin token). The token is
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). The token is
     returned exactly once as supervisor_token, with a token_id you can
     pass to session_revoke_supervisor_token. A supervisor token cannot
     mint or revoke tokens.
     """
         return await session_mint_supervisor_token(
-            deps, session_id, creator_token, source_ip=_client_ip(ctx)
+            deps, session_id, _creator_cred(creator_token, ctx), source_ip=_client_ip(ctx)
         )
 
     @_tool("session_list_supervisor_tokens")
     async def session_list_supervisor_tokens_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """List a session's supervisor tokens (ids and timestamps, never the secrets).
 
-    Requires the creator_token (or the relay admin token). Each entry has
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Each entry has
     token_id, created_at and revoked_at (null while the token is active).
     """
         return {
             "supervisor_tokens": await session_list_supervisor_tokens(
-                deps, session_id, creator_token, source_ip=_client_ip(ctx)
+                deps, session_id, _creator_cred(creator_token, ctx), source_ip=_client_ip(ctx)
             )
         }
 
     @_tool("session_revoke_supervisor_token")
     async def session_revoke_supervisor_token_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
         token_id: Annotated[str, Field(description=
             "The token_id of the supervisor token to revoke, from "
             "session_mint_supervisor_token, session_create or "
             "session_list_supervisor_tokens."
         )],
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Revoke a supervisor token so it stops working immediately.
 
-    Requires the creator_token (or the relay admin token). Fails with
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Fails with
     token_not_found if token_id is unknown. Returns {"revoked": true}.
     """
         await session_revoke_supervisor_token(
-            deps, session_id, creator_token, token_id, source_ip=_client_ip(ctx)
+            deps, session_id, _creator_cred(creator_token, ctx), token_id, source_ip=_client_ip(ctx)
         )
         return {"revoked": True}
 
     @_tool("session_remove_participant")
     async def session_remove_participant_tool(
         session_id: SessionIdArg,
-        creator_token: ManagerTokenArg,
         participant_id: Annotated[str, Field(description=
             "The participant_id of the agent to remove, as shown in the roster."
         )],
+        creator_token: ManagerTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Remove one agent from a session.
 
-    Requires the creator_token (or the relay admin token); a supervisor
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header); a supervisor
     token is refused. The agent first receives a halt order, then leaves
     the session: its token stops working and the others see
     participant.left with reason removed. Every still-valid join token of
@@ -946,16 +982,13 @@ def _build_fastmcp(
     join_tokens_invalidated.
     """
         return await session_remove_participant(
-            deps, session_id, creator_token, participant_id, source_ip=_client_ip(ctx)
+            deps, session_id, _creator_cred(creator_token, ctx), participant_id,
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_post_order")
     async def session_post_order_tool(
         session_id: SessionIdArg,
-        token: Annotated[str, Field(description=
-            "A supervisor_token, the creator_token, or the relay admin token. "
-            "A participant or join token is refused with permission_denied."
-        )],
         kind: Annotated[Literal["note", "halt", "continue", "redirect", "undo"], Field(description=
             "note: guidance for the work in progress (state unchanged). "
             "halt: stop all work now and wait, paused. continue: resume where "
@@ -969,6 +1002,12 @@ def _build_fastmcp(
         message: Annotated[str | None, Field(description=
             "The order's text, at most 2048 bytes. Required for note, "
             "redirect and undo; optional for halt and continue."
+        )] = None,
+        token: Annotated[str | None, Field(description=
+            "A supervisor_token, the creator_token, the token of the account that "
+            "owns the session, or the relay admin token. May be omitted when it "
+            "arrives as the MCP Authorization: Bearer header. A participant or "
+            "join token is refused with permission_denied."
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -987,7 +1026,7 @@ def _build_fastmcp(
         if message is not None:
             body["message"] = message
         return await session_post_order(
-            deps, session_id, token, body,
+            deps, session_id, _creator_cred(token, ctx), body,
             limiter=order_limiter, source_ip=_client_ip(ctx),
         )
 
@@ -1046,6 +1085,7 @@ def _build_fastmcp(
 
 def build_app() -> Starlette:
     """Build the Starlette app exposing the MCP endpoint and health probes."""
+    creation_mode = session_creation_mode(os.environ)
     deps_cfg = load_deployment_defaults(os.environ)
     connections = ConnectionManager()
     metrics = Metrics()
@@ -1066,6 +1106,7 @@ def build_app() -> Starlette:
         auth_limiter=auth_limiter,
         admin_token=admin_token,
     )
+    tool_deps.session_creation = creation_mode
 
     note_limiter = _note_rate_limiter()
     mcp = _build_fastmcp(
@@ -1109,6 +1150,7 @@ def build_app() -> Starlette:
                 "subproject": "#1 (anonymous, transient, in-memory)",
                 "auth_model": "scoped-tokens-v1",
                 "relay_epoch": relay_epoch,
+                "session_creation": creation_mode,
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {
                     "firehose": True,
@@ -1172,6 +1214,7 @@ def build_app() -> Starlette:
                     metrics.session_stranded_recovered_total.inc()
             # Hand store to registry
             registry._store = store
+            tool_deps.accounts = AccountStore(store)
             # Sweep loop
             sweep_task = asyncio.create_task(
                 registry.sweep_expired_loop(

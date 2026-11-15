@@ -53,6 +53,10 @@ class Principal:
     # stream opened with it can be cut off on revocation). Not part of
     # equality: the role and participant are the identity.
     token_id: str | None = field(default=None, compare=False)
+    # Set when the principal is the session's owner account acting through one of
+    # its account tokens, so live streams can be cut when that token or account dies.
+    account_id: str | None = field(default=None, compare=False)
+    account_token_id: str | None = field(default=None, compare=False)
 
 
 def _now_ms() -> int:
@@ -82,8 +86,11 @@ class IssuedToken:
 class SessionAuth:
     """Per-session credential registry (hashes only)."""
 
-    def __init__(self, creator_token_hash: bytes | None) -> None:
+    def __init__(
+        self, creator_token_hash: bytes | None, owner_account_id: str | None = None
+    ) -> None:
         self._creator_hash = creator_token_hash
+        self._owner_account_id = owner_account_id
         self._issued: dict[bytes, IssuedToken] = {}
         self._participants: dict[bytes, str] = {}
         # Token digest of a removed participant -> tombstone expiry (ms).
@@ -92,6 +99,10 @@ class SessionAuth:
     @property
     def creator_token_hash(self) -> bytes | None:
         return self._creator_hash
+
+    @property
+    def owner_account_id(self) -> str | None:
+        return self._owner_account_id
 
     def _mint(
         self, kind: Literal["join", "supervisor"], now_ms: int, ttl_ms: int | None
@@ -312,6 +323,12 @@ async def resolve_principal(
     principal = auth.match(token, now_ms)
     if principal is not None:
         return principal
+    if auth.owner_account_id and deps.accounts is not None:
+        matched = await deps.accounts.match_token_with_id(token, now_ms)
+        if matched is not None and matched[0].account_id == auth.owner_account_id:
+            return Principal(
+                "creator", account_id=matched[0].account_id, account_token_id=matched[1]
+            )
 
     if auth.was_removed(token, now_ms):
         raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)

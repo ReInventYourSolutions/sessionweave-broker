@@ -11,7 +11,9 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 @contextlib.asynccontextmanager
-async def sw_client(base_url: str) -> AsyncIterator[Client]:
+async def sw_client(
+    base_url: str, headers: dict[str, str] | None = None
+) -> AsyncIterator[Client]:
     """Open an MCP ClientSession over Streamable HTTP against the relay.
 
     The relay tunnels its application events through ``notifications/message``
@@ -28,7 +30,7 @@ async def sw_client(base_url: str) -> AsyncIterator[Client]:
     # The mcp 2.x client takes a configured httpx2 client instead of a
     # ``timeout`` argument.
     async with (
-        httpx2.AsyncClient(timeout=120) as http_client,
+        httpx2.AsyncClient(timeout=120, headers=headers) as http_client,
         streamable_http_client(url, http_client=http_client) as (read, write),
     ):
         client_holder: list[Client] = []

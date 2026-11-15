@@ -108,3 +108,26 @@ async def test_persisted_create_hands_back_all_credentials(deps_with_store):
     auth = await deps_with_store.registry._store.load_auth(out["session_id"])
     assert auth.match(out["supervisor_token"], 0) is not None
     assert auth.creator_token_hash == hash_token(out["creator_token"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,suspended", [("active", False), ("disabled", True),
+                                              ("pending", True)])
+async def test_admin_created_session_follows_owner_account_status(
+    deps_with_store, store, status, suspended
+):
+    from sessionweave.accounts import AccountStore
+
+    accounts = AccountStore(store)
+    acc = await accounts.create("alice", status=status)
+    deps_with_store.accounts = accounts
+    deps_with_store.admin_token = "adm"
+    out = await session_create(
+        deps_with_store, {"owner_account_id": acc.account_id,
+                          "persistence": {"mode": "ttl", "ttl_seconds": 3600}},
+        bearer="adm",
+    )
+    sess = await deps_with_store.registry.get_or_raise(out["session_id"])
+    assert sess.suspended is suspended
+    summaries = await store.owned_summaries(acc.account_id)
+    assert summaries[0][1] is suspended
