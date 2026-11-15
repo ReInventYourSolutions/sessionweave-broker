@@ -272,6 +272,13 @@ async def session_create(
     supervisor_token, supervisor_issued = await sess.mint_supervisor_token()
     join_token, join_issued = await sess.mint_join_token()
     assert join_issued.expires_at_ms is not None
+    # Done after minting: a suspended session refuses new tokens.
+    if owner_account_id is not None and deps.accounts is not None:
+        # An admin may create a session for an account that is not active: it
+        # starts suspended, like the account's other sessions. (No participants
+        # yet, so there is nothing to halt.)
+        if (await deps.accounts.get(owner_account_id)).status != "active":
+            await sess.suspend()
     invite_url, invite_link = _invite_fields(public_base_url, sid, join_token)
     return SessionCreateOutput(
         session_id=sid,
