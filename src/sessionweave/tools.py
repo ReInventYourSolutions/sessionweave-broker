@@ -219,6 +219,25 @@ async def _creation_owner(
     return account.account_id
 
 
+async def check_creation_credential(
+    deps: ToolDeps, bearer: str | None, source_ip: str = ""
+) -> None:
+    """Reject a missing or invalid creation credential without needing the body.
+
+    The same checks ``session_create`` makes, minus the ones that depend on the
+    request body (``owner_account_id``), so HTTP callers can fail early.
+    """
+    if not bearer:
+        if deps.session_creation == "account":
+            await _creation_owner(deps, None, None, source_ip)  # raises
+        return
+    if admin_matches(bearer, deps.admin_token):
+        return
+    if deps.accounts is None:
+        raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "invalid account token")
+    await resolve_account(deps, bearer, source_ip=source_ip)
+
+
 async def session_create(
     deps: ToolDeps,
     payload: dict[str, Any],
