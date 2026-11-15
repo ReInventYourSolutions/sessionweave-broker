@@ -131,3 +131,19 @@ def test_non_json_success_body_prints_raw(
 
     assert _run(["list"], handler, monkeypatch) == 0
     assert capsys.readouterr().out.strip() == "plain text"
+
+
+@pytest.mark.parametrize(
+    "given", ["http://h:8080/mcp", "http://h:8080/mcp/", "http://h:8080/", "http://h:8080"]
+)
+def test_url_from_mcp_endpoint_is_normalised(
+    given: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json={"accounts": []})
+
+    assert _run(["--url", given, "list"], handler, monkeypatch) == 0
+    assert str(seen[0].url) == "http://h:8080/v1/accounts"

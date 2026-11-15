@@ -18,6 +18,14 @@ import httpx
 DEFAULT_URL = "http://127.0.0.1:8080"
 
 
+def _base_url(url: str) -> str:
+    """SW_URL elsewhere is the MCP endpoint (``.../mcp``); the REST base is its parent."""
+    url = url.rstrip("/")
+    if url.endswith("/mcp"):
+        url = url[: -len("/mcp")]
+    return url.rstrip("/")
+
+
 def _client(url: str, token: str) -> httpx.Client:
     return httpx.Client(
         base_url=url, headers={"Authorization": f"Bearer {token}"}, timeout=30
@@ -95,6 +103,7 @@ def _error_message(resp: httpx.Response) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    args.url = _base_url(args.url)
     if not args.admin_token:
         print("error: an admin token is required (--admin-token or SW_ADMIN_TOKEN)",
               file=sys.stderr)
