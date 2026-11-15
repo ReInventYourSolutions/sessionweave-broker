@@ -105,6 +105,7 @@ class RequestSizeLimitMiddleware:
         seen = 0
         exceeded = False
         started = False
+        closed = False
 
         async def limited_receive() -> Message:
             nonlocal seen, exceeded
@@ -117,13 +118,26 @@ class RequestSizeLimitMiddleware:
             return message
 
         async def guarded_send(message: Message) -> None:
-            nonlocal started
+            nonlocal started, closed
+            if closed:
+                return
             if exceeded:
                 # The handler may have swallowed the abort and answered
-                # something else; the client still gets the 413.
+                # something else; the client still gets the 413 unless the
+                # response is already under way, which is then ended cleanly.
+                closed = True
                 if not started:
                     started = True
                     await self._refuse(send)
+                elif not (
+                    message["type"] == "http.response.body"
+                    and not message.get("more_body", False)
+                ):
+                    await send(
+                        {"type": "http.response.body", "body": b"", "more_body": False}
+                    )
+                else:
+                    await send(message)
                 return
             if message["type"] == "http.response.start":
                 started = True
@@ -133,8 +147,12 @@ class RequestSizeLimitMiddleware:
             await self.app(scope, limited_receive, guarded_send)
         except _BodyTooLargeError:
             pass
-        if exceeded and not started:
-            await self._refuse(send)
+        if exceeded and not closed:
+            closed = True
+            if not started:
+                await self._refuse(send)
+            else:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 DEFAULT_MCP_NEW_SESSIONS_PER_MINUTE = 30

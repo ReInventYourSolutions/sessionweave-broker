@@ -1261,8 +1261,8 @@ def build_app() -> Starlette:
             Mount("/", app=McpNewSessionLimitMiddleware(mcp_app)),
         ],
         middleware=[
+            cors_cfg.as_middleware(),  # outermost: error responses keep CORS headers
             Middleware(RequestSizeLimitMiddleware),
-            cors_cfg.as_middleware(),
         ],
         lifespan=lifespan,
     )

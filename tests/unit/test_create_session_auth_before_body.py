@@ -74,12 +74,18 @@ def test_invalid_bearer_without_accounts_does_not_read_body(body_guard: list[int
     assert body_guard == []
 
 
-def test_admin_bearer_reads_body(body_guard: list[int]) -> None:
+def test_admin_bearer_reads_body(
+    body_guard: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_create(deps: Any, body: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        assert kw["bearer"] == "adm"
+        return {"session_id": "s1"}
+
+    monkeypatch.setattr(http_api, "session_create", _fake_create)
     with TestClient(_app(None, "open")) as c:
-        try:
-            c.post("/v1/sessions", json={}, headers={"Authorization": "Bearer adm"})
-        except Exception:  # deps stub is too thin to finish creating
-            pass
+        r = c.post("/v1/sessions", json={}, headers={"Authorization": "Bearer adm"})
+    assert r.status_code == 201
+    assert r.json() == {"session_id": "s1"}
     assert body_guard == [1]
 
 

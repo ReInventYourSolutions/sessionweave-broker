@@ -411,7 +411,10 @@ Checklist for a broker reachable from the internet behind a reverse proxy:
   only from the proxy.
 - **MCP idle transports.** Keep `SW_MCP_SESSION_IDLE_TIMEOUT` positive (default
   1800 s) so abandoned MCP connections are reclaimed; `SW_MCP_MAX_SESSIONS`
-  caps concurrent transports (default `10000`).
+  caps concurrent transports (default `10000`). Idle transports per IP can reach about
+  `SW_MCP_NEW_SESSIONS_PER_MINUTE` x idle timeout in minutes (30 x 30 = 900 at the
+  defaults), so public brokers should set `SW_MCP_SESSION_IDLE_TIMEOUT` low,
+  e.g. `300`.
 - **Request size.** `SW_MAX_REQUEST_BYTES` (default `5242880`) caps any HTTP
   request body; larger ones get 413 `payload_too_large` before being read.
   Also set a body limit at the proxy (for Caddy, `request_body { max_size 5MB }`)

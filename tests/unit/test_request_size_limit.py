@@ -87,3 +87,43 @@ def test_env_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     assert max_request_bytes() == 1234
     monkeypatch.setenv("SW_MAX_REQUEST_BYTES", "junk")
     assert max_request_bytes() == 5_242_880
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("swallow", [False, True])
+async def test_response_already_streaming_is_ended_cleanly(swallow: bool) -> None:
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"first", "more_body": True})
+        try:
+            while True:
+                if not (await receive()).get("more_body"):
+                    break
+        except Exception:
+            if not swallow:
+                raise
+        await send({"type": "http.response.body", "body": b"second", "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    chunks = [
+        {"type": "http.request", "body": b"x" * 6, "more_body": True},
+        {"type": "http.request", "body": b"x" * 6, "more_body": True},
+        {"type": "http.request", "body": b"", "more_body": False},
+    ]
+
+    async def receive() -> Any:
+        return chunks.pop(0)
+
+    sent: list[Any] = []
+
+    async def send(message: Any) -> None:
+        sent.append(message)
+
+    mw = RequestSizeLimitMiddleware(app, max_bytes=10)
+    scope = {"type": "http", "method": "POST", "headers": []}
+    await mw(scope, receive, send)
+    assert sent[0]["status"] == 200
+    assert b"".join(m.get("body", b"") for m in sent[1:]) == b"first"
+    assert sent[-1]["type"] == "http.response.body"
+    assert sent[-1].get("more_body") is False
+    assert sum(1 for m in sent if m["type"] == "http.response.start") == 1
