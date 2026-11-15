@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.31.0"
+  version: "0.32.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -441,6 +441,8 @@ components:
                 - account_name_taken
                 - accounts_unavailable
                 - session_suspended
+                - account_session_limit
+                - account_token_limit
                 - persistence_failed
                 - token_not_found
                 - invalid_request
@@ -563,7 +565,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.31.0" }
+                  version: { type: string, example: "0.32.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -733,7 +735,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
-          description: rate_limited (too many invalid account tokens from this source IP)
+          description: |
+            account_session_limit (the owning account already has
+            `SW_ACCOUNT_MAX_SESSIONS` live sessions, default 100; end one
+            first) or rate_limited (too many invalid account tokens from this
+            source IP)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -742,6 +748,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}:
     parameters:
@@ -950,6 +957,7 @@ paths:
         '404': { description: Session not found, or participant_not_found for an unknown target }
         '409': { description: "session_suspended (the owner account is disabled)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '429': { description: Rate-limited }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/supervisor/notes/{note_id}/replies:
     parameters:
@@ -1005,6 +1013,7 @@ paths:
         '401': { description: Missing or invalid participant token }
         '403': { description: permission_denied (private note addressed to another participant) }
         '404': { description: note_not_found }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/join-tokens:
     parameters:
@@ -1036,6 +1045,7 @@ paths:
         '404': { description: session_not_found }
         '409': { description: "session_suspended (the owner account is disabled)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '429': { description: Too many invalid tokens from this source IP for this session }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/supervisor-tokens:
     parameters:
@@ -1059,6 +1069,7 @@ paths:
         '401': { description: Missing bearer }
         '403': { description: permission_denied }
         '404': { description: session_not_found }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     get:
       tags: [sessions]
       summary: List supervisor tokens (ids and timestamps only, never secrets)
@@ -1159,6 +1170,7 @@ paths:
         '409':
           description: session_full | session_suspended (the owner account is disabled)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     get:
       tags: [participants]
       summary: List the session roster
@@ -1298,6 +1310,7 @@ paths:
         '401':
           description: not_in_session
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/participants/me/inbox/wait:
     parameters:
@@ -1371,6 +1384,7 @@ paths:
             wait so subsequent calls don't see `wait_already_in_flight`.
             The client never reads this body in practice.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/participants/me/events:
     parameters:
@@ -1510,6 +1524,7 @@ paths:
         '403':
           description: not_a_recipient
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/accounts:
     post:
@@ -1543,6 +1558,7 @@ paths:
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     get:
       tags: [accounts]
       summary: List accounts
@@ -1712,12 +1728,16 @@ paths:
         '404':
           description: account_not_found
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/accounts/{account_id}/tokens/{token_id}:
     parameters:
@@ -1809,12 +1829,16 @@ paths:
         '401':
           description: invalid_account_token
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: rate_limited (too many failed attempts from this source IP)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/me/tokens/{token_id}:
     parameters:
