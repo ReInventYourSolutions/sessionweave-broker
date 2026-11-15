@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from starlette.routing import WebSocketRoute
@@ -287,6 +288,21 @@ async def events_ws(websocket: WebSocket) -> None:
             await session.requeue_to_buffer(pid, undelivered)
 
 
+async def _account_token_still_valid(
+    deps: Any, sid: str, token: str, account_id: str | None
+) -> bool:
+    """Same test ``resolve_principal`` applies to an owner-account token."""
+    hot = deps.registry.get(sid)
+    if hot is None or deps.accounts is None:
+        return False
+    matched = await deps.accounts.match_token_with_id(token, int(time.time() * 1000))
+    return (
+        matched is not None
+        and matched[0].account_id == account_id
+        and hot.auth.owner_account_id == account_id
+    )
+
+
 async def firehose_ws(websocket: WebSocket) -> None:
     sid = websocket.path_params["sid"]
     token = websocket.query_params.get("token", "")
@@ -325,6 +341,12 @@ async def firehose_ws(websocket: WebSocket) -> None:
     ):
         # Revoked between the token check and the subscription.
         sub.close_reason = "supervisor token revoked"
+        sub.closed.set()
+    if principal.account_token_id is not None and not await _account_token_still_valid(
+        deps, sid, token, principal.account_id
+    ):
+        # Revoked / disabled between the token check and the subscription.
+        sub.close_reason = "account token revoked"
         sub.closed.set()
     revoked = asyncio.create_task(sub.closed.wait())
     getter: asyncio.Task[Any] | None = None

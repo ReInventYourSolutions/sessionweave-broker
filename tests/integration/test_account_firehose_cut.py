@@ -93,3 +93,28 @@ async def test_delete_closes_account_streams(relay: Seeded) -> None:
             r = await c.delete(f"/v1/accounts/{s.acc.account_id}", headers=bearer(ADMIN))
         assert r.status_code == 200, r.text
         await _assert_cut(ws)
+
+
+async def test_recheck_after_subscribe_closes_revoked_token() -> None:
+    """A token revoked between resolve and subscribe is cut at once."""
+    from types import SimpleNamespace
+
+    from sessionweave import events_ws
+
+    acc = SimpleNamespace(account_id="acc_1")
+
+    class _Accounts:
+        result: Any = None
+
+        async def match_token_with_id(self, token: str, now_ms: int) -> Any:
+            return self.result
+
+    accounts = _Accounts()
+    hot = SimpleNamespace(auth=SimpleNamespace(owner_account_id="acc_1"))
+    deps = SimpleNamespace(accounts=accounts, registry=SimpleNamespace(get=lambda sid: hot))
+    accounts.result = (acc, "tok_1")
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is True
+    accounts.result = None  # revoked
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is False
+    accounts.result = (SimpleNamespace(account_id="acc_2"), "tok_9")
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is False
