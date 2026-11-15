@@ -55,3 +55,45 @@ async def test_patch_disabled_batch_failure_keeps_status_and_retry_succeeds(
         assert r.status_code == 200 and r.json()["sessions_affected"] == 2
         assert reg.calls == 2
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_row_failure_is_503_and_retry_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = PersistenceStore(str(tmp_path / "t.db"))
+    await store.init(pool_size=2)
+    accounts = AccountStore(store)
+    acc = await accounts.create("alice")
+
+    class _Reg:
+        async def delete_owned(self, account_id: str) -> int:
+            return 0
+
+    deps: Any = SimpleNamespace(
+        accounts=accounts, registry=_Reg(), admin_token="adm",
+        auth_limiter=SimpleNamespace(
+            is_throttled=lambda *a: False, record_failure=lambda *a: None
+        ),
+    )
+    app = Starlette(routes=accounts_api.routes())
+    app.state.tool_deps = deps
+    h = {"Authorization": "Bearer adm"}
+    real_delete = accounts.delete
+    boom = {"on": True}
+
+    async def flaky(account_id: str) -> None:
+        if boom["on"]:
+            raise RuntimeError("disk full")
+        await real_delete(account_id)
+
+    monkeypatch.setattr(accounts, "delete", flaky)
+    with TestClient(app) as c:
+        r = c.delete(f"/v1/accounts/{acc.account_id}", headers=h)
+        assert r.status_code == 503
+        assert r.json()["error"]["code"] == "persistence_failed"
+        assert "retry" in r.json()["error"]["message"]
+        boom["on"] = False
+        r = c.delete(f"/v1/accounts/{acc.account_id}", headers=h)
+        assert r.status_code == 200
+    await store.close()
