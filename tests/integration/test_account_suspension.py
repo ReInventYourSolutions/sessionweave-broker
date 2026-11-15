@@ -54,7 +54,7 @@ def _notes(h: FakeHandle) -> list[dict]:
     return [p for n, p in h.sent if n == "supervisor.note"]
 
 
-async def _suspended_with_two(store):
+async def _two_participants(store):
     reg = _registry(store)
     sid = await _create(reg)
     sess = await reg.get_or_raise(sid)
@@ -68,7 +68,7 @@ async def _suspended_with_two(store):
 
 @pytest.mark.asyncio
 async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
-    reg, sid, sess, (a, ha), (b, hb) = await _suspended_with_two(store)
+    reg, sid, sess, (a, ha), (b, hb) = await _two_participants(store)
     assert await reg.suspend_owned(OWNER) == 1
     for h in (ha, hb):
         notes = _notes(h)
@@ -100,7 +100,7 @@ async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
 
 @pytest.mark.asyncio
 async def test_resume_continues(store: PersistenceStore) -> None:
-    reg, sid, sess, (_a, ha), (_b, hb) = await _suspended_with_two(store)
+    reg, sid, sess, (_a, ha), (_b, hb) = await _two_participants(store)
     await reg.suspend_owned(OWNER)
     ha.sent.clear()
     hb.sent.clear()
@@ -166,14 +166,16 @@ async def test_resume_restarts_ttl_and_reschedules() -> None:
     sid = await _create(reg, persist=False)
     sess = await reg.get_or_raise(sid)
     await sess.suspend()
-    reg._schedule(sess)
+    ttl = sess.config.idle_ttl_seconds
+    # consume the creation-time heap entry while suspended: it is re-pushed
+    # at the "no deadline" sentinel
+    reg.tick(now=datetime.now(UTC) + timedelta(seconds=ttl + 60))
+    assert sid in reg._sessions
     await sess.unsuspend()
-    # activity bumped: not idle-expired right now
     assert not sess.is_idle_expired()
     reg.tick(now=datetime.now(UTC) + timedelta(seconds=5))
     assert sid in reg._sessions
-    # idle past the TTL after resume: the heap must have been re-pushed
-    reg.tick(now=datetime.now(UTC) + timedelta(seconds=sess.config.idle_ttl_seconds + 60))
+    reg.tick(now=datetime.now(UTC) + timedelta(seconds=ttl + 60))
     assert sid not in reg._sessions
 
 
@@ -190,18 +192,97 @@ async def test_resume_persists_activity(store: PersistenceStore) -> None:
     assert snap.last_activity_at > int(time.time() * 1000) - 60_000
 
 
+class _FlakyStore:
+    """Delegates to a real store; set_suspended can be told to fail once."""
+
+    def __init__(self, inner: PersistenceStore) -> None:
+        self._inner = inner
+        self.fail_set_suspended = 0
+        self.fail_sids: set[str] = set()
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    async def set_suspended(self, sid: str, suspended: bool) -> None:
+        if self.fail_set_suspended or sid in self.fail_sids:
+            self.fail_set_suspended = max(0, self.fail_set_suspended - 1)
+            raise RuntimeError("disk full")
+        await self._inner.set_suspended(sid, suspended)
+
+
 @pytest.mark.asyncio
-async def test_wait_on_suspended_session_past_ttl_blocks() -> None:
-    reg = _registry(None)
-    sid = await _create(reg, persist=False)
+async def test_failed_suspend_write_leaves_session_unchanged(
+    store: PersistenceStore,
+) -> None:
+    flaky = _FlakyStore(store)
+    reg = _registry(flaky)  # type: ignore[arg-type]
+    sid = await _create(reg)
     sess = await reg.get_or_raise(sid)
-    p = await sess.join(FakeHandle(), role="w", capabilities=[], delivery_mode="pull")
+    h = FakeHandle()
+    await sess.join(h, role="w", capabilities=[])
+    h.sent.clear()
+    flaky.fail_set_suspended = 1
+    with pytest.raises(RuntimeError):
+        await sess.suspend()
+    assert sess.suspended is False and _notes(h) == []
     await sess.suspend()
-    # the halt note is waiting in the inbox: drain it so the wait must block
-    first = await sess.wait_for_event(p.participant_id, None, 1)
-    assert [m["name"] for m in first.messages] == ["supervisor.note"]
-    sess._last_activity_at = datetime.now(UTC) - timedelta(days=2)
-    t0 = time.monotonic()
-    res = await sess.wait_for_event(p.participant_id, None, 1)
-    assert time.monotonic() - t0 >= 0.9
-    assert res.timed_out and res.effective_timeout_seconds == 1.0
+    assert sess.suspended is True
+    assert [n["kind"] for n in _notes(h)] == ["halt"]
+
+
+@pytest.mark.asyncio
+async def test_failed_unsuspend_write_leaves_session_suspended(
+    store: PersistenceStore,
+) -> None:
+    flaky = _FlakyStore(store)
+    reg = _registry(flaky)  # type: ignore[arg-type]
+    sid = await _create(reg)
+    sess = await reg.get_or_raise(sid)
+    h = FakeHandle()
+    await sess.join(h, role="w", capabilities=[])
+    await sess.suspend()
+    h.sent.clear()
+    flaky.fail_set_suspended = 1
+    with pytest.raises(RuntimeError):
+        await sess.unsuspend()
+    assert sess.suspended is True and _notes(h) == []
+    await sess.unsuspend()
+    assert sess.suspended is False
+    assert [n["kind"] for n in _notes(h)] == ["continue"]
+
+
+@pytest.mark.asyncio
+async def test_vanished_session_does_not_abort_batch(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reg = _registry(store)
+    s1, s2, s3 = [await _create(reg) for _ in range(3)]
+    real = SessionRegistry.get_or_raise
+
+    async def vanishing(self: SessionRegistry, sid: str):
+        if sid == s2:
+            raise ToolError(ErrorCode.SESSION_NOT_FOUND, "gone")
+        return await real(self, sid)
+
+    monkeypatch.setattr(SessionRegistry, "get_or_raise", vanishing)
+    assert await reg.suspend_owned(OWNER) == 3
+    monkeypatch.undo()
+    assert (await reg.get_or_raise(s1)).suspended
+    assert (await reg.get_or_raise(s3)).suspended
+
+
+@pytest.mark.asyncio
+async def test_failing_session_is_reported_after_the_rest(
+    store: PersistenceStore,
+) -> None:
+    flaky = _FlakyStore(store)
+    reg = _registry(flaky)  # type: ignore[arg-type]
+    s1, s2, s3 = [await _create(reg) for _ in range(3)]
+    flaky.fail_sids = {s2}
+    with pytest.raises(ToolError) as ei:
+        await reg.suspend_owned(OWNER)
+    assert ei.value.code == ErrorCode.PERSISTENCE_FAILED
+    assert "1 of 3" in ei.value.message
+    assert (await reg.get_or_raise(s1)).suspended
+    assert (await reg.get_or_raise(s3)).suspended
+    assert not (await reg.get_or_raise(s2)).suspended

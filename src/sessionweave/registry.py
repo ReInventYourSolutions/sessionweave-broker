@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import heapq
 import json
+import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -15,6 +17,8 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
 from sessionweave.session import MAX_PURPOSE_BYTES, Session
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sessionweave.persistence import PersistenceStore
@@ -440,24 +444,54 @@ class SessionRegistry:
             ids += [s for s in await self._store.find_owned(account_id) if s not in ids]
         return ids
 
-    async def suspend_owned(self, account_id: str) -> int:
+    async def _for_each_owned(
+        self, account_id: str, what: str, action: Callable[[str], Awaitable[None]]
+    ) -> int:
+        """Run ``action`` on each owned session; one failure never aborts the rest.
+
+        A session that vanished meanwhile counts as done. Other failures are
+        logged and, after every session was tried, raised as one error.
+        """
         sids = await self.owned_session_ids(account_id)
+        done = failed = 0
         for sid in sids:
+            try:
+                await action(sid)
+            except ToolError as e:
+                if e.code != ErrorCode.SESSION_NOT_FOUND:
+                    logger.exception("%s failed for session %s", what, sid)
+                    failed += 1
+                    continue
+            except Exception:
+                logger.exception("%s failed for session %s", what, sid)
+                failed += 1
+                continue
+            done += 1
+        if failed:
+            raise ToolError(
+                ErrorCode.PERSISTENCE_FAILED,
+                f"{what} failed for {failed} of {len(sids)} sessions",
+            )
+        return done
+
+    async def suspend_owned(self, account_id: str) -> int:
+        async def act(sid: str) -> None:
             await (await self.get_or_raise(sid)).suspend()
-        return len(sids)
+
+        return await self._for_each_owned(account_id, "suspend", act)
 
     async def resume_owned(self, account_id: str) -> int:
-        sids = await self.owned_session_ids(account_id)
-        for sid in sids:
+        async def act(sid: str) -> None:
             await (await self.get_or_raise(sid)).unsuspend()
-        return len(sids)
+
+        return await self._for_each_owned(account_id, "resume", act)
 
     async def delete_owned(self, account_id: str) -> int:
         """Delete every session the account owns, ended ones included."""
-        sids = await self.owned_session_ids(account_id)
-        for sid in sids:
+        async def act(sid: str) -> None:
             await self.delete(sid, reason="account_deleted")
-        removed = len(sids)
+
+        removed = await self._for_each_owned(account_id, "delete", act)
         if self._store is not None:
             for sid in await self._store.find_owned_all(account_id):
                 await self._store.delete_session(sid)

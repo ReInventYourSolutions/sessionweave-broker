@@ -357,13 +357,18 @@ class Session:
         async with self.lock:
             if self.suspended:
                 return
-            self.suspended = True
+            # Persist first: a failed write leaves RAM untouched so a retry works.
             if self._store is not None:
                 await self._store.set_suspended(self.session_id, True)
+            self.suspended = True
             if self._participants:
-                await self._apply_order(
-                    new_note("halt", "all", "owner account disabled")
-                )
+                try:
+                    await self._apply_order(
+                        new_note("halt", "all", "owner account disabled")
+                    )
+                except Exception:
+                    await self._revert_suspension(True)
+                    raise
 
     async def unsuspend(self) -> None:
         """Lift the suspension and restart the idle TTL. Idempotent.
@@ -373,18 +378,31 @@ class Session:
         async with self.lock:
             if not self.suspended:
                 return
+            if self._store is not None:
+                await self._store.update_last_activity(self.session_id, _now_ms())
+                await self._store.set_suspended(self.session_id, False)
             self.suspended = False
             self.bump_activity()
-            if self._store is not None:
-                await self._store.set_suspended(self.session_id, False)
-                await self._store.update_last_activity(self.session_id, _now_ms())
+            if self._participants:
+                try:
+                    await self._apply_order(
+                        new_note("continue", "all", "owner account re-enabled")
+                    )
+                except Exception:
+                    await self._revert_suspension(False)
+                    raise
             # While suspended the heap entry sat at the "no deadline" sentinel.
             if self._on_deadline_shortened is not None:
                 self._on_deadline_shortened(self)
-            if self._participants:
-                await self._apply_order(
-                    new_note("continue", "all", "owner account re-enabled")
-                )
+
+    async def _revert_suspension(self, value: bool) -> None:
+        """Undo a flag change whose order failed, so a retry starts clean."""
+        self.suspended = value
+        if self._store is not None:
+            try:
+                await self._store.set_suspended(self.session_id, value)
+            except Exception:
+                logger.exception("could not revert suspended flag of %s", self.session_id)
 
     # --- activity tracking ---
 
@@ -540,10 +558,9 @@ class Session:
                     ErrorCode.PARTICIPANT_NOT_FOUND,
                     f"{participant_id!r} is not a participant of this session",
                 )
-            await self._apply_order(SupervisorNote(
-                note_id=f"sn-{uuid.uuid4().hex[:12]}", kind="halt",
-                target=participant_id, message=REMOVED_HALT_MESSAGE, ts_ms=_now_ms(),
-            ))
+            await self._apply_order(
+                new_note("halt", participant_id, REMOVED_HALT_MESSAGE)
+            )
             now_ms = _now_ms()
             to_expire = self.auth.valid_join_tokens(now_ms)
             if self._store is not None:
@@ -936,12 +953,10 @@ class Session:
             remaining_ttl = max(
                 0.0, (self.expires_at() - _utcnow()).total_seconds()
             )
-            # A suspended session never idle-expires: waits are not capped
-            # by a TTL that no longer applies (else halted agents busy-loop).
             effective_timeout = min(
                 float(timeout_seconds),
                 float(self.config.max_wait_seconds),
-                float("inf") if self.suspended else remaining_ttl,
+                remaining_ttl,
             )
 
         # Once we exited the lock above, _wait_in_flight already contains
