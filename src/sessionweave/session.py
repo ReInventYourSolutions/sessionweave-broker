@@ -122,7 +122,6 @@ class Session:
         "_picker",
         "_store",
         "_subscribers",
-        "_suspend_order_pending",
         "_wait_in_flight",
         "auth",
         "config",
@@ -150,8 +149,6 @@ class Session:
         # Set while the owning account is disabled; the session is frozen,
         # not ended, and the idle reaper leaves it alone.
         self.suspended: bool = False
-        # True while a suspension's halt order is still owed (it failed once).
-        self._suspend_order_pending: bool = False
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
@@ -363,21 +360,19 @@ class Session:
         tokens are refused until ``unsuspend``. Reads and waits stay allowed.
         """
         async with self.lock:
-            if self.suspended and not self._suspend_order_pending:
-                return
             if not self.suspended:
                 # Persist first: a failed write leaves RAM untouched so a retry works.
                 if self._store is not None:
                     await self._store.set_suspended(self.session_id, True)
                 self.suspended = True
-            if self._participants:
-                # Fail closed: the session stays suspended even if the halt cannot
-                # be delivered; the owed halt is re-sent by the next suspend().
-                self._suspend_order_pending = True
+            # Fail closed: the session stays suspended even if the halt cannot be
+            # delivered. While suspended nobody can join or post orders, so a
+            # participant that is not paused means the halt is still owed (also
+            # after a restart); the next suspend() re-sends it.
+            if any(p.supervision_state != "paused" for p in self._participants.values()):
                 await self._apply_order(
                     new_note("halt", "all", "owner account disabled")
                 )
-            self._suspend_order_pending = False
 
     async def unsuspend(self) -> None:
         """Lift the suspension and restart the idle TTL. Idempotent.

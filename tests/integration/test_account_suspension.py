@@ -298,6 +298,35 @@ async def test_failed_halt_order_keeps_session_suspended(
 
 
 @pytest.mark.asyncio
+async def test_owed_halt_survives_restart(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reg = _registry(store)
+    sid = await _create(reg)
+    sess = await reg.get_or_raise(sid)
+    await sess.join(FakeHandle(), role="w", capabilities=[])
+    _fail_once(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await sess.suspend()
+    assert await _db_suspended(store) is True
+    monkeypatch.undo()
+    # Restart: RAM flags are gone; the halt is derived from persisted state.
+    reg2 = _registry(store)
+    sess2 = await reg2.get_or_raise(sid)
+    assert sess2.suspended is True
+    assert {p.supervision_state for p in sess2.roster_snapshot()} == {"active"}
+    h = FakeHandle()
+    (pid,) = [p.participant_id for p in sess2.roster_snapshot()]
+    await sess2.resume(h, pid)
+    h.sent.clear()
+    assert await reg2.suspend_owned(OWNER) == 1
+    assert [n["kind"] for n in _notes(h)] == ["halt"]
+    assert {p.supervision_state for p in sess2.roster_snapshot()} == {"paused"}
+    assert await reg2.suspend_owned(OWNER) == 1
+    assert [n["kind"] for n in _notes(h)] == ["halt"]
+
+
+@pytest.mark.asyncio
 async def test_vanished_session_does_not_abort_batch(
     store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
