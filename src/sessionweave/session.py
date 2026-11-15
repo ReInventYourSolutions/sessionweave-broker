@@ -372,7 +372,7 @@ class Session:
                         new_note("halt", "all", "owner account disabled")
                     )
                 except Exception:
-                    await self._revert_suspension(True)
+                    await self._restore_suspension(False)
                     raise
 
     async def unsuspend(self) -> None:
@@ -394,18 +394,18 @@ class Session:
                         new_note("continue", "all", "owner account re-enabled")
                     )
                 except Exception:
-                    await self._revert_suspension(False)
+                    await self._restore_suspension(True)
                     raise
             # While suspended the heap entry sat at the "no deadline" sentinel.
             if self._on_deadline_shortened is not None:
                 self._on_deadline_shortened(self)
 
-    async def _revert_suspension(self, value: bool) -> None:
-        """Undo a flag change whose order failed, so a retry starts clean."""
-        self.suspended = value
+    async def _restore_suspension(self, prior: bool) -> None:
+        """Put the flag back to ``prior`` after its order failed, so a retry works."""
+        self.suspended = prior
         if self._store is not None:
             try:
-                await self._store.set_suspended(self.session_id, value)
+                await self._store.set_suspended(self.session_id, prior)
             except Exception:
                 logger.exception("could not revert suspended flag of %s", self.session_id)
 

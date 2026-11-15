@@ -13,6 +13,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.persistence import PersistenceStore
 from sessionweave.registry import SessionRegistry
 from sessionweave.schemas import DispatchMode, PersistenceConfig, Target
+from sessionweave.session import Session
 from sessionweave.supervisor import SupervisorNote
 from tests.unit.fakes import FakeHandle
 
@@ -248,6 +249,64 @@ async def test_failed_unsuspend_write_leaves_session_suspended(
     assert sess.suspended is True and _notes(h) == []
     await sess.unsuspend()
     assert sess.suspended is False
+    assert [n["kind"] for n in _notes(h)] == ["continue"]
+
+
+async def _db_suspended(store: PersistenceStore) -> bool:
+    return (await store.owned_summaries(OWNER))[0][1]
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = Session._apply_order
+    calls = {"n": 0}
+
+    async def flaky(self, note):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("order failed")
+        return await real(self, note)
+
+    monkeypatch.setattr(Session, "_apply_order", flaky)
+
+
+@pytest.mark.asyncio
+async def test_failed_halt_order_rolls_back_suspension(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reg = _registry(store)
+    sid = await _create(reg)
+    sess = await reg.get_or_raise(sid)
+    h = FakeHandle()
+    await sess.join(h, role="w", capabilities=[])
+    h.sent.clear()
+    _fail_once(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await sess.suspend()
+    assert sess.suspended is False
+    assert await _db_suspended(store) is False
+    await sess.suspend()
+    assert sess.suspended is True and await _db_suspended(store) is True
+    assert [n["kind"] for n in _notes(h)] == ["halt"]
+
+
+@pytest.mark.asyncio
+async def test_failed_continue_order_rolls_back_unsuspension(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reg = _registry(store)
+    sid = await _create(reg)
+    sess = await reg.get_or_raise(sid)
+    h = FakeHandle()
+    await sess.join(h, role="w", capabilities=[])
+    await sess.suspend()
+    h.sent.clear()
+    _fail_once(monkeypatch)
+    with pytest.raises(RuntimeError):
+        await sess.unsuspend()
+    assert sess.suspended is True
+    assert await _db_suspended(store) is True
+    await sess.unsuspend()
+    assert sess.suspended is False and await _db_suspended(store) is False
     assert [n["kind"] for n in _notes(h)] == ["continue"]
 
 
