@@ -14,6 +14,11 @@ from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
 ADMIN = "adm-token-xyz"
+REQUIRED_MSG = (
+    "this broker requires an account token to create sessions: send "
+    "Authorization: Bearer <account token> "
+    "(ask the broker administrator for an account)"
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -75,7 +80,7 @@ async def test_account_mode_requires_token(account_relay: Seeded) -> None:
     r = await _post(account_relay.base)
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "account_token_required"
-    assert "Authorization: Bearer" in r.json()["error"]["message"]
+    assert r.json()["error"]["message"] == REQUIRED_MSG
 
 
 async def test_account_mode_valid_token_owns_session(account_relay: Seeded) -> None:
@@ -119,8 +124,23 @@ async def test_mcp_create_uses_header(account_relay: Seeded) -> None:
         out = await c.call_tool("session_create", {"account_token": s.token})
         assert out["owner_account_id"] == s.acc.account_id
     async with sw_client(s.base) as c:
-        with pytest.raises(RuntimeError, match="account_token_required"):
+        with pytest.raises(RuntimeError, match="account_token_required") as ei:
             await c.call_tool("session_create", {})
+        assert REQUIRED_MSG in str(ei.value)
+
+
+async def test_mcp_header_wins_over_param(account_relay: Seeded) -> None:
+    s = account_relay
+    async with sw_client(s.base, headers=bearer(s.token)) as c:
+        out = await c.call_tool("session_create", {"account_token": s.pending_token})
+        assert out["owner_account_id"] == s.acc.account_id
+
+
+async def test_mcp_invalid_header_token_rejected(account_relay: Seeded) -> None:
+    s = account_relay
+    async with sw_client(s.base, headers=bearer("garbage")) as c:
+        with pytest.raises(RuntimeError, match="invalid_account_token"):
+            await c.call_tool("session_create", {"account_token": s.token})
 
 
 async def test_failed_account_tokens_throttled(account_relay: Seeded) -> None:

@@ -193,7 +193,9 @@ async def _creation_owner(
         if deps.session_creation == "account":
             raise ToolError(
                 ErrorCode.ACCOUNT_TOKEN_REQUIRED,
-                "session creation requires an account token: send Authorization: Bearer <token>",
+                "this broker requires an account token to create sessions: send "
+                "Authorization: Bearer <account token> "
+                "(ask the broker administrator for an account)",
             )
         if requested_owner is not None:
             raise ToolError(
