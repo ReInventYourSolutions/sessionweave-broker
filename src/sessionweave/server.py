@@ -33,7 +33,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.limits import RequestSizeLimitMiddleware
+from sessionweave.limits import McpNewSessionLimitMiddleware, RequestSizeLimitMiddleware
 from sessionweave.mcp_adapter import (
     HandleRegistry,
     connection_of,
@@ -1251,7 +1251,7 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
-            Mount("/", app=mcp_app),
+            Mount("/", app=McpNewSessionLimitMiddleware(mcp_app)),
         ],
         middleware=[
             Middleware(RequestSizeLimitMiddleware),

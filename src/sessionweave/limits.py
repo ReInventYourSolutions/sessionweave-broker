@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import time
+from collections import deque
+from collections.abc import Callable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -121,3 +125,104 @@ class RequestSizeLimitMiddleware:
             pass
         if exceeded and not started:
             await self._refuse(send)
+
+
+DEFAULT_MCP_NEW_SESSIONS_PER_MINUTE = 30
+_WINDOW_SECONDS = 60.0
+
+
+def mcp_new_sessions_per_minute() -> int:
+    """``SW_MCP_NEW_SESSIONS_PER_MINUTE``: new MCP transports per client IP."""
+    return _env_int(
+        "SW_MCP_NEW_SESSIONS_PER_MINUTE", DEFAULT_MCP_NEW_SESSIONS_PER_MINUTE
+    )
+
+
+class McpNewSessionLimitMiddleware:
+    """Limit, per client IP, POSTs that open a new MCP transport.
+
+    A POST without an ``mcp-session-id`` header is an ``initialize``: it makes
+    the SDK allocate a transport. Calls that carry a session id (and GET/DELETE)
+    are not counted. The client address is ``scope["client"]``, which uvicorn
+    already resolves through the trusted proxy. Sliding window; refused
+    requests are not counted. Memory is bounded: buckets whose hits have all
+    aged out are dropped, and the table is swept when it grows past
+    ``max_tracked_ips`` (the oldest bucket goes if it is still full).
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        per_minute: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        max_tracked_ips: int = 10_000,
+    ) -> None:
+        self.app = app
+        self.per_minute = (
+            per_minute if per_minute is not None else mcp_new_sessions_per_minute()
+        )
+        self._clock = clock
+        self._max_tracked = max_tracked_ips
+        self._hits: dict[str, deque[float]] = {}
+        self._last_sweep = 0.0
+
+    def _sweep(self, now: float) -> None:
+        cutoff = now - _WINDOW_SECONDS
+        for ip in [ip for ip, q in self._hits.items() if not q or q[-1] <= cutoff]:
+            del self._hits[ip]
+
+    def _allow(self, ip: str) -> float:
+        """0.0 when allowed (and counted), else seconds until a slot frees."""
+        now = self._clock()
+        q = self._hits.get(ip)
+        if q is None:
+            if len(self._hits) >= self._max_tracked:
+                if now - self._last_sweep >= 1.0:
+                    self._last_sweep = now
+                    self._sweep(now)
+                if len(self._hits) >= self._max_tracked:
+                    # Still full of live buckets (address flood): drop the oldest.
+                    del self._hits[next(iter(self._hits))]
+            q = self._hits[ip] = deque()
+        cutoff = now - _WINDOW_SECONDS
+        while q and q[0] <= cutoff:
+            q.popleft()
+        if len(q) >= self.per_minute:
+            return max(q[0] + _WINDOW_SECONDS - now, 0.001)
+        q.append(now)
+        return 0.0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        if any(name == b"mcp-session-id" for name, _ in scope.get("headers", [])):
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        retry_after = self._allow(client[0] if client else "")
+        if retry_after == 0.0:
+            await self.app(scope, receive, send)
+            return
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32000,
+                    "message": "too many new MCP sessions from this address; retry later",
+                },
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"retry-after", str(max(1, math.ceil(retry_after))).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
