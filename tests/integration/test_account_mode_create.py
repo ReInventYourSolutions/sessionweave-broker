@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import contextlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import pytest
 
-from sessionweave.accounts import Account, AccountStore
-from sessionweave.persistence import PersistenceStore
+from tests.integration.accounts_fixtures import ADMIN, Seeded, seeded_relay
 from tests.integration.client import bearer, sw_client
-from tests.integration.harness import relay_subprocess
 
-ADMIN = "adm-token-xyz"
 REQUIRED_MSG = (
     "this broker requires an account token to create sessions: send "
     "Authorization: Bearer <account token> "
@@ -23,43 +18,15 @@ REQUIRED_MSG = (
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
-@dataclass
-class Seeded:
-    base: str
-    acc: Account
-    other: Account
-    token: str
-    pending_token: str
-
-
-@contextlib.asynccontextmanager
-async def _relay(tmp_path: Path, *, mode: str | None) -> AsyncIterator[Seeded]:
-    db = str(tmp_path / f"acc-{mode}.db")
-    store = PersistenceStore(db)
-    await store.init(pool_size=2)
-    accounts = AccountStore(store)
-    acc = await accounts.create("Alice")
-    other = await accounts.create("Bob")
-    pending = await accounts.create("Pending", status="pending")
-    token, _ = await accounts.create_token(acc.account_id, "t")
-    ptoken, _ = await accounts.create_token(pending.account_id, "p")
-    await store.close()
-    env = {"SW_ADMIN_TOKEN": ADMIN}
-    if mode is not None:
-        env["SW_SESSION_CREATION"] = mode
-    async with relay_subprocess(env_overrides=env, persistence_db_path=db) as base:
-        yield Seeded(base, acc, other, token, ptoken)
-
-
 @pytest.fixture
 async def account_relay(tmp_path: Path) -> AsyncIterator[Seeded]:
-    async with _relay(tmp_path, mode="account") as s:
+    async with seeded_relay(tmp_path, mode="account") as s:
         yield s
 
 
 @pytest.fixture
 async def open_relay(tmp_path: Path) -> AsyncIterator[Seeded]:
-    async with _relay(tmp_path, mode=None) as s:
+    async with seeded_relay(tmp_path, mode=None) as s:
         yield s
 
 

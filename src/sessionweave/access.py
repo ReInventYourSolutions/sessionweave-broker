@@ -319,6 +319,10 @@ async def resolve_principal(
     principal = auth.match(token, now_ms)
     if principal is not None:
         return principal
+    if auth.owner_account_id and deps.accounts is not None:
+        account = await deps.accounts.match_token(token, now_ms)
+        if account is not None and account.account_id == auth.owner_account_id:
+            return Principal("creator")
 
     if auth.was_removed(token, now_ms):
         raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)
