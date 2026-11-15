@@ -101,7 +101,7 @@ async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
 
 @pytest.mark.asyncio
 async def test_resume_lifts_suspension_without_continuing(store: PersistenceStore) -> None:
-    reg, sid, sess, (a, ha), (_b, hb) = await _two_participants(store)
+    reg, sid, sess, (_a, ha), (_b, hb) = await _two_participants(store)
     await reg.suspend_owned(OWNER)
     ha.sent.clear()
     hb.sent.clear()

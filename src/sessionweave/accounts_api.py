@@ -200,8 +200,9 @@ async def get_account(request: Request) -> Response:
 
 async def patch_account(request: Request) -> Response:
     """Update an account. A status change takes effect at once for its tokens;
-    its sessions follow: ``disabled`` suspends them, ``active`` lifts the suspension (no continue is sent)
-    (both idempotent, so repeating the PATCH repairs a partial failure)."""
+    its sessions follow: ``disabled`` suspends them, ``active`` lifts the
+    suspension (no continue is sent); both idempotent,
+    so repeating the PATCH repairs a partial failure."""
     deps = _deps(request)
     try:
         store = _store(deps)
