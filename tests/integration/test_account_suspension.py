@@ -270,7 +270,7 @@ def _fail_once(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_halt_order_rolls_back_suspension(
+async def test_failed_halt_order_keeps_session_suspended(
     store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reg = _registry(store)
@@ -282,10 +282,15 @@ async def test_failed_halt_order_rolls_back_suspension(
     _fail_once(monkeypatch)
     with pytest.raises(RuntimeError):
         await sess.suspend()
-    assert sess.suspended is False
-    assert await _db_suspended(store) is False
-    await sess.suspend()
-    assert sess.suspended is True and await _db_suspended(store) is True
+    # Fail closed: a disabled account's session stays suspended.
+    assert sess.suspended is True
+    assert await _db_suspended(store) is True
+    with pytest.raises(ToolError) as ei:
+        await sess.join(FakeHandle(), role="x", capabilities=[])
+    assert ei.value.code is ErrorCode.SESSION_SUSPENDED
+    await sess.suspend()  # retry re-sends the owed halt, exactly once
+    assert [n["kind"] for n in _notes(h)] == ["halt"]
+    await sess.suspend()  # nothing owed now: no-op
     assert [n["kind"] for n in _notes(h)] == ["halt"]
 
 
