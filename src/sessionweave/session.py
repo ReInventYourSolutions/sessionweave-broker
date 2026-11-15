@@ -348,6 +348,11 @@ class Session:
                 "session suspended: its owner account is disabled",
             )
 
+    @property
+    def persisted(self) -> bool:
+        """True when this session is stored (persistence enabled for it)."""
+        return self._store is not None and self._persistence_mode is not None
+
     async def suspend(self) -> None:
         """Freeze the session: its owner account is disabled. Idempotent.
 

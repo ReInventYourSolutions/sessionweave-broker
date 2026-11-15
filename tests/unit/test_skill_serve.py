@@ -66,3 +66,15 @@ def test_load_canonical_skill_returns_the_bundled_skill() -> None:
     md = load_canonical_skill()
     assert "sessionweave-participant" in md
     assert "Default relay" in md
+
+
+def test_render_mcp_snippet_account_mode_adds_header_placeholder() -> None:
+    entry = render_mcp_snippet("https://b.example", account_mode=True)["mcpServers"][
+        "sessionweave"
+    ]
+    assert entry["headers"] == {"Authorization": "Bearer ${SW_ACCOUNT_TOKEN}"}
+
+
+def test_render_mcp_snippet_open_mode_has_no_headers() -> None:
+    entry = render_mcp_snippet("https://b.example")["mcpServers"]["sessionweave"]
+    assert "headers" not in entry

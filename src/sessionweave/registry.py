@@ -444,6 +444,34 @@ class SessionRegistry:
             ids += [s for s in await self._store.find_owned(account_id) if s not in ids]
         return ids
 
+    async def owned_session_summaries(self, account_id: str) -> list[dict[str, Any]]:
+        """``{session_id, suspended, persisted, purpose}`` per live owned session.
+
+        Hot sessions come from RAM; persisted sessions that are not in RAM
+        (cold) are read from the store. No session appears twice.
+        """
+        out: list[dict[str, Any]] = []
+        hot: set[str] = set()
+        for sid, sess in list(self._sessions.items()):
+            if sess.auth.owner_account_id == account_id:
+                hot.add(sid)
+                out.append({
+                    "session_id": sid,
+                    "suspended": sess.suspended,
+                    "persisted": sess.persisted,
+                    "purpose": sess.purpose,
+                })
+        if self._store is not None:
+            for sid, suspended, purpose_json in await self._store.owned_summaries(account_id):
+                if sid not in hot:
+                    out.append({
+                        "session_id": sid,
+                        "suspended": suspended,
+                        "persisted": True,
+                        "purpose": json.loads(purpose_json) if purpose_json else None,
+                    })
+        return out
+
     async def _for_each_owned(
         self, account_id: str, what: str, action: Callable[[str], Awaitable[None]]
     ) -> int:

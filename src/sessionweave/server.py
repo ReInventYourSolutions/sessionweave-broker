@@ -271,8 +271,8 @@ ManagerTokenArg = Annotated[str | None, Field(
 AccessTokenArg = Annotated[str | None, Field(
     description="Any credential that may read the session: the join token "
                 "from the invite link, your participant_token, a "
-                "supervisor_token, the creator_token, or the relay admin "
-                "token. Not needed if you already joined on this same "
+                "supervisor_token, the creator_token, the owning account's "
+                "token, or the relay admin token. Not needed if you already joined on this same "
                 "connection. It is a credential: keep it secret.")]
 
 PurposeArg = Annotated[dict[str, Any] | None, Field(
@@ -490,7 +490,8 @@ def _build_fastmcp(
         """Replace the purpose of a session, or clear it.
 
     Pass no purpose to clear. Requires the creator_token (or the relay
-    admin token); participants cannot change the purpose. Broadcasts
+    admin token, or the owning account's token, also accepted from the MCP
+    Authorization: Bearer header); participants cannot change the purpose. Broadcasts
     session.purpose_updated to the participants. Needs no session_join.
     """
         return await session_update_purpose(
@@ -864,7 +865,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """Delete a session permanently, for everyone in it.
 
-    Requires the creator_token returned once by session_create (or the relay admin token). Every
+    Requires the creator_token returned once by session_create (or the relay
+    admin token, or the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Every
     participant is disconnected with session.ended, and a persisted
     session's stored timeline is removed. Needs no session_join, and
     cannot be undone.
@@ -883,7 +886,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """Mint a fresh join token and invite link for a session.
 
-    Requires the creator_token (or the relay admin token). The join token
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). The join token
     is valid for 15 minutes and can be used by several joiners within that
     time; participants who already joined are unaffected when it expires.
     Returns join_token, expires_at, invite_url and invite_link.
@@ -901,7 +906,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """Mint an additional supervisor token for a session.
 
-    Requires the creator_token (or the relay admin token). The token is
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). The token is
     returned exactly once as supervisor_token, with a token_id you can
     pass to session_revoke_supervisor_token. A supervisor token cannot
     mint or revoke tokens.
@@ -918,7 +925,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """List a session's supervisor tokens (ids and timestamps, never the secrets).
 
-    Requires the creator_token (or the relay admin token). Each entry has
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Each entry has
     token_id, created_at and revoked_at (null while the token is active).
     """
         return {
@@ -940,7 +949,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """Revoke a supervisor token so it stops working immediately.
 
-    Requires the creator_token (or the relay admin token). Fails with
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header). Fails with
     token_not_found if token_id is unknown. Returns {"revoked": true}.
     """
         await session_revoke_supervisor_token(
@@ -959,7 +970,9 @@ def _build_fastmcp(
     ) -> dict[str, Any]:
         """Remove one agent from a session.
 
-    Requires the creator_token (or the relay admin token); a supervisor
+    Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP
+    Authorization: Bearer header); a supervisor
     token is refused. The agent first receives a halt order, then leaves
     the session: its token stops working and the others see
     participant.left with reason removed. Every still-valid join token of

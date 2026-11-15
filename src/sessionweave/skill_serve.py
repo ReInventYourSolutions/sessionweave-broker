@@ -51,17 +51,17 @@ def render_skill(canonical_md: str, base_url: str) -> str:
     return out
 
 
-def render_mcp_snippet(base_url: str) -> dict[str, Any]:
-    """Return a ready ``.mcp.json`` registration snippet for this broker."""
+def render_mcp_snippet(base_url: str, *, account_mode: bool = False) -> dict[str, Any]:
+    """Return a ready ``.mcp.json`` registration snippet for this broker.
+
+    In account mode the entry also carries the Authorization header that
+    sends the caller's account token (read from ``SW_ACCOUNT_TOKEN``).
+    """
     base = base_url.rstrip("/")
-    return {
-        "mcpServers": {
-            "sessionweave": {
-                "type": "http",
-                "url": f"{base}/mcp",
-            }
-        }
-    }
+    entry: dict[str, Any] = {"type": "http", "url": f"{base}/mcp"}
+    if account_mode:
+        entry["headers"] = {"Authorization": "Bearer ${SW_ACCOUNT_TOKEN}"}
+    return {"mcpServers": {"sessionweave": entry}}
 
 
 def load_canonical_skill() -> str:

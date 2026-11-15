@@ -100,3 +100,14 @@ def test_hand_back_labels_every_credential() -> None:
     assert out["my_participant_token"] == "ptok"
     assert out["poller_pid"] == 7
     assert "who_gets_what" in out
+
+
+def test_account_token_env_sets_bearer_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sessionweave import host_cli
+
+    monkeypatch.setenv("SW_ACCOUNT_TOKEN", "swa_abc")
+    client = host_cli._http_client()
+    assert client is not None
+    assert client.headers["authorization"] == "Bearer swa_abc"
+    monkeypatch.delenv("SW_ACCOUNT_TOKEN")
+    assert host_cli._http_client() is None

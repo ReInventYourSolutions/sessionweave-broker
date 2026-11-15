@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -57,6 +58,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -78,6 +80,19 @@ def _unwrap(res: Any) -> dict[str, Any]:
     return {"result": sc}
 
 
+def _http_client() -> httpx2.AsyncClient | None:
+    """An HTTP client sending ``SW_ACCOUNT_TOKEN`` as Bearer, if that is set.
+
+    Needed on brokers that require an account token to create sessions.
+    """
+    token = os.environ.get("SW_ACCOUNT_TOKEN")
+    if not token:
+        return None
+    return httpx2.AsyncClient(
+        headers={"Authorization": f"Bearer {token}"}, timeout=30
+    )
+
+
 async def _create_and_join(
     relay_url: str,
     purpose: dict[str, Any] | None,
@@ -86,7 +101,13 @@ async def _create_and_join(
     my_metadata: dict[str, Any],
     delivery_mode: str,
 ) -> tuple[dict[str, Any], str, str]:
-    async with streamable_http_client(relay_url) as (r, w):
+    http_client = _http_client()
+    async with contextlib.AsyncExitStack() as stack:
+        if http_client is not None:
+            await stack.enter_async_context(http_client)
+        r, w = await stack.enter_async_context(
+            streamable_http_client(relay_url, http_client=http_client)
+        )
         async with ClientSession(r, w) as session:
             await session.initialize()
             create_args: dict[str, Any] = {}

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.30.0"
+  version: "0.31.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -51,9 +51,23 @@ tags:
     description: Participant lifecycle (join / leave / drain)
   - name: commands
     description: Dispatch and respond
+  - name: accounts
+    description: Account administration (relay admin token)
+  - name: me
+    description: Account self-service (account token)
 
 components:
   securitySchemes:
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: The relay admin token (`SW_ADMIN_TOKEN`). Missing -> 401; wrong -> 403.
+    accountAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An account token (`swa_...`). Valid only while it is not revoked, not
+        expired and its account is `active`; otherwise 401 `invalid_account_token`.
     bearerAuth:
       type: http
       scheme: bearer
@@ -418,8 +432,84 @@ components:
                 - participant_removed
                 - too_many_waits
                 - client_disconnect
+                - unauthorized
+                - account_token_required
+                - invalid_account_token
+                - account_not_found
+                - account_name_taken
+                - accounts_unavailable
+                - session_suspended
+                - persistence_failed
+                - token_not_found
+                - invalid_request
             message:
               type: string
+    Account:
+      type: object
+      properties:
+        account_id: { type: string, example: acc_0123456789abcdef }
+        name: { type: string }
+        status: { type: string, enum: [pending, active, disabled] }
+        contact: { type: string, nullable: true }
+        created_by: { type: string }
+        created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
+    AccountToken:
+      type: object
+      description: Token metadata. The secret is never returned after minting.
+      properties:
+        token_id: { type: string }
+        account_id: { type: string }
+        label: { type: string }
+        created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
+        expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+        revoked_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+    AccountWithTokens:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            tokens:
+              type: array
+              items: { $ref: '#/components/schemas/AccountToken' }
+    CreateAccountRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128, description: Unique across accounts }
+        contact: { type: string }
+        status: { type: string, enum: [pending, active, disabled], default: active }
+        created_by: { type: string, default: admin }
+    PatchAccountRequest:
+      type: object
+      description: Every field is optional; omitted fields are unchanged.
+      properties:
+        status: { type: string, enum: [pending, active, disabled] }
+        name: { type: string, minLength: 1, maxLength: 128 }
+        contact: { type: string }
+    CreateTokenRequest:
+      type: object
+      required: [label]
+      properties:
+        label: { type: string, minLength: 1, maxLength: 64 }
+        expires_at:
+          type: string
+          format: date-time
+          description: ISO 8601 (a trailing `Z` is accepted); must be in the future. Omit for no expiry.
+    CreatedToken:
+      type: object
+      properties:
+        token: { type: string, description: The secret, shown only in this response }
+        token_id: { type: string }
+        label: { type: string }
+        created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
+        expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+    OwnedSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        suspended: { type: boolean }
+        persisted: { type: boolean }
+        purpose: { type: object, nullable: true, additionalProperties: true }
 
 paths:
   /invite/{sid}:
@@ -471,7 +561,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.30.0" }
+                  version: { type: string, example: "0.31.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -1354,4 +1444,327 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '403':
           description: not_a_recipient
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts:
+    post:
+      tags: [accounts]
+      summary: Create an account
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAccountRequest' }
+      responses:
+        '201':
+          description: Created
+          content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: account_name_taken
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    get:
+      tags: [accounts]
+      summary: List accounts
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: All accounts, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: '#/components/schemas/Account' }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [accounts]
+      summary: Show an account with its token metadata
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: The account
+          content: { application/json: { schema: { $ref: '#/components/schemas/AccountWithTokens' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    patch:
+      tags: [accounts]
+      summary: Update an account (disable / enable / rename)
+      description: |
+        The new status is stored first, so the account's tokens stop (or start)
+        working at once. Then the account's sessions follow: target `disabled`
+        suspends them (participants get a halt note, joins and commands are
+        refused), target `active` resumes them. Both are idempotent, so
+        repeating the call repairs a partial failure. `pending` does not touch
+        sessions. `sessions_affected` is the number of sessions processed.
+        If any session fails, the answer is 503 `persistence_failed` and the
+        stored status stays.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchAccountRequest' }
+      responses:
+        '200':
+          description: The updated account
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Account'
+                  - type: object
+                    properties:
+                      sessions_affected: { type: integer }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: account_name_taken
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [accounts]
+      summary: Delete an account and all its sessions
+      description: |
+        Deletes every session the account owns (ended ones included), then the
+        account and its tokens. If any session cannot be deleted the answer is
+        503 `persistence_failed` and the account is kept; retry to finish.
+        To keep the sessions, disable the account instead.
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_sessions: { type: integer }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/tokens:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [accounts]
+      summary: Mint an API token for an account
+      description: The plaintext `token` is returned once and cannot be recovered.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTokenRequest' }
+      responses:
+        '201':
+          description: Created
+          content: { application/json: { schema: { $ref: '#/components/schemas/CreatedToken' } } }
+        '400':
+          description: invalid_request (bad label, or expires_at not ISO 8601 / not in the future)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/tokens/{token_id}:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+      - { name: token_id, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [accounts]
+      summary: Revoke an account token
+      security: [{ adminAuth: [] }]
+      responses:
+        '204':
+          description: Revoked (idempotent)
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found / token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me:
+    get:
+      tags: [me]
+      summary: The calling account with its token metadata
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: The account
+          content: { application/json: { schema: { $ref: '#/components/schemas/AccountWithTokens' } } }
+        '401':
+          description: invalid_account_token (missing, unknown, revoked, expired, or account not active)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/tokens:
+    get:
+      tags: [me]
+      summary: List the calling account's tokens (metadata only)
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: Token metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: '#/components/schemas/AccountToken' }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    post:
+      tags: [me]
+      summary: Mint another token for the calling account
+      security: [{ accountAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTokenRequest' }
+      responses:
+        '201':
+          description: Created
+          content: { application/json: { schema: { $ref: '#/components/schemas/CreatedToken' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/tokens/{token_id}:
+    parameters:
+      - { name: token_id, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [me]
+      summary: Revoke one of the calling account's tokens
+      description: A token id of another account answers 404 `token_not_found`.
+      security: [{ accountAuth: [] }]
+      responses:
+        '204':
+          description: Revoked (idempotent)
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/sessions:
+    get:
+      tags: [me]
+      summary: Live sessions owned by the calling account
+      description: |
+        Hot sessions plus persisted sessions that are not currently in memory;
+        ended sessions are not listed.
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: Owned sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/OwnedSession' }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

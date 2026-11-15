@@ -334,7 +334,10 @@ async def serve_mcp_snippet(request: Request) -> JSONResponse:
     """A ready-to-paste ``.mcp.json`` registration snippet for this broker."""
     from sessionweave.skill_serve import render_mcp_snippet
 
-    return JSONResponse(render_mcp_snippet(_public_base_url(request)))
+    account_mode = _deps(request).session_creation == "account"
+    return JSONResponse(
+        render_mcp_snippet(_public_base_url(request), account_mode=account_mode)
+    )
 
 
 async def serve_api_docs(request: Request) -> HTMLResponse:
@@ -957,7 +960,10 @@ async def _access_handler(request: Request) -> Response:
 
 def routes() -> list[Route]:
     """Return the list of `/v1/...` routes to mount on the main app."""
+    from sessionweave import accounts_api
+
     return [
+        *accounts_api.routes(),
         Route("/", landing, methods=["GET"]),
         Route("/skill.md", serve_skill, methods=["GET"]),
         Route("/connect.mcp.json", serve_mcp_snippet, methods=["GET"]),

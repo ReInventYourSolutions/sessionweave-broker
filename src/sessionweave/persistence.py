@@ -205,6 +205,19 @@ class PersistenceStore:
         async with self._read_pool[0].execute(sql + " ORDER BY created_at", (account_id,)) as cur:
             return [sid async for (sid,) in cur]
 
+    async def owned_summaries(
+        self, account_id: str
+    ) -> list[tuple[str, bool, str | None]]:
+        """(session_id, suspended, purpose_json) of the account's live sessions."""
+        if not self._read_pool:
+            return []
+        async with self._read_pool[0].execute(
+            "SELECT session_id, suspended, purpose_json FROM sessions"
+            " WHERE owner_account_id = ? AND ended_at IS NULL ORDER BY created_at",
+            (account_id,),
+        ) as cur:
+            return [(sid, bool(susp), purpose) async for sid, susp, purpose in cur]
+
     async def exists(self, sid: str) -> bool:
         if not self._read_pool:
             return False
