@@ -97,3 +97,36 @@ async def test_delete_row_failure_is_503_and_retry_works(
         r = c.delete(f"/v1/accounts/{acc.account_id}", headers=h)
         assert r.status_code == 200
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_patch_disabled_cuts_streams_even_when_suspend_fails(tmp_path: Path) -> None:
+    store = PersistenceStore(str(tmp_path / "t.db"))
+    await store.init(pool_size=2)
+    accounts = AccountStore(store)
+    acc = await accounts.create("alice")
+    cut: list[str] = []
+
+    class _Firehose:
+        async def close_for_account(
+            self, account_id: str, token_id: str | None = None, *, reason: str
+        ) -> None:
+            cut.append(account_id)
+
+    deps: Any = SimpleNamespace(
+        accounts=accounts, registry=_Registry(), admin_token="adm",
+        auth_limiter=SimpleNamespace(
+            is_throttled=lambda *a: False, record_failure=lambda *a: None
+        ),
+    )
+    app = Starlette(routes=accounts_api.routes())
+    app.state.tool_deps = deps
+    app.state.firehose = _Firehose()
+    with TestClient(app) as c:
+        r = c.patch(
+            f"/v1/accounts/{acc.account_id}", json={"status": "disabled"},
+            headers={"Authorization": "Bearer adm"},
+        )
+        assert r.status_code == 503
+    assert cut == [acc.account_id]
+    await store.close()

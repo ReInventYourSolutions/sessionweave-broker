@@ -200,7 +200,7 @@ async def get_account(request: Request) -> Response:
 
 async def patch_account(request: Request) -> Response:
     """Update an account. A status change takes effect at once for its tokens;
-    its sessions follow: ``disabled`` suspends them, ``active`` resumes them
+    its sessions follow: ``disabled`` suspends them, ``active`` lifts the suspension (no continue is sent)
     (both idempotent, so repeating the PATCH repairs a partial failure)."""
     deps = _deps(request)
     try:
@@ -216,13 +216,14 @@ async def patch_account(request: Request) -> Response:
             name=_name(_opt_str(body, "name")),
             contact=_opt_str(body, "contact"),
         )
+        if after.status != "active":
+            # Cut first: a failed (fail-closed) suspend must not leave streams open.
+            await _cut_streams(request, account_id, reason="account not active")
         affected = 0
         if status == "disabled":
             affected = await deps.registry.suspend_owned(account_id)
         elif status == "active":
             affected = await deps.registry.resume_owned(account_id)
-        if after.status != "active":
-            await _cut_streams(request, account_id, reason="account not active")
         return JSONResponse({**after.to_public(), "sessions_affected": affected})
     except ToolError as exc:
         return _error_response(exc)
