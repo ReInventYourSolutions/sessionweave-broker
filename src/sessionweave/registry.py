@@ -464,11 +464,15 @@ class SessionRegistry:
         if self._store is not None:
             for sid, suspended, purpose_json in await self._store.owned_summaries(account_id):
                 if sid not in hot:
+                    try:
+                        purpose = json.loads(purpose_json) if purpose_json else None
+                    except ValueError:
+                        purpose = None  # corrupt stored purpose: list the session anyway
                     out.append({
                         "session_id": sid,
                         "suspended": suspended,
                         "persisted": True,
-                        "purpose": json.loads(purpose_json) if purpose_json else None,
+                        "purpose": purpose,
                     })
         return out
 

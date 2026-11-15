@@ -284,3 +284,59 @@ async def test_mcp_snippet_account_mode(relay: Seeded) -> None:
     assert snip["mcpServers"]["sessionweave"]["headers"] == {
         "Authorization": "Bearer ${SW_ACCOUNT_TOKEN}"
     }
+
+
+async def test_delete_disables_first_and_removes_fresh_session(relay: Seeded) -> None:
+    s = relay
+    sid = (await _create_session(s, s.token))["session_id"]
+    async with httpx.AsyncClient(base_url=s.base) as c:
+        r = await c.delete(f"/v1/accounts/{s.acc.account_id}", headers=bearer(ADMIN))
+        assert r.status_code == 200 and r.json() == {"deleted_sessions": 1}
+        assert (await c.get(f"/v1/sessions/{sid}", headers=bearer(ADMIN))).status_code == 404
+        r = await c.post("/v1/sessions", json={}, headers=bearer(s.token))
+        assert r.status_code == 401
+
+
+async def test_malformed_body_is_400_invalid_request(relay: Seeded) -> None:
+    async with httpx.AsyncClient(base_url=relay.base) as c:
+        for content in (b"{not json", b"[1]"):
+            r = await c.post(
+                "/v1/accounts", content=content,
+                headers={**bearer(ADMIN), "content-type": "application/json"},
+            )
+            assert r.status_code == 400, r.text
+            assert r.json()["error"]["code"] == "invalid_request"
+
+
+async def test_admin_failures_throttled_valid_admin_passes(relay: Seeded) -> None:
+    async with httpx.AsyncClient(base_url=relay.base) as c:
+        codes = [(await c.get("/v1/accounts", headers=bearer("bad"))).status_code for _ in range(6)]
+        assert codes == [403] * 5 + [429]
+        assert (await c.get("/v1/accounts", headers=bearer(ADMIN))).status_code == 200
+
+
+async def test_admin_cannot_revoke_other_accounts_token(relay: Seeded) -> None:
+    s = relay
+    async with httpx.AsyncClient(base_url=s.base) as c:
+        r = await c.get("/v1/me", headers=bearer(s.other_token))
+        bob_tid = r.json()["tokens"][0]["token_id"]
+        r = await c.delete(
+            f"/v1/accounts/{s.acc.account_id}/tokens/{bob_tid}", headers=bearer(ADMIN)
+        )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "token_not_found"
+        assert (await c.get("/v1/me", headers=bearer(s.other_token))).status_code == 200
+
+
+async def test_label_and_contact_validation(relay: Seeded) -> None:
+    s = relay
+    async with httpx.AsyncClient(base_url=s.base) as c:
+        r = await c.post(
+            f"/v1/accounts/{s.acc.account_id}/tokens", json={"label": "   "},
+            headers=bearer(ADMIN),
+        )
+        assert r.status_code == 400
+        r = await c.post(
+            "/v1/accounts", json={"name": "carol", "contact": "x" * 257}, headers=bearer(ADMIN)
+        )
+        assert r.status_code == 400

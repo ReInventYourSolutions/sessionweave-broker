@@ -110,3 +110,24 @@ def test_missing_admin_token_errors(
     monkeypatch.delenv("SW_ADMIN_TOKEN", raising=False)
     assert accounts_cli.main(["list"]) == 1
     assert "admin token" in capsys.readouterr().err
+
+
+def test_ids_are_url_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(204)
+
+    assert _run(["token-revoke", "a/b", "t?x"], handler, monkeypatch) == 0
+    assert seen[0].url.raw_path == b"/v1/accounts/a%2Fb/tokens/t%3Fx"
+
+
+def test_non_json_success_body_prints_raw(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="plain text")
+
+    assert _run(["list"], handler, monkeypatch) == 0
+    assert capsys.readouterr().out.strip() == "plain text"

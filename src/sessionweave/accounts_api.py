@@ -26,6 +26,7 @@ from sessionweave.http_api import (
 from sessionweave.tools import ToolDeps, resolve_account
 
 NAME_MAX_LEN = 128
+CONTACT_MAX_LEN = 256
 
 
 def _store(deps: ToolDeps) -> AccountStore:
@@ -68,10 +69,22 @@ def _bad(message: str) -> ToolError:
     return ToolError(ErrorCode.INVALID_REQUEST, message)
 
 
+async def _body(request: Request) -> dict[str, Any]:
+    """The JSON object body; malformed or non-object bodies are invalid_request."""
+    try:
+        return await _read_json_body(request)
+    except ToolError as exc:
+        if exc.code is ErrorCode.INVALID_CONFIG:
+            raise _bad(exc.message) from exc
+        raise
+
+
 def _opt_str(body: dict[str, Any], key: str) -> str | None:
     value = body.get(key)
     if value is not None and not isinstance(value, str):
         raise _bad(f"{key} must be a string")
+    if key == "contact" and value is not None and len(value) > CONTACT_MAX_LEN:
+        raise _bad(f"contact must be at most {CONTACT_MAX_LEN} characters")
     return value
 
 
@@ -132,7 +145,7 @@ async def create_account(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        body = await _read_json_body(request)
+        body = await _body(request)
         name = _name(body.get("name") if isinstance(body.get("name"), str) else None)
         if name is None:
             raise _bad("name is required")
@@ -183,7 +196,7 @@ async def patch_account(request: Request) -> Response:
         if (denied := _require_admin(request, deps)) is not None:
             return denied
         account_id = request.path_params["account_id"]
-        body = await _read_json_body(request)
+        body = await _body(request)
         status = _opt_str(body, "status")
         _, after = await store.update(
             account_id,
@@ -210,7 +223,18 @@ async def delete_account(request: Request) -> Response:
             return denied
         account_id = request.path_params["account_id"]
         await store.get(account_id)
-        deleted = await deps.registry.delete_owned(account_id)
+        # Disable first: its tokens stop at once, so no new session can be
+        # created while the existing ones are deleted.
+        await store.update(account_id, status="disabled")
+        try:
+            deleted = await deps.registry.delete_owned(account_id)
+        except ToolError as exc:
+            if exc.code is ErrorCode.PERSISTENCE_FAILED:
+                raise ToolError(
+                    ErrorCode.PERSISTENCE_FAILED,
+                    f"account disabled but kept; {exc.message}; retry the delete",
+                ) from exc
+            raise
         await store.delete(account_id)
         return JSONResponse({"deleted_sessions": deleted})
     except ToolError as exc:
@@ -224,7 +248,7 @@ async def create_account_token(request: Request) -> Response:
         if (denied := _require_admin(request, deps)) is not None:
             return denied
         return await _mint_token(store, request.path_params["account_id"],
-                                 await _read_json_body(request))
+                                 await _body(request))
     except ToolError as exc:
         return _error_response(exc)
 
@@ -272,7 +296,7 @@ async def create_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        return await _mint_token(store, account.account_id, await _read_json_body(request))
+        return await _mint_token(store, account.account_id, await _body(request))
     except ToolError as exc:
         return _error_response(exc)
 

@@ -39,6 +39,10 @@ Output is a JSON object on stdout:
 
 All tokens are shown once, here only.
 
+On a broker that requires an account token to create sessions, set
+``SW_ACCOUNT_TOKEN`` in the environment; it is sent as
+``Authorization: Bearer <token>`` on the MCP connection.
+
 Exit codes:
   0  — session created and joined; poller (if any) spawned.
   2  — usage / argument error.
@@ -89,7 +93,8 @@ def _http_client() -> httpx2.AsyncClient | None:
     if not token:
         return None
     return httpx2.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"}, timeout=30
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=httpx2.Timeout(30, read=300),
     )
 
 
@@ -220,7 +225,10 @@ def _hand_back(
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="sessionweave-host")
+    p = argparse.ArgumentParser(
+        prog="sessionweave-host",
+        epilog="Env: SW_ACCOUNT_TOKEN is sent as the Bearer token (account-mode brokers).",
+    )
     p.add_argument(
         "--relay-url",
         default=os.environ.get("SW_URL", "https://relay.sessionweave.com/mcp"),

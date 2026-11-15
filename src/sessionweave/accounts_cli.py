@@ -11,6 +11,7 @@ import json
 import os
 import sys
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -69,7 +70,7 @@ def _request(args: argparse.Namespace) -> tuple[str, str, dict[str, Any] | None]
         return "POST", "/v1/accounts", body
     if cmd == "list":
         return "GET", "/v1/accounts", None
-    path = f"/v1/accounts/{getattr(args, 'account_id', '')}"
+    path = f"/v1/accounts/{quote(getattr(args, 'account_id', ''), safe='')}"
     if cmd == "show":
         return "GET", path, None
     if cmd in ("enable", "disable"):
@@ -81,7 +82,7 @@ def _request(args: argparse.Namespace) -> tuple[str, str, dict[str, Any] | None]
         if args.expires_at:
             body["expires_at"] = args.expires_at
         return "POST", f"{path}/tokens", body
-    return "DELETE", f"{path}/tokens/{args.token_id}", None  # token-revoke
+    return "DELETE", f"{path}/tokens/{quote(args.token_id, safe='')}", None  # token-revoke
 
 
 def _error_message(resp: httpx.Response) -> str:
@@ -109,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {_error_message(resp)}", file=sys.stderr)
         return 1
     if resp.content:
-        print(json.dumps(resp.json(), indent=2))
+        try:
+            print(json.dumps(resp.json(), indent=2))
+        except ValueError:
+            print(resp.text)
     return 0
 
 

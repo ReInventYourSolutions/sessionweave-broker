@@ -202,7 +202,7 @@ class AccountStore:
         self, account_id: str, label: str, *, expires_at_ms: int | None = None
     ) -> tuple[str, AccountToken]:
         """Mint a token; the plaintext is returned here and never stored."""
-        if not 1 <= len(label) <= LABEL_MAX_LEN:
+        if not 1 <= len(label.strip()) <= LABEL_MAX_LEN or len(label) > LABEL_MAX_LEN:
             raise ToolError(
                 ErrorCode.INVALID_REQUEST,
                 f"token label must be 1-{LABEL_MAX_LEN} characters",
