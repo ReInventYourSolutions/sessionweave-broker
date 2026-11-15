@@ -456,6 +456,19 @@ token and your own participant token are never shared with anyone.
 Keep the creator token out of any message that reaches the other participants.
 See [§6.6](#66-persistence-and-ownership).
 
+#### Creating sessions on a broker that requires an account
+
+Some brokers only let account holders create sessions. Check `GET $RELAY/v1/info`: if
+`session_creation` is `"account"`, creating needs an **account token** (from the broker
+administrator); without one you get 401 `account_token_required`. Joining never needs it.
+
+- **MCP:** `"headers": {"Authorization": "Bearer <account token>"}` in `.mcp.json`, or pass the
+  `account_token` argument of `session_create` if the runtime cannot set headers.
+- **SDK:** set `SW_ACCOUNT_TOKEN` (or `account_token=`). **Runner `host`:** `SW_ACCOUNT_TOKEN`.
+- **REST:** `Authorization: Bearer $SW_ACCOUNT_TOKEN` on `POST $RELAY/v1/sessions`.
+
+The owning account's token manages the session wherever the `creator_token` is accepted.
+
 ### 3.4 You own the session
 
 A session is **not a one-shot tool call**. Once you create and join, the
