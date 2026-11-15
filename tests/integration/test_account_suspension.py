@@ -1,6 +1,8 @@
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -51,11 +53,11 @@ def _order() -> SupervisorNote:
     return SupervisorNote("sn-x", "note", "all", "hi", 1)
 
 
-def _notes(h: FakeHandle) -> list[dict]:
+def _notes(h: FakeHandle) -> list[dict[str, Any]]:
     return [p for n, p in h.sent if n == "supervisor.note"]
 
 
-async def _two_participants(store):
+async def _two_participants(store: PersistenceStore) -> tuple[Any, ...]:
     reg = _registry(store)
     sid = await _create(reg)
     sess = await reg.get_or_raise(sid)
@@ -78,7 +80,7 @@ async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
         ]
     assert {p.supervision_state for p in sess.roster_snapshot()} == {"paused"}
 
-    for call in (
+    calls: list[Callable[[], Awaitable[Any]]] = [
         lambda: sess.join(FakeHandle(), role="w", capabilities=[]),
         lambda: sess.send(
             sender_id=a.participant_id, dispatch=DispatchMode.ALL,
@@ -86,7 +88,8 @@ async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
         ),
         lambda: sess.post_order(_order()),
         lambda: sess.mint_join_token(),
-    ):
+    ]
+    for call in calls:
         with pytest.raises(ToolError) as ei:
             await call()
         assert ei.value.code == ErrorCode.SESSION_SUSPENDED
