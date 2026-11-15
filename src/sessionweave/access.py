@@ -53,6 +53,10 @@ class Principal:
     # stream opened with it can be cut off on revocation). Not part of
     # equality: the role and participant are the identity.
     token_id: str | None = field(default=None, compare=False)
+    # Set when the principal is the session's owner account acting through one of
+    # its account tokens, so live streams can be cut when that token or account dies.
+    account_id: str | None = field(default=None, compare=False)
+    account_token_id: str | None = field(default=None, compare=False)
 
 
 def _now_ms() -> int:
@@ -320,9 +324,11 @@ async def resolve_principal(
     if principal is not None:
         return principal
     if auth.owner_account_id and deps.accounts is not None:
-        account = await deps.accounts.match_token(token, now_ms)
-        if account is not None and account.account_id == auth.owner_account_id:
-            return Principal("creator")
+        matched = await deps.accounts.match_token_with_id(token, now_ms)
+        if matched is not None and matched[0].account_id == auth.owner_account_id:
+            return Principal(
+                "creator", account_id=matched[0].account_id, account_token_id=matched[1]
+            )
 
     if auth.was_removed(token, now_ms):
         raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)

@@ -260,9 +260,16 @@ class AccountStore:
 
     async def match_token(self, token: str, now_ms: int) -> Account | None:
         """The active account owning a usable token, else None."""
+        matched = await self.match_token_with_id(token, now_ms)
+        return matched[0] if matched is not None else None
+
+    async def match_token_with_id(
+        self, token: str, now_ms: int
+    ) -> tuple[Account, str] | None:
+        """The active account owning a usable token, with that token's id."""
         async with self._read().execute(
             "SELECT a.account_id, a.name, a.status, a.contact, a.created_by,"
-            " a.created_at FROM account_tokens t JOIN accounts a"
+            " a.created_at, t.token_id FROM account_tokens t JOIN accounts a"
             " ON a.account_id = t.account_id"
             " WHERE t.token_hash = ? AND t.revoked_at IS NULL"
             " AND (t.expires_at IS NULL OR t.expires_at > ?)"
@@ -270,7 +277,7 @@ class AccountStore:
             (hash_token(token), now_ms),
         ) as cur:
             row = await cur.fetchone()
-        return Account(*row) if row is not None else None
+        return (Account(*row[:6]), row[6]) if row is not None else None
 
     # ----- connections -----
 

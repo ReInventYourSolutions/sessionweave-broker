@@ -313,7 +313,12 @@ async def firehose_ws(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    sub = await firehose.subscribe(sid, token_id=principal.token_id)
+    sub = await firehose.subscribe(
+        sid,
+        token_id=principal.token_id,
+        account_id=principal.account_id,
+        account_token_id=principal.account_token_id,
+    )
     hot = deps.registry.get(sid)
     if principal.token_id is not None and (
         hot is None or hot.auth.supervisor_revoked(principal.token_id)

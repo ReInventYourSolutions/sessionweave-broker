@@ -29,6 +29,9 @@ class FirehoseSubscriber:
     # The supervisor token that authenticated this stream (None for creator
     # or admin streams). Revoking that token closes the stream.
     token_id: str | None = None
+    # The owner account (and its token) that authenticated this stream, if any.
+    account_id: str | None = None
+    account_token_id: str | None = None
     # Set when the stream must end (e.g. its token was revoked); the reason
     # is sent as the WebSocket close reason.
     closed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -48,7 +51,11 @@ class FirehoseRegistry:
         self._lock = asyncio.Lock()
 
     async def subscribe(
-        self, session_id: str, token_id: str | None = None
+        self,
+        session_id: str,
+        token_id: str | None = None,
+        account_id: str | None = None,
+        account_token_id: str | None = None,
     ) -> FirehoseSubscriber:
         async with self._lock:
             bucket = self._subs.setdefault(session_id, [])
@@ -59,6 +66,8 @@ class FirehoseRegistry:
                 session_id=session_id,
                 queue=asyncio.Queue(maxsize=self._queue_capacity),
                 token_id=token_id,
+                account_id=account_id,
+                account_token_id=account_token_id,
             )
             bucket.append(sub)
             return sub
@@ -81,6 +90,28 @@ class FirehoseRegistry:
         """
         async with self._lock:
             hits = [s for s in self._subs.get(session_id, ()) if s.token_id == token_id]
+        for sub in hits:
+            sub.close_reason = reason
+            sub.closed.set()
+        return len(hits)
+
+    async def close_for_account(
+        self,
+        account_id: str,
+        *,
+        token_id: str | None = None,
+        reason: str = "account token revoked",
+    ) -> int:
+        """Signal every stream opened by ``account_id`` (or only through its token
+        ``token_id``) to close, across all sessions."""
+        async with self._lock:
+            hits = [
+                s
+                for bucket in self._subs.values()
+                for s in bucket
+                if s.account_id == account_id
+                and (token_id is None or s.account_token_id == token_id)
+            ]
         for sub in hits:
             sub.close_reason = reason
             sub.closed.set()

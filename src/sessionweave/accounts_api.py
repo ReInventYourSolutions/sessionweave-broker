@@ -6,6 +6,7 @@ Self routes (``/v1/me...``) take an account token. Both answer 503
 """
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +26,8 @@ from sessionweave.http_api import (
 )
 from sessionweave.tools import ToolDeps, resolve_account
 
+logger = logging.getLogger(__name__)
+
 NAME_MAX_LEN = 128
 CONTACT_MAX_LEN = 256
 
@@ -33,6 +36,15 @@ def _store(deps: ToolDeps) -> AccountStore:
     if deps.accounts is None:
         raise ToolError(ErrorCode.ACCOUNTS_UNAVAILABLE, "accounts are not enabled on this relay")
     return deps.accounts
+
+
+async def _cut_streams(
+    request: Request, account_id: str, token_id: str | None = None, *, reason: str
+) -> None:
+    """End live firehose streams opened with the account's (revoked) token(s)."""
+    firehose = getattr(request.app.state, "firehose", None)
+    if firehose is not None:
+        await firehose.close_for_account(account_id, token_id=token_id, reason=reason)
 
 
 def _unauthorized() -> JSONResponse:
@@ -209,6 +221,8 @@ async def patch_account(request: Request) -> Response:
             affected = await deps.registry.suspend_owned(account_id)
         elif status == "active":
             affected = await deps.registry.resume_owned(account_id)
+        if after.status != "active":
+            await _cut_streams(request, account_id, reason="account not active")
         return JSONResponse({**after.to_public(), "sessions_affected": affected})
     except ToolError as exc:
         return _error_response(exc)
@@ -226,6 +240,7 @@ async def delete_account(request: Request) -> Response:
         # Disable first: its tokens stop at once, so no new session can be
         # created while the existing ones are deleted.
         await store.update(account_id, status="disabled")
+        await _cut_streams(request, account_id, reason="account deleted")
         try:
             deleted = await deps.registry.delete_owned(account_id)
         except ToolError as exc:
@@ -235,7 +250,17 @@ async def delete_account(request: Request) -> Response:
                     f"account disabled but kept; {exc.message}; retry the delete",
                 ) from exc
             raise
-        await store.delete(account_id)
+        try:
+            await store.delete(account_id)
+        except ToolError:
+            raise
+        except Exception as exc:
+            logger.exception("could not delete account %s", account_id)
+            raise ToolError(
+                ErrorCode.PERSISTENCE_FAILED,
+                "account disabled and its sessions deleted, but the account row "
+                "could not be removed; retry the delete",
+            ) from exc
         return JSONResponse({"deleted_sessions": deleted})
     except ToolError as exc:
         return _error_response(exc)
@@ -261,7 +286,9 @@ async def revoke_account_token(request: Request) -> Response:
             return denied
         account_id = request.path_params["account_id"]
         await store.get(account_id)
-        await store.revoke_token(account_id, request.path_params["token_id"])
+        token_id = request.path_params["token_id"]
+        await store.revoke_token(account_id, token_id)
+        await _cut_streams(request, account_id, token_id, reason="account token revoked")
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)
@@ -306,7 +333,11 @@ async def revoke_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        await store.revoke_token(account.account_id, request.path_params["token_id"])
+        token_id = request.path_params["token_id"]
+        await store.revoke_token(account.account_id, token_id)
+        await _cut_streams(
+            request, account.account_id, token_id, reason="account token revoked"
+        )
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)
