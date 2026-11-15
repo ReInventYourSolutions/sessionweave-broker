@@ -17,6 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError as MCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, ValidationError
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
@@ -32,6 +33,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
+from sessionweave.limits import RequestSizeLimitMiddleware
 from sessionweave.mcp_adapter import (
     HandleRegistry,
     connection_of,
@@ -1251,7 +1253,10 @@ def build_app() -> Starlette:
             *events_ws_routes(),
             Mount("/", app=mcp_app),
         ],
-        middleware=[cors_cfg.as_middleware()],
+        middleware=[
+            Middleware(RequestSizeLimitMiddleware),
+            cors_cfg.as_middleware(),
+        ],
         lifespan=lifespan,
     )
     app.state.registry = registry
