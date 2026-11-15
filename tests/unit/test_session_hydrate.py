@@ -25,6 +25,8 @@ def _snap(**overrides: Any) -> SessionSnapshot:
         inflight={},
         buffered=[],
         max_event_seq=0,
+        owner_account_id=None,
+        suspended=False,
     )
     defaults.update(overrides)
     return SessionSnapshot(**defaults)

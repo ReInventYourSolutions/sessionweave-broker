@@ -82,8 +82,11 @@ class IssuedToken:
 class SessionAuth:
     """Per-session credential registry (hashes only)."""
 
-    def __init__(self, creator_token_hash: bytes | None) -> None:
+    def __init__(
+        self, creator_token_hash: bytes | None, owner_account_id: str | None = None
+    ) -> None:
         self._creator_hash = creator_token_hash
+        self._owner_account_id = owner_account_id
         self._issued: dict[bytes, IssuedToken] = {}
         self._participants: dict[bytes, str] = {}
         # Token digest of a removed participant -> tombstone expiry (ms).
@@ -92,6 +95,10 @@ class SessionAuth:
     @property
     def creator_token_hash(self) -> bytes | None:
         return self._creator_hash
+
+    @property
+    def owner_account_id(self) -> str | None:
+        return self._owner_account_id
 
     def _mint(
         self, kind: Literal["join", "supervisor"], now_ms: int, ttl_ms: int | None

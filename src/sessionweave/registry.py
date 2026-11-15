@@ -106,6 +106,7 @@ class SessionRegistry:
         persistence: PersistenceConfig | None = None,
         creator_token_hash: bytes | None = None,
         relay_epoch: int = 0,
+        owner_account_id: str | None = None,
     ) -> tuple[str, str, dict[str, int], dict[str, Any] | None, PersistenceStatePublic | None]:
         from sessionweave.schemas import PersistenceStatePublic
 
@@ -148,6 +149,7 @@ class SessionRegistry:
                     created_at=created_at_ms,
                     last_activity_at=created_at_ms,
                     relay_epoch_at_create=relay_epoch,
+                    owner_account_id=owner_account_id,
                 )
                 try:
                     await self._store.save_session_metadata(meta)
@@ -170,7 +172,7 @@ class SessionRegistry:
                 store=self._store if persistence is not None else None,
                 persistence_mode=persistence.mode if persistence is not None else None,
             )
-            sess.auth = SessionAuth(creator_token_hash)
+            sess.auth = SessionAuth(creator_token_hash, owner_account_id)
             self._sessions[sid] = sess
             self._schedule(sess)
             if self._metrics is not None:

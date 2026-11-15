@@ -125,6 +125,7 @@ class Session:
         "lock",
         "purpose",
         "session_id",
+        "suspended",
     )
 
     def __init__(
@@ -142,6 +143,9 @@ class Session:
         now = _utcnow()
         self.session_id = session_id
         self.config = config
+        # Set while the owning account is disabled; the session is frozen,
+        # not ended, and the idle reaper leaves it alone.
+        self.suspended: bool = False
         self._participants: dict[str, Participant] = {}
         self._inflight: dict[str, CommandTracker] = {}
         self._buffers: dict[str, NotificationBuffer] = {}
@@ -215,8 +219,9 @@ class Session:
             store=store,
             persistence_mode=snap.persistence_mode,
         )
-        sess.auth = SessionAuth(snap.creator_token_hash)
+        sess.auth = SessionAuth(snap.creator_token_hash, snap.owner_account_id)
         sess.auth.restore(snap.tokens)
+        sess.suspended = snap.suspended
         # Participants (only active — left_at NULL)
         for p in snap.participants:
             s = p["snapshot"]
@@ -296,6 +301,8 @@ class Session:
         return self._last_activity_at + timedelta(seconds=self.config.idle_ttl_seconds)
 
     def is_idle_expired(self, *, at: datetime | None = None) -> bool:
+        if self.suspended:
+            return False
         now = at or _utcnow()
         return now >= self.expires_at()
 
