@@ -11,8 +11,9 @@ from __future__ import annotations
 import secrets
 import sqlite3
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from sessionweave.access import hash_token
 from sessionweave.errors import ErrorCode, ToolError
@@ -21,6 +22,33 @@ from sessionweave.persistence import PersistenceStore
 ACCOUNT_STATUSES: frozenset[str] = frozenset({"pending", "active", "disabled"})
 TOKEN_PREFIX = "swa_"
 LABEL_MAX_LEN = 64
+
+def session_creation_mode(env: Mapping[str, str]) -> Literal["open", "account"]:
+    """Deployment mode from ``SW_SESSION_CREATION`` (default ``open``).
+
+    ``account`` needs a persistence DB (accounts live there) and an admin token
+    (the only way to mint accounts), so both are validated up front.
+    """
+    raw = (env.get("SW_SESSION_CREATION") or "open").strip().lower()
+    if raw == "open":
+        return "open"
+    if raw != "account":
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            f"SW_SESSION_CREATION={raw!r} must be 'open' or 'account'",
+        )
+    if not env.get("SW_PERSISTENCE_DB_PATH"):
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            "SW_SESSION_CREATION=account requires SW_PERSISTENCE_DB_PATH",
+        )
+    if not env.get("SW_ADMIN_TOKEN"):
+        raise ToolError(
+            ErrorCode.INVALID_CONFIG,
+            "SW_SESSION_CREATION=account requires SW_ADMIN_TOKEN",
+        )
+    return "account"
+
 
 _ACCOUNT_COLS = "account_id, name, status, contact, created_by, created_at"
 _TOKEN_COLS = "token_id, account_id, label, created_at, expires_at, revoked_at"

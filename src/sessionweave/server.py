@@ -23,6 +23,7 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter
+from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
 from sessionweave.connections import ConnectionManager
@@ -325,6 +326,14 @@ def _build_fastmcp(
         client = getattr(_request_of(ctx), "client", None)
         return getattr(client, "host", "") or ""
 
+    def _bearer_of(ctx: Context | None) -> str | None:
+        """Bearer token of the MCP HTTP request's Authorization header, if any."""
+        headers = getattr(_request_of(ctx), "headers", None)
+        auth = (headers.get("authorization") if headers is not None else "") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[len("bearer "):].strip() or None
+        return None
+
     def _public_base_url(ctx: Context | None) -> str | None:
         """Configured public base URL, else the MCP HTTP request's own base URL."""
         configured = os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/")
@@ -412,6 +421,11 @@ def _build_fastmcp(
             '"ttl_seconds": N} or {"mode": "until_deleted"} to persist to disk. Refused with '
             'persistence_failed if this relay has persistence disabled.'
         )] = None,
+        account_token: Annotated[str | None, Field(description=
+            'Account API token authorising session creation. Used only when the MCP HTTP '
+            'request carries no Authorization: Bearer header. Required on relays running in '
+            'account mode; omit on open relays.'
+        )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Open a new session; returns session_id, invite_link and the one-time tokens.
@@ -436,6 +450,8 @@ def _build_fastmcp(
             deps,
             {"config": config, "purpose": purpose, "persistence": persistence},
             public_base_url=_public_base_url(ctx),
+            bearer=_bearer_of(ctx) or account_token or None,
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_describe")
@@ -1046,6 +1062,7 @@ def _build_fastmcp(
 
 def build_app() -> Starlette:
     """Build the Starlette app exposing the MCP endpoint and health probes."""
+    creation_mode = session_creation_mode(os.environ)
     deps_cfg = load_deployment_defaults(os.environ)
     connections = ConnectionManager()
     metrics = Metrics()
@@ -1066,6 +1083,7 @@ def build_app() -> Starlette:
         auth_limiter=auth_limiter,
         admin_token=admin_token,
     )
+    tool_deps.session_creation = creation_mode
 
     note_limiter = _note_rate_limiter()
     mcp = _build_fastmcp(
@@ -1109,6 +1127,7 @@ def build_app() -> Starlette:
                 "subproject": "#1 (anonymous, transient, in-memory)",
                 "auth_model": "scoped-tokens-v1",
                 "relay_epoch": relay_epoch,
+                "session_creation": creation_mode,
                 "transports": ["mcp", "http", "ws"],
                 "capabilities": {
                     "firehose": True,
@@ -1172,6 +1191,7 @@ def build_app() -> Starlette:
                     metrics.session_stranded_recovered_total.inc()
             # Hand store to registry
             registry._store = store
+            tool_deps.accounts = AccountStore(store)
             # Sweep loop
             sweep_task = asyncio.create_task(
                 registry.sweep_expired_loop(

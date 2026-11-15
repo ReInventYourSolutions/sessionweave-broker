@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -10,12 +11,14 @@ from sessionweave.access import (
     AuthFailureLimiter,
     Principal,
     Role,
+    admin_matches,
     generate_token,
     hash_token,
     participant_id_for_token,
     require,
     resolve_principal,
 )
+from sessionweave.accounts import Account, AccountStore
 from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.invite import create_link, http_invite_url
@@ -67,7 +70,16 @@ if TYPE_CHECKING:
 class ToolDeps:
     """Bag of dependencies passed to each tool handler."""
 
-    __slots__ = ("admin_token", "auth_limiter", "bounds", "metrics", "registry", "relay_epoch")
+    __slots__ = (
+        "accounts",
+        "admin_token",
+        "auth_limiter",
+        "bounds",
+        "metrics",
+        "registry",
+        "relay_epoch",
+        "session_creation",
+    )
 
     def __init__(
         self,
@@ -94,6 +106,9 @@ class ToolDeps:
         self.auth_limiter = auth_limiter if auth_limiter is not None else AuthFailureLimiter()
         # Relay-wide admin token (SW_ADMIN_TOKEN); None means no admin access.
         self.admin_token = admin_token or None
+        # Set in the server lifespan once the persistence store exists.
+        self.accounts: AccountStore | None = None
+        self.session_creation: Literal["open", "account"] = "open"
 
 
 def _int_config(cfg_dict: dict[str, Any]) -> dict[str, int]:
@@ -153,10 +168,65 @@ def _invite_fields(
     )
 
 
+async def resolve_account(deps: ToolDeps, token: str, *, source_ip: str = "") -> Account:
+    """The active account a bearer token belongs to, or a ToolError.
+
+    A valid token always passes, even from a throttled IP; failures are
+    counted per source IP and throttled like other credential failures.
+    """
+    if deps.accounts is None:
+        raise ToolError(ErrorCode.ACCOUNTS_UNAVAILABLE, "accounts are not enabled on this relay")
+    account = await deps.accounts.match_token(token, int(time.time() * 1000))
+    if account is not None:
+        return account
+    if deps.auth_limiter.is_throttled("", source_ip):
+        raise ToolError(ErrorCode.RATE_LIMITED, "too many failed account-token attempts")
+    deps.auth_limiter.record_failure("", source_ip)
+    raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "invalid account token")
+
+
+async def _creation_owner(
+    deps: ToolDeps, requested_owner: str | None, bearer: str | None, source_ip: str
+) -> str | None:
+    """Owner account id for a new session, enforcing the deployment mode."""
+    if not bearer:
+        if deps.session_creation == "account":
+            raise ToolError(
+                ErrorCode.ACCOUNT_TOKEN_REQUIRED,
+                "session creation requires an account token: send Authorization: Bearer <token>",
+            )
+        if requested_owner is not None:
+            raise ToolError(
+                ErrorCode.PERMISSION_DENIED, "owner_account_id requires the admin token"
+            )
+        return None
+    if admin_matches(bearer, deps.admin_token):
+        if requested_owner is None:
+            return None
+        if deps.accounts is None:
+            raise ToolError(
+                ErrorCode.ACCOUNTS_UNAVAILABLE, "accounts are not enabled on this relay"
+            )
+        return (await deps.accounts.get(requested_owner)).account_id
+    if deps.accounts is None:
+        # No accounts exist on this relay, so no non-admin token can be valid.
+        raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "invalid account token")
+    account = await resolve_account(deps, bearer, source_ip=source_ip)
+    if requested_owner is not None:
+        raise ToolError(ErrorCode.PERMISSION_DENIED, "owner_account_id requires the admin token")
+    return account.account_id
+
+
 async def session_create(
-    deps: ToolDeps, payload: dict[str, Any], *, public_base_url: str | None = None
+    deps: ToolDeps,
+    payload: dict[str, Any],
+    *,
+    public_base_url: str | None = None,
+    bearer: str | None = None,
+    source_ip: str = "",
 ) -> dict[str, Any]:
     inp = SessionCreateInput.model_validate(payload)
+    owner_account_id = await _creation_owner(deps, inp.owner_account_id, bearer, source_ip)
 
     # Validate persistence ttl up-front against operator bounds
     if inp.persistence is not None and inp.persistence.mode == "ttl":
@@ -187,6 +257,7 @@ async def session_create(
         purpose=inp.purpose,
         persistence=inp.persistence,
         creator_token_hash=token_hash,
+        owner_account_id=owner_account_id,
     )
     # Echo back a creator_id so the caller has a stable handle for display.
     # If the client passed one (e.g. a cockpit user_id), we use it verbatim;
@@ -214,6 +285,7 @@ async def session_create(
         join_token_expires_at=_iso_from_ms(join_issued.expires_at_ms),
         invite_url=invite_url,
         invite_link=invite_link,
+        owner_account_id=owner_account_id,
     ).model_dump()
 
 

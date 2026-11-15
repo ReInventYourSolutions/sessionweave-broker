@@ -211,7 +211,13 @@ async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
     try:
         body = await _read_json_body(request)
-        out = await session_create(deps, body, public_base_url=_public_base_url(request))
+        out = await session_create(
+            deps,
+            body,
+            public_base_url=_public_base_url(request),
+            bearer=_bearer(request),
+            source_ip=_request_source_ip(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
     except ValidationError as exc:
