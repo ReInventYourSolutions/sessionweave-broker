@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from contextlib import AsyncExitStack
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -71,6 +73,9 @@ class ToolDeps:
     """Bag of dependencies passed to each tool handler."""
 
     __slots__ = (
+        "account_create_lock",
+        "account_max_sessions",
+        "account_max_tokens",
         "accounts",
         "admin_token",
         "auth_limiter",
@@ -109,6 +114,11 @@ class ToolDeps:
         # Set in the server lifespan once the persistence store exists.
         self.accounts: AccountStore | None = None
         self.session_creation: Literal["open", "account"] = "open"
+        # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).
+        self.account_max_sessions: int = 100
+        self.account_max_tokens: int = 20
+        # Serialises count-then-create so concurrent creations cannot overshoot.
+        self.account_create_lock = asyncio.Lock()
 
 
 def _int_config(cfg_dict: dict[str, Any]) -> dict[str, int]:
@@ -273,13 +283,24 @@ async def session_create(
 
     token = generate_token()
     token_hash = hash_token(token)
-    sid, expires_at, cfg, purpose, persistence_state = await deps.registry.create(
-        inp.config or {},
-        purpose=inp.purpose,
-        persistence=inp.persistence,
-        creator_token_hash=token_hash,
-        owner_account_id=owner_account_id,
-    )
+    async with AsyncExitStack() as slot:
+        if owner_account_id is not None:
+            # Count and create under one lock so concurrent creations cannot overshoot.
+            await slot.enter_async_context(deps.account_create_lock)
+            live = len(await deps.registry.owned_session_ids(owner_account_id))
+            if live >= deps.account_max_sessions:
+                raise ToolError(
+                    ErrorCode.ACCOUNT_SESSION_LIMIT,
+                    f"this account already has {live} live sessions (limit "
+                    f"{deps.account_max_sessions}); end one before creating another",
+                )
+        sid, expires_at, cfg, purpose, persistence_state = await deps.registry.create(
+            inp.config or {},
+            purpose=inp.purpose,
+            persistence=inp.persistence,
+            creator_token_hash=token_hash,
+            owner_account_id=owner_account_id,
+        )
     # Echo back a creator_id so the caller has a stable handle for display.
     # If the client passed one (e.g. a cockpit user_id), we use it verbatim;
     # otherwise we mint a uuid4. Not persisted on the relay yet — that

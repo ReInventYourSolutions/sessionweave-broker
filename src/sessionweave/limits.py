@@ -36,6 +36,16 @@ def max_request_bytes() -> int:
     return _env_int("SW_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)
 
 
+def account_max_sessions() -> int:
+    """``SW_ACCOUNT_MAX_SESSIONS``: live sessions one account may own (default 100)."""
+    return _env_int("SW_ACCOUNT_MAX_SESSIONS", 100)
+
+
+def account_max_tokens() -> int:
+    """``SW_ACCOUNT_MAX_TOKENS``: active tokens one account may hold (default 20)."""
+    return _env_int("SW_ACCOUNT_MAX_TOKENS", 20)
+
+
 class _BodyTooLargeError(Exception):
     pass
 

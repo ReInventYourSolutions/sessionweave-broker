@@ -33,7 +33,12 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.limits import McpNewSessionLimitMiddleware, RequestSizeLimitMiddleware
+from sessionweave.limits import (
+    McpNewSessionLimitMiddleware,
+    RequestSizeLimitMiddleware,
+    account_max_sessions,
+    account_max_tokens,
+)
 from sessionweave.mcp_adapter import (
     HandleRegistry,
     connection_of,
@@ -1109,6 +1114,8 @@ def build_app() -> Starlette:
         admin_token=admin_token,
     )
     tool_deps.session_creation = creation_mode
+    tool_deps.account_max_sessions = account_max_sessions()
+    tool_deps.account_max_tokens = account_max_tokens()
 
     note_limiter = _note_rate_limiter()
     mcp = _build_fastmcp(

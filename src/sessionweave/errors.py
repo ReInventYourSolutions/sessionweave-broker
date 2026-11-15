@@ -37,6 +37,8 @@ class ErrorCode(StrEnum):
     ACCOUNT_NAME_TAKEN = "account_name_taken"
     ACCOUNTS_UNAVAILABLE = "accounts_unavailable"
     SESSION_SUSPENDED = "session_suspended"
+    ACCOUNT_SESSION_LIMIT = "account_session_limit"
+    ACCOUNT_TOKEN_LIMIT = "account_token_limit"
 
 
 @dataclass(slots=True)
