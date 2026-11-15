@@ -1604,7 +1604,9 @@ paths:
         The new status is stored first, so the account's tokens stop (or start)
         working at once. Then the account's sessions follow: target `disabled`
         suspends them (participants get a halt note, joins and commands are
-        refused), target `active` resumes them. Both are idempotent, so
+        refused), target `active` lifts the suspension and restarts their idle TTL
+        but sends no order: halted participants stay paused until a supervisor,
+        the creator or the owner posts `continue`. Both are idempotent, so
         repeating the call repairs a partial failure. `pending` does not touch
         sessions. `sessions_affected` is the number of sessions processed.
         If any session fails, the answer is 503 `persistence_failed` and the

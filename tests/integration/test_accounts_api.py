@@ -129,6 +129,31 @@ async def test_disable_suspends_and_enable_resumes(relay: Seeded) -> None:
         )
         assert r.status_code == 201, r.text
 
+        # Re-enabling lifts the suspension only: no continue order was sent, the
+        # halted participant stays paused until the owner continues it.
+        r = await c.post(f"/v1/sessions/{sid}/participants/me/inbox/drain", headers=bearer(ptoken))
+        kinds = [
+            m["payload"].get("kind") for m in r.json()["messages"]
+            if m["name"] == "supervisor.note"
+        ]
+        assert "continue" not in kinds
+        r = await c.get(f"/v1/sessions/{sid}/participants", headers=bearer(creator))
+        assert r.status_code == 200, r.text
+        states = {p["role"]: p["supervision_state"] for p in r.json()["roster"]}
+        assert states["w"] == "paused"
+        r = await c.post(
+            f"/v1/sessions/{sid}/supervisor/notes", headers=bearer(s.token),
+            json={"kind": "continue", "target": "all", "message": "go"},
+        )
+        assert r.status_code in (200, 201, 202), r.text
+        r = await c.post(f"/v1/sessions/{sid}/participants/me/inbox/drain", headers=bearer(ptoken))
+        assert [
+            m["payload"].get("kind") for m in r.json()["messages"]
+            if m["name"] == "supervisor.note"
+        ] == ["continue"]
+        r = await c.get(f"/v1/sessions/{sid}/participants", headers=bearer(creator))
+        assert {p["supervision_state"] for p in r.json()["roster"]} == {"active"}
+
 
 async def test_owner_token_refused_after_disable_or_revoke(relay: Seeded) -> None:
     s = relay

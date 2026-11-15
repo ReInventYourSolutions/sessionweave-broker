@@ -371,7 +371,7 @@ sessionweave-accounts create alice --contact alice@example.com
 sessionweave-accounts token-create ACC_ID --label laptop --expires-at 2027-01-01T00:00:00Z
 sessionweave-accounts list
 sessionweave-accounts disable ACC_ID      # suspend its sessions
-sessionweave-accounts enable ACC_ID       # resume them
+sessionweave-accounts enable ACC_ID       # lift the suspension (does not continue them)
 sessionweave-accounts token-revoke ACC_ID TOKEN_ID
 sessionweave-accounts delete ACC_ID --yes
 ```
@@ -391,7 +391,9 @@ revoke its own tokens under `/v1/me/tokens` (see [`openapi.yaml`](src/sessionwea
 
 **Disable vs delete.** *Disabling* an account stops its tokens at once and
 suspends its sessions: participants receive a halt, and joins, commands and
-orders are refused until you enable it again, which resumes them. *Deleting*
+orders are refused until you enable it again. Enabling lifts the suspension
+only: the sessions stay halted until you (or a supervisor) post `continue`.
+*Deleting*
 removes the account, its tokens and all its sessions for good. Both are safe to
 repeat if a session failed to update (the broker answers 503
 `persistence_failed`).

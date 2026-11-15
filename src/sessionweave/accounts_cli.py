@@ -49,7 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("list", help="list accounts")
     for name, helptext in (
         ("show", "show an account and its tokens"),
-        ("enable", "activate an account and resume its sessions"),
+        ("enable", "activate an account and lift its sessions' suspension"),
         ("disable", "disable an account and suspend its sessions"),
     ):
         sub.add_parser(name, help=helptext).add_argument("account_id")

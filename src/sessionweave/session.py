@@ -382,7 +382,9 @@ class Session:
     async def unsuspend(self) -> None:
         """Lift the suspension and restart the idle TTL. Idempotent.
 
-        (``resume`` is the participant reconnect operation.)
+        Sends no order: halted participants stay paused until a supervisor,
+        the creator or the owner posts ``continue``. (``resume`` is the
+        participant reconnect operation.)
         """
         async with self.lock:
             if not self.suspended:
@@ -390,31 +392,11 @@ class Session:
             if self._store is not None:
                 await self._store.update_last_activity(self.session_id, _now_ms())
                 await self._store.set_suspended(self.session_id, False)
-            owed = self._suspend_order_pending
             self.suspended = False
-            self._suspend_order_pending = False
             self.bump_activity()
-            if self._participants:
-                try:
-                    await self._apply_order(
-                        new_note("continue", "all", "owner account re-enabled")
-                    )
-                except Exception:
-                    self._suspend_order_pending = owed
-                    await self._restore_suspension(True)
-                    raise
             # While suspended the heap entry sat at the "no deadline" sentinel.
             if self._on_deadline_shortened is not None:
                 self._on_deadline_shortened(self)
-
-    async def _restore_suspension(self, prior: bool) -> None:
-        """Put the flag back to ``prior`` after its order failed, so a retry works."""
-        self.suspended = prior
-        if self._store is not None:
-            try:
-                await self._store.set_suspended(self.session_id, prior)
-            except Exception:
-                logger.exception("could not revert suspended flag of %s", self.session_id)
 
     # --- activity tracking ---
 

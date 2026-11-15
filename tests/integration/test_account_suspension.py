@@ -100,19 +100,22 @@ async def test_suspend_halts_and_refuses(store: PersistenceStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_continues(store: PersistenceStore) -> None:
-    reg, sid, sess, (_a, ha), (_b, hb) = await _two_participants(store)
+async def test_resume_lifts_suspension_without_continuing(store: PersistenceStore) -> None:
+    reg, sid, sess, (a, ha), (_b, hb) = await _two_participants(store)
     await reg.suspend_owned(OWNER)
     ha.sent.clear()
     hb.sent.clear()
     assert await reg.resume_owned(OWNER) == 1
     for h in (ha, hb):
-        assert [(n["kind"], n["message"]) for n in _notes(h)] == [
-            ("continue", "owner account re-enabled")
-        ]
-    assert {p.supervision_state for p in sess.roster_snapshot()} == {"active"}
+        assert _notes(h) == []
+    assert {p.supervision_state for p in sess.roster_snapshot()} == {"paused"}
     await sess.join(FakeHandle(), role="w", capabilities=[])
     assert (await store.load_session(sid)).suspended is False  # type: ignore[union-attr]
+    # An explicit continue is accepted again and un-pauses.
+    await sess.post_order(SupervisorNote("sn-c", "continue", "all", "go", 1))
+    assert {p.supervision_state for p in sess.roster_snapshot()} == {"active"}
+    for h in (ha, hb):
+        assert [n["kind"] for n in _notes(h)] == ["continue"]
 
 
 @pytest.mark.asyncio
@@ -249,7 +252,7 @@ async def test_failed_unsuspend_write_leaves_session_suspended(
     assert sess.suspended is True and _notes(h) == []
     await sess.unsuspend()
     assert sess.suspended is False
-    assert [n["kind"] for n in _notes(h)] == ["continue"]
+    assert _notes(h) == []
 
 
 async def _db_suspended(store: PersistenceStore) -> bool:
@@ -292,27 +295,6 @@ async def test_failed_halt_order_keeps_session_suspended(
     assert [n["kind"] for n in _notes(h)] == ["halt"]
     await sess.suspend()  # nothing owed now: no-op
     assert [n["kind"] for n in _notes(h)] == ["halt"]
-
-
-@pytest.mark.asyncio
-async def test_failed_continue_order_rolls_back_unsuspension(
-    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    reg = _registry(store)
-    sid = await _create(reg)
-    sess = await reg.get_or_raise(sid)
-    h = FakeHandle()
-    await sess.join(h, role="w", capabilities=[])
-    await sess.suspend()
-    h.sent.clear()
-    _fail_once(monkeypatch)
-    with pytest.raises(RuntimeError):
-        await sess.unsuspend()
-    assert sess.suspended is True
-    assert await _db_suspended(store) is True
-    await sess.unsuspend()
-    assert sess.suspended is False and await _db_suspended(store) is False
-    assert [n["kind"] for n in _notes(h)] == ["continue"]
 
 
 @pytest.mark.asyncio
