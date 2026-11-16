@@ -128,13 +128,14 @@ async def _account_with_tokens(store: AccountStore, account: Account) -> dict[st
 
 
 async def _mint_token(
-    store: AccountStore, account_id: str, body: dict[str, Any]
+    deps: ToolDeps, store: AccountStore, account_id: str, body: dict[str, Any]
 ) -> JSONResponse:
     label = body.get("label")
     if not isinstance(label, str):
         raise _bad("label is required")
     plaintext, meta = await store.create_token(
-        account_id, label, expires_at_ms=_expires_ms(body)
+        account_id, label, expires_at_ms=_expires_ms(body),
+        max_tokens=deps.account_max_tokens,
     )
     return JSONResponse(
         {
@@ -274,7 +275,7 @@ async def create_account_token(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        return await _mint_token(store, request.path_params["account_id"],
+        return await _mint_token(deps, store, request.path_params["account_id"],
                                  await _body(request))
     except ToolError as exc:
         return _error_response(exc)
@@ -325,7 +326,7 @@ async def create_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        return await _mint_token(store, account.account_id, await _body(request))
+        return await _mint_token(deps, store, account.account_id, await _body(request))
     except ToolError as exc:
         return _error_response(exc)
 

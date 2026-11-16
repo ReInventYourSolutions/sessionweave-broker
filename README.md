@@ -398,6 +398,43 @@ removes the account, its tokens and all its sessions for good. Both are safe to
 repeat if a session failed to update (the broker answers 503
 `persistence_failed`).
 
+### Running publicly
+
+Checklist for a broker reachable from the internet behind a reverse proxy:
+
+- **Account mode.** `SW_SESSION_CREATION=account` with `SW_PERSISTENCE_DB_PATH`
+  and `SW_ADMIN_TOKEN` (above), so only account holders can create sessions.
+- **Trusted proxy only.** Set `SW_FORWARDED_ALLOW_IPS` to the *exact* IP of your
+  reverse proxy, never `*`. The per-IP limits below (and the failed-token
+  throttle) key on the client address uvicorn derives from `X-Forwarded-For`;
+  with `*` any client could forge it. Make sure the broker port is reachable
+  only from the proxy.
+- **MCP idle transports.** Keep `SW_MCP_SESSION_IDLE_TIMEOUT` positive (default
+  1800 s) so abandoned MCP connections are reclaimed; `SW_MCP_MAX_SESSIONS`
+  caps concurrent transports (default `10000`). Idle transports per IP can reach about
+  `SW_MCP_NEW_SESSIONS_PER_MINUTE` x idle timeout in minutes (30 x 30 = 900 at the
+  defaults), so public brokers should set `SW_MCP_SESSION_IDLE_TIMEOUT` low,
+  e.g. `300`.
+- **Request size.** `SW_MAX_REQUEST_BYTES` (default `5242880`) caps any HTTP
+  request body; larger ones get 413 `payload_too_large` before being read.
+  Also set a body limit at the proxy (for Caddy, `request_body { max_size 5MB }`)
+  so oversized uploads never reach the broker.
+- **New MCP sessions.** `SW_MCP_NEW_SESSIONS_PER_MINUTE` (default `30`) limits,
+  per client IP, POSTs that open a new MCP transport (no `mcp-session-id`
+  header); excess gets 429 with `Retry-After`. Calls inside an existing MCP
+  session are not counted.
+- **Per-account caps.** `SW_ACCOUNT_MAX_SESSIONS` (default `100`): live
+  sessions an account may own (in memory or persisted, not ended; sessions the
+  admin creates for it count); one more is 429 `account_session_limit`.
+  `SW_ACCOUNT_MAX_TOKENS` (default `20`): non-revoked, non-expired tokens per
+  account; one more is 409 `account_token_limit`.
+- **Metrics.** Set `SW_METRICS_TOKEN` (or keep `/metrics` unreachable from the
+  internet at the proxy).
+- **Container hardening.** Run the container as a non-root user with
+  `read_only: true` (mount only the data volume and a tmpfs `/tmp` writable),
+  `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, and memory /
+  pids limits.
+
 ## Architecture (sub-project #1)
 
 Four in-process modules, no external dependencies:

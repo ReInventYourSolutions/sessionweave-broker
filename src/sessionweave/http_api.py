@@ -31,6 +31,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
 from sessionweave.tools import (
     ToolDeps,
+    check_creation_credential,
     session_check_inbox,
     session_create,
     session_describe,
@@ -118,6 +119,8 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.ACCOUNT_NAME_TAKEN: 409,
     ErrorCode.ACCOUNTS_UNAVAILABLE: 503,
     ErrorCode.SESSION_SUSPENDED: 409,
+    ErrorCode.ACCOUNT_SESSION_LIMIT: 429,
+    ErrorCode.ACCOUNT_TOKEN_LIMIT: 409,
 }
 
 
@@ -209,14 +212,18 @@ def _deps(request: Request) -> ToolDeps:
 
 async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
+    bearer = _bearer(request)
+    source_ip = _request_source_ip(request)
     try:
+        # Authenticate before touching the (possibly huge) body.
+        await check_creation_credential(deps, bearer, source_ip)
         body = await _read_json_body(request)
         out = await session_create(
             deps,
             body,
             public_base_url=_public_base_url(request),
-            bearer=_bearer(request),
-            source_ip=_request_source_ip(request),
+            bearer=bearer,
+            source_ip=source_ip,
         )
     except ToolError as exc:
         return _error_response(exc)

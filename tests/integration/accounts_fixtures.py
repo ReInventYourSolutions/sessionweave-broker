@@ -25,7 +25,9 @@ class Seeded:
 
 
 @contextlib.asynccontextmanager
-async def seeded_relay(tmp_path: Path, *, mode: str | None) -> AsyncIterator[Seeded]:
+async def seeded_relay(
+    tmp_path: Path, *, mode: str | None, env_extra: dict[str, str] | None = None
+) -> AsyncIterator[Seeded]:
     db = str(tmp_path / f"acc-{mode}.db")
     store = PersistenceStore(db)
     await store.init(pool_size=2)
@@ -39,7 +41,7 @@ async def seeded_relay(tmp_path: Path, *, mode: str | None) -> AsyncIterator[See
     revoked, rec = await accounts.create_token(acc.account_id, "r")
     await accounts.revoke_token(acc.account_id, rec.token_id)
     await store.close()
-    env = {"SW_ADMIN_TOKEN": ADMIN}
+    env = {"SW_ADMIN_TOKEN": ADMIN, **(env_extra or {})}
     if mode is not None:
         env["SW_SESSION_CREATION"] = mode
     async with relay_subprocess(env_overrides=env, persistence_db_path=db) as base:

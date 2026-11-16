@@ -17,12 +17,13 @@ from mcp.server.mcpserver.exceptions import ToolError as MCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, ValidationError
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
-from sessionweave.access import AuthFailureLimiter
+from sessionweave.access import AuthFailureLimiter, admin_matches
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -32,6 +33,12 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
+from sessionweave.limits import (
+    McpNewSessionLimitMiddleware,
+    RequestSizeLimitMiddleware,
+    account_max_sessions,
+    account_max_tokens,
+)
 from sessionweave.mcp_adapter import (
     HandleRegistry,
     connection_of,
@@ -1107,6 +1114,8 @@ def build_app() -> Starlette:
         admin_token=admin_token,
     )
     tool_deps.session_creation = creation_mode
+    tool_deps.account_max_sessions = account_max_sessions()
+    tool_deps.account_max_tokens = account_max_tokens()
 
     note_limiter = _note_rate_limiter()
     mcp = _build_fastmcp(
@@ -1169,7 +1178,7 @@ def build_app() -> Starlette:
             auth = request.headers.get("authorization", "")
             if not auth.lower().startswith("bearer "):
                 return Response("unauthorized", status_code=401)
-            if auth[7:].strip() != metrics_token:
+            if not admin_matches(auth[7:].strip(), metrics_token):
                 return Response("forbidden", status_code=403)
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 
@@ -1249,9 +1258,12 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
-            Mount("/", app=mcp_app),
+            Mount("/", app=McpNewSessionLimitMiddleware(mcp_app)),
         ],
-        middleware=[cors_cfg.as_middleware()],
+        middleware=[
+            cors_cfg.as_middleware(),  # outermost: error responses keep CORS headers
+            Middleware(RequestSizeLimitMiddleware),
+        ],
         lifespan=lifespan,
     )
     app.state.registry = registry

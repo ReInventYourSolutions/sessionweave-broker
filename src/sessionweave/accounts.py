@@ -199,9 +199,18 @@ class AccountStore:
     # ----- tokens -----
 
     async def create_token(
-        self, account_id: str, label: str, *, expires_at_ms: int | None = None
+        self,
+        account_id: str,
+        label: str,
+        *,
+        expires_at_ms: int | None = None,
+        max_tokens: int | None = None,
     ) -> tuple[str, AccountToken]:
-        """Mint a token; the plaintext is returned here and never stored."""
+        """Mint a token; the plaintext is returned here and never stored.
+
+        With ``max_tokens``, refuses (``account_token_limit``) when the account
+        already has that many tokens that are neither revoked nor expired.
+        """
         if not 1 <= len(label.strip()) <= LABEL_MAX_LEN or len(label) > LABEL_MAX_LEN:
             raise ToolError(
                 ErrorCode.INVALID_REQUEST,
@@ -219,6 +228,19 @@ class AccountStore:
         )
         conn = self._write_conn()
         async with self._store._write_tx_lock:
+            if max_tokens is not None:
+                async with conn.execute(
+                    "SELECT COUNT(*) FROM account_tokens WHERE account_id = ?"
+                    " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+                    (account_id, meta.created_at),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None and row[0] >= max_tokens:
+                    raise ToolError(
+                        ErrorCode.ACCOUNT_TOKEN_LIMIT,
+                        f"this account already has {row[0]} active tokens (limit "
+                        f"{max_tokens}); revoke one before minting another",
+                    )
             try:
                 await conn.execute(
                     "INSERT INTO account_tokens (token_id, account_id, token_hash,"
