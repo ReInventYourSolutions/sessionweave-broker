@@ -5,7 +5,7 @@ Pure functions only (no I/O) for ``render_skill`` / ``render_mcp_snippet`` so
 they are trivially testable; ``load_canonical_skill`` reads the bundled skill
 shipped as package data.
 
-The canonical skill hardcodes the public relay host ``relay.sessionweave.com``.
+The canonical skill hardcodes the public broker host ``broker.sessionweave.com``.
 A private broker rewrites every occurrence to its own ``host[:port]``, adjusting
 the scheme families (``https``/``wss``/``swvs`` → ``http``/``ws``/``swv``) when
 the broker is plain-HTTP, so copy-paste examples work against the private host.
@@ -17,7 +17,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 #: The host token the canonical skill hardcodes.
-CANONICAL_HOST = "relay.sessionweave.com"
+CANONICAL_HOST = "broker.sessionweave.com"
+
+#: Pre-move hostname; old skill copies may still carry it, so it is rewritten too.
+LEGACY_HOST = "relay.sessionweave.com"
 
 
 def render_skill(canonical_md: str, base_url: str) -> str:
@@ -39,12 +42,14 @@ def render_skill(canonical_md: str, base_url: str) -> str:
     swv_scheme = "swvs" if tls else "swv"
 
     # Ordered: scheme-qualified first, bare host last.
-    replacements = [
-        (f"https://{CANONICAL_HOST}", f"{scheme}://{netloc}"),
-        (f"wss://{CANONICAL_HOST}", f"{ws_scheme}://{netloc}"),
-        (f"swvs://{CANONICAL_HOST}", f"{swv_scheme}://{netloc}"),
-        (CANONICAL_HOST, netloc),
-    ]
+    replacements: list[tuple[str, str]] = []
+    for host in (CANONICAL_HOST, LEGACY_HOST):
+        replacements += [
+            (f"https://{host}", f"{scheme}://{netloc}"),
+            (f"wss://{host}", f"{ws_scheme}://{netloc}"),
+            (f"swvs://{host}", f"{swv_scheme}://{netloc}"),
+        ]
+    replacements += [(CANONICAL_HOST, netloc), (LEGACY_HOST, netloc)]
     out = canonical_md
     for old, new in replacements:
         out = out.replace(old, new)

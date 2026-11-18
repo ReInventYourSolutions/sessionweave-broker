@@ -12,7 +12,7 @@ record ``{"ts": ..., "error": "<message>"}``.
 Standalone usage:
 
     python -m sessionweave.poller \
-        --relay-url https://relay.sessionweave.com/mcp \
+        --relay-url https://broker.sessionweave.com/mcp \
         --session-id <sid> \
         --participant-token <participant_token> \
         --participant-id <pid> \
@@ -173,7 +173,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="sessionweave-poller")
     p.add_argument(
         "--relay-url",
-        default=os.environ.get("SW_URL", "https://relay.sessionweave.com/mcp"),
+        default=os.environ.get("SW_URL", "https://broker.sessionweave.com/mcp"),
         help="Full HTTP MCP endpoint of the relay.",
     )
     p.add_argument("--session-id", required=True)

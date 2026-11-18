@@ -89,3 +89,23 @@ async def test_landing_indexes_every_resource() -> None:
                 "/v1/info",
             ):
                 assert href in body, f"landing missing link to {href}"
+
+
+def _first_server(text: str) -> tuple[str, str]:
+    lines = text.split("servers:\n", 1)[1].splitlines()
+    return lines[0].split("url:", 1)[1].strip(), lines[1].split("description:", 1)[1].strip()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_openapi_servers_first_entry_is_this_broker() -> None:
+    async with relay_subprocess(env_overrides={"SW_PUBLIC_BASE_URL": "https://b.example"}) as base:
+        async with httpx.AsyncClient(base_url=base, timeout=5) as c:
+            r = await c.get("/openapi.yaml")
+            assert r.status_code == 200
+            assert _first_server(r.text) == ("https://b.example", "This broker")
+            assert "http://127.0.0.1:8765" in r.text
+    async with relay_subprocess(env_overrides={"SW_PUBLIC_BASE_URL": ""}) as base:
+        async with httpx.AsyncClient(base_url=base, timeout=5) as c:
+            r = await c.get("/openapi.yaml")
+            assert _first_server(r.text)[0] == base

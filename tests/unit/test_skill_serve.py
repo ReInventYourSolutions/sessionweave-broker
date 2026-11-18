@@ -9,10 +9,10 @@ from sessionweave.skill_serve import (
 # A miniature stand-in for the canonical skill carrying every scheme family
 # that appears in the real SKILL.md, plus a bare-host prose mention.
 SAMPLE = (
-    "Default relay: https://relay.sessionweave.com\n"
-    "WS: wss://relay.sessionweave.com/v1/sessions/x/events\n"
-    "Compact: swvs://relay.sessionweave.com/sid\n"
-    "Allowed hosts include relay.sessionweave.com in prose.\n"
+    "Default relay: https://broker.sessionweave.com\n"
+    "WS: wss://broker.sessionweave.com/v1/sessions/x/events\n"
+    "Compact: swvs://broker.sessionweave.com/sid\n"
+    "Allowed hosts include broker.sessionweave.com in prose.\n"
 )
 
 
@@ -21,7 +21,7 @@ def test_https_with_port_rewrites_all_families() -> None:
     assert "https://broker.internal:9000" in out
     assert "wss://broker.internal:9000" in out
     assert "swvs://broker.internal:9000" in out
-    assert "relay.sessionweave.com" not in out
+    assert "broker.sessionweave.com" not in out
 
 
 def test_http_non_tls_downgrades_scheme_families() -> None:
@@ -32,12 +32,12 @@ def test_http_non_tls_downgrades_scheme_families() -> None:
     # the TLS-flavoured schemes must NOT survive against a plain-HTTP broker
     assert "wss://127.0.0.1:8080" not in out
     assert "swvs://127.0.0.1:8080" not in out
-    assert "relay.sessionweave.com" not in out
+    assert "broker.sessionweave.com" not in out
 
 
 def test_public_base_is_a_noop() -> None:
     # When the broker IS the public relay, the served skill equals canonical.
-    out = render_skill(SAMPLE, "https://relay.sessionweave.com")
+    out = render_skill(SAMPLE, "https://broker.sessionweave.com")
     assert out == SAMPLE
 
 
@@ -78,3 +78,13 @@ def test_render_mcp_snippet_account_mode_adds_header_placeholder() -> None:
 def test_render_mcp_snippet_open_mode_has_no_headers() -> None:
     entry = render_mcp_snippet("https://b.example")["mcpServers"]["sessionweave"]
     assert "headers" not in entry
+
+
+def test_render_skill_rewrites_legacy_host() -> None:
+    out = render_skill(
+        "see https://relay.sessionweave.com/mcp and "
+        "swvs://relay.sessionweave.com/x relay.sessionweave.com",
+        "http://10.0.0.5:9000",
+    )
+    assert "relay.sessionweave.com" not in out
+    assert "http://10.0.0.5:9000/mcp" in out and "swv://10.0.0.5:9000/x" in out

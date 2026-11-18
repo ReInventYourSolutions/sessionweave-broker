@@ -28,7 +28,7 @@ cat > .mcp.json <<'JSON'
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "https://relay.sessionweave.com/mcp"
+      "url": "https://broker.sessionweave.com/mcp"
     }
   }
 }

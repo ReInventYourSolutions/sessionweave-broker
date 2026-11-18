@@ -28,7 +28,7 @@ share what you choose to share, ignore everything else.
 - **Anonymous baseline, registered upgrades** — anyone can spin up a session
   anonymously today; persistence and richer services land in later sub-projects.
 
-The relay is in production at [`relay.sessionweave.com`](https://relay.sessionweave.com)
+The public broker is in production at [`broker.sessionweave.com`](https://broker.sessionweave.com)
 (version surfaced at `GET /v1/info`). The Python client SDK lives in
 [`SDK/python/`](../SDK/python/).
 
@@ -167,8 +167,8 @@ out = await session.call_tool("session_create", {"purpose": purpose})
 sid = out["session_id"]
 
 # Primary, shareable URL — any HTTP client can GET it for the brief.
-url = http_invite_url("https://relay.sessionweave.com/mcp", sid)
-# url == "https://relay.sessionweave.com/invite/<sid>"
+url = http_invite_url("https://broker.sessionweave.com/mcp", sid)
+# url == "https://broker.sessionweave.com/invite/<sid>"
 
 # Compact alias for SDK/runner joins (parse_link accepts swv:// / swvs://).
 link = create_link("http://127.0.0.1:8765/mcp", sid)
@@ -246,7 +246,7 @@ object `{"name": "<event>", "payload": {...}}` matching the
 `inbox/drain` schema.
 
 ```bash
-RELAY=https://relay.sessionweave.com
+RELAY=https://broker.sessionweave.com
 
 # Create + join + send + drain
 CREATED=$(curl -sS -X POST "$RELAY/v1/sessions" -H 'content-type: application/json' \
@@ -535,7 +535,7 @@ import asyncio
 from sessionweave_client import SessionWeaveClient
 
 async def main():
-    async with SessionWeaveClient() as c:           # default: relay.sessionweave.com
+    async with SessionWeaveClient() as c:           # default: broker.sessionweave.com
         sess = await c.create_session(purpose={"kind": "demo"})
         me = await c.join(sess["session_id"], role="worker", capabilities=["respond"])
         async with me.events() as stream:           # live WS push
@@ -562,7 +562,7 @@ If your runtime already speaks MCP, register the relay in `.mcp.json`:
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "https://relay.sessionweave.com/mcp"
+      "url": "https://broker.sessionweave.com/mcp"
     }
   }
 }
@@ -636,7 +636,7 @@ Each sub-project gets its own design spec under `docs/superpowers/specs/` and
 its own implementation plan.
 
 1. **MCP core + session relay** — anonymous, transient sessions. *Implemented
-   and deployed at* `relay.sessionweave.com`. Design:
+   and deployed at* `broker.sessionweave.com`. Design:
    [`docs/superpowers/specs/2026-05-06-mcp-core-session-relay-design.md`][spec].
    The original spec covered MCP only; subsequent additions (REST surface,
    WebSocket events, exit feedback, heap-driven eviction, disconnect
