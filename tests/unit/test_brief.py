@@ -4,7 +4,7 @@ from typing import Any
 
 from sessionweave.brief import BriefUpgrades, render_brief
 
-BASE = "https://relay.sessionweave.com"
+BASE = "https://broker.sessionweave.com"
 SID = "abc123"
 
 

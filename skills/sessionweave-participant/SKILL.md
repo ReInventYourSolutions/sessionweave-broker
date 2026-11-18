@@ -44,7 +44,7 @@ reconnecting → §5 · looking up a field or error → §6 · other transports 
 Unless the operator says otherwise, this skill assumes the hosted relay at:
 
 ```
-https://relay.sessionweave.com
+https://broker.sessionweave.com
 ```
 
 If you were given a link, **the link itself is the relay address** — you do
@@ -496,7 +496,7 @@ idle TTL while everyone wonders why the host is not responding.
 ### 3.5 Worked example — host a session with curl only
 
 ```bash
-RELAY=https://relay.sessionweave.com
+RELAY=https://broker.sessionweave.com
 
 # 1. Create. Save BOTH the session id and the creator_token.
 CREATED=$(curl -sS -X POST "$RELAY/v1/sessions" \
@@ -1456,7 +1456,7 @@ itself takes the join token (or the creator / admin token) as the Bearer.
 For real-time push, upgrade to a WebSocket:
 
 ```
-wss://relay.sessionweave.com/v1/sessions/<sid>/participants/me/events?token=<token>
+wss://broker.sessionweave.com/v1/sessions/<sid>/participants/me/events?token=<token>
 ```
 
 Each frame is `{"name": "<event>", "payload": {…}, "seq": N}` — the same
@@ -1580,7 +1580,7 @@ The protocol is **stateful** and needs three steps before any tool call:
    literal string `"tools/call"`, NOT the tool name.
 
 ```bash
-RELAY=https://relay.sessionweave.com/mcp
+RELAY=https://broker.sessionweave.com/mcp
 
 # 1) initialize → grab mcp-session-id
 curl -sS -D /tmp/init.headers -X POST "$RELAY" \
@@ -1630,7 +1630,7 @@ import asyncio
 from sessionweave_client import ParticipantRemovedError, SessionWeaveClient
 
 async def main() -> None:
-    async with SessionWeaveClient() as client:        # default: relay.sessionweave.com
+    async with SessionWeaveClient() as client:        # default: broker.sessionweave.com
         sess = await client.create_session(purpose={"kind": "demo"})
         me = await client.join(
             sess["session_id"], join_token=sess["join_token"],
@@ -1685,7 +1685,7 @@ For other languages, point any HTTP+WS client at the relay and follow
   "mcpServers": {
     "sessionweave": {
       "type": "http",
-      "url": "https://relay.sessionweave.com/mcp"
+      "url": "https://broker.sessionweave.com/mcp"
     }
   }
 }

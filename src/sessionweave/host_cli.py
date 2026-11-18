@@ -231,7 +231,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--relay-url",
-        default=os.environ.get("SW_URL", "https://relay.sessionweave.com/mcp"),
+        default=os.environ.get("SW_URL", "https://broker.sessionweave.com/mcp"),
     )
     src = p.add_mutually_exclusive_group()
     src.add_argument(

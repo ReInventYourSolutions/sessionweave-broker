@@ -11,11 +11,11 @@ def test_http_relay_emits_swv_scheme() -> None:
 
 
 def test_https_relay_emits_swvs_scheme_and_strips_default_port() -> None:
-    link = create_link("https://relay.sessionweave.com/mcp", "sid-1", "T")
-    assert link == "swvs://relay.sessionweave.com/sid-1?jt=T"
+    link = create_link("https://broker.sessionweave.com/mcp", "sid-1", "T")
+    assert link == "swvs://broker.sessionweave.com/sid-1?jt=T"
     # Explicit :443 also gets stripped for tidy hosted-relay links.
-    link2 = create_link("https://relay.sessionweave.com:443/mcp", "sid-2", "T")
-    assert link2 == "swvs://relay.sessionweave.com/sid-2?jt=T"
+    link2 = create_link("https://broker.sessionweave.com:443/mcp", "sid-2", "T")
+    assert link2 == "swvs://broker.sessionweave.com/sid-2?jt=T"
 
 
 def test_https_relay_keeps_non_default_port() -> None:
@@ -38,16 +38,16 @@ def test_parse_compact_swv_link() -> None:
 
 
 def test_parse_compact_swvs_link() -> None:
-    parsed = parse_link("swvs://relay.sessionweave.com/sess-xyz")
+    parsed = parse_link("swvs://broker.sessionweave.com/sess-xyz")
     assert parsed == InviteLink(
-        relay_url="https://relay.sessionweave.com/mcp",
+        relay_url="https://broker.sessionweave.com/mcp",
         session_id="sess-xyz",
         purpose=None,
     )
 
 
 def test_round_trip_https() -> None:
-    relay = "https://relay.sessionweave.com/mcp"
+    relay = "https://broker.sessionweave.com/mcp"
     link = create_link(relay, "abc-1234", "T")
     parsed = parse_link(link)
     assert parsed.relay_url == relay
@@ -100,8 +100,8 @@ def test_parse_rejects_invalid_fragment() -> None:
 def test_http_invite_url_https():
     from sessionweave.invite import http_invite_url
     assert (
-        http_invite_url("https://relay.sessionweave.com/mcp", "sid-1", "T")
-        == "https://relay.sessionweave.com/invite/sid-1?jt=T"
+        http_invite_url("https://broker.sessionweave.com/mcp", "sid-1", "T")
+        == "https://broker.sessionweave.com/invite/sid-1?jt=T"
     )
 
 
@@ -149,7 +149,7 @@ def test_parse_link_without_jt_has_none() -> None:
 
 
 def test_link_round_trip_with_jt() -> None:
-    link = create_link("https://relay.sessionweave.com/mcp", "abc", "x_y-z")
+    link = create_link("https://broker.sessionweave.com/mcp", "abc", "x_y-z")
     parsed = parse_link(link)
     assert (parsed.session_id, parsed.join_token) == ("abc", "x_y-z")
 

@@ -6,6 +6,7 @@ import inspect
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -19,7 +20,7 @@ from pydantic import Field, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from sessionweave import __version__
@@ -82,7 +83,7 @@ def _allowed_hosts() -> list[str]:
 
     Defaults to loopback only (matches the SDK's stock policy). Extra
     hosts come from ``SW_ALLOWED_HOSTS`` (comma-separated, e.g.
-    ``relay.sessionweave.com,relay.sessionweave.com:443``). Wildcard
+    ``broker.sessionweave.com,broker.sessionweave.com:443``). Wildcard
     port patterns (``host:*``) are honoured by the upstream middleware.
     """
     extra = os.environ.get("SW_ALLOWED_HOSTS", "").strip()
@@ -1183,6 +1184,7 @@ def build_app() -> Starlette:
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 
     _openapi_path = Path(__file__).parent / "openapi.yaml"
+    _openapi_text_cache: dict[str, str] = {}
 
     async def openapi_yaml(request: Request) -> Response:
         """Canonical OpenAPI spec, shipped alongside the package.
@@ -1191,7 +1193,24 @@ def build_app() -> Starlette:
         through any YAML→JSON converter. CORS is handled by the
         global middleware.
         """
-        return FileResponse(_openapi_path, media_type="application/yaml")
+        from sessionweave.http_api import _public_base_url as _pub
+
+        text = _openapi_text_cache.get("t")
+        if text is None:
+            text = _openapi_path.read_text(encoding="utf-8")
+            _openapi_text_cache["t"] = text
+        own = _pub(request)
+        block = (
+            "servers:\n"
+            f"  - url: {own}\n"
+            "    description: This broker\n"
+        )
+        # Replace the hosted-production entry with this broker's own; the
+        # local-dev entry stays after it. Skip a duplicate of the dev URL.
+        out = re.sub(
+            r"servers:\n  - url: [^\n]*\n    description: [^\n]*\n", lambda _m: block, text, count=1
+        )
+        return Response(out, media_type="application/yaml")
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:

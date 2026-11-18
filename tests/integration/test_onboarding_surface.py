@@ -33,7 +33,7 @@ async def test_skill_md_parametrized_on_public_base() -> None:
             assert r.headers["content-type"].startswith("text/markdown")
             body = r.text
             assert "https://broker.internal:9000" in body
-            assert "relay.sessionweave.com" not in body
+            assert "broker.sessionweave.com" not in body
 
 
 @pytest.mark.integration
@@ -58,7 +58,7 @@ async def test_skill_md_fallback_downgrades_scheme_for_plain_http() -> None:
             r = await c.get("/skill.md")
             assert r.status_code == 200
             body = r.text
-            assert "relay.sessionweave.com" not in body
+            assert "broker.sessionweave.com" not in body
             assert f"http://{netloc}" in body
             assert f"ws://{netloc}" in body
             # the canonical skill's one wss:// host literal must downgrade
