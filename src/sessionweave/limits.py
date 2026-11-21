@@ -46,6 +46,11 @@ def account_max_tokens() -> int:
     return _env_int("SW_ACCOUNT_MAX_TOKENS", 20)
 
 
+def account_events_retention_days() -> int:
+    """``SW_ACCOUNT_EVENTS_RETENTION_DAYS``: how long account events are kept (default 30)."""
+    return _env_int("SW_ACCOUNT_EVENTS_RETENTION_DAYS", 30)
+
+
 class _BodyTooLargeError(Exception):
     pass
 

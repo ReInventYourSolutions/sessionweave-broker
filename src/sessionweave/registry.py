@@ -569,7 +569,9 @@ class SessionRegistry:
         return purged
 
     async def sweep_expired_loop(self, *, interval_seconds: int,
-                                  safety_seconds: int) -> None:
+                                  safety_seconds: int,
+                                  on_tick: Callable[[int], Awaitable[object]] | None = None,
+                                  ) -> None:
         """Periodic loop scheduled at server startup; runs until cancelled."""
         import time as _time
         while True:
@@ -578,6 +580,8 @@ class SessionRegistry:
                     now_ms=int(_time.time() * 1000),
                     safety_seconds=safety_seconds,
                 )
+                if on_tick is not None:
+                    await on_tick(int(_time.time() * 1000))
             except asyncio.CancelledError:
                 raise
             except Exception:

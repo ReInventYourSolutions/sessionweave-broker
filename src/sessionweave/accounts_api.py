@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from sessionweave.access import admin_matches
+from sessionweave.account_events import EventLog
 from sessionweave.accounts import Account, AccountStore
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.http_api import (
@@ -358,8 +359,73 @@ async def list_my_sessions(request: Request) -> Response:
         return _error_response(exc)
 
 
+EVENTS_MAX_LIMIT = 500
+EVENTS_DEFAULT_LIMIT = 100
+EVENTS_MAX_WAIT = 60.0
+
+
+def _events(deps: ToolDeps) -> EventLog:
+    if deps.events is None:
+        raise ToolError(ErrorCode.ACCOUNTS_UNAVAILABLE, "accounts are not enabled on this relay")
+    return deps.events
+
+
+def _num_param(request: Request, name: str, default: float, lo: float, hi: float) -> float:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise _bad(f"{name} must be a number") from exc
+    if not lo <= value <= hi:  # also rejects NaN
+        raise _bad(f"{name} must be between {lo:g} and {hi:g}")
+    return value
+
+
+async def _events_page(
+    request: Request, log: EventLog, account_id: str | None
+) -> JSONResponse:
+    after = int(_num_param(request, "after", 0, 0, 2**62))
+    limit = int(_num_param(request, "limit", EVENTS_DEFAULT_LIMIT, 1, EVENTS_MAX_LIMIT))
+    wait = _num_param(request, "wait", 0, 0, EVENTS_MAX_WAIT)
+    events, nxt, truncated = await log.list_events(after, account_id=account_id, limit=limit)
+    if not events and wait > 0:
+        await log.wait_for(after, account_id=account_id, timeout=wait)
+        events, nxt, truncated = await log.list_events(
+            after, account_id=account_id, limit=limit
+        )
+    return JSONResponse({"events": events, "next": nxt, "truncated": truncated})
+
+
+async def my_events(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        _store(deps)
+        log = _events(deps)
+        account = await _require_self(request, deps)
+        return await _events_page(request, log, account.account_id)
+    except ToolError as exc:
+        return _error_response(exc)
+
+
+async def all_events(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        _store(deps)
+        log = _events(deps)
+        denied = _require_admin(request, deps)
+        if denied is not None:
+            return denied
+        return await _events_page(request, log, request.query_params.get("account_id"))
+    except ToolError as exc:
+        return _error_response(exc)
+
+
 def routes() -> list[Route]:
     return [
+        Route("/v1/accounts/events", all_events, methods=["GET"]),
+        Route("/v1/me/events", my_events, methods=["GET"]),
         Route("/v1/accounts", create_account, methods=["POST"]),
         Route("/v1/accounts", list_accounts, methods=["GET"]),
         Route("/v1/accounts/{account_id}", get_account, methods=["GET"]),

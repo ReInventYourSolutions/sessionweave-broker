@@ -20,6 +20,7 @@ from sessionweave.access import (
     require,
     resolve_principal,
 )
+from sessionweave.account_events import EventLog
 from sessionweave.accounts import Account, AccountStore
 from sessionweave.connections import ConnectionHandle
 from sessionweave.errors import ErrorCode, ToolError
@@ -80,6 +81,7 @@ class ToolDeps:
         "admin_token",
         "auth_limiter",
         "bounds",
+        "events",
         "metrics",
         "registry",
         "relay_epoch",
@@ -113,6 +115,7 @@ class ToolDeps:
         self.admin_token = admin_token or None
         # Set in the server lifespan once the persistence store exists.
         self.accounts: AccountStore | None = None
+        self.events: EventLog | None = None
         self.session_creation: Literal["open", "account"] = "open"
         # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).
         self.account_max_sessions: int = 100

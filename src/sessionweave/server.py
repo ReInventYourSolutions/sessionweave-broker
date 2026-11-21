@@ -25,6 +25,7 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter, admin_matches
+from sessionweave.account_events import EventLog
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -37,6 +38,7 @@ from sessionweave.http_api import routes as http_api_routes
 from sessionweave.limits import (
     McpNewSessionLimitMiddleware,
     RequestSizeLimitMiddleware,
+    account_events_retention_days,
     account_max_sessions,
     account_max_tokens,
 )
@@ -1243,11 +1245,19 @@ def build_app() -> Starlette:
             # Hand store to registry
             registry._store = store
             tool_deps.accounts = AccountStore(store)
+            events = EventLog(store)
+            tool_deps.events = events
+            retention_days = account_events_retention_days()
+
+            async def _prune_events(now_ms: int) -> None:
+                await events.prune(now_ms, retention_days)
+
             # Sweep loop
             sweep_task = asyncio.create_task(
                 registry.sweep_expired_loop(
                     interval_seconds=deps_cfg.defaults.persistence_sweep_interval_seconds,
                     safety_seconds=deps_cfg.defaults.persistence_until_deleted_safety_seconds,
+                    on_tick=_prune_events,
                 )
             )
         app.state.persistence_store = store
