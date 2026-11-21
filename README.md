@@ -407,8 +407,11 @@ Checklist for a broker reachable from the internet behind a reverse proxy:
 - **Trusted proxy only.** Set `SW_FORWARDED_ALLOW_IPS` to the *exact* IP of your
   reverse proxy, never `*`. The per-IP limits below (and the failed-token
   throttle) key on the client address uvicorn derives from `X-Forwarded-For`;
-  with `*` any client could forge it. Make sure the broker port is reachable
-  only from the proxy.
+  with `*` any client could forge it (the bundled `deploy/` compose is the exception: the port is unpublished and Caddy is the only peer). Make sure the broker port is reachable
+  only from the proxy. Before relying on token network policies other than
+  `any`, pin the proxy's container IP (or verify `last_used_ip` in the token
+  listing after one real request through the proxy): a wrong value makes every
+  client look like the proxy, or lets clients forge their address.
 - **MCP idle transports.** Keep `SW_MCP_SESSION_IDLE_TIMEOUT` positive (default
   1800 s) so abandoned MCP connections are reclaimed; `SW_MCP_MAX_SESSIONS`
   caps concurrent transports (default `10000`). Idle transports per IP can reach about
@@ -488,6 +491,10 @@ curl -X POST -H "Authorization: Bearer $SW_ACCOUNT_TOKEN" \
 # admin: /v1/accounts/{id}/network-approvals[...]; CLI: approvals / approve / deny
 sessionweave-accounts approve ACC_ID APPROVAL_ID --scope ip
 ```
+
+Removing every network from a `first_use` token (a `PUT` with an empty list) re-arms
+first-use binding: the next successful use binds its network again. A first-use bind
+emits `token.network_approved` with `by: "first_use"`.
 
 Approving adds the CIDR to the token's approved networks; denying drops the request
 (the address may ask again). One account can never see or decide another account's
