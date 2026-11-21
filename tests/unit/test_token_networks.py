@@ -81,9 +81,32 @@ async def test_first_use_binds_then_refuses(accounts: AccountStore, log: EventLo
     pend = await accounts.list_approvals(acc.account_id)
     assert len(pend) == 1 and pend[0]["ip"] == "198.51.100.1"
     assert pend[0]["token_id"] == meta.token_id and pend[0]["client"] == "ua/1"
-    assert await _kinds(log) == ["token.network_pending"]
+    assert await _kinds(log) == ["token.network_approved", "token.network_pending"]
     events, _, _ = await log.list_events(0, account_id=None, limit=10)
     assert tok not in str(events)
+    bound = next(e for e in events if e["kind"] == "token.network_approved")["data"]
+    assert bound["token"] == {"id": meta.token_id, "label": "cli"}
+    assert bound["ip"] == "203.0.113.7" and bound["cidr"] == "203.0.113.7/32"
+    assert bound["by"] == "first_use" and bound["client"] == "ua/1"
+    pending = next(e for e in events if e["kind"] == "token.network_pending")["data"]
+    assert pending["expires_at"] > _now()
+
+
+async def test_first_use_not_bound_when_policy_changed_meanwhile(
+    accounts: AccountStore, log: EventLog
+) -> None:
+    acc, _tok, meta = await _setup(accounts, network_policy="first_use")
+    await accounts.set_token_networks(
+        acc.account_id, meta.token_id, network_policy="approved_only", approved_networks=None
+    )
+    # A request that read the stale "first_use" policy must not bind.
+    res = await accounts._check_network(
+        acc, meta.token_id, "cli", "first_use", [], _now(), _o("203.0.113.7")
+    )
+    assert res is not None and res.refusal == "network"
+    (t,) = await accounts.list_tokens(acc.account_id)
+    assert t.approved_networks == ()
+    assert "token.network_approved" not in await _kinds(log)
 
 
 async def test_approved_only_cidr(accounts: AccountStore) -> None:
@@ -134,14 +157,18 @@ async def test_approve_ip_and_network(accounts: AccountStore, log: EventLog) -> 
     ap = next(e for e in events if e["kind"] == "token.network_approved")["data"]
     assert ap["cidr"] == "198.51.100.9/32" and ap["ip"] == "198.51.100.9"
     assert ap["token_id"] == meta.token_id and ap["label"] == "cli"
+    assert ap["by"] == "self" and ap["client"] is None
 
 
 async def test_deny(accounts: AccountStore, log: EventLog) -> None:
     acc, tok, _ = await _setup(accounts, network_policy="approved_only")
     r = await accounts.authenticate(tok, _now(), _o("198.51.100.9"))
-    await accounts.deny(acc.account_id, _aid(r))
+    await accounts.deny(acc.account_id, _aid(r), by="admin", client="curl/8")
     assert await accounts.list_approvals(acc.account_id) == []
     assert "token.network_denied" in await _kinds(log)
+    events, _, _ = await log.list_events(0, account_id=None, limit=100)
+    d = next(e for e in events if e["kind"] == "token.network_denied")["data"]
+    assert d["by"] == "admin" and d["client"] == "curl/8"
     r2 = await accounts.authenticate(tok, _now(), _o("198.51.100.9"))
     assert r2.refusal == "network" and _aid(r2) != _aid(r)
 

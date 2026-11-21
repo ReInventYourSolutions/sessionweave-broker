@@ -575,22 +575,40 @@ class AccountStore:
             if _ip_in(ip, networks):
                 return None
             if policy == "first_use" and not networks:
+                bound: str | None = None
                 async with self._store._write_tx_lock:
                     async with self._write_conn().execute(
-                        "SELECT approved_networks FROM account_tokens WHERE token_id = ?",
+                        "SELECT approved_networks, network_policy FROM account_tokens"
+                        " WHERE token_id = ?",
                         (token_id,),
                     ) as cur:
                         cur_row = await cur.fetchone()
                     current = json.loads(cur_row[0]) if cur_row is not None else None
-                    if current == []:
+                    cur_policy = cur_row[1] if cur_row is not None else None
+                    if current == [] and cur_policy == "first_use":
+                        bound = _host_cidr(ip)
                         await self._write_conn().execute(
                             "UPDATE account_tokens SET approved_networks = ?"
                             " WHERE token_id = ?",
-                            (json.dumps([_host_cidr(ip)]), token_id),
+                            (json.dumps([bound]), token_id),
                         )
+                    elif current is not None and _ip_in(ip, current):
                         return None
-                    if current is not None and _ip_in(ip, current):
-                        return None
+                if bound is not None:
+                    await self._emit(
+                        account.account_id,
+                        "token.network_approved",
+                        {
+                            "token": {"id": token_id, "label": label},
+                            "token_id": token_id,
+                            "label": label,
+                            "ip": str(ip),
+                            "cidr": bound,
+                            "by": "first_use",
+                            "client": origin.client,
+                        },
+                    )
+                    return None
         if ip is None:
             # No usable address to approve: refuse, but record nothing.
             return AuthResult(
@@ -611,6 +629,7 @@ class AccountStore:
                     "approval_id": approval_id,
                     "ip": ip_text,
                     "client": origin.client,
+                    "expires_at": now_ms + APPROVAL_TTL_MS,
                 },
             )
         return AuthResult(
@@ -727,7 +746,13 @@ class AccountStore:
         return row[0], row[1], row[2]
 
     async def approve(
-        self, account_id: str, approval_id: str, scope: Literal["ip", "network"]
+        self,
+        account_id: str,
+        approval_id: str,
+        scope: Literal["ip", "network"],
+        *,
+        by: str = "self",
+        client: str | None = None,
     ) -> AccountToken:
         if scope not in ("ip", "network"):
             raise ToolError(ErrorCode.INVALID_REQUEST, f"invalid approval scope: {scope!r}")
@@ -769,11 +794,25 @@ class AccountStore:
         await self._emit(
             account_id,
             "token.network_approved",
-            {"token_id": token_id, "label": label, "ip": ip_text, "cidr": cidr},
+            {
+                "token_id": token_id,
+                "label": label,
+                "ip": ip_text,
+                "cidr": cidr,
+                "by": by,
+                "client": client,
+            },
         )
         return await self._get_token(account_id, token_id)
 
-    async def deny(self, account_id: str, approval_id: str) -> None:
+    async def deny(
+        self,
+        account_id: str,
+        approval_id: str,
+        *,
+        by: str = "self",
+        client: str | None = None,
+    ) -> None:
         async with self._store._write_tx_lock:
             token_id, label, ip_text = await self._live_approval(
                 account_id, approval_id, int(time.time() * 1000)
@@ -784,7 +823,13 @@ class AccountStore:
         await self._emit(
             account_id,
             "token.network_denied",
-            {"token_id": token_id, "label": label, "ip": ip_text},
+            {
+                "token_id": token_id,
+                "label": label,
+                "ip": ip_text,
+                "by": by,
+                "client": client,
+            },
         )
 
     # ----- connections -----

@@ -215,6 +215,10 @@ async def _get_networks(
     return _networks_json(await store.get_token(account_id, request.path_params["token_id"]))
 
 
+def _is_admin_route(request: Request) -> bool:
+    return request.url.path.startswith("/v1/accounts/")
+
+
 async def _approve(
     request: Request, store: AccountStore, account_id: str
 ) -> Response:
@@ -222,12 +226,20 @@ async def _approve(
     scope = body.get("scope")
     if scope not in ("ip", "network"):
         raise _bad('scope must be "ip" or "network"')
-    token = await store.approve(account_id, request.path_params["approval_id"], scope)
+    token = await store.approve(
+        account_id, request.path_params["approval_id"], scope,
+        by="admin" if _is_admin_route(request) else "self",
+        client=origin_from_request(request).client,
+    )
     return _networks_json(token)
 
 
 async def _deny(request: Request, store: AccountStore, account_id: str) -> Response:
-    await store.deny(account_id, request.path_params["approval_id"])
+    await store.deny(
+        account_id, request.path_params["approval_id"],
+        by="admin" if _is_admin_route(request) else "self",
+        client=origin_from_request(request).client,
+    )
     return Response(status_code=204)
 
 

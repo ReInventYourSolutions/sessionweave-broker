@@ -179,6 +179,8 @@ async def test_approval_flow_self_ip_scope(tmp_path: Path) -> None:
         }
         evs = (await c.get("/v1/me/events", headers=bearer(r.a_free))).json()["events"]
         assert "token.network_approved" in [e["kind"] for e in evs]
+        ev = next(e for e in evs if e["kind"] == "token.network_approved")
+        assert ev["data"]["by"] == "self"
 
 
 async def test_approval_network_scope_and_deny_admin(tmp_path: Path) -> None:
@@ -202,6 +204,8 @@ async def test_approval_network_scope_and_deny_admin(tmp_path: Path) -> None:
             for e in (await c.get("/v1/me/events", headers=bearer(r.a_free))).json()["events"]
         ]
         assert "token.network_denied" in kinds
+        evs = (await c.get("/v1/me/events", headers=bearer(r.a_free))).json()["events"]
+        assert next(e for e in evs if e["kind"] == "token.network_denied")["data"]["by"] == "admin"
         # a denied approval is gone
         again = await c.post(f"{base}/{aid}/deny", headers=bearer(ADMIN))
         assert again.status_code == 404

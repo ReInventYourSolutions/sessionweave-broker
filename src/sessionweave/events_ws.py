@@ -334,7 +334,7 @@ async def firehose_ws(websocket: WebSocket) -> None:
             else _CLOSE_MISSING_TOKEN
         )
         reason = (
-            "network_not_approved"
+            "network not approved"
             if exc.code is ErrorCode.NETWORK_NOT_APPROVED
             else "invalid token"
         )
