@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.32.1"
+  version: "0.33.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -446,6 +446,8 @@ components:
                 - persistence_failed
                 - token_not_found
                 - invalid_request
+                - network_not_approved
+                - approval_not_found
             message:
               type: string
     Account:
@@ -467,6 +469,74 @@ components:
         created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
         expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
         revoked_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+        network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
+        approved_networks:
+          type: array
+          items: { type: string, example: 203.0.113.0/24 }
+          description: Approved CIDRs (an exact IP is stored as `/32` or `/128`)
+        last_used_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+        last_used_ip: { type: string, nullable: true }
+    NetworkPolicy:
+      type: string
+      enum: [any, first_use, approved_only]
+      description: |
+        `any` (default): no restriction. `first_use`: the network of the first
+        successful use is approved automatically, afterwards only approved
+        networks work. `approved_only`: only already approved networks work.
+    TokenNetworks:
+      type: object
+      properties:
+        network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
+        approved_networks: { type: array, items: { type: string } }
+    SetTokenNetworksRequest:
+      type: object
+      description: Every field is optional. `approved_networks` replaces the whole list.
+      properties:
+        network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
+        approved_networks: { type: array, items: { type: string } }
+    NetworkApproval:
+      type: object
+      properties:
+        approval_id: { type: string, example: apr_0123456789abcdef }
+        token_id: { type: string }
+        label: { type: string }
+        ip: { type: string }
+        client: { type: string, nullable: true, description: User agent / MCP client name+version }
+        created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
+        expires_at: { type: integer, format: int64, description: Unix epoch milliseconds (24 h after the first attempt) }
+    ApproveRequest:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          enum: [ip, network]
+          description: Approve the exact IP (`/32`, `/128`) or its network (`/24` for IPv4, `/64` for IPv6)
+    AccountEvent:
+      type: object
+      properties:
+        event_id: { type: integer, format: int64, description: Monotonic cursor }
+        account_id: { type: string }
+        kind:
+          type: string
+          enum:
+            - session.created
+            - session.deleted
+            - token.created
+            - token.revoked
+            - token.network_pending
+            - token.network_approved
+            - token.network_denied
+            - token.rejected
+            - account.status_changed
+        ts: { type: integer, format: int64, description: Unix epoch milliseconds }
+        data: { type: object, additionalProperties: true, description: Never contains token values or join links }
+    AccountEventsPage:
+      type: object
+      properties:
+        events: { type: array, items: { $ref: '#/components/schemas/AccountEvent' } }
+        next: { type: integer, format: int64, description: Resume cursor (pass as `after`) }
+        truncated: { type: boolean, description: "`after` is older than the oldest kept event" }
     AccountWithTokens:
       allOf:
         - $ref: '#/components/schemas/Account'
@@ -499,6 +569,11 @@ components:
           type: string
           format: date-time
           description: ISO 8601 (a trailing `Z` is accepted); must be in the future. Omit for no expiry.
+        network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
+        approved_networks:
+          type: array
+          items: { type: string }
+          description: CIDRs or exact IPs the token may be used from
     CreatedToken:
       type: object
       properties:
@@ -507,6 +582,8 @@ components:
         label: { type: string }
         created_at: { type: integer, format: int64, description: Unix epoch milliseconds }
         expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+        network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
+        approved_networks: { type: array, items: { type: string } }
     OwnedSession:
       type: object
       properties:
@@ -565,7 +642,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.32.1" }
+                  version: { type: string, example: "0.33.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -1891,6 +1968,365 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '429':
           description: rate_limited (too many failed attempts from this source IP)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/events:
+    get:
+      tags: [me]
+      summary: The calling account's event log (cursor, long-poll)
+      security: [{ accountAuth: [] }]
+      parameters:
+      - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 }, description: Return events with a larger event_id }
+      - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      - { name: wait, in: query, schema: { type: number, minimum: 0, maximum: 60, default: 0 }, description: Long-poll seconds; returns as soon as a newer event exists }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/AccountEventsPage' } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/events:
+    get:
+      tags: [accounts]
+      summary: Event log of all accounts, or one (cursor, long-poll)
+      security: [{ adminAuth: [] }]
+      parameters:
+      - { name: account_id, in: query, schema: { type: string }, description: Only this account }
+      - { name: after, in: query, schema: { type: integer, minimum: 0, default: 0 }, description: Return events with a larger event_id }
+      - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      - { name: wait, in: query, schema: { type: number, minimum: 0, maximum: 60, default: 0 }, description: Long-poll seconds; returns as soon as a newer event exists }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/AccountEventsPage' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/tokens/{token_id}/networks:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+      - { name: token_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [accounts]
+      summary: A token's network policy and approved networks
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found / account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    put:
+      tags: [accounts]
+      summary: Change a token's network policy and/or approved networks
+      description: Narrowing the policy or removing a network closes firehose streams opened with the token from addresses that are no longer allowed.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetTokenNetworksRequest' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found / account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/network-approvals:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [accounts]
+      summary: Pending network approvals (not expired)
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: object, properties: { approvals: { type: array, items: { $ref: '#/components/schemas/NetworkApproval' } } } } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/network-approvals/{approval_id}/approve:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+      - { name: approval_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [accounts]
+      summary: Approve a pending network approval
+      description: Adds the IP or its network to the token's approved networks and returns the token's networks. Another account's approval is 404.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApproveRequest' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: approval_not_found / account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/accounts/{account_id}/network-approvals/{approval_id}/deny:
+    parameters:
+      - { name: account_id, in: path, required: true, schema: { type: string } }
+      - { name: approval_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [accounts]
+      summary: Deny a pending network approval
+      description: Drops the request; the address may ask again later.
+      security: [{ adminAuth: [] }]
+      responses:
+        '204':
+          description: Done
+        '401':
+          description: unauthorized (no Bearer header)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: permission_denied (not the admin token)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: approval_not_found / account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/tokens/{token_id}/networks:
+    parameters:
+      - { name: token_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [me]
+      summary: A token's network policy and approved networks
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    put:
+      tags: [me]
+      summary: Change a token's network policy and/or approved networks
+      description: Narrowing the policy or removing a network closes firehose streams opened with the token from addresses that are no longer allowed.
+      security: [{ accountAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetTokenNetworksRequest' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/network-approvals:
+    parameters:
+    get:
+      tags: [me]
+      summary: Pending network approvals (not expired)
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: object, properties: { approvals: { type: array, items: { $ref: '#/components/schemas/NetworkApproval' } } } } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: account_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/network-approvals/{approval_id}/approve:
+    parameters:
+      - { name: approval_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [me]
+      summary: Approve a pending network approval
+      description: Adds the IP or its network to the token's approved networks and returns the token's networks. Another account's approval is 404.
+      security: [{ accountAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApproveRequest' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TokenNetworks' } } }
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '400':
+          description: invalid_request
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: approval_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503':
+          description: accounts_unavailable (relay has no persistence DB)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /v1/me/network-approvals/{approval_id}/deny:
+    parameters:
+      - { name: approval_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [me]
+      summary: Deny a pending network approval
+      description: Drops the request; the address may ask again later.
+      security: [{ accountAuth: [] }]
+      responses:
+        '204':
+          description: Done
+        '401':
+          description: invalid_account_token
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403':
+          description: network_not_approved (this account token is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: approval_not_found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429':
+          description: rate_limited
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503':
           description: accounts_unavailable (relay has no persistence DB)

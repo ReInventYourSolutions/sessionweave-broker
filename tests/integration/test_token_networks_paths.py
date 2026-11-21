@@ -122,10 +122,17 @@ async def test_owner_as_creator_delete_and_join_unaffected(tmp_path: Path) -> No
             headers={"X-Forwarded-For": BAD},
         )
         assert brief.status_code == 200, brief.text
-        sup = await c.delete(
-            f"/v1/sessions/{sid}/tokens/nope", headers=_h(made["creator_token"], BAD)
+        joined = await c.post(
+            f"/v1/sessions/{sid}/participants",
+            json={"role": "worker"},
+            headers=_h(made["join_token"], BAD),
         )
-        assert sup.status_code != 403 or sup.json()["error"]["code"] != "network_not_approved"
+        assert joined.status_code == 201, joined.text
+        assert joined.json()["participant_token"]
+        sup = await c.get(
+            f"/v1/sessions/{sid}/participants", headers=_h(made["creator_token"], BAD)
+        )
+        assert sup.status_code == 200, sup.text
         assert (await c.delete(f"/v1/sessions/{sid}", headers=_h(r.bound, GOOD))).status_code == 200
         deleted = (await _kind(r, "session.deleted"))[0]["data"]
         assert deleted == {"session_id": sid, "by": "owner"}
@@ -143,13 +150,17 @@ async def test_admin_delete_event(tmp_path: Path) -> None:
 async def test_mcp_create_and_creator_tool(tmp_path: Path) -> None:
     async with rig(tmp_path) as r:
         async with sw_client(r.base, headers=_h(r.bound, BAD)) as c:
-            with pytest.raises(RuntimeError, match="not approved for your network"):
+            with pytest.raises(RuntimeError) as ei:
                 await c.call_tool("session_create", {})
+            assert "network_not_approved" in str(ei.value)
+            assert NETWORK_NOT_APPROVED_MESSAGE in str(ei.value)
         async with sw_client(r.base, headers=_h(r.free, GOOD)) as c:
             sid = (await c.call_tool("session_create", {}))["session_id"]
         async with sw_client(r.base, headers=_h(r.bound, BAD)) as c:
-            with pytest.raises(RuntimeError, match="not approved for your network"):
+            with pytest.raises(RuntimeError) as ei2:
                 await c.call_tool("session_mint_join_token", {"session_id": sid})
+            assert "network_not_approved" in str(ei2.value)
+            assert NETWORK_NOT_APPROVED_MESSAGE in str(ei2.value)
         async with sw_client(r.base, headers=_h(r.bound, GOOD)) as c:
             out = await c.call_tool("session_create", {"purpose": {"title": "viaMCP"}})
             assert out["session_id"]
@@ -249,13 +260,15 @@ async def test_token_and_status_events(tmp_path: Path) -> None:
         aid = adm.json()["token_id"]
         mine = _h(r.free, "192.0.2.9")
         assert (await c.delete(f"/v1/me/tokens/{tid}", headers=mine)).status_code == 204
+        # Revoking again is idempotent (204) and emits nothing.
         again = await c.delete(f"/v1/me/tokens/{tid}", headers=mine)
-        assert again.status_code in (204, 401, 404)
-        assert (
-            await c.delete(
-                f"/v1/accounts/{r.account_id}/tokens/{aid}", headers=bearer(ADMIN)
-            )
-        ).status_code == 204
+        assert again.status_code == 204, again.text
+        # Concurrent admin DELETEs of one token both succeed; one event only.
+        url = f"/v1/accounts/{r.account_id}/tokens/{aid}"
+        both = await asyncio.gather(
+            c.delete(url, headers=bearer(ADMIN)), c.delete(url, headers=bearer(ADMIN))
+        )
+        assert [x.status_code for x in both] == [204, 204]
         for status in ("disabled", "disabled", "active"):
             assert (
                 await c.patch(

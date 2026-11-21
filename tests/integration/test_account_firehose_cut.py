@@ -108,8 +108,13 @@ async def test_recheck_after_subscribe_closes_revoked_token() -> None:
 
     class _Accounts:
         result: Any = None
+        network = False
 
         async def authenticate(self, token: str, now_ms: int, origin: Any) -> Any:
+            if self.network:
+                return SimpleNamespace(
+                    account=None, token_id=None, refusal="network", account_id="acc_1"
+                )
             if self.result is None:
                 return SimpleNamespace(account=None, token_id=None, refusal=None)
             return SimpleNamespace(
@@ -120,8 +125,12 @@ async def test_recheck_after_subscribe_closes_revoked_token() -> None:
     hot = SimpleNamespace(auth=SimpleNamespace(owner_account_id="acc_1"))
     deps = SimpleNamespace(accounts=accounts, registry=SimpleNamespace(get=lambda sid: hot))
     accounts.result = (acc, "tok_1")
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is True
+    refusal = events_ws._account_token_refusal
+    assert await refusal(deps, "s", "t", "acc_1", ORIGIN) is None
     accounts.result = None  # revoked
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is False
+    assert await refusal(deps, "s", "t", "acc_1", ORIGIN) == "account token revoked"
     accounts.result = (SimpleNamespace(account_id="acc_2"), "tok_9")
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is False
+    assert await refusal(deps, "s", "t", "acc_1", ORIGIN) == "account token revoked"
+    # valid token, refused for its network: same wording as the other paths
+    accounts.network = True
+    assert await refusal(deps, "s", "t", "acc_1", ORIGIN) == "network not approved"

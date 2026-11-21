@@ -289,20 +289,25 @@ async def events_ws(websocket: WebSocket) -> None:
             await session.requeue_to_buffer(pid, undelivered)
 
 
-async def _account_token_still_valid(
+async def _account_token_refusal(
     deps: Any, sid: str, token: str, account_id: str | None, origin: Origin
-) -> bool:
-    """Same test ``resolve_principal`` applies to an owner-account token,
-    including the token's network policy for ``origin``."""
+) -> str | None:
+    """None while the owner-account token still passes the test
+    ``resolve_principal`` applies (including its network policy for ``origin``);
+    otherwise the close reason."""
     hot = deps.registry.get(sid)
     if hot is None or deps.accounts is None:
-        return False
+        return "account token revoked"
     res = await deps.accounts.authenticate(token, int(time.time() * 1000), origin)
-    return (
+    if (
         res.account is not None
         and res.account.account_id == account_id
         and hot.auth.owner_account_id == account_id
-    )
+    ):
+        return None
+    if res.refusal == "network":
+        return "network not approved"
+    return "account token revoked"
 
 
 async def firehose_ws(websocket: WebSocket) -> None:
@@ -351,12 +356,14 @@ async def firehose_ws(websocket: WebSocket) -> None:
         # Revoked between the token check and the subscription.
         sub.close_reason = "supervisor token revoked"
         sub.closed.set()
-    if principal.account_token_id is not None and not await _account_token_still_valid(
-        deps, sid, token, principal.account_id, origin
-    ):
-        # Revoked / disabled between the token check and the subscription.
-        sub.close_reason = "account token revoked"
-        sub.closed.set()
+    if principal.account_token_id is not None:
+        refusal = await _account_token_refusal(
+            deps, sid, token, principal.account_id, origin
+        )
+        if refusal is not None:
+            # Revoked / disabled / unapproved between the token check and the subscription.
+            sub.close_reason = refusal
+            sub.closed.set()
     revoked = asyncio.create_task(sub.closed.wait())
     getter: asyncio.Task[Any] | None = None
     try:

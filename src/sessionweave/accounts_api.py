@@ -16,7 +16,7 @@ from starlette.routing import Route
 
 from sessionweave.access import admin_matches
 from sessionweave.account_events import EventLog, Origin
-from sessionweave.accounts import Account, AccountStore
+from sessionweave.accounts import Account, AccountStore, AccountToken
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.http_api import (
     _bearer,
@@ -157,9 +157,13 @@ async def _mint_token(
     label = body.get("label")
     if not isinstance(label, str):
         raise _bad("label is required")
+    policy = body.get("network_policy", "any")
+    if not isinstance(policy, str):
+        raise _bad("network_policy must be a string")
     plaintext, meta = await store.create_token(
         account_id, label, expires_at_ms=_expires_ms(body),
         max_tokens=deps.account_max_tokens,
+        network_policy=policy, approved_networks=body.get("approved_networks"),
     )
     await emit_account_event(
         deps, account_id, "token.created",
@@ -172,6 +176,8 @@ async def _mint_token(
             "label": meta.label,
             "created_at": meta.created_at,
             "expires_at": meta.expires_at,
+            "network_policy": meta.network_policy,
+            "approved_networks": list(meta.approved_networks),
         },
         status_code=201,
     )
@@ -181,10 +187,9 @@ async def _revoke(
     request: Request, deps: ToolDeps, store: AccountStore, account_id: str,
     token_id: str, *, by: str,
 ) -> None:
-    before = await store.get_token(account_id, token_id)
-    after = await store.revoke_token(account_id, token_id)
+    after, changed = await store.revoke_token_changed(account_id, token_id)
     await _cut_streams(request, account_id, token_id, reason="account token revoked")
-    if before.revoked_at is None and after.revoked_at is not None:
+    if changed:
         await emit_account_event(
             deps, account_id, "token.revoked",
             {
@@ -193,6 +198,37 @@ async def _revoke(
                 "ip": origin_from_request(request).ip,
             },
         )
+
+
+def _networks_json(token: AccountToken) -> JSONResponse:
+    return JSONResponse(
+        {
+            "network_policy": token.network_policy,
+            "approved_networks": list(token.approved_networks),
+        }
+    )
+
+
+async def _get_networks(
+    request: Request, store: AccountStore, account_id: str
+) -> Response:
+    return _networks_json(await store.get_token(account_id, request.path_params["token_id"]))
+
+
+async def _approve(
+    request: Request, store: AccountStore, account_id: str
+) -> Response:
+    body = await _body(request)
+    scope = body.get("scope")
+    if scope not in ("ip", "network"):
+        raise _bad('scope must be "ip" or "network"')
+    token = await store.approve(account_id, request.path_params["approval_id"], scope)
+    return _networks_json(token)
+
+
+async def _deny(request: Request, store: AccountStore, account_id: str) -> Response:
+    await store.deny(account_id, request.path_params["approval_id"])
+    return Response(status_code=204)
 
 
 async def _set_networks(
@@ -208,12 +244,7 @@ async def _set_networks(
         approved_networks=body.get("approved_networks"),
     )
     await _cut_unapproved_streams(request, store, account_id, token_id)
-    return JSONResponse(
-        {
-            "network_policy": token.network_policy,
-            "approved_networks": list(token.approved_networks),
-        }
-    )
+    return _networks_json(token)
 
 
 # ---------- admin routes ----------
@@ -442,6 +473,44 @@ async def put_my_token_networks(request: Request) -> Response:
         return _error_response(exc)
 
 
+def _admin_account(handler: Any) -> Any:
+    """Wrap ``handler(request, store, account_id)`` as an admin-only route
+    for ``/v1/accounts/{account_id}/...`` (404 for an unknown account)."""
+
+    async def route(request: Request) -> Response:
+        deps = _deps(request)
+        try:
+            store = _store(deps)
+            if (denied := _require_admin(request, deps)) is not None:
+                return denied
+            account_id = request.path_params["account_id"]
+            await store.get(account_id)
+            return await handler(request, store, account_id)  # type: ignore[no-any-return]
+        except ToolError as exc:
+            return _error_response(exc)
+
+    return route
+
+
+def _self_account(handler: Any) -> Any:
+    """Wrap ``handler(request, store, account_id)`` as a ``/v1/me/...`` route."""
+
+    async def route(request: Request) -> Response:
+        deps = _deps(request)
+        try:
+            store = _store(deps)
+            account = await _require_self(request, deps)
+            return await handler(request, store, account.account_id)  # type: ignore[no-any-return]
+        except ToolError as exc:
+            return _error_response(exc)
+
+    return route
+
+
+async def _list_approvals(request: Request, store: AccountStore, account_id: str) -> Response:
+    return JSONResponse({"approvals": await store.list_approvals(account_id)})
+
+
 async def list_my_sessions(request: Request) -> Response:
     deps = _deps(request)
     try:
@@ -535,7 +604,35 @@ def routes() -> list[Route]:
             "/v1/accounts/{account_id}/tokens/{token_id}/networks",
             put_account_token_networks, methods=["PUT"],
         ),
+        Route(
+            "/v1/accounts/{account_id}/tokens/{token_id}/networks",
+            _admin_account(_get_networks), methods=["GET"],
+        ),
         Route("/v1/me/tokens/{token_id}/networks", put_my_token_networks, methods=["PUT"]),
+        Route(
+            "/v1/me/tokens/{token_id}/networks", _self_account(_get_networks), methods=["GET"]
+        ),
+        Route("/v1/me/network-approvals", _self_account(_list_approvals), methods=["GET"]),
+        Route(
+            "/v1/me/network-approvals/{approval_id}/approve",
+            _self_account(_approve), methods=["POST"],
+        ),
+        Route(
+            "/v1/me/network-approvals/{approval_id}/deny",
+            _self_account(_deny), methods=["POST"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals",
+            _admin_account(_list_approvals), methods=["GET"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals/{approval_id}/approve",
+            _admin_account(_approve), methods=["POST"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals/{approval_id}/deny",
+            _admin_account(_deny), methods=["POST"],
+        ),
         Route("/v1/me", get_me, methods=["GET"]),
         Route("/v1/me/tokens", list_my_tokens, methods=["GET"]),
         Route("/v1/me/tokens", create_my_token, methods=["POST"]),

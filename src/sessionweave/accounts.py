@@ -383,22 +383,23 @@ class AccountStore:
 
     async def revoke_token(self, account_id: str, token_id: str) -> AccountToken:
         """Revoke a token. Idempotent: a revoked token keeps its first revoke time."""
+        return (await self.revoke_token_changed(account_id, token_id))[0]
+
+    async def revoke_token_changed(
+        self, account_id: str, token_id: str
+    ) -> tuple[AccountToken, bool]:
+        """Revoke a token; also report whether this call changed the row, so a
+        caller emits ``token.revoked`` exactly once under concurrent revokes."""
         conn = self._write_conn()
         async with self._store._write_tx_lock:
-            await conn.execute(
+            cur = await conn.execute(
                 "UPDATE account_tokens SET revoked_at = ?"
                 " WHERE account_id = ? AND token_id = ? AND revoked_at IS NULL",
                 (int(time.time() * 1000), account_id, token_id),
             )
-        async with self._read().execute(
-            f"SELECT {_TOKEN_COLS} FROM account_tokens"
-            " WHERE account_id = ? AND token_id = ?",
-            (account_id, token_id),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            raise ToolError(ErrorCode.TOKEN_NOT_FOUND, f"unknown token: {token_id}")
-        return AccountToken.from_row(row)
+            changed = cur.rowcount > 0
+            await cur.close()
+        return await self._get_token(account_id, token_id), changed
 
     async def _get_token(self, account_id: str, token_id: str) -> AccountToken:
         async with self._read().execute(
@@ -474,11 +475,17 @@ class AccountStore:
         return res.account, res.token_id
 
     async def authenticate(
-        self, token: str, now_ms: int, origin: Origin | None
+        self,
+        token: str,
+        now_ms: int,
+        origin: Origin | None,
+        *,
+        reject_origin: Origin | None = None,
     ) -> AuthResult:
         """Resolve an account token, applying its network policy to ``origin``.
 
         ``origin=None`` is a trusted internal call: the network check is skipped.
+        ``reject_origin`` only labels a ``token.rejected`` event of such a call.
         """
         async with self._read().execute(
             "SELECT a.account_id, a.name, a.status, a.contact, a.created_by,"
@@ -501,7 +508,9 @@ class AccountStore:
         elif account.status != "active":
             reason = f"account_{account.status}"
         if reason is not None:
-            await self._reject(account.account_id, token_id, label, reason, now_ms, origin)
+            await self._reject(
+                account.account_id, token_id, label, reason, now_ms, origin or reject_origin
+            )
             return AuthResult(None, None)
         policy, networks = row[10], json.loads(row[11])
         if origin is not None and policy != "any":

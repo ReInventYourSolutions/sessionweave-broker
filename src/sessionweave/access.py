@@ -325,17 +325,28 @@ async def resolve_principal(
     if principal is not None:
         return principal
     if auth.owner_account_id and deps.accounts is not None:
-        res = await deps.accounts.authenticate(
-            token, now_ms, Origin(source_ip, request_client.get())
+        # Ownership first, without an origin: a foreign account's token must not
+        # create a pending approval or an event on that other account.
+        owner_check = await deps.accounts.authenticate(
+            token, now_ms, None, reject_origin=Origin(source_ip, request_client.get())
         )
-        if res.account is not None and res.account.account_id == auth.owner_account_id:
-            assert res.token_id is not None
-            return Principal(
-                "creator", account_id=res.account.account_id, account_token_id=res.token_id
+        if (
+            owner_check.account is not None
+            and owner_check.account.account_id == auth.owner_account_id
+        ):
+            res = await deps.accounts.authenticate(
+                token, now_ms, Origin(source_ip, request_client.get())
             )
-        if res.refusal == "network" and res.account_id == auth.owner_account_id:
-            # The owner's own token, valid but not approved for this network.
-            raise ToolError(ErrorCode.NETWORK_NOT_APPROVED, NETWORK_NOT_APPROVED_MESSAGE)
+            if res.account is not None and res.account.account_id == auth.owner_account_id:
+                assert res.token_id is not None
+                return Principal(
+                    "creator",
+                    account_id=res.account.account_id,
+                    account_token_id=res.token_id,
+                )
+            if res.refusal == "network" and res.account_id == auth.owner_account_id:
+                # The owner's own token, valid but not approved for this network.
+                raise ToolError(ErrorCode.NETWORK_NOT_APPROVED, NETWORK_NOT_APPROVED_MESSAGE)
 
     if auth.was_removed(token, now_ms):
         raise ToolError(ErrorCode.PARTICIPANT_REMOVED, PARTICIPANT_REMOVED_MESSAGE)

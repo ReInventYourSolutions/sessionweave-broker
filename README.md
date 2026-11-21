@@ -435,6 +435,112 @@ Checklist for a broker reachable from the internet behind a reverse proxy:
   `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, and memory /
   pids limits.
 
+## Token networks and account events
+
+Account tokens can be bound to networks, and an account can follow what happens
+to it through a cursor-based event channel (relay 0.33.0+).
+
+### Network policies
+
+Every account token has a **network policy** and a list of **approved networks**
+(CIDRs; an exact IP is stored as `/32` or `/128`):
+
+| policy | behaviour |
+|---|---|
+| `any` (default) | no restriction |
+| `first_use` | the network of the first successful use is approved automatically; afterwards only approved networks work |
+| `approved_only` | only networks already approved (given at creation or added later) work |
+
+Set them when minting (`network_policy`, `approved_networks` in the body of
+`POST /v1/me/tokens` and `POST /v1/accounts/{id}/tokens`), or change them later with
+`GET`/`PUT /v1/me/tokens/{token_id}/networks` (admin: `/v1/accounts/{id}/tokens/{token_id}/networks`).
+`approved_networks` in a `PUT` replaces the list. Token listings also show
+`last_used_at` and `last_used_ip`. Removing a network or tightening the policy closes
+firehose streams opened with that token from addresses that are no longer allowed.
+
+```bash
+sessionweave-accounts token-create ACC_ID --label ci --network-policy approved_only \
+  --network 203.0.113.0/24 --network 2001:db8::1
+sessionweave-accounts token-networks ACC_ID TOKEN_ID                    # show
+sessionweave-accounts token-networks ACC_ID TOKEN_ID --policy first_use --network 10.1.0.0/16
+```
+
+The check applies to **every** use of an account token: session creation, the
+`/v1/me` routes, and the token acting as creator of its own sessions (REST, MCP
+creator tools, the firehose WebSocket). Admin, creator, supervisor, join and
+participant tokens are not affected: joining and participating never change.
+
+### Approval flow
+
+A request from a network that is not approved is refused with **403
+`network_not_approved`** ("this token is not approved for your network; the account
+owner has been asked to approve it") and the broker records a **pending approval**
+(`approval_id`, `token_id`, `ip`, `client`, expires after 24 h). Repeated attempts from
+the same address reuse it; a token keeps at most 10 pending approvals. The account
+owner, with another valid token, or the admin then decides:
+
+```bash
+curl -H "Authorization: Bearer $SW_ACCOUNT_TOKEN" $URL/v1/me/network-approvals
+curl -X POST -H "Authorization: Bearer $SW_ACCOUNT_TOKEN" -d '{"scope":"network"}' \
+  $URL/v1/me/network-approvals/APPROVAL_ID/approve     # "ip" = /32 or /128; "network" = /24 or /64
+curl -X POST -H "Authorization: Bearer $SW_ACCOUNT_TOKEN" \
+  $URL/v1/me/network-approvals/APPROVAL_ID/deny
+# admin: /v1/accounts/{id}/network-approvals[...]; CLI: approvals / approve / deny
+sessionweave-accounts approve ACC_ID APPROVAL_ID --scope ip
+```
+
+Approving adds the CIDR to the token's approved networks; denying drops the request
+(the address may ask again). One account can never see or decide another account's
+approvals. Keep a token with policy `any` for the client that makes approvals (the
+Cockpit's own tokens are like that), so the approval path always works.
+
+### Which address is used
+
+The **client address** is the proxy-resolved IP the broker already uses for rate
+limiting: the address uvicorn derives from `X-Forwarded-For`. Set
+`SW_FORWARDED_ALLOW_IPS` to the exact IP of your reverse proxy (see *Running
+publicly*); otherwise either every request looks like it comes from the proxy, or
+(with `*`) a client can forge its address and bypass the binding. A broad network such
+as `0.0.0.0/0` or `::/0` approves every address and so effectively means *any*.
+
+### Account events
+
+The broker keeps an event log per account (retention `SW_ACCOUNT_EVENTS_RETENTION_DAYS`,
+default 30). Event data never contains token values or join links.
+
+| kind | data |
+|---|---|
+| `session.created` | session_id, title, persistence, token (id + label) or `admin`, ip, client |
+| `session.deleted` | session_id, by (`owner`, `admin`, `account_deleted`) |
+| `token.created`, `token.revoked` | token (id + label), by (`self`, `admin`), ip |
+| `token.network_pending` | approval_id, token_id, label, ip, client |
+| `token.network_approved` | token_id, label, ip, cidr |
+| `token.network_denied` | token_id, label, ip |
+| `token.rejected` | a known token was refused (revoked, expired, account not active): token_id, label, reason, ip, client; at most one per token and reason per 10 min |
+| `account.status_changed` | from, to, by |
+
+Read them with `GET /v1/me/events` (own account) or, as admin,
+`GET /v1/accounts/events?account_id=...` (all accounts, or one). Parameters:
+`after` (event id cursor), `limit` (<= 500, default 100), `wait` (<= 60 s long-poll).
+The answer is `{"events": [...], "next": N, "truncated": false}`: store `next` and pass
+it as `after` next time. `truncated: true` means `after` is older than the oldest kept
+event. With `wait`, the call returns as soon as a newer event exists, or empty after
+the wait.
+
+```bash
+after=0
+while true; do
+  page=$(curl -s -H "Authorization: Bearer $SW_ACCOUNT_TOKEN" \
+    "$URL/v1/me/events?after=$after&wait=30")
+  echo "$page" | jq -c '.events[]'
+  after=$(echo "$page" | jq .next)
+done
+sessionweave-accounts events --account ACC_ID --after 120 --wait 30   # admin CLI
+```
+
+Actions a user performs in the Cockpit reach the broker from the Cockpit's server, so
+the event's `ip` is the Cockpit's and the token label is `cockpit`.
+
 ## Architecture (sub-project #1)
 
 Four in-process modules, no external dependencies:
