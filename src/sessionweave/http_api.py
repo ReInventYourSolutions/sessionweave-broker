@@ -121,6 +121,8 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.SESSION_SUSPENDED: 409,
     ErrorCode.ACCOUNT_SESSION_LIMIT: 429,
     ErrorCode.ACCOUNT_TOKEN_LIMIT: 409,
+    ErrorCode.NETWORK_NOT_APPROVED: 403,
+    ErrorCode.APPROVAL_NOT_FOUND: 404,
 }
 
 

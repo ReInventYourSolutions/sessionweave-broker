@@ -1244,8 +1244,8 @@ def build_app() -> Starlette:
                     metrics.session_stranded_recovered_total.inc()
             # Hand store to registry
             registry._store = store
-            tool_deps.accounts = AccountStore(store)
             events = EventLog(store)
+            tool_deps.accounts = AccountStore(store, events=events)
             tool_deps.events = events
             retention_days = account_events_retention_days()
 
