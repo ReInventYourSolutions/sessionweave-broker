@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 
@@ -70,7 +71,7 @@ async def test_first_use_binds_then_refuses(accounts: AccountStore, log: EventLo
     acc, tok, meta = await _setup(accounts, network_policy="first_use")
     assert (await accounts.authenticate(tok, _now(), _o("203.0.113.7"))).account == acc
     (t,) = await accounts.list_tokens(acc.account_id)
-    assert t.approved_networks == ["203.0.113.7/32"]
+    assert t.approved_networks == ("203.0.113.7/32",)
     assert (await accounts.authenticate(tok, _now(), _o("203.0.113.7"))).account == acc
     r1 = await accounts.authenticate(tok, _now(), _o("198.51.100.1"))
     r2 = await accounts.authenticate(tok, _now(), _o("198.51.100.1"))
@@ -90,7 +91,7 @@ async def test_approved_only_cidr(accounts: AccountStore) -> None:
         accounts, network_policy="approved_only", approved_networks=["10.0.5.99/24"]
     )
     (t,) = await accounts.list_tokens(acc.account_id)
-    assert t.approved_networks == ["10.0.5.0/24"]
+    assert t.approved_networks == ("10.0.5.0/24",)
     assert (await accounts.authenticate(tok, _now(), _o("10.0.5.200"))).account == acc
     assert (await accounts.authenticate(tok, _now(), _o("10.0.6.1"))).refusal == "network"
 
@@ -119,12 +120,12 @@ async def test_approve_ip_and_network(accounts: AccountStore, log: EventLog) -> 
     acc, tok, meta = await _setup(accounts, network_policy="approved_only")
     r = await accounts.authenticate(tok, _now(), _o("198.51.100.9"))
     t = await accounts.approve(acc.account_id, _aid(r), "ip")
-    assert t.approved_networks == ["198.51.100.9/32"]
+    assert t.approved_networks == ("198.51.100.9/32",)
     assert await accounts.list_approvals(acc.account_id) == []
     assert (await accounts.authenticate(tok, _now(), _o("198.51.100.9"))).account == acc
     r = await accounts.authenticate(tok, _now(), _o("2001:db8:1:2::5"))
     t = await accounts.approve(acc.account_id, _aid(r), "network")
-    assert t.approved_networks == ["198.51.100.9/32", "2001:db8:1:2::/64"]
+    assert t.approved_networks == ("198.51.100.9/32", "2001:db8:1:2::/64",)
     r = await accounts.authenticate(tok, _now(), _o("192.0.2.77"))
     t = await accounts.approve(acc.account_id, _aid(r), "network")
     assert "192.0.2.0/24" in t.approved_networks
@@ -184,7 +185,7 @@ async def test_set_token_networks_and_validation(accounts: AccountStore) -> None
         acc.account_id, meta.token_id, network_policy="approved_only",
         approved_networks=["192.0.2.5/24"],
     )
-    assert t.network_policy == "approved_only" and t.approved_networks == ["192.0.2.0/24"]
+    assert t.network_policy == "approved_only" and t.approved_networks == ("192.0.2.0/24",)
     t = await accounts.set_token_networks(
         acc.account_id, meta.token_id, network_policy=None, approved_networks=None
     )
@@ -244,3 +245,133 @@ async def test_last_used_written_and_throttled(accounts: AccountStore) -> None:
     await accounts.authenticate(tok, _now(), _o("5.6.7.8"))
     (t,) = await accounts.list_tokens(acc.account_id)
     assert t.last_used_at == first and t.last_used_ip == "1.2.3.4"
+
+
+# ----- Task 3: carried review minors -----
+
+
+async def test_approved_networks_is_hashable_tuple(accounts: AccountStore) -> None:
+    _, _, meta = await _setup(accounts, approved_networks=["192.0.2.0/24"])
+    assert isinstance(meta.approved_networks, tuple)
+    hash(meta)
+    assert meta.to_public()["approved_networks"] == ["192.0.2.0/24"]
+    assert isinstance(meta.to_public()["approved_networks"], list)
+
+
+async def test_concurrent_approve_and_deny_only_one_wins(
+    accounts: AccountStore, log: EventLog
+) -> None:
+    acc, tok, _ = await _setup(accounts, network_policy="approved_only")
+    r = await accounts.authenticate(tok, _now(), _o("198.51.100.9"))
+    res = await asyncio.gather(
+        accounts.approve(acc.account_id, _aid(r), "ip"),
+        accounts.deny(acc.account_id, _aid(r)),
+        accounts.approve(acc.account_id, _aid(r), "network"),
+        accounts.deny(acc.account_id, _aid(r)),
+        return_exceptions=True,
+    )
+    wins = [x for x in res if not isinstance(x, BaseException)]
+    assert len(wins) == 1
+    for x in res:
+        if isinstance(x, BaseException):
+            assert isinstance(x, ToolError) and x.code == ErrorCode.APPROVAL_NOT_FOUND
+    kinds = await _kinds(log)
+    decided = [k for k in kinds if k in ("token.network_approved", "token.network_denied")]
+    assert len(decided) == 1
+
+
+async def test_deny_then_approve_cannot_both_succeed(accounts: AccountStore) -> None:
+    acc, tok, _ = await _setup(accounts, network_policy="approved_only")
+    r = await accounts.authenticate(tok, _now(), _o("198.51.100.9"))
+    await accounts.deny(acc.account_id, _aid(r))
+    with pytest.raises(ToolError) as ei:
+        await accounts.approve(acc.account_id, _aid(r), "ip")
+    assert ei.value.code == ErrorCode.APPROVAL_NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "bad", ["10.0.0.0/8", 5, ["ok", 5], [["10.0.0.0/8"]], {"a": 1}, [None]]
+)
+async def test_bad_network_input_is_invalid_request(accounts: AccountStore, bad) -> None:
+    acc = await accounts.create("Alice")
+    with pytest.raises(ToolError) as ei:
+        await accounts.create_token(acc.account_id, "x", approved_networks=bad)
+    assert ei.value.code == ErrorCode.INVALID_REQUEST
+    _, meta = await accounts.create_token(acc.account_id, "y")
+    with pytest.raises(ToolError) as ei:
+        await accounts.set_token_networks(
+            acc.account_id, meta.token_id, network_policy=None, approved_networks=bad
+        )
+    assert ei.value.code == ErrorCode.INVALID_REQUEST
+
+
+async def test_ipv4_mapped_cidr_normalized(accounts: AccountStore) -> None:
+    _, tok, meta = await _setup(
+        accounts,
+        network_policy="approved_only",
+        approved_networks=["::ffff:1.2.3.4", "::ffff:10.1.2.0/120", "::ffff:0:0/80"],
+    )
+    assert meta.approved_networks[:2] == ("1.2.3.4/32", "10.1.2.0/24")
+    acc = (await accounts.authenticate(tok, _now(), _o("1.2.3.4"))).account
+    assert acc is not None
+    assert (await accounts.authenticate(tok, _now(), _o("10.1.2.77"))).account is not None
+
+
+async def test_unparseable_origin_refused_without_pending(
+    accounts: AccountStore, log: EventLog
+) -> None:
+    acc, tok, _ = await _setup(accounts, network_policy="approved_only")
+    for ip in ("", "not-an-ip", "999.1.1.1"):
+        r = await accounts.authenticate(tok, _now(), _o(ip))
+        assert r.account is None and r.refusal == "network" and r.approval_id is None
+    assert await accounts.list_approvals(acc.account_id) == []
+    assert "token.network_pending" not in await _kinds(log)
+
+
+async def test_expired_pruned_at_most_once_a_minute(
+    accounts: AccountStore, store: PersistenceStore
+) -> None:
+    acc, tok, _ = await _setup(accounts, network_policy="approved_only")
+    now = _now()
+    await accounts.authenticate(tok, now, _o("198.51.100.1"))
+    assert store._write_conn is not None
+    await store._write_conn.execute("UPDATE network_approvals SET expires_at = ?", (now - 1,))
+
+    conn = store._write_conn
+
+    async def rows() -> int:
+        async with conn.execute("SELECT COUNT(*) FROM network_approvals") as c:
+            row = await c.fetchone()
+            assert row is not None
+            return int(row[0])
+
+    await accounts.authenticate(tok, now + 1_000, _o("198.51.100.2"))  # within a minute
+    assert await rows() == 2  # expired row kept (no prune yet)
+    await accounts.authenticate(tok, now + 61_000, _o("198.51.100.3"))
+    assert await rows() == 2  # expired row pruned, two live remain
+    assert len(await accounts.list_approvals(acc.account_id)) == 2
+
+
+async def test_expires_at_index_exists(store: PersistenceStore) -> None:
+    assert store._write_conn is not None
+    async with store._write_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_network_approvals_expires'"
+    ) as c:
+        assert await c.fetchone() is not None
+
+
+async def test_ipv6_pending_deduped_per_slash64(accounts: AccountStore, log: EventLog) -> None:
+    acc, tok, _ = await _setup(accounts, network_policy="approved_only")
+    ids = set()
+    for i in range(20):
+        r = await accounts.authenticate(tok, _now(), _o(f"2001:db8:1:2::{i + 1:x}"))
+        ids.add(r.approval_id)
+    assert len(ids) == 1
+    assert (await _kinds(log)).count("token.network_pending") == 1
+    r = await accounts.authenticate(tok, _now(), _o("2001:db8:1:3::1"))
+    assert r.approval_id not in ids
+    assert len(await accounts.list_approvals(acc.account_id)) == 2
+    # IPv4 stays exact
+    a = await accounts.authenticate(tok, _now(), _o("192.0.2.1"))
+    b = await accounts.authenticate(tok, _now(), _o("192.0.2.2"))
+    assert a.approval_id != b.approval_id

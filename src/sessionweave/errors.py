@@ -53,3 +53,9 @@ class ToolError(Exception):
 
     def to_dict(self) -> dict[str, str]:
         return {"code": self.code.value, "message": self.message}
+
+
+NETWORK_NOT_APPROVED_MESSAGE = (
+    "this token is not approved for your network; "
+    "the account owner has been asked to approve it"
+)

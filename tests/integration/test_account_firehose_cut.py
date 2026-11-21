@@ -11,8 +11,11 @@ import pytest
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from sessionweave.account_events import Origin
 from tests.integration.accounts_fixtures import ADMIN, Seeded, seeded_relay
 from tests.integration.client import bearer
+
+ORIGIN = Origin(ip="127.0.0.1", client=None)
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -106,15 +109,19 @@ async def test_recheck_after_subscribe_closes_revoked_token() -> None:
     class _Accounts:
         result: Any = None
 
-        async def match_token_with_id(self, token: str, now_ms: int) -> Any:
-            return self.result
+        async def authenticate(self, token: str, now_ms: int, origin: Any) -> Any:
+            if self.result is None:
+                return SimpleNamespace(account=None, token_id=None, refusal=None)
+            return SimpleNamespace(
+                account=self.result[0], token_id=self.result[1], refusal=None
+            )
 
     accounts = _Accounts()
     hot = SimpleNamespace(auth=SimpleNamespace(owner_account_id="acc_1"))
     deps = SimpleNamespace(accounts=accounts, registry=SimpleNamespace(get=lambda sid: hot))
     accounts.result = (acc, "tok_1")
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is True
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is True
     accounts.result = None  # revoked
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is False
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is False
     accounts.result = (SimpleNamespace(account_id="acc_2"), "tok_9")
-    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1") is False
+    assert await events_ws._account_token_still_valid(deps, "s", "t", "acc_1", ORIGIN) is False

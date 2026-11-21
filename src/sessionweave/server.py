@@ -25,7 +25,12 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter, admin_matches
-from sessionweave.account_events import EventLog
+from sessionweave.account_events import (
+    EventLog,
+    RequestClientMiddleware,
+    client_label,
+    request_client,
+)
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -335,8 +340,24 @@ def _build_fastmcp(
         return getattr(getattr(ctx, "request_context", None), "request", None)
 
     def _client_ip(ctx: Context | None) -> str:
+        """The request's client IP; also records this tool call's client label
+        (User-Agent plus MCP clientInfo) for the account-token origin."""
+        request_client.set(_client_label(ctx))
         client = getattr(_request_of(ctx), "client", None)
         return getattr(client, "host", "") or ""
+
+    def _client_label(ctx: Context | None) -> str | None:
+        headers = getattr(_request_of(ctx), "headers", None)
+        ua = headers.get("user-agent") if headers is not None else None
+        info = None
+        try:
+            params = ctx.session.client_params if ctx is not None else None
+            info = getattr(params, "client_info", None) or getattr(params, "clientInfo", None)
+        except Exception:  # no session (stateless call) or an older SDK shape
+            info = None
+        return client_label(
+            ua, getattr(info, "name", None), getattr(info, "version", None)
+        )
 
     def _bearer_of(ctx: Context | None) -> str | None:
         """Bearer token of the MCP HTTP request's Authorization header, if any."""
@@ -1247,6 +1268,7 @@ def build_app() -> Starlette:
             events = EventLog(store)
             tool_deps.accounts = AccountStore(store, events=events)
             tool_deps.events = events
+            registry.events = events
             retention_days = account_events_retention_days()
 
             async def _prune_events(now_ms: int) -> None:
@@ -1292,6 +1314,7 @@ def build_app() -> Starlette:
         middleware=[
             cors_cfg.as_middleware(),  # outermost: error responses keep CORS headers
             Middleware(RequestSizeLimitMiddleware),
+            Middleware(RequestClientMiddleware),
         ],
         lifespan=lifespan,
     )

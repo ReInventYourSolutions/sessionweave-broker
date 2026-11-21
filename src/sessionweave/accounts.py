@@ -14,7 +14,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from sessionweave.access import hash_token
@@ -63,6 +63,7 @@ APPROVAL_TTL_MS = 24 * 3_600_000
 MAX_PENDING_PER_TOKEN = 10
 REJECTED_EVENT_INTERVAL_MS = 10 * 60_000
 LAST_USED_INTERVAL_MS = 60_000
+APPROVALS_PRUNE_INTERVAL_MS = 60_000
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class AccountToken:
     expires_at: int | None
     revoked_at: int | None
     network_policy: str = "any"
-    approved_networks: list[str] = field(default_factory=list)
+    approved_networks: tuple[str, ...] = ()
     last_used_at: int | None = None
     last_used_ip: str | None = None
 
@@ -102,7 +103,7 @@ class AccountToken:
     def from_row(cls, row: Any) -> AccountToken:
         return cls(
             row[0], row[1], row[2], row[3], row[4], row[5],
-            row[6], json.loads(row[7]), row[8], row[9],
+            row[6], tuple(json.loads(row[7])), row[8], row[9],
         )
 
     def to_public(self) -> dict[str, Any]:
@@ -126,6 +127,8 @@ class AuthResult:
     token_id: str | None
     refusal: Literal["network"] | None = None
     approval_id: str | None = None
+    token_label: str | None = None
+    account_id: str | None = None
 
 
 def _parse_ip(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -135,20 +138,42 @@ def _parse_ip(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     return ip
 
 
-def _normalize_cidr(raw: str) -> str:
+def _normalize_cidr(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ToolError(ErrorCode.INVALID_REQUEST, "networks must be strings")
     try:
-        return str(ipaddress.ip_network(raw.strip(), strict=False))
+        net = ipaddress.ip_network(raw.strip(), strict=False)
     except ValueError as exc:
         raise ToolError(ErrorCode.INVALID_REQUEST, f"invalid network: {raw!r}") from exc
+    if (
+        isinstance(net, ipaddress.IPv6Network)
+        and net.prefixlen >= 96
+        and net.network_address.ipv4_mapped is not None
+    ):
+        # ::ffff:a.b.c.d/N is the IPv4 network a.b.c.d/(N-96): _parse_ip maps
+        # client addresses the same way, so store the IPv4 form.
+        net = ipaddress.IPv4Network(
+            (net.network_address.ipv4_mapped, net.prefixlen - 96), strict=False
+        )
+    return str(net)
 
 
-def _normalize_networks(raw: list[str]) -> list[str]:
+def _normalize_networks(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        raise ToolError(ErrorCode.INVALID_REQUEST, "approved_networks must be a list")
     out: list[str] = []
     for item in raw:
         cidr = _normalize_cidr(item)
         if cidr not in out:
             out.append(cidr)
     return out
+
+
+def _pending_key(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """Pending approvals are one per address (IPv4) or per /64 (IPv6)."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
 
 
 def _check_policy(policy: str) -> None:
@@ -191,6 +216,7 @@ class AccountStore:
         self.events = events
         self._rejected: dict[tuple[str, str], int] = {}
         self._last_used: dict[str, int] = {}
+        self._approvals_pruned_at = 0
 
     async def _emit(self, account_id: str, kind: str, data: dict[str, Any]) -> None:
         if self.events is not None:
@@ -304,7 +330,9 @@ class AccountStore:
                 f"token label must be 1-{LABEL_MAX_LEN} characters",
             )
         _check_policy(network_policy)
-        networks = _normalize_networks(approved_networks or [])
+        networks = _normalize_networks(
+            approved_networks if approved_networks is not None else []
+        )
         await self.get(account_id)
         plaintext = TOKEN_PREFIX + secrets.token_urlsafe(32)
         meta = AccountToken(
@@ -315,7 +343,7 @@ class AccountStore:
             expires_at=expires_at_ms,
             revoked_at=None,
             network_policy=network_policy,
-            approved_networks=networks,
+            approved_networks=tuple(networks),
         )
         conn = self._write_conn()
         async with self._store._write_tx_lock:
@@ -382,6 +410,23 @@ class AccountStore:
         if row is None:
             raise ToolError(ErrorCode.TOKEN_NOT_FOUND, f"unknown token: {token_id}")
         return AccountToken.from_row(row)
+
+    async def get_token(self, account_id: str, token_id: str) -> AccountToken:
+        return await self._get_token(account_id, token_id)
+
+    @staticmethod
+    def network_allows(token: AccountToken, ip: str) -> bool:
+        """Whether ``ip`` may use ``token`` under its current policy and networks.
+
+        A pure check (no approvals, no first-use binding): used to decide which
+        live streams to close after a policy change.
+        """
+        if token.network_policy == "any":
+            return True
+        try:
+            return _ip_in(_parse_ip(ip), list(token.approved_networks))
+        except ValueError:
+            return False
 
     async def set_token_networks(
         self,
@@ -467,7 +512,9 @@ class AccountStore:
                 return refusal
         if origin is not None:
             await self._touch(token_id, row[12], now_ms, origin)
-        return AuthResult(account, token_id)
+        return AuthResult(
+            account, token_id, token_label=label, account_id=account.account_id
+        )
 
     async def _reject(
         self,
@@ -530,9 +577,15 @@ class AccountStore:
                         return None
                     if current is not None and _ip_in(ip, current):
                         return None
-        ip_text = str(ip) if ip is not None else origin.ip
+        if ip is None:
+            # No usable address to approve: refuse, but record nothing.
+            return AuthResult(
+                None, token_id, refusal="network",
+                token_label=label, account_id=account.account_id,
+            )
+        ip_text = str(ip)
         approval_id, created = await self._pending(
-            account.account_id, token_id, ip_text, origin.client, now_ms
+            account.account_id, token_id, ip, origin.client, now_ms
         )
         if created:
             await self._emit(
@@ -546,28 +599,56 @@ class AccountStore:
                     "client": origin.client,
                 },
             )
-        return AuthResult(None, token_id, refusal="network", approval_id=approval_id)
+        return AuthResult(
+            None, token_id, refusal="network", approval_id=approval_id,
+            token_label=label, account_id=account.account_id,
+        )
+
+    async def _find_pending(
+        self, conn: Any, token_id: str, key: str, now_ms: int
+    ) -> str | None:
+        async with conn.execute(
+            "SELECT approval_id, ip FROM network_approvals"
+            " WHERE token_id = ? AND expires_at > ? ORDER BY created_at, rowid",
+            (token_id, now_ms),
+        ) as cur:
+            for approval_id, ip_text in await cur.fetchall():
+                try:
+                    if _pending_key(_parse_ip(ip_text)) == key:
+                        return str(approval_id)
+                except ValueError:
+                    continue
+        return None
 
     async def _pending(
-        self, account_id: str, token_id: str, ip: str, client: str | None, now_ms: int
+        self,
+        account_id: str,
+        token_id: str,
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        client: str | None,
+        now_ms: int,
     ) -> tuple[str, bool]:
+        key = _pending_key(ip)
+        # Repeats (the common case under attack) are answered from a read
+        # connection: no write transaction per refused request.
+        found = await self._find_pending(self._read(), token_id, key, now_ms)
+        if found is not None:
+            return found, False
         conn = self._write_conn()
         async with self._store._write_tx_lock:
-            await conn.execute(
-                "DELETE FROM network_approvals WHERE expires_at <= ?", (now_ms,)
-            )
-            async with conn.execute(
-                "SELECT approval_id FROM network_approvals WHERE token_id = ? AND ip = ?",
-                (token_id, ip),
-            ) as cur:
-                existing = await cur.fetchone()
-            if existing is not None:
-                return existing[0], False
+            found = await self._find_pending(conn, token_id, key, now_ms)
+            if found is not None:
+                return found, False
+            if now_ms - self._approvals_pruned_at >= APPROVALS_PRUNE_INTERVAL_MS:
+                self._approvals_pruned_at = now_ms
+                await conn.execute(
+                    "DELETE FROM network_approvals WHERE expires_at <= ?", (now_ms,)
+                )
             approval_id = "apr_" + secrets.token_hex(8)
             await conn.execute(
                 "INSERT INTO network_approvals (approval_id, token_id, account_id, ip,"
                 " client, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (approval_id, token_id, account_id, ip, client, now_ms,
+                (approval_id, token_id, account_id, str(ip), client, now_ms,
                  now_ms + APPROVAL_TTL_MS),
             )
             await conn.execute(
@@ -616,25 +697,19 @@ class AccountStore:
                 async for r in cur
             ]
 
-    async def _take_approval(
-        self, account_id: str, approval_id: str, *, delete: bool
+    async def _live_approval(
+        self, account_id: str, approval_id: str, now_ms: int
     ) -> tuple[str, str, str]:
-        """(token_id, label, ip) of a live approval of this account."""
-        now_ms = int(time.time() * 1000)
-        async with self._store._write_tx_lock:
-            async with self._write_conn().execute(
-                "SELECT a.token_id, t.label, a.ip FROM network_approvals a"
-                " JOIN account_tokens t ON t.token_id = a.token_id"
-                " WHERE a.approval_id = ? AND a.account_id = ? AND a.expires_at > ?",
-                (approval_id, account_id, now_ms),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise _approval_not_found(approval_id)
-            if delete:
-                await self._write_conn().execute(
-                    "DELETE FROM network_approvals WHERE approval_id = ?", (approval_id,)
-                )
+        """(token_id, label, ip) of a live approval; caller holds the write lock."""
+        async with self._write_conn().execute(
+            "SELECT a.token_id, t.label, a.ip FROM network_approvals a"
+            " JOIN account_tokens t ON t.token_id = a.token_id"
+            " WHERE a.approval_id = ? AND a.account_id = ? AND a.expires_at > ?",
+            (approval_id, account_id, now_ms),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise _approval_not_found(approval_id)
         return row[0], row[1], row[2]
 
     async def approve(
@@ -642,20 +717,24 @@ class AccountStore:
     ) -> AccountToken:
         if scope not in ("ip", "network"):
             raise ToolError(ErrorCode.INVALID_REQUEST, f"invalid approval scope: {scope!r}")
-        token_id, label, ip_text = await self._take_approval(
-            account_id, approval_id, delete=False
-        )
-        try:
-            ip = _parse_ip(ip_text)
-        except ValueError as exc:
-            raise ToolError(ErrorCode.INVALID_REQUEST, "approval has an invalid address") from exc
-        if scope == "ip":
-            cidr = _host_cidr(ip)
-        else:
-            prefix = 24 if ip.version == 4 else 64
-            cidr = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+        # Lookup and mutation share one locked section, so a concurrent
+        # approve/deny of the same approval cannot both succeed.
         async with self._store._write_tx_lock:
             conn = self._write_conn()
+            token_id, label, ip_text = await self._live_approval(
+                account_id, approval_id, int(time.time() * 1000)
+            )
+            try:
+                ip = _parse_ip(ip_text)
+            except ValueError as exc:
+                raise ToolError(
+                    ErrorCode.INVALID_REQUEST, "approval has an invalid address"
+                ) from exc
+            if scope == "ip":
+                cidr = _host_cidr(ip)
+            else:
+                prefix = 24 if ip.version == 4 else 64
+                cidr = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
             async with conn.execute(
                 "SELECT approved_networks FROM account_tokens WHERE token_id = ?",
                 (token_id,),
@@ -681,9 +760,13 @@ class AccountStore:
         return await self._get_token(account_id, token_id)
 
     async def deny(self, account_id: str, approval_id: str) -> None:
-        token_id, label, ip_text = await self._take_approval(
-            account_id, approval_id, delete=True
-        )
+        async with self._store._write_tx_lock:
+            token_id, label, ip_text = await self._live_approval(
+                account_id, approval_id, int(time.time() * 1000)
+            )
+            await self._write_conn().execute(
+                "DELETE FROM network_approvals WHERE approval_id = ?", (approval_id,)
+            )
         await self._emit(
             account_id,
             "token.network_denied",

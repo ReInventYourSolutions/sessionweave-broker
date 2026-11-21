@@ -26,6 +26,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from sessionweave.access import participant_id_for_token
+from sessionweave.account_events import Origin, client_label
 from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.supervisor import SupervisorRequestError, parse_supervisor_request
@@ -215,10 +216,11 @@ def _deps(request: Request) -> ToolDeps:
 async def create_session(request: Request) -> JSONResponse:
     deps = _deps(request)
     bearer = _bearer(request)
-    source_ip = _request_source_ip(request)
+    origin = origin_from_request(request)
+    source_ip = origin.ip
     try:
         # Authenticate before touching the (possibly huge) body.
-        await check_creation_credential(deps, bearer, source_ip)
+        await check_creation_credential(deps, bearer, source_ip, origin=origin)
         body = await _read_json_body(request)
         out = await session_create(
             deps,
@@ -226,6 +228,7 @@ async def create_session(request: Request) -> JSONResponse:
             public_base_url=_public_base_url(request),
             bearer=bearer,
             source_ip=source_ip,
+            origin=origin,
         )
     except ToolError as exc:
         return _error_response(exc)
@@ -844,6 +847,13 @@ async def _get_session_events_handler(request: Request) -> Response:
             status_code=_STATUS_BY_CODE.get(e.code, 500),
         )
     return JSONResponse(result, status_code=200)
+
+
+def origin_from_request(request: Request) -> Origin:
+    """Where an HTTP request came from: trusted client IP plus its User-Agent."""
+    return Origin(
+        _request_source_ip(request), client_label(request.headers.get("user-agent"))
+    )
 
 
 def _request_source_ip(request: Request) -> str:

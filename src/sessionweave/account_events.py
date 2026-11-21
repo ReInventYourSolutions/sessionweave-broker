@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sessionweave.persistence import PersistenceStore
+if TYPE_CHECKING:
+    from sessionweave.persistence import PersistenceStore
 
 _DAY_MS = 86_400_000
 
@@ -24,6 +26,55 @@ class Origin:
 
     ip: str
     client: str | None
+
+
+CLIENT_MAX_LEN = 200
+
+# Client label (User-Agent) of the HTTP/WebSocket request being served, set by
+# RequestClientMiddleware so deep call paths (resolve_principal) can build an
+# Origin without threading the header through every signature.
+request_client: ContextVar[str | None] = ContextVar("sw_request_client", default=None)
+
+
+def client_label(
+    user_agent: str | None, mcp_name: str | None = None, mcp_version: str | None = None
+) -> str | None:
+    """Printable, bounded client description: User-Agent plus MCP clientInfo."""
+
+    def clean(v: str | None) -> str:
+        return "".join(c for c in (v or "") if c.isprintable()).strip()
+
+    ua = clean(user_agent)
+    mcp = " ".join(x for x in (clean(mcp_name), clean(mcp_version)) if x)
+    if ua and mcp:
+        out = f"{ua} (mcp: {mcp})"
+    elif mcp:
+        out = f"mcp: {mcp}"
+    else:
+        out = ua
+    return out[:CLIENT_MAX_LEN] or None
+
+
+class RequestClientMiddleware:
+    """Pure ASGI middleware: expose the request's User-Agent via ``request_client``."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        ua = None
+        for k, v in scope.get("headers") or ():
+            if k == b"user-agent":
+                ua = v.decode("latin-1")
+                break
+        token = request_client.set(client_label(ua))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            request_client.reset(token)
 
 
 def _event(row: tuple[Any, ...]) -> dict[str, Any]:

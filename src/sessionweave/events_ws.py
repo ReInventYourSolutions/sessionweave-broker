@@ -36,6 +36,7 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from sessionweave.access import participant_id_for_token
+from sessionweave.account_events import Origin, request_client
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.tools import ToolDeps
 
@@ -289,16 +290,17 @@ async def events_ws(websocket: WebSocket) -> None:
 
 
 async def _account_token_still_valid(
-    deps: Any, sid: str, token: str, account_id: str | None
+    deps: Any, sid: str, token: str, account_id: str | None, origin: Origin
 ) -> bool:
-    """Same test ``resolve_principal`` applies to an owner-account token."""
+    """Same test ``resolve_principal`` applies to an owner-account token,
+    including the token's network policy for ``origin``."""
     hot = deps.registry.get(sid)
     if hot is None or deps.accounts is None:
         return False
-    matched = await deps.accounts.match_token_with_id(token, int(time.time() * 1000))
+    res = await deps.accounts.authenticate(token, int(time.time() * 1000), origin)
     return (
-        matched is not None
-        and matched[0].account_id == account_id
+        res.account is not None
+        and res.account.account_id == account_id
         and hot.auth.owner_account_id == account_id
     )
 
@@ -316,6 +318,7 @@ async def firehose_ws(websocket: WebSocket) -> None:
     from sessionweave.access import require, resolve_principal
 
     source_ip = (websocket.client.host if websocket.client is not None else "") or ""
+    origin = Origin(source_ip, request_client.get())
     try:
         principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
         require(principal, "supervisor", "creator", "admin")
@@ -325,7 +328,12 @@ async def firehose_ws(websocket: WebSocket) -> None:
             if exc.code is ErrorCode.SESSION_NOT_FOUND
             else _CLOSE_MISSING_TOKEN
         )
-        await websocket.close(code=code, reason="invalid token")
+        reason = (
+            "network_not_approved"
+            if exc.code is ErrorCode.NETWORK_NOT_APPROVED
+            else "invalid token"
+        )
+        await websocket.close(code=code, reason=reason)
         return
 
     await websocket.accept()
@@ -334,6 +342,7 @@ async def firehose_ws(websocket: WebSocket) -> None:
         token_id=principal.token_id,
         account_id=principal.account_id,
         account_token_id=principal.account_token_id,
+        source_ip=source_ip,
     )
     hot = deps.registry.get(sid)
     if principal.token_id is not None and (
@@ -343,7 +352,7 @@ async def firehose_ws(websocket: WebSocket) -> None:
         sub.close_reason = "supervisor token revoked"
         sub.closed.set()
     if principal.account_token_id is not None and not await _account_token_still_valid(
-        deps, sid, token, principal.account_id
+        deps, sid, token, principal.account_id, origin
     ):
         # Revoked / disabled between the token check and the subscription.
         sub.close_reason = "account token revoked"
