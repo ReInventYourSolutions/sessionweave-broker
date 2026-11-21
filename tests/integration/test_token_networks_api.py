@@ -13,7 +13,7 @@ import pytest
 from sessionweave.accounts import AccountStore
 from sessionweave.persistence import PersistenceStore
 from tests.integration.accounts_fixtures import ADMIN
-from tests.integration.client import bearer
+from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -277,3 +277,81 @@ async def test_events_example_shape(tmp_path: Path) -> None:
         ).json()
         assert body["events"][0]["kind"] == "token.network_pending"
         assert body["next"] == body["events"][-1]["event_id"]
+
+
+async def test_invalid_put_bodies_and_admin_approve_body(tmp_path: Path) -> None:
+    async with rig(tmp_path) as r, httpx.AsyncClient(base_url=r.base) as c:
+        bodies = (
+            {"approved_networks": "10.0.0.0/8"},
+            {"approved_networks": [5]},
+            {"approved_networks": ["nope"]},
+            {"network_policy": "bogus"},
+            {"network_policy": 3},
+        )
+        for body in bodies:
+            self_put = await c.put(
+                f"/v1/me/tokens/{r.a_bound_id}/networks", json=body, headers=bearer(r.a_free)
+            )
+            assert self_put.status_code == 400, (body, self_put.text)
+            adm_put = await c.put(
+                f"/v1/accounts/{r.a_id}/tokens/{r.a_bound_id}/networks",
+                json=body, headers=bearer(ADMIN),
+            )
+            assert adm_put.status_code == 400, (body, adm_put.text)
+        await _pend(c, r.a_bound)
+        base = f"/v1/accounts/{r.a_id}/network-approvals"
+        aid = (await c.get(base, headers=bearer(ADMIN))).json()["approvals"][0]["approval_id"]
+        for body in ({}, {"scope": "all"}, {"scope": 3}):
+            resp = await c.post(f"{base}/{aid}/approve", json=body, headers=bearer(ADMIN))
+            assert resp.status_code == 400, (body, resp.text)
+        # admin deny with the wrong account id: 404, approval untouched
+        wrong = await c.post(
+            f"/v1/accounts/{r.b_id}/network-approvals/{aid}/deny", headers=bearer(ADMIN)
+        )
+        assert wrong.status_code == 404
+        assert len((await c.get(base, headers=bearer(ADMIN))).json()["approvals"]) == 1
+
+
+async def test_mcp_join_with_join_token_from_unapproved_ip(tmp_path: Path) -> None:
+    async with rig(tmp_path) as r, httpx.AsyncClient(base_url=r.base) as c:
+        made = (await c.post("/v1/sessions", json={}, headers=_h(r.a_free, GOOD))).json()
+        async with sw_client(r.base, headers={"X-Forwarded-For": BAD, "User-Agent": UA}) as m:
+            out = await m.call_tool(
+                "session_join",
+                {"session_id": made["session_id"], "join_token": made["join_token"],
+                 "role": "w"},
+            )
+        assert out["participant_id"]
+
+
+async def test_foreign_revoked_token_records_rejected_on_its_own_account_only(
+    tmp_path: Path,
+) -> None:
+    async with rig(tmp_path) as r, httpx.AsyncClient(base_url=r.base) as c:
+        sid = (
+            await c.post("/v1/sessions", json={}, headers=_h(r.a_free, GOOD))
+        ).json()["session_id"]
+        made = await c.post(
+            f"/v1/accounts/{r.b_id}/tokens",
+            json={"label": "gone", "network_policy": "approved_only"},
+            headers=bearer(ADMIN),
+        )
+        assert made.status_code == 201
+        assert (
+            await c.delete(
+                f"/v1/accounts/{r.b_id}/tokens/{made.json()['token_id']}",
+                headers=bearer(ADMIN),
+            )
+        ).status_code == 204
+        resp = await c.delete(f"/v1/sessions/{sid}", headers=_h(made.json()["token"], BAD))
+        assert resp.status_code == 403
+        bob = (await c.get("/v1/me/events", headers=bearer(r.b_free))).json()["events"]
+        rejected = [e for e in bob if e["kind"] == "token.rejected"]
+        assert len(rejected) == 1
+        assert rejected[0]["data"]["reason"] == "revoked" and rejected[0]["data"]["ip"] == BAD
+        assert [e for e in bob if e["kind"].startswith("token.network_")] == []
+        assert (await c.get("/v1/me/network-approvals", headers=bearer(r.b_free))).json() == {
+            "approvals": []
+        }
+        alice = (await c.get("/v1/me/events", headers=bearer(r.a_free))).json()["events"]
+        assert [e for e in alice if e["kind"] == "token.rejected"] == []

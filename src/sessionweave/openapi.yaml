@@ -2244,7 +2244,6 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /v1/me/network-approvals:
-    parameters:
     get:
       tags: [me]
       summary: Pending network approvals (not expired)

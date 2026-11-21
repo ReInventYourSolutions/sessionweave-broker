@@ -486,6 +486,11 @@ class AccountStore:
 
         ``origin=None`` is a trusted internal call: the network check is skipped.
         ``reject_origin`` only labels a ``token.rejected`` event of such a call.
+
+        A revoked, expired or inactive-account token always records
+        ``token.rejected`` on the token's own account, even when presented on
+        another account's session; it never creates a pending approval or a
+        network event.
         """
         async with self._read().execute(
             "SELECT a.account_id, a.name, a.status, a.contact, a.created_by,"

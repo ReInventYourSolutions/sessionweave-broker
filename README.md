@@ -538,6 +538,10 @@ done
 sessionweave-accounts events --account ACC_ID --after 120 --wait 30   # admin CLI
 ```
 
+A revoked or expired account token (or one of a non-active account) that is presented
+on *another* account's session still records `token.rejected` on the token's own
+account; it never creates a pending approval or a network event, on either account.
+
 Actions a user performs in the Cockpit reach the broker from the Cockpit's server, so
 the event's `ip` is the Cockpit's and the token label is `cockpit`.
 
