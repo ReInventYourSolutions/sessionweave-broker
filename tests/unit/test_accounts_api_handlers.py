@@ -37,7 +37,7 @@ async def test_patch_disabled_batch_failure_keeps_status_and_retry_succeeds(
     acc = await accounts.create("alice")
     reg = _Registry()
     deps: Any = SimpleNamespace(
-        accounts=accounts, registry=reg, admin_token="adm",
+        accounts=accounts, events=None, registry=reg, admin_token="adm",
         auth_limiter=SimpleNamespace(
             is_throttled=lambda *a: False, record_failure=lambda *a: None
         ),
@@ -71,7 +71,7 @@ async def test_delete_row_failure_is_503_and_retry_works(
             return 0
 
     deps: Any = SimpleNamespace(
-        accounts=accounts, registry=_Reg(), admin_token="adm",
+        accounts=accounts, events=None, registry=_Reg(), admin_token="adm",
         auth_limiter=SimpleNamespace(
             is_throttled=lambda *a: False, record_failure=lambda *a: None
         ),
@@ -114,7 +114,7 @@ async def test_patch_disabled_cuts_streams_even_when_suspend_fails(tmp_path: Pat
             cut.append(account_id)
 
     deps: Any = SimpleNamespace(
-        accounts=accounts, registry=_Registry(), admin_token="adm",
+        accounts=accounts, events=None, registry=_Registry(), admin_token="adm",
         auth_limiter=SimpleNamespace(
             is_throttled=lambda *a: False, record_failure=lambda *a: None
         ),

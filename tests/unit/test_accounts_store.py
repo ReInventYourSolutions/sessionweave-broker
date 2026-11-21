@@ -133,3 +133,12 @@ async def test_migration_adds_session_columns(store: PersistenceStore) -> None:
     async with store._read_pool[0].execute("PRAGMA table_info(sessions)") as cur:
         cols = {row[1] async for row in cur}
     assert {"owner_account_id", "suspended"} <= cols
+
+
+async def test_revoke_token_changed_reports_first_revoke_only(accounts: AccountStore) -> None:
+    acc = await accounts.create("Alice")
+    _, meta = await accounts.create_token(acc.account_id, "cli")
+    first, changed1 = await accounts.revoke_token_changed(acc.account_id, meta.token_id)
+    second, changed2 = await accounts.revoke_token_changed(acc.account_id, meta.token_id)
+    assert (changed1, changed2) == (True, False)
+    assert first.revoked_at == second.revoked_at is not None

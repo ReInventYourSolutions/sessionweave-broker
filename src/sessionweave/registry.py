@@ -21,6 +21,7 @@ from sessionweave.session import MAX_PURPOSE_BYTES, Session
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sessionweave.account_events import EventLog
     from sessionweave.persistence import PersistenceStore
     from sessionweave.schemas import PersistenceConfig, PersistenceStatePublic
 
@@ -33,6 +34,13 @@ _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES
 # the sleep keeps that lateness bounded without forcing a per-event
 # heap re-push.
 _MAX_SLEEP_SECONDS = 1.0
+
+# delete() reason -> ``by`` of the session.deleted account event.
+_DELETED_BY = {
+    "host_deleted": "owner",
+    "admin_deleted": "admin",
+    "account_deleted": "account_deleted",
+}
 
 
 def _utcnow() -> datetime:
@@ -67,6 +75,7 @@ class SessionRegistry:
         "_sessions",
         "_store",
         "_wake",
+        "events",
     )
 
     def __init__(
@@ -85,6 +94,8 @@ class SessionRegistry:
         self._metrics = metrics
         self._firehose = firehose
         self._store = store
+        # Account event log (set when accounts are enabled): owned-session deletes are recorded.
+        self.events: EventLog | None = None
         # heap entries are (deadline_epoch_seconds, sid). A session may
         # appear multiple times after re-pushes; lazy invalidation drops
         # stale entries on pop.
@@ -409,6 +420,7 @@ class SessionRegistry:
         from RAM. Returns ISO timestamp.
         """
         sess = await self.get_or_raise(sid)
+        owner_account_id = sess.auth.owner_account_id
         async with sess.lock:
             sess.broadcast_session_ended(reason=reason)
             sess.close_all_subscribers()
@@ -432,6 +444,15 @@ class SessionRegistry:
                 self._metrics.sessions_active.dec()
             except Exception:
                 pass
+        if owner_account_id is not None and self.events is not None:
+            by = _DELETED_BY.get(reason)
+            if by is not None:
+                try:
+                    await self.events.emit(
+                        owner_account_id, "session.deleted", {"session_id": sid, "by": by}
+                    )
+                except Exception:
+                    logger.exception("could not record session.deleted for %s", sid)
         return _isoformat(_utcnow())
 
     async def owned_session_ids(self, account_id: str) -> list[str]:
@@ -569,7 +590,9 @@ class SessionRegistry:
         return purged
 
     async def sweep_expired_loop(self, *, interval_seconds: int,
-                                  safety_seconds: int) -> None:
+                                  safety_seconds: int,
+                                  on_tick: Callable[[int], Awaitable[object]] | None = None,
+                                  ) -> None:
         """Periodic loop scheduled at server startup; runs until cancelled."""
         import time as _time
         while True:
@@ -582,6 +605,13 @@ class SessionRegistry:
                 raise
             except Exception:
                 pass
+            if on_tick is not None:
+                try:
+                    await on_tick(int(_time.time() * 1000))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("periodic tick failed: %s", type(exc).__name__)
             try:
                 await asyncio.sleep(interval_seconds)
             except asyncio.CancelledError:

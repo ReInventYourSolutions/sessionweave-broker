@@ -39,6 +39,8 @@ class ErrorCode(StrEnum):
     SESSION_SUSPENDED = "session_suspended"
     ACCOUNT_SESSION_LIMIT = "account_session_limit"
     ACCOUNT_TOKEN_LIMIT = "account_token_limit"
+    NETWORK_NOT_APPROVED = "network_not_approved"
+    APPROVAL_NOT_FOUND = "approval_not_found"
 
 
 @dataclass(slots=True)
@@ -51,3 +53,9 @@ class ToolError(Exception):
 
     def to_dict(self) -> dict[str, str]:
         return {"code": self.code.value, "message": self.message}
+
+
+NETWORK_NOT_APPROVED_MESSAGE = (
+    "this token is not approved for your network; "
+    "the account owner has been asked to approve it"
+)

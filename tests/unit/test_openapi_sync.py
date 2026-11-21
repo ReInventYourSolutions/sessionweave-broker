@@ -73,3 +73,21 @@ def test_openapi_session_config_schema_lists_every_config_field() -> None:
         f"openapi.yaml SessionConfig schema is missing fields: {missing}. "
         f"Every dataclass field on config.SessionConfig must be documented."
     )
+
+
+def test_openapi_has_no_bare_keys() -> None:
+    """A key with no value and no nested block parses to null (invalid for
+    ``parameters``, ``responses``...). Checked on the text, stdlib only: only
+    structural keys (identifier or path/status-code keys) are considered, and
+    free text (block scalars, prose) is skipped."""
+    lines = (_project_root() / "src/sessionweave/openapi.yaml").read_text().splitlines()
+    bare = []
+    for i, line in enumerate(lines):
+        if not re.match(r"^\s*(?:[A-Za-z_][\w.-]*|'\d+'|/[^\s:]*):\s*$", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        nxt = next((x for x in lines[i + 1:] if x.strip() and not x.lstrip().startswith("#")), "")
+        n_indent = len(nxt) - len(nxt.lstrip())
+        if n_indent < indent or (n_indent == indent and not nxt.lstrip().startswith("- ")):
+            bare.append(f"{i + 1}: {line.strip()}")
+    assert bare == []

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -32,6 +33,8 @@ class FirehoseSubscriber:
     # The owner account (and its token) that authenticated this stream, if any.
     account_id: str | None = None
     account_token_id: str | None = None
+    # Client address the stream was opened from ("" when unknown).
+    source_ip: str = ""
     # Set when the stream must end (e.g. its token was revoked); the reason
     # is sent as the WebSocket close reason.
     closed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -56,6 +59,7 @@ class FirehoseRegistry:
         token_id: str | None = None,
         account_id: str | None = None,
         account_token_id: str | None = None,
+        source_ip: str = "",
     ) -> FirehoseSubscriber:
         async with self._lock:
             bucket = self._subs.setdefault(session_id, [])
@@ -68,6 +72,7 @@ class FirehoseRegistry:
                 token_id=token_id,
                 account_id=account_id,
                 account_token_id=account_token_id,
+                source_ip=source_ip,
             )
             bucket.append(sub)
             return sub
@@ -101,9 +106,11 @@ class FirehoseRegistry:
         *,
         token_id: str | None = None,
         reason: str = "account token revoked",
+        ip_filter: Callable[[str], bool] | None = None,
     ) -> int:
         """Signal every stream opened by ``account_id`` (or only through its token
-        ``token_id``) to close, across all sessions."""
+        ``token_id``) to close, across all sessions. With ``ip_filter``, only
+        streams whose client address it accepts are closed."""
         async with self._lock:
             hits = [
                 s
@@ -111,6 +118,7 @@ class FirehoseRegistry:
                 for s in bucket
                 if s.account_id == account_id
                 and (token_id is None or s.account_token_id == token_id)
+                and (ip_filter is None or ip_filter(s.source_ip))
             ]
         for sub in hits:
             sub.close_reason = reason

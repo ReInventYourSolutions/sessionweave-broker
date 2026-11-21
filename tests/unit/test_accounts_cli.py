@@ -147,3 +147,72 @@ def test_url_from_mcp_endpoint_is_normalised(
 
     assert _run(["--url", given, "list"], handler, monkeypatch) == 0
     assert str(seen[0].url) == "http://h:8080/v1/accounts"
+
+
+def test_network_commands_map_to_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(204 if req.url.path.endswith("/deny") else 200, json={})
+
+    cases: list[tuple[list[str], str, str, str, Any]] = [
+        (
+            ["token-create", "acc_1", "--label", "L", "--network-policy", "first_use",
+             "--network", "10.0.0.0/8", "--network", "192.0.2.1"],
+            "POST", "/v1/accounts/acc_1/tokens", "",
+            {"label": "L", "network_policy": "first_use",
+             "approved_networks": ["10.0.0.0/8", "192.0.2.1"]},
+        ),
+        (["token-networks", "acc_1", "tk"], "GET",
+         "/v1/accounts/acc_1/tokens/tk/networks", "", None),
+        (
+            ["token-networks", "acc_1", "tk", "--policy", "approved_only",
+             "--network", "10.1.0.0/16"],
+            "PUT", "/v1/accounts/acc_1/tokens/tk/networks", "",
+            {"network_policy": "approved_only", "approved_networks": ["10.1.0.0/16"]},
+        ),
+        (
+            ["token-networks", "acc_1", "tk", "--no-networks"],
+            "PUT", "/v1/accounts/acc_1/tokens/tk/networks", "", {"approved_networks": []},
+        ),
+        (["approvals", "acc_1"], "GET", "/v1/accounts/acc_1/network-approvals", "", None),
+        (
+            ["approve", "acc_1", "apr_1"], "POST",
+            "/v1/accounts/acc_1/network-approvals/apr_1/approve", "", {"scope": "ip"},
+        ),
+        (
+            ["approve", "acc_1", "apr_1", "--scope", "network"], "POST",
+            "/v1/accounts/acc_1/network-approvals/apr_1/approve", "", {"scope": "network"},
+        ),
+        (
+            ["deny", "acc_1", "apr_1"], "POST",
+            "/v1/accounts/acc_1/network-approvals/apr_1/deny", "", None,
+        ),
+        (["events"], "GET", "/v1/accounts/events", "", None),
+        (
+            ["events", "--account", "acc_1", "--after", "7", "--wait", "20"],
+            "GET", "/v1/accounts/events", "account_id=acc_1&after=7&wait=20.0", None,
+        ),
+    ]
+    for argv, method, path, query, body in cases:
+        seen.clear()
+        assert _run(argv, handler, monkeypatch) == 0, argv
+        req = seen[0]
+        assert (req.method, req.url.path, req.url.query.decode()) == (
+            method, path, query,
+        ), argv
+        if body is not None:
+            assert json.loads(req.content) == body, argv
+
+
+def test_invalid_policy_and_scope_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    for argv in (
+        ["token-create", "a", "--label", "L", "--network-policy", "bogus"],
+        ["approve", "a", "apr", "--scope", "all"],
+    ):
+        with pytest.raises(SystemExit):
+            _run(argv, handler, monkeypatch)

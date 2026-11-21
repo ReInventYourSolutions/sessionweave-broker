@@ -15,7 +15,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from sessionweave.access import admin_matches
-from sessionweave.accounts import Account, AccountStore
+from sessionweave.account_events import EventLog, Origin
+from sessionweave.accounts import Account, AccountStore, AccountToken
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.http_api import (
     _bearer,
@@ -23,8 +24,9 @@ from sessionweave.http_api import (
     _error_response,
     _read_json_body,
     _request_source_ip,
+    origin_from_request,
 )
-from sessionweave.tools import ToolDeps, resolve_account
+from sessionweave.tools import ToolDeps, emit_account_event, resolve_account
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,22 @@ async def _cut_streams(
     firehose = getattr(request.app.state, "firehose", None)
     if firehose is not None:
         await firehose.close_for_account(account_id, token_id=token_id, reason=reason)
+
+
+async def _cut_unapproved_streams(
+    request: Request, store: AccountStore, account_id: str, token_id: str
+) -> None:
+    """End streams opened with the token from addresses its policy no longer allows."""
+    firehose = getattr(request.app.state, "firehose", None)
+    if firehose is None:
+        return
+    token = await store.get_token(account_id, token_id)
+    await firehose.close_for_account(
+        account_id,
+        token_id=token_id,
+        reason="network not approved",
+        ip_filter=lambda ip: not store.network_allows(token, ip),
+    )
 
 
 def _unauthorized() -> JSONResponse:
@@ -74,7 +92,7 @@ async def _require_self(request: Request, deps: ToolDeps) -> Account:
     token = _bearer(request)
     if not token:
         raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "missing Authorization: Bearer header")
-    return await resolve_account(deps, token, source_ip=_request_source_ip(request))
+    return await resolve_account(deps, token, origin=origin_from_request(request))
 
 
 def _bad(message: str) -> ToolError:
@@ -128,14 +146,28 @@ async def _account_with_tokens(store: AccountStore, account: Account) -> dict[st
 
 
 async def _mint_token(
-    deps: ToolDeps, store: AccountStore, account_id: str, body: dict[str, Any]
+    deps: ToolDeps,
+    store: AccountStore,
+    account_id: str,
+    body: dict[str, Any],
+    *,
+    by: str,
+    origin: Origin,
 ) -> JSONResponse:
     label = body.get("label")
     if not isinstance(label, str):
         raise _bad("label is required")
+    policy = body.get("network_policy", "any")
+    if not isinstance(policy, str):
+        raise _bad("network_policy must be a string")
     plaintext, meta = await store.create_token(
         account_id, label, expires_at_ms=_expires_ms(body),
         max_tokens=deps.account_max_tokens,
+        network_policy=policy, approved_networks=body.get("approved_networks"),
+    )
+    await emit_account_event(
+        deps, account_id, "token.created",
+        {"token": {"id": meta.token_id, "label": meta.label}, "by": by, "ip": origin.ip},
     )
     return JSONResponse(
         {
@@ -144,9 +176,87 @@ async def _mint_token(
             "label": meta.label,
             "created_at": meta.created_at,
             "expires_at": meta.expires_at,
+            "network_policy": meta.network_policy,
+            "approved_networks": list(meta.approved_networks),
         },
         status_code=201,
     )
+
+
+async def _revoke(
+    request: Request, deps: ToolDeps, store: AccountStore, account_id: str,
+    token_id: str, *, by: str,
+) -> None:
+    after, changed = await store.revoke_token_changed(account_id, token_id)
+    await _cut_streams(request, account_id, token_id, reason="account token revoked")
+    if changed:
+        await emit_account_event(
+            deps, account_id, "token.revoked",
+            {
+                "token": {"id": token_id, "label": after.label},
+                "by": by,
+                "ip": origin_from_request(request).ip,
+            },
+        )
+
+
+def _networks_json(token: AccountToken) -> JSONResponse:
+    return JSONResponse(
+        {
+            "network_policy": token.network_policy,
+            "approved_networks": list(token.approved_networks),
+        }
+    )
+
+
+async def _get_networks(
+    request: Request, store: AccountStore, account_id: str
+) -> Response:
+    return _networks_json(await store.get_token(account_id, request.path_params["token_id"]))
+
+
+def _is_admin_route(request: Request) -> bool:
+    return request.url.path.startswith("/v1/accounts/")
+
+
+async def _approve(
+    request: Request, store: AccountStore, account_id: str
+) -> Response:
+    body = await _body(request)
+    scope = body.get("scope")
+    if scope not in ("ip", "network"):
+        raise _bad('scope must be "ip" or "network"')
+    token = await store.approve(
+        account_id, request.path_params["approval_id"], scope,
+        by="admin" if _is_admin_route(request) else "self",
+        client=origin_from_request(request).client,
+    )
+    return _networks_json(token)
+
+
+async def _deny(request: Request, store: AccountStore, account_id: str) -> Response:
+    await store.deny(
+        account_id, request.path_params["approval_id"],
+        by="admin" if _is_admin_route(request) else "self",
+        client=origin_from_request(request).client,
+    )
+    return Response(status_code=204)
+
+
+async def _set_networks(
+    request: Request, deps: ToolDeps, store: AccountStore, account_id: str
+) -> Response:
+    body = await _body(request)
+    policy = body.get("network_policy")
+    if policy is not None and not isinstance(policy, str):
+        raise _bad("network_policy must be a string")
+    token_id = request.path_params["token_id"]
+    token = await store.set_token_networks(
+        account_id, token_id, network_policy=policy,
+        approved_networks=body.get("approved_networks"),
+    )
+    await _cut_unapproved_streams(request, store, account_id, token_id)
+    return _networks_json(token)
 
 
 # ---------- admin routes ----------
@@ -212,12 +322,17 @@ async def patch_account(request: Request) -> Response:
         account_id = request.path_params["account_id"]
         body = await _body(request)
         status = _opt_str(body, "status")
-        _, after = await store.update(
+        before, after = await store.update(
             account_id,
             status=status,
             name=_name(_opt_str(body, "name")),
             contact=_opt_str(body, "contact"),
         )
+        if before.status != after.status:
+            await emit_account_event(
+                deps, account_id, "account.status_changed",
+                {"from": before.status, "to": after.status, "by": "admin"},
+            )
         if after.status != "active":
             # Cut first: a failed (fail-closed) suspend must not leave streams open.
             await _cut_streams(request, account_id, reason="account not active")
@@ -275,8 +390,10 @@ async def create_account_token(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        return await _mint_token(deps, store, request.path_params["account_id"],
-                                 await _body(request))
+        return await _mint_token(
+            deps, store, request.path_params["account_id"], await _body(request),
+            by="admin", origin=origin_from_request(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
 
@@ -290,8 +407,7 @@ async def revoke_account_token(request: Request) -> Response:
         account_id = request.path_params["account_id"]
         await store.get(account_id)
         token_id = request.path_params["token_id"]
-        await store.revoke_token(account_id, token_id)
-        await _cut_streams(request, account_id, token_id, reason="account token revoked")
+        await _revoke(request, deps, store, account_id, token_id, by="admin")
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)
@@ -326,7 +442,10 @@ async def create_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        return await _mint_token(deps, store, account.account_id, await _body(request))
+        return await _mint_token(
+            deps, store, account.account_id, await _body(request),
+            by="self", origin=origin_from_request(request),
+        )
     except ToolError as exc:
         return _error_response(exc)
 
@@ -337,13 +456,71 @@ async def revoke_my_token(request: Request) -> Response:
         store = _store(deps)
         account = await _require_self(request, deps)
         token_id = request.path_params["token_id"]
-        await store.revoke_token(account.account_id, token_id)
-        await _cut_streams(
-            request, account.account_id, token_id, reason="account token revoked"
-        )
+        await _revoke(request, deps, store, account.account_id, token_id, by="self")
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)
+
+
+async def put_account_token_networks(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        store = _store(deps)
+        if (denied := _require_admin(request, deps)) is not None:
+            return denied
+        account_id = request.path_params["account_id"]
+        await store.get(account_id)
+        return await _set_networks(request, deps, store, account_id)
+    except ToolError as exc:
+        return _error_response(exc)
+
+
+async def put_my_token_networks(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        store = _store(deps)
+        account = await _require_self(request, deps)
+        return await _set_networks(request, deps, store, account.account_id)
+    except ToolError as exc:
+        return _error_response(exc)
+
+
+def _admin_account(handler: Any) -> Any:
+    """Wrap ``handler(request, store, account_id)`` as an admin-only route
+    for ``/v1/accounts/{account_id}/...`` (404 for an unknown account)."""
+
+    async def route(request: Request) -> Response:
+        deps = _deps(request)
+        try:
+            store = _store(deps)
+            if (denied := _require_admin(request, deps)) is not None:
+                return denied
+            account_id = request.path_params["account_id"]
+            await store.get(account_id)
+            return await handler(request, store, account_id)  # type: ignore[no-any-return]
+        except ToolError as exc:
+            return _error_response(exc)
+
+    return route
+
+
+def _self_account(handler: Any) -> Any:
+    """Wrap ``handler(request, store, account_id)`` as a ``/v1/me/...`` route."""
+
+    async def route(request: Request) -> Response:
+        deps = _deps(request)
+        try:
+            store = _store(deps)
+            account = await _require_self(request, deps)
+            return await handler(request, store, account.account_id)  # type: ignore[no-any-return]
+        except ToolError as exc:
+            return _error_response(exc)
+
+    return route
+
+
+async def _list_approvals(request: Request, store: AccountStore, account_id: str) -> Response:
+    return JSONResponse({"approvals": await store.list_approvals(account_id)})
 
 
 async def list_my_sessions(request: Request) -> Response:
@@ -358,8 +535,73 @@ async def list_my_sessions(request: Request) -> Response:
         return _error_response(exc)
 
 
+EVENTS_MAX_LIMIT = 500
+EVENTS_DEFAULT_LIMIT = 100
+EVENTS_MAX_WAIT = 60.0
+
+
+def _events(deps: ToolDeps) -> EventLog:
+    if deps.events is None:
+        raise ToolError(ErrorCode.ACCOUNTS_UNAVAILABLE, "accounts are not enabled on this relay")
+    return deps.events
+
+
+def _num_param(request: Request, name: str, default: float, lo: float, hi: float) -> float:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise _bad(f"{name} must be a number") from exc
+    if not lo <= value <= hi:  # also rejects NaN
+        raise _bad(f"{name} must be between {lo:g} and {hi:g}")
+    return value
+
+
+async def _events_page(
+    request: Request, log: EventLog, account_id: str | None
+) -> JSONResponse:
+    after = int(_num_param(request, "after", 0, 0, 2**62))
+    limit = int(_num_param(request, "limit", EVENTS_DEFAULT_LIMIT, 1, EVENTS_MAX_LIMIT))
+    wait = _num_param(request, "wait", 0, 0, EVENTS_MAX_WAIT)
+    events, nxt, truncated = await log.list_events(after, account_id=account_id, limit=limit)
+    if not events and wait > 0:
+        await log.wait_for(after, account_id=account_id, timeout=wait)
+        events, nxt, truncated = await log.list_events(
+            after, account_id=account_id, limit=limit
+        )
+    return JSONResponse({"events": events, "next": nxt, "truncated": truncated})
+
+
+async def my_events(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        _store(deps)
+        log = _events(deps)
+        account = await _require_self(request, deps)
+        return await _events_page(request, log, account.account_id)
+    except ToolError as exc:
+        return _error_response(exc)
+
+
+async def all_events(request: Request) -> Response:
+    deps = _deps(request)
+    try:
+        _store(deps)
+        log = _events(deps)
+        denied = _require_admin(request, deps)
+        if denied is not None:
+            return denied
+        return await _events_page(request, log, request.query_params.get("account_id"))
+    except ToolError as exc:
+        return _error_response(exc)
+
+
 def routes() -> list[Route]:
     return [
+        Route("/v1/accounts/events", all_events, methods=["GET"]),
+        Route("/v1/me/events", my_events, methods=["GET"]),
         Route("/v1/accounts", create_account, methods=["POST"]),
         Route("/v1/accounts", list_accounts, methods=["GET"]),
         Route("/v1/accounts/{account_id}", get_account, methods=["GET"]),
@@ -369,6 +611,39 @@ def routes() -> list[Route]:
         Route(
             "/v1/accounts/{account_id}/tokens/{token_id}",
             revoke_account_token, methods=["DELETE"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/tokens/{token_id}/networks",
+            put_account_token_networks, methods=["PUT"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/tokens/{token_id}/networks",
+            _admin_account(_get_networks), methods=["GET"],
+        ),
+        Route("/v1/me/tokens/{token_id}/networks", put_my_token_networks, methods=["PUT"]),
+        Route(
+            "/v1/me/tokens/{token_id}/networks", _self_account(_get_networks), methods=["GET"]
+        ),
+        Route("/v1/me/network-approvals", _self_account(_list_approvals), methods=["GET"]),
+        Route(
+            "/v1/me/network-approvals/{approval_id}/approve",
+            _self_account(_approve), methods=["POST"],
+        ),
+        Route(
+            "/v1/me/network-approvals/{approval_id}/deny",
+            _self_account(_deny), methods=["POST"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals",
+            _admin_account(_list_approvals), methods=["GET"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals/{approval_id}/approve",
+            _admin_account(_approve), methods=["POST"],
+        ),
+        Route(
+            "/v1/accounts/{account_id}/network-approvals/{approval_id}/deny",
+            _admin_account(_deny), methods=["POST"],
         ),
         Route("/v1/me", get_me, methods=["GET"]),
         Route("/v1/me/tokens", list_my_tokens, methods=["GET"]),
