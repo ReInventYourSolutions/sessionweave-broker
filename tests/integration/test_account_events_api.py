@@ -1,6 +1,7 @@
 """``/v1/me/events`` and ``/v1/accounts/events`` over HTTP."""
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -91,3 +92,37 @@ async def test_long_poll_times_out_empty(relay) -> None:
         assert r.status_code == 200
         assert r.json() == {"events": [], "next": last, "truncated": False}
         assert time.monotonic() - t0 >= 0.9
+
+
+async def test_long_poll_released_early_by_emit(tmp_path: Path) -> None:
+    """In-process ASGI: an emit in the same loop releases a long poll well before ``wait``."""
+    from types import SimpleNamespace
+
+    from starlette.applications import Starlette
+
+    from sessionweave import accounts_api
+
+    store = PersistenceStore(str(tmp_path / "lp.db"))
+    await store.init(pool_size=2)
+    log = EventLog(store)
+    deps = SimpleNamespace(
+        accounts=object(), events=log, admin_token="adm",
+        auth_limiter=SimpleNamespace(
+            is_throttled=lambda *a: False, record_failure=lambda *a: None
+        ),
+    )
+    app = Starlette(routes=accounts_api.routes())
+    app.state.tool_deps = deps
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        t0 = time.monotonic()
+        poll = asyncio.create_task(
+            c.get("/v1/accounts/events", params={"wait": 30}, headers=bearer("adm"))
+        )
+        await asyncio.sleep(0.3)
+        await log.emit("acc_x", "token.created", {"n": 1})
+        r = await asyncio.wait_for(poll, 5)
+    assert r.status_code == 200
+    assert [e["data"]["n"] for e in r.json()["events"]] == [1]
+    assert time.monotonic() - t0 < 5
+    await store.close()

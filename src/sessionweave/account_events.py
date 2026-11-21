@@ -67,9 +67,8 @@ class EventLog:
     ) -> tuple[list[dict[str, Any]], int, bool]:
         """Events with ``event_id > after`` (oldest first), ``next`` cursor, ``truncated``.
 
-        ``truncated`` means events after ``after`` were pruned before they
-        could be read (it can also fire when the pruned events belonged to
-        another account, since ids are global).
+        ``truncated`` means events of this scope with id > ``after`` were pruned
+        before they could be read.
         """
         sql = (
             "SELECT event_id, account_id, kind, ts, data_json FROM account_events"
@@ -84,16 +83,15 @@ class EventLog:
         read = self._store._read_pool[0]
         async with read.execute(sql, params) as cur:
             events = [_event(tuple(row)) async for row in cur]
-        async with read.execute("SELECT MIN(event_id) FROM account_events") as cur:
+        qp: tuple[str, ...] = ()
+        if account_id is None:
+            q = "SELECT MAX(max_pruned_id) FROM account_event_prune"
+        else:
+            q = "SELECT max_pruned_id FROM account_event_prune WHERE account_id = ?"
+            qp = (account_id,)
+        async with read.execute(q, qp) as cur:
             row = await cur.fetchone()
-        oldest = row[0] if row is not None else None
-        if oldest is None:
-            async with read.execute(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'account_events'"
-            ) as cur:
-                seq_row = await cur.fetchone()
-            oldest = (seq_row[0] if seq_row is not None else 0) + 1
-        truncated = after + 1 < oldest
+        truncated = row is not None and row[0] is not None and row[0] > after
         nxt = events[-1]["event_id"] if events else after
         return events, nxt, truncated
 
@@ -102,7 +100,11 @@ class EventLog:
         return last > after
 
     async def wait_for(self, after: int, *, account_id: str | None, timeout: float) -> None:
-        """Return once an event newer than ``after`` exists for the scope, or on timeout."""
+        """Return once an event newer than ``after`` exists for the scope, or on timeout.
+
+        The initial DB check covers events written before this process started
+        (the in-memory last-id map only knows events emitted since startup).
+        """
         events, _, _ = await self.list_events(after, account_id=account_id, limit=1)
         if events:
             return
@@ -114,11 +116,39 @@ class EventLog:
             except TimeoutError:
                 return
 
-    async def prune(self, now_ms: int, retention_days: int) -> int:
+    async def prune(self, now_ms: int, retention_days: int, *, batch: int = 1000) -> int:
+        """Delete events older than the retention window, ``batch`` rows at a time.
+
+        The write lock is released between batches. The highest pruned id per
+        account is recorded first, in the same locked block as the delete.
+        """
         conn = self._store._write_conn
         assert conn is not None
-        async with self._store._write_tx_lock:
-            cur = await conn.execute(
-                "DELETE FROM account_events WHERE ts < ?", (now_ms - retention_days * _DAY_MS,)
-            )
-            return cur.rowcount
+        cutoff = now_ms - retention_days * _DAY_MS
+        total = 0
+        while True:
+            async with self._store._write_tx_lock:
+                async with conn.execute(
+                    "SELECT event_id, account_id FROM account_events WHERE ts < ?"
+                    " ORDER BY event_id LIMIT ?",
+                    (cutoff, batch),
+                ) as cur:
+                    rows = [tuple(r) async for r in cur]
+                if not rows:
+                    return total
+                per_account: dict[str, int] = {}
+                for event_id, acc in rows:
+                    per_account[acc] = max(per_account.get(acc, 0), event_id)
+                await conn.executemany(
+                    "INSERT INTO account_event_prune (account_id, max_pruned_id) VALUES (?, ?)"
+                    " ON CONFLICT(account_id) DO UPDATE SET"
+                    " max_pruned_id = MAX(max_pruned_id, excluded.max_pruned_id)",
+                    list(per_account.items()),
+                )
+                await conn.execute(
+                    "DELETE FROM account_events WHERE event_id <= ? AND ts < ?",
+                    (rows[-1][0], cutoff),
+                )
+                total += len(rows)
+            if len(rows) < batch:
+                return total

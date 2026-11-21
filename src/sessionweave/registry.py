@@ -580,12 +580,17 @@ class SessionRegistry:
                     now_ms=int(_time.time() * 1000),
                     safety_seconds=safety_seconds,
                 )
-                if on_tick is not None:
-                    await on_tick(int(_time.time() * 1000))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
+            if on_tick is not None:
+                try:
+                    await on_tick(int(_time.time() * 1000))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("periodic tick failed: %s", type(exc).__name__)
             try:
                 await asyncio.sleep(interval_seconds)
             except asyncio.CancelledError:

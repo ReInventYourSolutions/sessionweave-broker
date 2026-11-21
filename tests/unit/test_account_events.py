@@ -58,6 +58,45 @@ async def test_truncated_after_prune(log: EventLog) -> None:
     assert events == [] and truncated is True
 
 
+async def test_truncated_is_per_account(log: EventLog) -> None:
+    a1 = await log.emit("a", "k", {})
+    b1 = await log.emit("b", "k", {})
+    now = int(time.time() * 1000)
+    # Prune only b's event: backdate it via the table, keep a's fresh.
+    conn = log._store._write_conn
+    assert conn is not None
+    await conn.execute("UPDATE account_events SET ts = 0 WHERE event_id = ?", (b1,))
+    assert await log.prune(now, 30) == 1
+    _, _, trunc_a = await log.list_events(0, account_id="a", limit=10)
+    assert trunc_a is False
+    _, _, trunc_b = await log.list_events(0, account_id="b", limit=10)
+    assert trunc_b is True
+    _, _, trunc_b = await log.list_events(b1, account_id="b", limit=10)
+    assert trunc_b is False
+    _, _, trunc_all = await log.list_events(0, account_id=None, limit=10)
+    assert trunc_all is True
+    # Now prune a's too.
+    await conn.execute("UPDATE account_events SET ts = 0 WHERE event_id = ?", (a1,))
+    await log.prune(now, 30)
+    _, _, trunc_a = await log.list_events(a1 - 1, account_id="a", limit=10)
+    assert trunc_a is True
+    _, _, trunc_a = await log.list_events(a1, account_id="a", limit=10)
+    assert trunc_a is False
+
+
+async def test_prune_keeps_rows_in_window_and_batches(log: EventLog) -> None:
+    now = int(time.time() * 1000)
+    conn = log._store._write_conn
+    assert conn is not None
+    old = [await log.emit("a", "k", {}) for _ in range(7)]
+    keep = await log.emit("a", "k", {})
+    await conn.execute("UPDATE account_events SET ts = 0 WHERE event_id <= ?", (old[-1],))
+    assert await log.prune(now, 30, batch=3) == 7
+    events, _, _ = await log.list_events(0, account_id=None, limit=100)
+    assert [e["event_id"] for e in events] == [keep]
+    assert await log.prune(now, 30, batch=3) == 0
+
+
 async def test_wait_for_returns_on_emit(log: EventLog) -> None:
     task = asyncio.create_task(log.wait_for(0, account_id="a", timeout=5))
     await asyncio.sleep(0.05)
