@@ -1196,13 +1196,19 @@ def build_app() -> Starlette:
     metrics_token = os.environ.get("SW_METRICS_TOKEN", "").strip() or None
 
     async def metrics_endpoint(request: Request) -> Response:
-        # When SW_METRICS_TOKEN is set, require a matching bearer token.
-        # Unset → endpoint is open (backwards-compatible default).
+        # When SW_METRICS_TOKEN is set, require a matching bearer token; the
+        # relay admin token is accepted too (it already grants far more, and
+        # the Cockpit's monitor scrapes with it). Unset → endpoint is open
+        # (backwards-compatible default).
         if metrics_token is not None:
             auth = request.headers.get("authorization", "")
             if not auth.lower().startswith("bearer "):
                 return Response("unauthorized", status_code=401)
-            if not admin_matches(auth[7:].strip(), metrics_token):
+            presented = auth[7:].strip()
+            if not (
+                admin_matches(presented, metrics_token)
+                or admin_matches(presented, admin_token)
+            ):
                 return Response("forbidden", status_code=403)
         return Response(metrics.render(), media_type=METRICS_CONTENT_TYPE)
 

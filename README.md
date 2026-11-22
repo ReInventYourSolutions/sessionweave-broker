@@ -432,7 +432,8 @@ Checklist for a broker reachable from the internet behind a reverse proxy:
   `SW_ACCOUNT_MAX_TOKENS` (default `20`): non-revoked, non-expired tokens per
   account; one more is 409 `account_token_limit`.
 - **Metrics.** Set `SW_METRICS_TOKEN` (or keep `/metrics` unreachable from the
-  internet at the proxy).
+  internet at the proxy). `/metrics` then accepts that token or the relay admin
+  token (`SW_ADMIN_TOKEN`) — the Cockpit's monitor scrapes with the admin token.
 - **Container hardening.** Run the container as a non-root user with
   `read_only: true` (mount only the data volume and a tmpfs `/tmp` writable),
   `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, and memory /
