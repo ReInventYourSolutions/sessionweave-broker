@@ -15,6 +15,7 @@ a final one is kept for an hour so its result stays readable.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -23,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from sessionweave.access import Principal, is_coordinator
+from sessionweave.access import Principal, hash_token, is_coordinator
 from sessionweave.errors import ErrorCode, ToolError
 
 if TYPE_CHECKING:
@@ -79,6 +80,8 @@ class Launch:
     # Identity of the launcher holding the agent, to re-associate it on reconnect.
     launcher_owner: str | None
     launcher_token_id: str | None
+    # sha256 of the launcher's resume secret (never the secret itself).
+    resume_hash: bytes
     launched_by: str | None
     accounts: tuple[str, ...]  # launcher owner + session owner (deduplicated)
     token_id: str | None  # the launch credential, until joined or invalidated
@@ -216,6 +219,7 @@ class LaunchManager:
             launch_id=launch_id, session_id=sid, launcher_id=lnc.launcher_id,
             machine=lnc.machine, profile_id=prof["id"],
             launcher_owner=lnc.owner_account_id, launcher_token_id=lnc.token_id,
+            resume_hash=lnc.resume_hash,
             launched_by=principal.participant_id if is_coordinator(sess, principal) else None,
             accounts=accounts, token_id=issued.token_id,
         )
@@ -241,7 +245,7 @@ class LaunchManager:
             await lnc.conn.send_json(order)
         except asyncio.CancelledError:
             if lch.status in _ACTIVE:
-                self._finish(lch, "failed", error="cancelled")
+                self._fail(lch, "cancelled")  # schedules its notifications
             raise
         except Exception:
             self._fail(lch, "launcher_offline")
@@ -278,6 +282,12 @@ class LaunchManager:
         lch.status = "joined"
         self._cancel_timer(lch)
         self._drop_credential(lch, sess)
+        if self._launchers.get_conn(lch.launcher_id) is None:
+            # Its launcher dropped while the agent was joining.
+            lch.slot_held = False
+            lch.lost_timer = asyncio.get_running_loop().call_later(
+                self.reconnect_grace_s, self._on_lost, lch.launch_id
+            )
 
     @staticmethod
     def join_metadata(lch: Launch) -> dict[str, Any]:
@@ -366,22 +376,30 @@ class LaunchManager:
 
     def reattach(
         self, launcher_id: str, owner: str | None, token_id: str | None, machine: str,
-        running: list[str],
+        running: list[str], resume_secret: str | None,
     ) -> list[dict[str, Any]]:
         """Re-associate the joined launches a reconnecting launcher reports
-        still running; return the stop orders for the ids it may not keep."""
+        still running; return the stop orders for the ids it may not keep.
+
+        A launch is claimed only with the resume secret its launcher got in
+        ``welcome`` (and, in account mode, by the same owner account). If the
+        old connection is still registered (a half-open socket), it is
+        replaced: closed and unregistered after its launches move over.
+        """
+        new_hash = self._launchers.resume_hash(launcher_id)
+        presented = hash_token(resume_secret) if resume_secret else None
         stops: list[dict[str, Any]] = []
+        replaced: set[str] = set()
         for lid in running:
             lch = self._launches.get(lid)
-            same_owner = lch is not None and lch.launcher_owner == owner and (
-                lch.machine == machine
-                or (owner is not None and token_id is not None
-                    and lch.launcher_token_id == token_id)
-            )
-            if lch is None or not same_owner:
+            if (
+                lch is None
+                or presented is None
+                or lch.launcher_owner != owner
+                or not hmac.compare_digest(presented, lch.resume_hash)
+            ):
                 stops.append({"type": "stop", "launch_id": lid, "reason": "unknown_launch"})
                 continue
-            assert lch is not None
             if lch.status != "joined":
                 reason = lch.reason or lch.error or "unknown_launch"
                 stops.append({"type": "stop", "launch_id": lid, "reason": reason})
@@ -389,16 +407,22 @@ class LaunchManager:
             if lch.launcher_id == launcher_id:
                 continue
             if self._launchers.get_conn(lch.launcher_id) is not None:
-                # Its launcher is still connected: not this one's to claim.
-                stops.append({"type": "stop", "launch_id": lid, "reason": "unknown_launch"})
-                continue
+                replaced.add(lch.launcher_id)  # the same launcher, reconnected early
             if lch.lost_timer is not None:
                 lch.lost_timer.cancel()
                 lch.lost_timer = None
             lch.launcher_id = launcher_id
             lch.launcher_token_id = token_id
             lch.machine = machine
+            if new_hash is not None:
+                lch.resume_hash = new_hash
             lch.slot_held = self._launchers.hold_slot(launcher_id, lch.profile_id)
+        for old in replaced:
+            conn = self._launchers.get_conn(old)
+            self._launchers.unregister(old)
+            close = getattr(conn, "close", None)
+            if close is not None:
+                self._spawn(close(code=4409, reason="replaced by a newer connection"))
         return stops
 
     # --- session hooks (sync, session lock held) ---

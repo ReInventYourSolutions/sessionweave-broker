@@ -573,8 +573,16 @@ async def test_launcher_reconnect_reattaches_running_agents() -> None:
         # the pending launch failed; the joined one waits for its launcher
         await _until(lambda: _is_status(c, s, gone_lid, "failed"))
         assert (await _status(c, s.sid, s.coord_token, lid))["status"] == "joined"
-        async with launcher(base, [_prof()], running=[lid, gone_lid, "lch_ffffffffffffffff"]) \
-                as fl2:
+        secret = fl.welcome["resume_secret"]
+        # without the resume secret nothing is re-attached
+        async with launcher(base, [_prof()], running=[lid]) as nosecret, \
+                launcher(base, [_prof()], running=[lid], resume_secret="wrong") as wrong:
+            for x in (nosecret, wrong):
+                assert await x.expect("stop") == {"type": "stop", "launch_id": lid,
+                                                  "reason": "unknown_launch"}
+        async with launcher(base, [_prof()], running=[lid, gone_lid, "lch_ffffffffffffffff"],
+                            resume_secret=secret) as fl2:
+            assert fl2.welcome["resume_secret"] != secret
             stops = {(m := await fl2.expect("stop"))["launch_id"]: m["reason"]
                      for _ in range(2)}
             assert stops == {gone_lid: "launcher_offline",
@@ -611,7 +619,8 @@ async def test_launcher_lost_after_grace_removes_agent() -> None:
         ev = next(i for i in items if i["name"] == "agent.stopped")
         assert ev["payload"]["reason"] == "launcher_lost"
         # a late reconnect is told to stop it
-        async with launcher(base, [_prof()], running=[lid]) as fl2:
+        async with launcher(base, [_prof()], running=[lid],
+                            resume_secret=fl.welcome["resume_secret"]) as fl2:
             assert await fl2.expect("stop") == {"type": "stop", "launch_id": lid,
                                                 "reason": "launcher_lost"}
 
@@ -624,12 +633,16 @@ async def test_reconnect_cannot_claim_another_owners_launch(tmp_path: Path) -> N
         s = _Setup(c, {**made, "creator_token": sd.token}, coord)
         async with launcher(sd.base, [_prof()], token=sd.token) as fl:
             lid, _agent = await _launched_agent(c, s, fl)
-        async with launcher(sd.base, [_prof()], token=sd.other_token, running=[lid]) as bob:
+        secret = fl.welcome["resume_secret"]
+        # even with the (leaked) secret, another account cannot claim it
+        async with launcher(sd.base, [_prof()], token=sd.other_token, running=[lid],
+                            resume_secret=secret) as bob:
             assert await bob.expect("stop") == {"type": "stop", "launch_id": lid,
                                                 "reason": "unknown_launch"}
             st = await _status(c, s.sid, s.coord_token, lid)
             assert st["status"] == "joined" and st["launcher_id"] == fl.launcher_id
-        async with launcher(sd.base, [_prof()], token=sd.token, running=[lid]) as again:
+        async with launcher(sd.base, [_prof()], token=sd.token, running=[lid],
+                            resume_secret=secret, machine="renamed") as again:
             st = await _status(c, s.sid, s.coord_token, lid)
             assert st["launcher_id"] == again.launcher_id
 
@@ -764,3 +777,71 @@ async def test_halt_messages_name_who_stopped_the_agent(tmp_path: Path) -> None:
             got = await halts()
             assert got[a1["participant_id"]] == "removed by the coordinator"
             assert got[a2["participant_id"]] == "stopped by its launcher: max_cost_usd"
+
+
+async def test_quick_reconnect_takes_over_half_open_launcher() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            secret = fl.welcome["resume_secret"]
+            # the old socket is still open (half-open from the launcher's view)
+            async with launcher(base, [_prof()], running=[lid], resume_secret=secret) as fl2:
+                with pytest.raises(asyncio.TimeoutError):
+                    await fl2.expect("stop", timeout=0.5)
+                await asyncio.wait_for(fl.ws.wait_closed(), 5)
+                assert fl.ws.close_code == 4409
+                st = await _status(c, s.sid, s.coord_token, lid)
+                assert st["status"] == "joined" and st["launcher_id"] == fl2.launcher_id
+                assert await _free_slots(c, s) == 1
+                # the old secret no longer claims it
+                async with launcher(base, [_prof()], running=[lid],
+                                    resume_secret=secret) as fl3:
+                    assert (await fl3.expect("stop"))["reason"] == "unknown_launch"
+                r = await c.delete(
+                    f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                    headers=bearer(s.coord_token))
+                assert r.status_code == 200, r.text
+                assert (await fl2.expect("stop"))["launch_id"] == lid
+
+
+async def test_launcher_dropping_during_join_arms_lost_timer() -> None:
+    from sessionweave.access import Principal
+    from sessionweave.config import load_deployment_defaults
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.tools import ToolDeps
+    from tests.unit.fakes import FakeHandle
+
+    class Conn:
+        async def send_json(self, data: Any) -> None:
+            self.order = data
+
+    reg = SessionRegistry(defaults=load_deployment_defaults({}),
+                          connections=ConnectionManager())
+    deps = ToolDeps(reg)
+    deps.launches.reconnect_grace_s = 0.1
+    sid, _, _, _, _ = await reg.create(overrides={}, purpose=None)
+    sess = await reg.get_or_raise(sid)
+    coord = await sess.join(FakeHandle(), role="c", as_coordinator=True)
+    conn = Conn()
+    lnc_id, _ = deps.launchers.register(conn, None, {"machine": "m", "profiles": [_prof()]})
+    out = await deps.launches.launch(
+        sess, Principal("participant", coord.participant_id),
+        {"launcher_id": lnc_id, "profile_id": "p1", "task": "t"},
+        broker_url=None, owner_name=None)
+    lch = deps.launches.get(out["launch_id"])
+    assert lch is not None and lch.token_id is not None
+    _lch, role, caps = deps.launches.begin_join(sess, lch.token_id)
+    deps.launchers.unregister(lnc_id)  # the launcher drops mid-join
+    assert lch.status == "pending"
+    p = await sess.join(FakeHandle(), role=role, capabilities=caps,
+                        metadata=deps.launches.join_metadata(lch))
+    deps.launches.joined(sess, lch, p.participant_id)
+    assert lch.status == "joined" and lch.lost_timer is not None
+    for _ in range(50):
+        if lch.status == "stopped" and p.participant_id not in sess._participants:
+            break
+        await asyncio.sleep(0.05)
+    assert lch.status == "stopped" and lch.reason == "launcher_lost"
+    assert p.participant_id not in sess._participants

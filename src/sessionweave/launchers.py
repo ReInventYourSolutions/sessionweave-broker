@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from sessionweave.access import admin_matches
+from sessionweave.access import admin_matches, hash_token
 from sessionweave.account_events import Origin, request_client
 from sessionweave.errors import ErrorCode, ToolError
 
@@ -151,6 +151,8 @@ class _Launcher:
     # mode), so it can be dropped when that token or account dies.
     token_id: str | None = None
     ip: str = ""
+    # sha256 of the resume secret sent in welcome (the secret is not kept).
+    resume_hash: bytes = b""
 
 
 class LauncherRegistry:
@@ -167,6 +169,7 @@ class LauncherRegistry:
         *,
         token_id: str | None = None,
         ip: str = "",
+        resume_hash: bytes = b"",
     ) -> tuple[str, list[dict[str, str]]]:
         """Register a launcher from a validated-shape hello.
 
@@ -205,6 +208,9 @@ class LauncherRegistry:
             or not all(isinstance(r, str) and 0 < len(r) <= 64 for r in running)
         ):
             raise HelloError("running must be a list of launch ids")
+        secret = hello.get("resume_secret")
+        if secret is not None and (not isinstance(secret, str) or len(secret) > 200):
+            raise HelloError("resume_secret must be a string")
         raw_profiles = hello.get("profiles", [])
         if not isinstance(raw_profiles, list) or len(raw_profiles) > _MAX_PROFILES:
             raise HelloError(f"profiles must be a list of at most {_MAX_PROFILES} entries")
@@ -212,6 +218,7 @@ class LauncherRegistry:
         lnc = _Launcher(
             launcher_id, conn, owner_account_id, machine.strip(), visibility,
             frozenset(a.casefold() for a in allowed), token_id=token_id, ip=ip,
+            resume_hash=resume_hash,
         )
         rejected: list[dict[str, str]] = []
         for raw in raw_profiles:
@@ -232,6 +239,10 @@ class LauncherRegistry:
         """Forget a launcher; its launches not yet joined fail (idempotent)."""
         if self._launchers.pop(launcher_id, None) is not None and self.launches is not None:
             self.launches.launcher_gone(launcher_id)
+
+    def resume_hash(self, launcher_id: str) -> bytes | None:
+        lnc = self._launchers.get(launcher_id)
+        return None if lnc is None else lnc.resume_hash
 
     def hold_slot(self, launcher_id: str, profile_id: str) -> bool:
         """Count one more running instance (a re-associated agent)."""
@@ -480,8 +491,12 @@ async def launcher_ws(websocket: WebSocket) -> None:
 
     try:
         hello = await _read_hello(websocket)
+        # Lets this launcher reclaim its running agents after a reconnect;
+        # only its hash is kept, and it is never logged.
+        resume_secret = secrets.token_urlsafe(32)
         launcher_id, rejected = registry.register(
-            websocket, owner_account_id, hello, token_id=token_id, ip=source_ip
+            websocket, owner_account_id, hello, token_id=token_id, ip=source_ip,
+            resume_hash=hash_token(resume_secret),
         )
     except FrameTooLargeError:
         await websocket.close(code=_CLOSE_TOO_BIG, reason="frame too large")
@@ -496,14 +511,15 @@ async def launcher_ws(websocket: WebSocket) -> None:
     if deps.launches is not None and hello.get("running"):
         stops = deps.launches.reattach(
             launcher_id, owner_account_id, token_id, hello["machine"].strip(),
-            list(hello["running"]),
+            list(hello["running"]), hello.get("resume_secret"),
         )
 
     pinger: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
     try:
         await websocket.send_json(
-            {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected}
+            {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
+             "resume_secret": resume_secret}
         )
         for stop in stops:
             await websocket.send_json(stop)

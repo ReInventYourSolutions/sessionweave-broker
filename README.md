@@ -617,7 +617,8 @@ the profile's role and capabilities whatever the body says (they are forced, not
 compared), and the participant's metadata carries `launch_id`, `launcher_id`,
 `launcher_machine`, `profile_id` and `launched_by` (the coordinator's participant
 id, or null when the creator launched); the agent cannot change any of these
-later. A second join, or a join to another session, is refused. Status:
+later. `launcher_id` / `launcher_machine` there mean "originally launched by": after
+a launcher reconnect the launch status shows the current launcher. A second join, or a join to another session, is refused. Status:
 `pending` → `started` → `joined`, or `failed` (`launcher_offline` when the
 launcher disconnects first, `join_timeout` after 120 s — `SW_LAUNCH_JOIN_TIMEOUT_S`
 — or the launcher's error; the credential is invalidated and the slot released).
@@ -638,11 +639,15 @@ itself (a profile limit), it sends `{"type":"stopped","launch_id","reason"}`; th
 broker removes the participant (halt "stopped by its launcher: <reason>") and sends
 the session event `agent.stopped {participant_id, launch_id, reason}`.
 
-**Launcher reconnects.** A launcher that reconnects lists the agents it still runs
-in its hello, `"running": ["lch_...", ...]`. Each joined launch whose previous
-launcher had the same owner account and machine (or, in account mode, the same
-token) is re-attached: stops reach the new connection and the slot counts again.
-Any other id gets an immediate `stop` (its final reason, or `unknown_launch`).
+**Launcher reconnects.** `welcome` carries a `resume_secret` for that connection
+(the broker keeps only its hash; keep it with the running launch ids). A launcher
+that reconnects sends `"resume_secret"` and `"running": ["lch_...", ...]` in its
+hello. Each joined launch whose secret matches (and, in account mode, whose owner
+account is the same) is re-attached: stops reach the new connection, the slot
+counts again, and from then on the new connection's secret is the one that
+counts. If the old connection is still registered (a half-open socket), it is
+closed (4409) and replaced, and the agents keep running. Any other id gets an
+immediate `stop` (its final reason, or `unknown_launch`).
 Joined agents whose launcher has not come back within 300 s
 (`SW_LAUNCHER_RECONNECT_GRACE_S`) are removed (halt first) with the session event
 `agent.stopped` reason `launcher_lost`. In account mode

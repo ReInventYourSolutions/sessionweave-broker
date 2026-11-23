@@ -1108,7 +1108,9 @@ paths:
         profile's (the body's are ignored), its metadata carries `launch_id`,
         `launcher_id`, `launcher_machine`, `profile_id` and `launched_by` (the
         coordinator's participant id, or null when the creator/admin launched),
-        and neither can be changed later. A second join with the credential, or
+        and neither can be changed later (`launcher_id` / `launcher_machine`
+        mean "originally launched by"; the launch status shows the current
+        launcher). A second join with the credential, or
         a join to another session, is refused. If the agent has not joined
         within 120 s (`SW_LAUNCH_JOIN_TIMEOUT_S`) the launch fails with
         `join_timeout`, the credential is invalidated and the launcher gets a
@@ -1187,9 +1189,12 @@ paths:
         request headers; otherwise the launcher uses the URL it connected to)
         and `{"type":"stop","launch_id","reason"}` with reason `removed`, `left`,
         `evicted`, `session_ended`, `join_timeout`, `launcher_lost` or
-        `unknown_launch`. The hello may carry `"running": [launch_id, ...]`
-        on reconnect: joined launches of the same owner and machine (account
-        mode: or token) are re-attached; other ids get an immediate `stop`.
+        `unknown_launch`. `welcome` carries `resume_secret` (only its hash is
+        kept). On reconnect the hello may carry `"resume_secret"` and
+        `"running": [launch_id, ...]`: joined launches whose secret matches
+        (account mode: and the same owner account) are re-attached, replacing
+        a still-registered old connection (closed 4409) without stopping its
+        agents; other ids get an immediate `stop`.
         A launcher that disconnects fails its launches not yet joined with
         `launcher_offline` (slot and session cap released, credential
         invalidated); its joined agents are removed with reason
@@ -1593,7 +1598,7 @@ paths:
         paused). It then leaves: its open events WebSocket closes with code
         4410 (reason `removed`), the commands it sent are cancelled, and the
         other participants and the firehose receive `participant.left` with
-        reason `removed`. Every still-valid join token of the session is
+        reason `removed`. Every still-valid join token of the session (not when the removed participant is a launched agent) is
         invalidated: joining with one answers "join link expired" (after a
         relay restart such a link reads as an invalid token instead, like
         any expired link). Only the addressed participant is affected. The
