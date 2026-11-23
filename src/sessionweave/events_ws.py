@@ -179,6 +179,10 @@ async def events_ws(websocket: WebSocket) -> None:
         try:
             while True:
                 msg = await websocket.receive()
+                if isinstance(msg, dict) and msg.get("type") == "websocket.disconnect":
+                    # A raw receive() returns the disconnect message instead of
+                    # raising; calling it again would raise RuntimeError.
+                    return
                 text = msg.get("text") if isinstance(msg, dict) else None
                 if not text:
                     continue
