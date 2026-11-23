@@ -167,3 +167,10 @@ def test_discovery_says_owner_and_own_first() -> None:
     reg2.register(_Conn(), None, _hello([_prof()]))
     (item,) = reg2.profiles_for(_sess(None), "backend")
     assert item["owner"] is None and item["own"] is True
+
+
+def test_owner_fields_open_mode_launcher_is_own_for_account_session() -> None:
+    session: Any = SimpleNamespace(auth=SimpleNamespace(owner_account_id="acct-1"))
+    assert LauncherRegistry.owner_fields(None, None, session) == {"owner": None, "own": True}
+    assert LauncherRegistry.owner_fields("acct-1", "alice", session)["own"] is True
+    assert LauncherRegistry.owner_fields("acct-2", "bob", session)["own"] is False

@@ -399,11 +399,11 @@ class LauncherRegistry:
     def owner_fields(lnc_owner: str | None, lnc_owner_name: str | None,
                      session: Session) -> dict[str, Any]:
         """``owner`` (the launcher owner's account name, None in open mode)
-        and ``own`` (it belongs to the session owner's account, or both are
-        ownerless in open mode)."""
+        and ``own`` (it belongs to the session owner's account, or it is an
+        ownerless open-mode launcher, which auto-select also treats as own)."""
         return {
             "owner": lnc_owner_name,
-            "own": lnc_owner == session.auth.owner_account_id,
+            "own": lnc_owner is None or lnc_owner == session.auth.owner_account_id,
         }
 
     def profiles_for(
