@@ -1,4 +1,6 @@
-FROM python:3.12-slim AS base
+# PYTHON_IMAGE lets a build pin the base by digest (the distributed e2e does).
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE} AS base
 WORKDIR /app
 
 FROM base AS build
