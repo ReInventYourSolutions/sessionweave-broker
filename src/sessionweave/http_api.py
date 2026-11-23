@@ -968,6 +968,25 @@ async def _remove_participant_handler(request: Request) -> Response:
     return await _run_credential_call(request, call)
 
 
+async def _set_coordinator_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    try:
+        body = await _read_json_body(request)
+    except ToolError as exc:
+        return _error_response(exc)
+    pid = body.get("participant_id")
+    if pid is not None and not isinstance(pid, str):
+        return _error_response(
+            ToolError(ErrorCode.INVALID_REQUEST, "participant_id must be a string or null")
+        )
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_set_coordinator(deps, sid, token, pid, source_ip=source_ip)
+
+    return await _run_credential_call(request, call)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -1020,6 +1039,11 @@ def routes() -> list[Route]:
             "/v1/sessions/{sid}/participants/me",
             delete_self,
             methods=["DELETE"],
+        ),
+        Route(
+            "/v1/sessions/{sid}/coordinator",
+            _set_coordinator_handler,
+            methods=["PUT"],
         ),
         Route(
             "/v1/sessions/{sid}/participants/{pid}",

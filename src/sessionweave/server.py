@@ -77,6 +77,7 @@ from sessionweave.tools import (
     session_resume,
     session_revoke_supervisor_token,
     session_send,
+    session_set_coordinator,
     session_update_purpose,
     session_update_self,
     session_wait_for_event,
@@ -1013,6 +1014,30 @@ def _build_fastmcp(
     join_tokens_invalidated.
     """
         return await session_remove_participant(
+            deps, session_id, _creator_cred(creator_token, ctx), participant_id,
+            source_ip=_client_ip(ctx),
+        )
+
+    @_tool("session_set_coordinator")
+    async def session_set_coordinator_tool(
+        session_id: SessionIdArg,
+        participant_id: Annotated[str | None, Field(description=
+            "The participant_id (from the roster) to make the session's coordinator, "
+            "or null to clear the role."
+        )],
+        creator_token: ManagerTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Assign, move or clear the session's coordinator.
+
+    The coordinator is the one participant allowed to discover and launch
+    agents; it is whoever first joined with the creator credential until you
+    change it here. Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP Authorization:
+    Bearer header). The target must be a current participant, else
+    participant_not_found. Returns coordinator_id.
+    """
+        return await session_set_coordinator(
             deps, session_id, _creator_cred(creator_token, ctx), participant_id,
             source_ip=_client_ip(ctx),
         )

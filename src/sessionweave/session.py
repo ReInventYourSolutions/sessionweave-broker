@@ -108,6 +108,7 @@ class Session:
         "_buffered_bytes",
         "_buffers",
         "_connections",
+        "_coordinator_dirty",
         "_created_at",
         "_event_seq",
         "_firehose",
@@ -125,6 +126,7 @@ class Session:
         "_wait_in_flight",
         "auth",
         "config",
+        "coordinator_id",
         "lock",
         "purpose",
         "session_id",
@@ -176,6 +178,9 @@ class Session:
         self._connections = connections
         self._metrics = metrics
         self.purpose: dict[str, Any] | None = purpose
+        # The one participant allowed to discover and launch agents (or None).
+        self.coordinator_id: str | None = None
+        self._coordinator_dirty = False
         # Notify the registry whenever an internal event shortens
         # ``next_deadline`` so its min-heap doesn't sit on a stale,
         # later deadline. The lazy-invalidation path already absorbs
@@ -246,6 +251,8 @@ class Session:
             )
             if token_hash:
                 sess.auth.register_participant(p["participant_id"], token_hash)
+        if snap.coordinator_id in sess._participants:
+            sess.coordinator_id = snap.coordinator_id
         if metrics is not None and sess._participants:
             # Cold -> hot: balance the dec() ``release_participant_metrics``
             # issued when this session left RAM. Restored participants are
@@ -409,6 +416,7 @@ class Session:
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         delivery_mode: str = "push",
+        as_coordinator: bool = False,
     ) -> Participant:
         async with self.lock:
             self._ensure_not_suspended()
@@ -432,6 +440,12 @@ class Session:
             self.bump_activity()
             if self._metrics is not None:
                 self._metrics.participants_active.labels(online="true").inc()
+            if as_coordinator and self.coordinator_id is None:
+                self.coordinator_id = p.participant_id
+                if self._store is not None:
+                    await self._store.update_session_coordinator(
+                        self.session_id, p.participant_id
+                    )
             if self._store is not None:
                 snapshot = self._participant_snapshot(p)
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
@@ -508,6 +522,7 @@ class Session:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             self.bump_activity()
             self._close_subscribers(participant_id, reason="left")
+            await self._persist_coordinator_cleared()
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
             if feedback is not None:
                 payload["feedback"] = feedback
@@ -566,6 +581,7 @@ class Session:
             self.auth.tombstone_participant(target.token_hash, now_ms)
             self._drop_participant(participant_id)
             self._close_subscribers(participant_id, reason="removed")
+            await self._persist_coordinator_cleared()
             self.bump_activity()
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "removed"}
             others = list(self._participants)
@@ -791,6 +807,36 @@ class Session:
             self.bump_activity()
             self._mirror_firehose("supervisor.note_reply", payload)
             return payload
+
+    async def _persist_coordinator_cleared(self) -> None:
+        """Write a coordinator cleared by a departure (caller holds the lock)."""
+        if self._coordinator_dirty:
+            self._coordinator_dirty = False
+            if self._store is not None:
+                await self._store.update_session_coordinator(self.session_id, None)
+
+    async def set_coordinator(self, participant_id: str | None) -> str | None:
+        """Assign, move or clear (None) the coordinator. Authorization is the
+        caller's job (creator/owner/admin). The target must be a participant."""
+        async with self.lock:
+            if participant_id is not None and participant_id not in self._participants:
+                raise ToolError(
+                    ErrorCode.PARTICIPANT_NOT_FOUND,
+                    f"{participant_id!r} is not a participant of this session",
+                )
+            self.coordinator_id = participant_id
+            self._coordinator_dirty = False
+            self.bump_activity()
+            if self._store is not None:
+                await self._store.update_session_coordinator(self.session_id, participant_id)
+            payload = {"coordinator_id": participant_id}
+            await self._dispatch_event(
+                kind="session.coordinator_changed",
+                payload=payload,
+                recipients=list(self._participants),
+            )
+            self._mirror_firehose("session.coordinator_changed", payload)
+            return participant_id
 
     async def update_purpose(
         self,
@@ -1932,6 +1978,10 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return None
+        if self.coordinator_id == pid:
+            # No promotion: the creator or admin names a new coordinator.
+            self.coordinator_id = None
+            self._coordinator_dirty = True
         self.auth.forget_participant(pid)
         if p.connection_ref is not None:
             # connection_ref is a ConnectionHandle (set by join/resume)

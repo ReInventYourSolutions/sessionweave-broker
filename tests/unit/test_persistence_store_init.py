@@ -49,7 +49,7 @@ async def test_init_idempotent(tmp_path: Path) -> None:
         _n_row = await cur.fetchone()
     assert _n_row is not None
     (n,) = _n_row
-    assert n == 6
+    assert n == 7
     await s2.close()
 
 

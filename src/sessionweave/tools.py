@@ -470,6 +470,7 @@ async def session_describe(
         roster=sess.roster_snapshot(),
         persistence=_persistence_public_for(sess),
         suspended=sess.suspended,
+        coordinator_id=sess.coordinator_id,
     ).model_dump()
 
 
@@ -495,6 +496,9 @@ async def session_join(
         capabilities=inp.capabilities,
         metadata=inp.metadata,
         delivery_mode=inp.delivery_mode,
+        # Joining with the creator credential (creator token or the owner's
+        # account token) makes this participant the coordinator, if none is set.
+        as_coordinator=principal.role == "creator",
     )
     # The plaintext token leaves RAM here: only its hash stays on the Participant.
     token, p.issued_token = p.issued_token, None
@@ -509,6 +513,7 @@ async def session_join(
         purpose=sess.purpose,
         relay_epoch=deps.relay_epoch,
         persistence=_persistence_public_for(sess),
+        coordinator_id=sess.coordinator_id,
     ).model_dump()
 
 
@@ -588,7 +593,9 @@ async def session_list_participants(
     deps: ToolDeps, handle: ConnectionHandle
 ) -> dict[str, Any]:
     sess, _ = await _session_for_handle(deps, handle)
-    return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
+    return SessionListParticipantsOutput(
+        roster=sess.roster_snapshot(), coordinator_id=sess.coordinator_id
+    ).model_dump()
 
 
 async def session_roster(
@@ -597,7 +604,9 @@ async def session_roster(
     """The roster for any credential that may read the session (REST)."""
     await _resolve_reader(deps, sid, token, None, source_ip=source_ip)
     sess = await deps.registry.get_or_raise(sid)
-    return SessionListParticipantsOutput(roster=sess.roster_snapshot()).model_dump()
+    return SessionListParticipantsOutput(
+        roster=sess.roster_snapshot(), coordinator_id=sess.coordinator_id
+    ).model_dump()
 
 
 async def session_check_inbox(
@@ -811,6 +820,19 @@ async def session_remove_participant(
     """Remove one participant: creator or admin token only."""
     sess = await _resolve_manager(deps, session_id, token, source_ip)
     return await sess.remove_participant(participant_id)
+
+
+async def session_set_coordinator(
+    deps: ToolDeps,
+    session_id: str,
+    token: str,
+    participant_id: str | None,
+    *,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Assign, move or clear the coordinator: creator, owner or admin only."""
+    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    return {"coordinator_id": await sess.set_coordinator(participant_id)}
 
 
 async def session_post_order(

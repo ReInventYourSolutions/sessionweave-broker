@@ -84,6 +84,7 @@ class SessionSnapshot:
     # PK). For sessions that never recorded any event this is 0.
     max_event_seq: int
     tokens: list[IssuedToken] = field(default_factory=list)
+    coordinator_id: str | None = None
     # Payloads of persisted ``supervisor.note`` events (note registry).
     notes: list[dict[str, Any]] = field(default_factory=list)
 
@@ -426,6 +427,13 @@ class PersistenceStore:
             (purpose_json, sid),
         )
 
+    async def update_session_coordinator(self, sid: str, coordinator_id: str | None) -> None:
+        assert self._write_conn is not None
+        await self._write_conn.execute(
+            "UPDATE sessions SET coordinator_id = ? WHERE session_id = ?",
+            (coordinator_id, sid),
+        )
+
     async def remove_buffered_through(self, sid: str, pid: str,
                                        max_seq_inclusive: int) -> int:
         assert self._write_conn is not None
@@ -446,7 +454,8 @@ class PersistenceStore:
         async with conn.execute(
             "SELECT config_json, purpose_json, creator_token_hash, persistence_mode,"
             " persistence_ttl_seconds, created_at, last_activity_at, ended_at,"
-            " ended_reason, relay_epoch_at_create, owner_account_id, suspended"
+            " ended_reason, relay_epoch_at_create, owner_account_id, suspended,"
+            " coordinator_id"
             " FROM sessions WHERE session_id = ?",
             (sid,),
         ) as cur:
@@ -514,6 +523,7 @@ class PersistenceStore:
             ended_at=srow[7], ended_reason=srow[8],
             relay_epoch_at_create=srow[9],
             owner_account_id=srow[10], suspended=bool(srow[11]),
+            coordinator_id=srow[12],
             participants=participants, inflight=inflight, buffered=buffered,
             max_event_seq=int(max_event_seq or 0),
             tokens=await self.load_tokens(sid),

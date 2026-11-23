@@ -48,6 +48,7 @@ REQUIRED = {
     "session_post_order": ["kind", "session_id", "target"],
     "session_remove_participant": ["participant_id", "session_id"],
     "session_reply_to_note": ["message", "note_id"],
+    "session_set_coordinator": ["participant_id", "session_id"],
 }
 
 # String parameters with a closed set of values.

@@ -403,3 +403,12 @@ def participant_id_for_token(
             limiter.record_failure(sid, source_ip)
         raise ToolError(ErrorCode.NOT_IN_SESSION, "unknown or stale participant token")
     return pid
+
+
+def is_coordinator(sess: Session, principal: Principal) -> bool:
+    """True when ``principal`` is a participant holding the session's coordinator role."""
+    return (
+        principal.role == "participant"
+        and principal.participant_id is not None
+        and principal.participant_id == sess.coordinator_id
+    )

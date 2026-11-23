@@ -100,6 +100,10 @@ components:
         max_command_timeout_seconds: { type: integer, example: 300 }
         offline_grace_seconds: { type: integer, example: 300 }
         max_pending_notifications_per_participant: { type: integer, example: 1000 }
+        max_launched_agents:
+          type: integer
+          example: 10
+          description: Cap on agents launched into this session through launchers (0 to 100; 0 = none). Launches beyond it are refused.
         max_wait_seconds:
           type: integer
           example: 600
@@ -197,6 +201,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ParticipantPublic'
+        coordinator_id:
+          type: string
+          nullable: true
+          description: The participant allowed to discover and launch agents; null when none is set.
 
     JoinRequest:
       type: object
@@ -293,6 +301,7 @@ components:
             - result.received
             - command.completed
             - session.purpose_updated
+            - session.coordinator_changed
             - session.ended
             - supervisor.note
         payload:
@@ -974,6 +983,43 @@ paths:
         '403': { description: "permission_denied; network_not_approved (an account token used here is not approved for the caller network)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
+  /v1/sessions/{sid}/coordinator:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [sessions]
+      summary: Assign, move or clear the session's coordinator (broadcasts session.coordinator_changed)
+      description: |
+        The coordinator is the only participant allowed to discover and launch agents.
+        It is the participant that first joined presenting the creator credential (the
+        creator token or the owning account's token); this route assigns another current
+        participant, or clears the role with ``participant_id: null``. When the coordinator
+        leaves or is removed the role becomes null (no promotion).
+        Bearer: the creator token, the owning account's token or the admin token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participant_id]
+              properties:
+                participant_id: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  coordinator_id: { type: string, nullable: true }
+        '401': { description: not_in_session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "participant_not_found (the target is not a current participant)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
   /v1/sessions/{sid}/supervisor/notes:
     parameters:
       - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
@@ -1266,6 +1312,7 @@ paths:
                   roster:
                     type: array
                     items: { $ref: '#/components/schemas/ParticipantPublic' }
+                  coordinator_id: { type: string, nullable: true }
         '401':
           description: not_in_session
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
