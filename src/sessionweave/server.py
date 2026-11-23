@@ -272,9 +272,10 @@ SessionIdArg = Annotated[str, Field(
                 "session_id returned by session_create.")]
 
 OptSessionIdArg = Annotated[str | None, Field(
-    description="Only together with participant_token, for a runtime that "
-                "opens a new connection per tool call. Leave unset if you "
-                "joined on this same connection.")]
+    description="Only together with participant_token (or a participant "
+                "token sent as the Authorization: Bearer header), for a "
+                "runtime that opens a new connection per tool call. Leave "
+                "unset if you joined on this same connection.")]
 
 ParticipantTokenArg = Annotated[str | None, Field(
     description="The participant_token session_join returned — not your "
@@ -437,14 +438,20 @@ def _build_fastmcp(
             if bound is not None:
                 yield _handle_for(ctx)
                 return
-        if not (session_id and participant_token):
+        # A launched agent's runtime carries its participant token only as
+        # the Authorization: Bearer header of the MCP request (it never
+        # appears in the agent's prompt), so the header stands in for an
+        # absent explicit token. The session still has to be named: the
+        # relay keeps no token -> session index.
+        token = participant_token or (_bearer_of(ctx) if session_id else None)
+        if not (session_id and token):
             # No binding and no explicit identity: let the normal
             # not_in_session error come from the tool itself.
             yield _handle_for(ctx)
             return
         from sessionweave.http_api import _bind_participant, _unbind_participant
         handle = await _bind_participant(
-            deps, session_id, participant_token, source_ip=_client_ip(ctx)
+            deps, session_id, token, source_ip=_client_ip(ctx)
         )
         try:
             yield handle
