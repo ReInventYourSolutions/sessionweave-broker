@@ -158,7 +158,8 @@ async def test_launch_by_profile_join_bound_and_single_use() -> None:
             assert r.status_code == 202, r.text
             lid = r.json()["launch_id"]
             assert r.json() == {"launch_id": lid, "status": "pending",
-                                "launcher_id": fl.launcher_id, "machine": "box"}
+                                "launcher_id": fl.launcher_id, "machine": "box",
+                                "owner": None, "own": True}
             assert lid.startswith("lch_") and len(lid) == 20
             order = await fl.expect("launch")
             assert order["launch_id"] == lid and order["session_id"] == s.sid
@@ -169,7 +170,8 @@ async def test_launch_by_profile_join_bound_and_single_use() -> None:
             assert isinstance(cred, str) and len(cred) > 20
             st = await _status(c, s.sid, s.coord_token, lid)
             assert st == {"launch_id": lid, "status": "pending", "profile_id": "p1",
-                          "launcher_id": fl.launcher_id, "machine": "box"}
+                          "launcher_id": fl.launcher_id, "machine": "box",
+                          "owner": None, "own": True}
             assert cred not in json.dumps(st)
             await fl.send({"type": "launch_result", "launch_id": lid, "status": "started"})
             await _until(lambda: _is_status(c, s, lid, "started"))
