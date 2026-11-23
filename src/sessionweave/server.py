@@ -25,12 +25,14 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter, admin_matches
+from sessionweave.access import _now_ms as access_now_ms
 from sessionweave.account_events import (
     EventLog,
     RequestClientMiddleware,
     client_label,
     request_client,
 )
+from sessionweave.accounts import TOKEN_PREFIX as ACCOUNT_TOKEN_PREFIX
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -403,6 +405,20 @@ def _build_fastmcp(
         except Exception:
             return None
 
+    def _may_be_participant_token(bearer: str, session_id: str) -> bool:
+        """False for a Bearer that is another kind of credential (admin, account,
+        or a creator/supervisor/join token of the session): it is the documented
+        header for session_create and manager tools, so it is never tried as a
+        participant token (which would count an auth failure and change the
+        error the caller gets)."""
+        if admin_matches(bearer, deps.admin_token) or bearer.startswith(ACCOUNT_TOKEN_PREFIX):
+            return False
+        sess = deps.registry.get(session_id)
+        if sess is None:
+            return True  # the bind reports the unknown session
+        principal = sess.auth.match(bearer, access_now_ms())
+        return principal is None or principal.role == "participant"
+
     @asynccontextmanager
     async def _participant(
         ctx: Context,
@@ -443,7 +459,11 @@ def _build_fastmcp(
         # appears in the agent's prompt), so the header stands in for an
         # absent explicit token. The session still has to be named: the
         # relay keeps no token -> session index.
-        token = participant_token or (_bearer_of(ctx) if session_id else None)
+        token = participant_token
+        if not token and session_id:
+            bearer = _bearer_of(ctx)
+            if bearer and _may_be_participant_token(bearer, session_id):
+                token = bearer
         if not (session_id and token):
             # No binding and no explicit identity: let the normal
             # not_in_session error come from the tool itself.

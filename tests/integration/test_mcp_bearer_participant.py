@@ -58,3 +58,34 @@ async def test_bearer_header_identifies_participant_without_binding() -> None:
                 )
                 out = await d.call_tool("session_list_participants", {"session_id": sid})
                 assert j2["participant_id"] in {r["participant_id"] for r in out["roster"]}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_non_participant_bearer_is_not_tried_as_participant_token() -> None:
+    """An admin or creator credential as Bearer (the documented session_create
+    path) is not a participant token: participant tools keep the plain
+    not_in_session answer, and no auth failure is counted for the caller."""
+    async with relay_subprocess({"SW_ADMIN_TOKEN": ADMIN}) as base:
+        async with sw_client(base, headers={"Authorization": f"Bearer {ADMIN}"}) as a:
+            created = await a.call_tool("session_create", {})
+            sid = created["session_id"]
+            # Far more calls than the per-(sid, ip) invalid-token budget.
+            for _ in range(40):
+                with pytest.raises(RuntimeError, match="call session_join first"):
+                    await a.call_tool("session_list_participants", {"session_id": sid})
+        creator = {"Authorization": f"Bearer {created['creator_token']}"}
+        async with sw_client(base, headers=creator) as c:
+            for _ in range(5):
+                with pytest.raises(RuntimeError, match="call session_join first"):
+                    await c.call_tool("session_list_participants", {"session_id": sid})
+        # The caller's IP is not throttled: a real participant still gets in.
+        async with sw_client(base) as j:
+            joined = await j.call_tool(
+                "session_join",
+                {"session_id": sid, "join_token": created["join_token"],
+                 "role": "w", "delivery_mode": "pull"})
+        hdr = {"Authorization": f"Bearer {joined['participant_token']}"}
+        async with sw_client(base, headers=hdr) as p:
+            ok = await p.call_tool("session_list_participants", {"session_id": sid})
+            assert ok["roster"]
