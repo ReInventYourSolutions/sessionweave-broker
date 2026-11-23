@@ -590,9 +590,14 @@ curl -s -H "$H" "$URL/v1/agents?session_id=$SID&domain=backend&role=analyst"
 # by launcher + profile, or by domain + role (first online launcher with a free slot)
 curl -s -H "$H" -X POST "$URL/v1/sessions/$SID/agents" \
   -d '{"domain": "backend", "role": "analyst", "task": "map the payment flow"}'
-# -> 202 {"launch_id": "lch_...", "status": "pending"}
+# -> 202 {"launch_id": "lch_...", "status": "pending", "launcher_id": "lnc_...", "machine": "box-1"}
 curl -s -H "$H" "$URL/v1/sessions/$SID/agents/lch_..."
 ```
+
+By domain + role the broker picks only among launchers of the session owner's
+account (or open-mode launchers); another account's `general` launcher is used only
+when named explicitly with `launcher_id` + `profile_id`. The response (and the
+status) says which launcher and machine got the task.
 
 MCP: `agents_discover`, `agents_launch`, `agents_launch_status`. Errors:
 `launch_limit` (409, the session's `max_launched_agents`, default 10, counting
@@ -601,8 +606,11 @@ pending, started and joined launches), `no_free_slot` (409), `profile_not_found`
 
 **What happens.** The broker reserves a slot, mints a **single-use join
 credential** bound to the session and to the profile's role and capabilities, and
-sends the launcher `{"type":"launch","launch_id","session_id","profile_id","task","broker_url","join_credential"}`
-— the only place the credential ever appears. The launcher answers
+sends the launcher `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","broker_url"?}`
+— the only place the credential ever appears. `broker_url` is present only when the
+operator set `SW_PUBLIC_BASE_URL`; it is never derived from request headers (a
+spoofed `Host` must not redirect the agent and its credential). Without it the
+launcher joins through the URL it connected to. The launcher answers
 `launch_result` (`started` | `failed` with `error`); the agent joins with the
 credential as Bearer on `POST /v1/sessions/{sid}/participants`. The join takes
 the profile's role and capabilities whatever the body says (they are forced, not
@@ -618,12 +626,26 @@ The coordinator receives the session event `agent.launch_failed {launch_id, erro
 **Lifecycle.** A launched agent stays until removed or the session ends. The
 coordinator may remove the agents it launched (`DELETE
 /v1/sessions/{sid}/participants/{pid}`, halt first), never others; the creator and
-admin remove anyone. The launcher then gets `{"type":"stop","launch_id","reason":"removed"}`;
-when the session ends or is deleted it gets reason `session_ended` (and
-`join_timeout` for a launch that timed out). When the launcher stops an agent
+admin remove anyone. Agents launched by the creator or admin have `launched_by`
+null, so only the creator or admin can remove them. Removing a launched agent does
+not invalidate the session's join tokens (it never held the invite link); its halt
+reads "removed by the coordinator" when the coordinator removed it. The launcher
+then gets `{"type":"stop","launch_id","reason":"removed"}` — `left` when the agent
+left by itself, `evicted` when it stayed offline past the grace period — and
+`session_ended` when the session ends or is deleted (also while it is cold), and
+`join_timeout` for a launch that timed out. When the launcher stops an agent
 itself (a profile limit), it sends `{"type":"stopped","launch_id","reason"}`; the
-broker removes the participant (halt first) and sends the session event
-`agent.stopped {participant_id, launch_id, reason}`. In account mode
+broker removes the participant (halt "stopped by its launcher: <reason>") and sends
+the session event `agent.stopped {participant_id, launch_id, reason}`.
+
+**Launcher reconnects.** A launcher that reconnects lists the agents it still runs
+in its hello, `"running": ["lch_...", ...]`. Each joined launch whose previous
+launcher had the same owner account and machine (or, in account mode, the same
+token) is re-attached: stops reach the new connection and the slot counts again.
+Any other id gets an immediate `stop` (its final reason, or `unknown_launch`).
+Joined agents whose launcher has not come back within 300 s
+(`SW_LAUNCHER_RECONNECT_GRACE_S`) are removed (halt first) with the session event
+`agent.stopped` reason `launcher_lost`. In account mode
 `agent.launched` / `agent.stopped` are recorded in the account event log.
 Launch records are kept in memory (a finished one for an hour); after a broker
 restart launches are forgotten, but joined agents remain participants.

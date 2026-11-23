@@ -1023,7 +1023,8 @@ async def _launch_agent_handler(request: Request) -> Response:
         body = await _read_json_body(request)
     except ToolError as exc:
         return _error_response(exc)
-    base = _public_base_url(request)
+    # Only the configured SW_PUBLIC_BASE_URL: never the request's Host header.
+    base = getattr(request.app.state, "public_base_url", None)
 
     async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
         return await tools.agents_launch(

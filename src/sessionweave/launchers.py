@@ -198,6 +198,13 @@ class LauncherRegistry:
             or not all(isinstance(a, str) and 0 < len(a) <= 200 for a in allowed)
         ):
             raise HelloError("allowed_accounts must be a list of account names")
+        running = hello.get("running", [])
+        if (
+            not isinstance(running, list)
+            or len(running) > 1000
+            or not all(isinstance(r, str) and 0 < len(r) <= 64 for r in running)
+        ):
+            raise HelloError("running must be a list of launch ids")
         raw_profiles = hello.get("profiles", [])
         if not isinstance(raw_profiles, list) or len(raw_profiles) > _MAX_PROFILES:
             raise HelloError(f"profiles must be a list of at most {_MAX_PROFILES} entries")
@@ -226,6 +233,14 @@ class LauncherRegistry:
         if self._launchers.pop(launcher_id, None) is not None and self.launches is not None:
             self.launches.launcher_gone(launcher_id)
 
+    def hold_slot(self, launcher_id: str, profile_id: str) -> bool:
+        """Count one more running instance (a re-associated agent)."""
+        lnc = self._launchers.get(launcher_id)
+        if lnc is None:
+            return False
+        lnc.running[profile_id] = lnc.running.get(profile_id, 0) + 1
+        return True
+
     def release_slot(self, launcher_id: str, profile_id: str) -> None:
         lnc = self._launchers.get(launcher_id)
         if lnc is not None and lnc.running.get(profile_id, 0) > 0:
@@ -244,13 +259,24 @@ class LauncherRegistry:
         """The launcher and profile to launch: the named one, or the first
         online launcher with a free slot for ``domain`` + ``role``.
 
+        Without ``launcher_id`` only launchers of the session owner's account
+        (or open-mode launchers) are candidates: another account's ``general``
+        launcher is used only when named explicitly.
+
         Raises PROFILE_NOT_FOUND (nothing visible matches) or NO_FREE_SLOT.
         """
+        session_owner = session.auth.owner_account_id
         matches: list[tuple[_Launcher, dict[str, Any]]] = []
         for lnc in self._launchers.values():
             if launcher_id is not None and lnc.launcher_id != launcher_id:
                 continue
             if not self._visible(lnc, session, owner_name):
+                continue
+            if (
+                launcher_id is None
+                and lnc.owner_account_id is not None
+                and lnc.owner_account_id != session_owner
+            ):
                 continue
             for p in lnc.profiles.values():
                 if profile_id is not None and p["id"] != profile_id:
@@ -367,11 +393,30 @@ class LauncherRegistry:
         return sorted(seen.values(), key=str.casefold)
 
 
+class FrameTooLargeError(Exception):
+    """A launcher frame over MAX_FRAME_BYTES."""
+
+
+def _frame_bytes(msg: Any) -> bytes:
+    text = msg.get("text")
+    if text is not None:
+        return str(text).encode("utf-8", "surrogatepass")
+    return bytes(msg.get("bytes") or b"")
+
+
 async def _read_hello(websocket: WebSocket) -> dict[str, Any]:
     try:
-        msg = await asyncio.wait_for(websocket.receive_text(), HELLO_TIMEOUT_S)
-        body = json.loads(msg)
-    except (TimeoutError, ValueError, WebSocketDisconnect, RuntimeError) as exc:
+        msg = await asyncio.wait_for(websocket.receive(), HELLO_TIMEOUT_S)
+    except (TimeoutError, WebSocketDisconnect, RuntimeError) as exc:
+        raise HelloError("expected a hello message") from exc
+    if msg.get("type") == "websocket.disconnect":
+        raise HelloError("expected a hello message")
+    raw = _frame_bytes(msg)
+    if len(raw) > MAX_FRAME_BYTES:
+        raise FrameTooLargeError
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
         raise HelloError("expected a hello message") from exc
     if not isinstance(body, dict) or body.get("type") != "hello":
         raise HelloError("first message must be type 'hello'")
@@ -438,12 +483,21 @@ async def launcher_ws(websocket: WebSocket) -> None:
         launcher_id, rejected = registry.register(
             websocket, owner_account_id, hello, token_id=token_id, ip=source_ip
         )
+    except FrameTooLargeError:
+        await websocket.close(code=_CLOSE_TOO_BIG, reason="frame too large")
+        return
     except HelloError as exc:
         await websocket.close(code=_CLOSE_BAD_HELLO, reason=str(exc)[:100])
         return
     except LauncherLimitError as exc:
         await websocket.close(code=_CLOSE_LIMITED, reason=str(exc)[:100])
         return
+    stops: list[dict[str, Any]] = []
+    if deps.launches is not None and hello.get("running"):
+        stops = deps.launches.reattach(
+            launcher_id, owner_account_id, token_id, hello["machine"].strip(),
+            list(hello["running"]),
+        )
 
     pinger: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
@@ -451,6 +505,8 @@ async def launcher_ws(websocket: WebSocket) -> None:
         await websocket.send_json(
             {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected}
         )
+        for stop in stops:
+            await websocket.send_json(stop)
         pinger = asyncio.create_task(_ping_loop(websocket))
         receiver = asyncio.create_task(_receive(websocket, launcher_id, deps.launches))
         await asyncio.wait({pinger, receiver}, return_when=asyncio.FIRST_COMPLETED)
@@ -480,10 +536,7 @@ async def _receive(websocket: WebSocket, launcher_id: str, launches: LaunchManag
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 return
-            text = msg.get("text")
-            raw: bytes = text.encode("utf-8", "surrogatepass") if text is not None else (
-                msg.get("bytes") or b""
-            )
+            raw = _frame_bytes(msg)
             if len(raw) > MAX_FRAME_BYTES:
                 await websocket.close(code=_CLOSE_TOO_BIG, reason="frame too large")
                 return

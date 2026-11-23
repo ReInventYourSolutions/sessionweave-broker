@@ -407,6 +407,7 @@ class SessionRegistry:
         async with self._lock:
             sess = self._sessions.pop(sid, None)
         if sess is None:
+            self._launches_ended(sid, reason)
             return
         sess.broadcast_session_ended(reason=reason)
         if self._metrics is not None:
@@ -459,6 +460,15 @@ class SessionRegistry:
                 except Exception:
                     logger.exception("could not record session.deleted for %s", sid)
         return _isoformat(_utcnow())
+
+    def _launches_ended(self, sid: str, reason: str) -> None:
+        """Stop the launched agents of a session ended while not in RAM."""
+        if self.launch_hooks is None:
+            return
+        try:
+            self.launch_hooks.session_ended(sid, reason)
+        except Exception:
+            logger.exception("launch hook failed for session %s", sid)
 
     async def owned_session_ids(self, account_id: str) -> list[str]:
         """Live sessions owned by the account: hot in RAM plus persisted."""
@@ -552,6 +562,7 @@ class SessionRegistry:
         removed = await self._for_each_owned(account_id, "delete", act)
         if self._store is not None:
             for sid in await self._store.find_owned_all(account_id):
+                self._launches_ended(sid, "account_deleted")
                 await self._store.delete_session(sid)
                 removed += 1
         return removed
@@ -583,6 +594,9 @@ class SessionRegistry:
                     self._sessions.pop(sid, None)
                     if self._metrics is not None:
                         self._metrics.sessions_active.dec()
+                else:
+                    # Cold: its launched agents still run somewhere.
+                    self._launches_ended(sid, "persistence_expired")
                 await self._store.delete_session(sid)
                 if self._metrics is not None:
                     self._metrics.session_purge_total.labels(

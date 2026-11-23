@@ -335,3 +335,11 @@ async def test_mcp_agents_discover_end_to_end() -> None:
             with pytest.raises(RuntimeError, match="permission_denied"):
                 await other.call_tool("agents_discover", {
                     "session_id": sid, "domain": "backend", "token": j2["participant_token"]})
+
+
+async def test_launcher_hello_too_large_closes_1009() -> None:
+    async with relay_subprocess() as base:
+        ws = await websockets.connect(_ws(base))
+        await ws.send(_hello([], pad="x" * (256 * 1024)))
+        code, _reason = await _closed_by_broker(ws)
+        assert code == 1009

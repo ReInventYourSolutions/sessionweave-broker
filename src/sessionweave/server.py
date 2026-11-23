@@ -1122,7 +1122,9 @@ def _build_fastmcp(
                 "domain": domain, "role": role}
         return await agents_launch(
             deps, session_id, _creator_cred(token, ctx), body,
-            broker_url=_public_base_url(ctx) or "", source_ip=_client_ip(ctx),
+            # Only the configured public URL, never one derived from headers.
+            broker_url=os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/") or None,
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("agents_launch_status")

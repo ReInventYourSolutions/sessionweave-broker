@@ -451,9 +451,10 @@ components:
         status: { type: string, enum: [pending, started, joined, failed, stopped] }
         profile_id: { type: string }
         launcher_id: { type: string }
+        machine: { type: string }
         participant_id: { type: string, description: Set once the agent joined }
         error: { type: string, description: "Why it failed: launcher_offline, join_timeout, or the launcher's message" }
-        reason: { type: string, description: "Why it stopped: removed, session_ended, or the launcher's limit (e.g. max_idle_s)" }
+        reason: { type: string, description: "Why it stopped: removed, left, evicted, session_ended, launcher_lost, or the launcher's limit (e.g. max_idle_s)" }
     Error:
       type: object
       properties:
@@ -1087,6 +1088,11 @@ paths:
       tags: [agents]
       summary: Launch an agent profile into the session
       description: |
+        By `domain` + `role` the broker picks only among launchers of the
+        session owner's account (or open-mode launchers); another account's
+        `general` launcher is used only when named with `launcher_id` +
+        `profile_id`.
+
         Bearer: the session coordinator's participant token, or the creator
         token, the owning account's token or the admin token (others:
         `permission_denied`, "only the session's coordinator can request agents
@@ -1125,6 +1131,8 @@ paths:
                 properties:
                   launch_id: { type: string, example: lch_0123456789abcdef }
                   status: { type: string, enum: [pending, failed] }
+                  launcher_id: { type: string, description: The launcher that got the order }
+                  machine: { type: string }
         '400': { description: "invalid_request (bad selection or task)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '404': { description: "session_not_found; profile_not_found (no visible online launcher offers it)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
@@ -1174,11 +1182,20 @@ paths:
         session event `agent.stopped {participant_id, launch_id, reason}`).
         Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}]}`,
         `{"type":"ping"}` every 20 s,
-        `{"type":"launch","launch_id","session_id","profile_id","task","broker_url","join_credential"}`
-        and `{"type":"stop","launch_id","reason":"removed"|"session_ended"|"join_timeout"}`.
+        `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","broker_url"?}`
+        (`broker_url` only when `SW_PUBLIC_BASE_URL` is configured — never from
+        request headers; otherwise the launcher uses the URL it connected to)
+        and `{"type":"stop","launch_id","reason"}` with reason `removed`, `left`,
+        `evicted`, `session_ended`, `join_timeout`, `launcher_lost` or
+        `unknown_launch`. The hello may carry `"running": [launch_id, ...]`
+        on reconnect: joined launches of the same owner and machine (account
+        mode: or token) are re-attached; other ids get an immediate `stop`.
         A launcher that disconnects fails its launches not yet joined with
         `launcher_offline` (slot and session cap released, credential
-        invalidated).
+        invalidated); its joined agents are removed with reason
+        `launcher_lost` unless it reconnects within
+        `SW_LAUNCHER_RECONNECT_GRACE_S` (default 300 s). Frames over 256 KiB,
+        the hello included, close with 1009.
       security:
         - bearerAuth: []
       responses:
@@ -1564,10 +1581,12 @@ paths:
       description: |
         Bearer: the creator token, the owning account's token or the admin
         token; the session coordinator's participant token may remove only the
-        agents it launched (`metadata.launched_by` is its participant id); a
+        agents it launched (`metadata.launched_by` is its participant id;
+        agents launched by the creator/admin have it null); a
         supervisor token is
         refused. A launched agent's launcher receives a `stop` order (reason
-        `removed`). The agent first receives a `supervisor.note` of kind `halt`
+        `removed`); removing a launched agent does not invalidate the join
+        tokens. The agent first receives a `supervisor.note` of kind `halt`
         (message `removed by the session creator`); as with any halt, the
         other participants and the firehose then see `participant.updated`
         with `supervision_state: paused` for it (unless it was already

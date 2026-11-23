@@ -13,7 +13,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.integration.accounts_fixtures import seeded_relay
+from tests.integration.accounts_fixtures import ADMIN, seeded_relay
 from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
@@ -37,6 +37,7 @@ class FakeLauncher:
         self.ws = ws
         self.welcome = welcome
         self.launcher_id: str = welcome["launcher_id"]
+        self.last_credential = ""
         self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._reader = asyncio.create_task(self._read())
 
@@ -156,17 +157,19 @@ async def test_launch_by_profile_join_bound_and_single_use() -> None:
                               launcher_id=fl.launcher_id, profile_id="p1")
             assert r.status_code == 202, r.text
             lid = r.json()["launch_id"]
-            assert r.json() == {"launch_id": lid, "status": "pending"}
+            assert r.json() == {"launch_id": lid, "status": "pending",
+                                "launcher_id": fl.launcher_id, "machine": "box"}
             assert lid.startswith("lch_") and len(lid) == 20
             order = await fl.expect("launch")
             assert order["launch_id"] == lid and order["session_id"] == s.sid
             assert order["profile_id"] == "p1" and order["task"] == "analyse the backend"
-            assert order["broker_url"].startswith("http://127.0.0.1:")
+            # no SW_PUBLIC_BASE_URL: the launcher uses the URL it connected to
+            assert "broker_url" not in order
             cred = order["join_credential"]
             assert isinstance(cred, str) and len(cred) > 20
             st = await _status(c, s.sid, s.coord_token, lid)
             assert st == {"launch_id": lid, "status": "pending", "profile_id": "p1",
-                          "launcher_id": fl.launcher_id}
+                          "launcher_id": fl.launcher_id, "machine": "box"}
             assert cred not in json.dumps(st)
             await fl.send({"type": "launch_result", "launch_id": lid, "status": "started"})
             await _until(lambda: _is_status(c, s, lid, "started"))
@@ -336,6 +339,7 @@ async def _launched_agent(
     assert r.status_code == 202, r.text
     lid = r.json()["launch_id"]
     cred = (await fl.expect("launch"))["join_credential"]
+    fl.last_credential = cred
     await fl.send({"type": "launch_result", "launch_id": lid, "status": "started"})
     agent = await _joined(c, s.sid, cred)
     return lid, agent
@@ -364,6 +368,9 @@ async def test_coordinator_removes_only_its_launched_agents() -> None:
             assert stop == {"type": "stop", "launch_id": lid, "reason": "removed"}
             st = await _status(c, s.sid, s.coord_token, lid)
             assert st["status"] == "stopped" and st["participant_id"] == agent["participant_id"]
+            assert st["reason"] == "removed"
+            assert r.json()["join_tokens_invalidated"] == 0
+            await _joined(c, s.sid, s.jt)  # the invite link still works
             # the creator still removes anyone
             r = await c.delete(
                 f"/v1/sessions/{s.sid}/participants/{by_creator['participant_id']}",
@@ -387,6 +394,7 @@ async def test_launcher_stop_removes_participant_with_reason() -> None:
                 return agent["participant_id"] not in {p["participant_id"] for p in roster}
 
             await _until(gone)
+            await _joined(c, s.sid, s.jt)  # the invite link still works
 
             async def has_event() -> bool:
                 items = await _drain(c, s.sid, s.coord_token)
@@ -509,5 +517,250 @@ async def test_account_events_on_launch_and_stop(tmp_path: Path) -> None:
             assert evs["agent.launched"]["profile_id"] == "p1"
             assert evs["agent.launched"]["launcher_id"] == fl.launcher_id
             assert evs["agent.stopped"]["reason"] == "removed"
-            dumped = json.dumps(evs)
-            assert "join_credential" not in dumped and "credential" not in dumped
+            dumped = json.dumps(await events())
+            assert "join_credential" not in dumped and fl.last_credential not in dumped
+
+
+async def test_agent_leaving_by_itself_stops_with_left() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/me",
+                               headers=bearer(agent["participant_token"]))
+            assert r.status_code == 204, r.text
+            assert await fl.expect("stop") == {"type": "stop", "launch_id": lid,
+                                               "reason": "left"}
+
+
+async def test_broker_url_only_from_configuration() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await c.post(f"/v1/sessions/{s.sid}/agents",
+                             headers={**bearer(s.coord_token), "Host": "evil.example"},
+                             json={"domain": "backend", "role": "analyst", "task": "t"})
+            assert r.status_code == 202, r.text
+            assert "broker_url" not in await fl.expect("launch")
+    env = {"SW_PUBLIC_BASE_URL": "https://pub.example/"}
+    async with relay_subprocess(env_overrides=env) as base, \
+            httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await c.post(f"/v1/sessions/{s.sid}/agents",
+                             headers={**bearer(s.coord_token), "Host": "evil.example",
+                                      "X-Forwarded-Host": "evil.example"},
+                             json={"domain": "backend", "role": "analyst", "task": "t"})
+            assert r.status_code == 202, r.text
+            assert (await fl.expect("launch"))["broker_url"] == "https://pub.example"
+
+
+async def _free_slots(c: httpx.AsyncClient, s: _Setup) -> int:
+    r = await c.get("/v1/agents", params={"session_id": s.sid, "domain": "backend"},
+                    headers=bearer(s.coord_token))
+    return int(r.json()["agents"][0]["free_slots"])
+
+
+async def test_launcher_reconnect_reattaches_running_agents() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=fl.launcher_id,
+                              profile_id="p1")
+            gone_lid = r.json()["launch_id"]
+            await fl.expect("launch")
+        # the pending launch failed; the joined one waits for its launcher
+        await _until(lambda: _is_status(c, s, gone_lid, "failed"))
+        assert (await _status(c, s.sid, s.coord_token, lid))["status"] == "joined"
+        async with launcher(base, [_prof()], running=[lid, gone_lid, "lch_ffffffffffffffff"]) \
+                as fl2:
+            stops = {(m := await fl2.expect("stop"))["launch_id"]: m["reason"]
+                     for _ in range(2)}
+            assert stops == {gone_lid: "launcher_offline",
+                             "lch_ffffffffffffffff": "unknown_launch"}
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["status"] == "joined" and st["launcher_id"] == fl2.launcher_id
+            assert await _free_slots(c, s) == 1  # the re-attached agent holds one
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                               headers=bearer(s.coord_token))
+            assert r.status_code == 200, r.text
+            assert await fl2.expect("stop") == {"type": "stop", "launch_id": lid,
+                                                "reason": "removed"}
+            assert await _free_slots(c, s) == 2
+
+
+async def test_launcher_lost_after_grace_removes_agent() -> None:
+    env = {"SW_LAUNCHER_RECONNECT_GRACE_S": "1"}
+    async with relay_subprocess(env_overrides=env) as base, \
+            httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            await _drain(c, s.sid, s.coord_token)
+        await _until(lambda: _is_status(c, s, lid, "stopped"))
+        assert (await _status(c, s.sid, s.coord_token, lid))["reason"] == "launcher_lost"
+
+        async def gone() -> bool:
+            roster = (await c.get(f"/v1/sessions/{s.sid}/participants",
+                                  headers=bearer(s.creator))).json()["roster"]
+            return agent["participant_id"] not in {p["participant_id"] for p in roster}
+
+        await _until(gone)
+        items = await _drain(c, s.sid, s.coord_token)
+        ev = next(i for i in items if i["name"] == "agent.stopped")
+        assert ev["payload"]["reason"] == "launcher_lost"
+        # a late reconnect is told to stop it
+        async with launcher(base, [_prof()], running=[lid]) as fl2:
+            assert await fl2.expect("stop") == {"type": "stop", "launch_id": lid,
+                                                "reason": "launcher_lost"}
+
+
+async def test_reconnect_cannot_claim_another_owners_launch(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.token)
+        coord = await _joined(c, made["session_id"], sd.token)
+        s = _Setup(c, {**made, "creator_token": sd.token}, coord)
+        async with launcher(sd.base, [_prof()], token=sd.token) as fl:
+            lid, _agent = await _launched_agent(c, s, fl)
+        async with launcher(sd.base, [_prof()], token=sd.other_token, running=[lid]) as bob:
+            assert await bob.expect("stop") == {"type": "stop", "launch_id": lid,
+                                                "reason": "unknown_launch"}
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["status"] == "joined" and st["launcher_id"] == fl.launcher_id
+        async with launcher(sd.base, [_prof()], token=sd.token, running=[lid]) as again:
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["launcher_id"] == again.launcher_id
+
+
+async def test_visibility_and_owner_only_auto_pick(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.other_token)  # Bob's session
+        coord = await _joined(c, made["session_id"], sd.other_token)
+        s = _Setup(c, {**made, "creator_token": sd.other_token}, coord)
+        async with launcher(sd.base, [_prof()], token=sd.token, machine="alice-p") as pers, \
+                launcher(sd.base, [_prof()], token=sd.token, machine="alice-c",
+                         visibility="general", allowed_accounts=["carol"]) as carol_only:
+            for lnc in (pers, carol_only):
+                r = await _launch(c, s.sid, s.coord_token, launcher_id=lnc.launcher_id,
+                                  profile_id="p1")
+                assert r.status_code == 404, r.text
+                assert r.json()["error"]["code"] == "profile_not_found"
+        async with launcher(sd.base, [_prof(max_instances=1)], token=sd.other_token,
+                            machine="bob") as own, \
+                launcher(sd.base, [_prof()], token=sd.token, machine="alice-g",
+                         visibility="general") as foreign:
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 202 and r.json()["launcher_id"] == own.launcher_id
+            assert r.json()["machine"] == "bob"
+            # own launcher full: a foreign general launcher is not auto-picked
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 409 and r.json()["error"]["code"] == "no_free_slot"
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=foreign.launcher_id,
+                              profile_id="p1")
+            assert r.status_code == 202, r.text
+            assert r.json()["machine"] == "alice-g"
+            lid = r.json()["launch_id"]
+            assert (await _status(c, s.sid, s.coord_token, lid))["machine"] == "alice-g"
+
+
+async def test_launch_after_launcher_token_revoked_is_refused(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        r = await c.post(f"/v1/accounts/{sd.acc.account_id}/tokens",
+                         headers=bearer(ADMIN), json={"label": "l"})
+        minted = r.json()
+        made = await _session(c, sd.token)
+        coord = await _joined(c, made["session_id"], sd.token)
+        s = _Setup(c, {**made, "creator_token": sd.token}, coord)
+        async with launcher(sd.base, [_prof()], token=minted["token"]) as fl:
+            r = await c.delete(f"/v1/accounts/{sd.acc.account_id}/tokens/{minted['token_id']}",
+                               headers=bearer(ADMIN))
+            assert r.status_code in (200, 204)
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=fl.launcher_id,
+                              profile_id="p1")
+            assert r.status_code == 404, r.text
+
+
+async def test_cold_session_expiry_stops_launched_agents(tmp_path: Path) -> None:
+    """A persisted session purged by the expiry sweep while cold still stops
+    its launched agents and releases their slots."""
+    from sessionweave.access import Principal, generate_token, hash_token
+    from sessionweave.config import load_deployment_defaults
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.persistence import PersistenceStore
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.schemas import PersistenceConfig
+    from sessionweave.tools import ToolDeps
+    from tests.unit.fakes import FakeHandle
+
+    sent: list[dict[str, Any]] = []
+
+    class Conn:
+        async def send_json(self, data: Any) -> None:
+            sent.append(data)
+
+    store = PersistenceStore(str(tmp_path / "cold.db"))
+    await store.init(pool_size=2)
+    try:
+        reg = SessionRegistry(defaults=load_deployment_defaults({}),
+                              connections=ConnectionManager(), store=store)
+        deps = ToolDeps(reg)
+        sid, _, _, _, _ = await reg.create(
+            overrides={}, purpose=None,
+            persistence=PersistenceConfig(mode="ttl", ttl_seconds=3600),
+            creator_token_hash=hash_token(generate_token()),
+        )
+        sess = await reg.get_or_raise(sid)
+        coord = await sess.join(FakeHandle(), role="c", as_coordinator=True)
+        lnc_id, _ = deps.launchers.register(Conn(), None, {
+            "machine": "m", "profiles": [_prof()]})
+        out = await deps.launches.launch(
+            sess, Principal("participant", coord.participant_id),
+            {"launcher_id": lnc_id, "profile_id": "p1", "task": "t"},
+            broker_url=None, owner_name=None)
+        lid = out["launch_id"]
+        reg._sessions.pop(sid)  # cold
+        purged = await reg.sweep_expired_once(now_ms=10**15, safety_seconds=0)
+        assert purged == 1
+        await asyncio.sleep(0.05)
+        assert {"type": "stop", "launch_id": lid, "reason": "session_ended"} in sent
+        launch = deps.launches.get(lid)
+        assert launch is not None and launch.status == "stopped"
+        assert deps.launchers._launchers[lnc_id].running["p1"] == 0
+    finally:
+        await store.close()
+
+
+async def test_halt_messages_name_who_stopped_the_agent(tmp_path: Path) -> None:
+    db = str(tmp_path / "halt.db")
+    async with relay_subprocess(persistence_db_path=db) as base, \
+            httpx.AsyncClient(base_url=base) as c:
+        made = await _session(c, None, persistence={"mode": "ttl", "ttl_seconds": 3600})
+        coord = await _joined(c, made["session_id"], made["creator_token"])
+        s = _Setup(c, made, coord)
+        async with launcher(base, [_prof()]) as fl:
+            _lid, a1 = await _launched_agent(c, s, fl)
+            lid2, a2 = await _launched_agent(c, s, fl)
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{a1['participant_id']}",
+                               headers=bearer(s.coord_token))
+            assert r.status_code == 200, r.text
+            await fl.send({"type": "stopped", "launch_id": lid2, "reason": "max_cost_usd"})
+            await _until(lambda: _is_status(c, s, lid2, "stopped"))
+
+            async def halts() -> dict[str, str]:
+                r = await c.get(f"/v1/sessions/{s.sid}/events",
+                                params={"kind": "supervisor.note"}, headers=bearer(s.creator))
+                assert r.status_code == 200, r.text
+                return {e["payload"]["target"]: e["payload"]["message"]
+                        for e in r.json()["events"] if e["payload"].get("kind") == "halt"}
+
+            async def both() -> bool:
+                return len(await halts()) == 2
+
+            await _until(both)
+            got = await halts()
+            assert got[a1["participant_id"]] == "removed by the coordinator"
+            assert got[a2["participant_id"]] == "stopped by its launcher: max_cost_usd"

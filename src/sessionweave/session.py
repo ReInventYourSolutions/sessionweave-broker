@@ -45,6 +45,7 @@ MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
 _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
 # The halt note a participant receives just before the creator removes it.
 REMOVED_HALT_MESSAGE = "removed by the session creator"
+COORDINATOR_REMOVED_HALT_MESSAGE = "removed by the coordinator"
 # Participant metadata keys only the broker sets (on a join with a launch
 # credential); a participant cannot set or change them.
 LAUNCH_METADATA_KEYS = frozenset(
@@ -55,7 +56,7 @@ LAUNCH_METADATA_KEYS = frozenset(
 class LaunchHooks(Protocol):
     """Told synchronously (session lock held) when launched agents must stop."""
 
-    def participant_gone(self, session_id: str, participant_id: str) -> None: ...
+    def participant_gone(self, session_id: str, participant_id: str, reason: str) -> None: ...
 
     def session_ended(self, session_id: str, reason: str) -> None: ...
 
@@ -536,7 +537,7 @@ class Session:
         if feedback is not None:
             self._enforce_feedback_size(feedback)
         async with self.lock:
-            if self._drop_participant(participant_id) is None:
+            if self._drop_participant(participant_id, reason="left") is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             self.bump_activity()
             self._close_subscribers(participant_id, reason="left")
@@ -557,7 +558,9 @@ class Session:
             )
             self._mirror_firehose("participant.left", payload)
 
-    async def remove_participant(self, participant_id: str) -> dict[str, Any]:
+    async def remove_participant(
+        self, participant_id: str, *, halt_message: str = REMOVED_HALT_MESSAGE
+    ) -> dict[str, Any]:
         """Remove one participant on the creator's (or admin's) order.
 
         The target first receives a ``halt`` supervisor note through the
@@ -580,11 +583,12 @@ class Session:
                     ErrorCode.PARTICIPANT_NOT_FOUND,
                     f"{participant_id!r} is not a participant of this session",
                 )
-            await self._apply_order(
-                new_note("halt", participant_id, REMOVED_HALT_MESSAGE)
-            )
+            await self._apply_order(new_note("halt", participant_id, halt_message))
             now_ms = _now_ms()
-            to_expire = self.auth.valid_join_tokens(now_ms)
+            # A launched agent never held the invite link: removing it leaves
+            # the session's join tokens alone.
+            launched = bool(target.metadata.get("launch_id"))
+            to_expire = [] if launched else self.auth.valid_join_tokens(now_ms)
             if self._store is not None:
                 if to_expire:
                     await self._store.expire_tokens(
@@ -595,9 +599,9 @@ class Session:
                 )
             # Disk holds the cut-off; RAM follows and nothing below can fail
             # before the participant is gone.
-            invalidated = self.auth.invalidate_join_tokens(now_ms)
+            invalidated = [] if launched else self.auth.invalidate_join_tokens(now_ms)
             self.auth.tombstone_participant(target.token_hash, now_ms)
-            self._drop_participant(participant_id)
+            self._drop_participant(participant_id, reason="removed")
             self._close_subscribers(participant_id, reason="removed")
             await self._persist_coordinator_cleared()
             self.bump_activity()
@@ -2017,7 +2021,7 @@ class Session:
             if self._metrics is not None:
                 self._metrics.command_cancelled_total.labels(reason=reason).inc()
 
-    def _drop_participant(self, pid: str) -> Participant | None:
+    def _drop_participant(self, pid: str, *, reason: str) -> Participant | None:
         """Take a participant out of the session's RAM state.
 
         Shared by leave, eviction and removal: the roster entry, its token,
@@ -2035,7 +2039,7 @@ class Session:
             self._coordinator_dirty = True
         if self.launch_hooks is not None and p.metadata.get("launch_id"):
             try:
-                self.launch_hooks.participant_gone(self.session_id, pid)
+                self.launch_hooks.participant_gone(self.session_id, pid, reason)
             except Exception:
                 logger.exception("launch hook failed for %s", pid)
         self.auth.forget_participant(pid)
@@ -2064,7 +2068,7 @@ class Session:
                 pass
 
     def _evict(self, pid: str, reason: str) -> None:
-        if self._drop_participant(pid) is None:
+        if self._drop_participant(pid, reason="evicted") is None:
             return
         self._persist_left(pid)
         self._notify_others(

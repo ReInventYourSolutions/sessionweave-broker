@@ -846,10 +846,13 @@ async def session_remove_participant(
     """Remove one participant: creator or admin token; the session's
     coordinator may remove the agents it launched."""
     from sessionweave.access import is_coordinator
+    from sessionweave.session import COORDINATOR_REMOVED_HALT_MESSAGE, REMOVED_HALT_MESSAGE
 
     principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
     sess = await deps.registry.get_or_raise(session_id)
+    halt_message = REMOVED_HALT_MESSAGE
     if principal.role not in ("creator", "admin"):
+        halt_message = COORDINATOR_REMOVED_HALT_MESSAGE
         target = sess._participants.get(participant_id)
         launched_by = target.metadata.get("launched_by") if target is not None else None
         if not (
@@ -862,7 +865,7 @@ async def session_remove_participant(
                 "requires one of: creator, admin (the coordinator may remove only "
                 "the agents it launched)",
             )
-    return await sess.remove_participant(participant_id)
+    return await sess.remove_participant(participant_id, halt_message=halt_message)
 
 
 async def session_set_coordinator(
@@ -1044,7 +1047,7 @@ async def agents_launch(
     token: str,
     body: dict[str, Any],
     *,
-    broker_url: str,
+    broker_url: str | None,
     source_ip: str = "",
 ) -> dict[str, Any]:
     """Ask a launcher to start a profile in this session (coordinator or

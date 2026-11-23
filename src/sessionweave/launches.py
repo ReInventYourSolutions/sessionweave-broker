@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 JOIN_TIMEOUT_S = 120.0
+RECONNECT_GRACE_S = 300.0
+_MAX_RUNNING_IDS = 1000
 TASK_MAX_BYTES = 16 * 1024
 _KEEP_FINAL_S = 3600.0
 _ACTIVE = frozenset({"pending", "started", "joined"})
@@ -50,6 +52,16 @@ def join_timeout_from_env() -> float:
     return min(max(value, 1.0), 3600.0)
 
 
+def reconnect_grace_from_env() -> float:
+    """SW_LAUNCHER_RECONNECT_GRACE_S (seconds, 1..86400), default 300."""
+    raw = os.environ.get("SW_LAUNCHER_RECONNECT_GRACE_S", "").strip()
+    try:
+        value = float(raw) if raw else RECONNECT_GRACE_S
+    except ValueError:
+        value = RECONNECT_GRACE_S
+    return min(max(value, 1.0), 86400.0)
+
+
 def _short_text(raw: Any, default: str, limit: int = 200) -> str:
     """A printable, bounded string from a launcher-supplied value."""
     if not isinstance(raw, str) or not raw.strip():
@@ -64,6 +76,9 @@ class Launch:
     launcher_id: str
     machine: str
     profile_id: str
+    # Identity of the launcher holding the agent, to re-associate it on reconnect.
+    launcher_owner: str | None
+    launcher_token_id: str | None
     launched_by: str | None
     accounts: tuple[str, ...]  # launcher owner + session owner (deduplicated)
     token_id: str | None  # the launch credential, until joined or invalidated
@@ -75,6 +90,8 @@ class Launch:
     joining: bool = False
     ended_at: float | None = None
     timer: asyncio.TimerHandle | None = field(default=None, repr=False)
+    # Armed while a joined agent's launcher is disconnected.
+    lost_timer: asyncio.TimerHandle | None = field(default=None, repr=False)
 
     def public(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -82,6 +99,7 @@ class Launch:
             "status": self.status,
             "profile_id": self.profile_id,
             "launcher_id": self.launcher_id,
+            "machine": self.machine,
         }
         if self.participant_id is not None:
             out["participant_id"] = self.participant_id
@@ -135,6 +153,7 @@ class LaunchManager:
         self._launches: dict[str, Launch] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self.join_timeout_s = join_timeout_from_env()
+        self.reconnect_grace_s = reconnect_grace_from_env()
 
     # --- queries ---
 
@@ -161,7 +180,7 @@ class LaunchManager:
         principal: Principal,
         body: dict[str, Any],
         *,
-        broker_url: str,
+        broker_url: str | None,
         owner_name: str | None,
     ) -> dict[str, Any]:
         """Reserve a slot, mint the credential and send the order (the caller
@@ -171,6 +190,8 @@ class LaunchManager:
         sid = sess.session_id
         # Synchronous from here to the reservation: no concurrent launch can
         # take the same slot or overshoot the session cap.
+        if self._deps.registry.get(sid) is not sess:
+            raise ToolError(ErrorCode.SESSION_NOT_FOUND, "session not found")
         if self.active_count(sid) >= sess.config.max_launched_agents:
             raise ToolError(
                 ErrorCode.LAUNCH_LIMIT,
@@ -194,6 +215,7 @@ class LaunchManager:
         lch = Launch(
             launch_id=launch_id, session_id=sid, launcher_id=lnc.launcher_id,
             machine=lnc.machine, profile_id=prof["id"],
+            launcher_owner=lnc.owner_account_id, launcher_token_id=lnc.token_id,
             launched_by=principal.participant_id if is_coordinator(sess, principal) else None,
             accounts=accounts, token_id=issued.token_id,
         )
@@ -202,20 +224,31 @@ class LaunchManager:
             self.join_timeout_s, self._on_timeout, launch_id
         )
         self._account_event(lch, "agent.launched")
-        order = {
+        order: dict[str, Any] = {
             "type": "launch",
             "launch_id": launch_id,
             "session_id": sid,
             "profile_id": prof["id"],
             "task": task,
-            "broker_url": broker_url,
             "join_credential": token,
         }
+        # Only the operator-configured public URL: never one derived from
+        # request headers (a spoofed Host must not redirect the credential).
+        # Without it the launcher uses the URL it connected to.
+        if broker_url:
+            order["broker_url"] = broker_url
         try:
             await lnc.conn.send_json(order)
+        except asyncio.CancelledError:
+            if lch.status in _ACTIVE:
+                self._finish(lch, "failed", error="cancelled")
+            raise
         except Exception:
             self._fail(lch, "launcher_offline")
-        return {"launch_id": launch_id, "status": lch.status}
+        return {
+            "launch_id": launch_id, "status": lch.status,
+            "launcher_id": lch.launcher_id, "machine": lch.machine,
+        }
 
     # --- join (called by session_join with a launch credential) ---
 
@@ -286,9 +319,9 @@ class LaunchManager:
             return
         self._finish(lch, "stopped", reason=reason)
         self._account_event(lch, "agent.stopped", reason=reason)
-        self._spawn(self._remove_stopped(lch, reason))
+        self._spawn(self._remove_stopped(lch, reason, f"stopped by its launcher: {reason}"))
 
-    async def _remove_stopped(self, lch: Launch, reason: str) -> None:
+    async def _remove_stopped(self, lch: Launch, reason: str, halt_message: str) -> None:
         try:
             sess = await self._deps.registry.get_or_raise(lch.session_id)
         except ToolError:
@@ -296,7 +329,7 @@ class LaunchManager:
         pid = lch.participant_id
         assert pid is not None
         try:
-            await sess.remove_participant(pid)
+            await sess.remove_participant(pid, halt_message=halt_message)
         except ToolError:
             pass  # already gone
         await sess.emit_event(
@@ -312,29 +345,84 @@ class LaunchManager:
             lch.slot_held = False  # the launcher and its slot count are gone
             if lch.status in ("pending", "started") and not lch.joining:
                 self._fail(lch, "launcher_offline")
+            elif lch.status == "joined" and lch.lost_timer is None:
+                # It may reconnect and report the agent still running.
+                lch.lost_timer = asyncio.get_running_loop().call_later(
+                    self.reconnect_grace_s, self._on_lost, lch.launch_id
+                )
+
+    def _on_lost(self, launch_id: str) -> None:
+        lch = self._launches.get(launch_id)
+        if lch is None:
+            return
+        lch.lost_timer = None
+        if lch.status != "joined" or self._launchers.get_conn(lch.launcher_id) is not None:
+            return
+        self._finish(lch, "stopped", reason="launcher_lost")
+        self._account_event(lch, "agent.stopped", reason="launcher_lost")
+        self._spawn(self._remove_stopped(
+            lch, "launcher_lost", "stopped: its launcher disconnected"
+        ))
+
+    def reattach(
+        self, launcher_id: str, owner: str | None, token_id: str | None, machine: str,
+        running: list[str],
+    ) -> list[dict[str, Any]]:
+        """Re-associate the joined launches a reconnecting launcher reports
+        still running; return the stop orders for the ids it may not keep."""
+        stops: list[dict[str, Any]] = []
+        for lid in running:
+            lch = self._launches.get(lid)
+            same_owner = lch is not None and lch.launcher_owner == owner and (
+                lch.machine == machine
+                or (owner is not None and token_id is not None
+                    and lch.launcher_token_id == token_id)
+            )
+            if lch is None or not same_owner:
+                stops.append({"type": "stop", "launch_id": lid, "reason": "unknown_launch"})
+                continue
+            assert lch is not None
+            if lch.status != "joined":
+                reason = lch.reason or lch.error or "unknown_launch"
+                stops.append({"type": "stop", "launch_id": lid, "reason": reason})
+                continue
+            if lch.launcher_id == launcher_id:
+                continue
+            if self._launchers.get_conn(lch.launcher_id) is not None:
+                # Its launcher is still connected: not this one's to claim.
+                stops.append({"type": "stop", "launch_id": lid, "reason": "unknown_launch"})
+                continue
+            if lch.lost_timer is not None:
+                lch.lost_timer.cancel()
+                lch.lost_timer = None
+            lch.launcher_id = launcher_id
+            lch.launcher_token_id = token_id
+            lch.machine = machine
+            lch.slot_held = self._launchers.hold_slot(launcher_id, lch.profile_id)
+        return stops
 
     # --- session hooks (sync, session lock held) ---
 
-    def participant_gone(self, session_id: str, participant_id: str) -> None:
+    def participant_gone(self, session_id: str, participant_id: str, reason: str) -> None:
+        """``reason``: removed, left (it left by itself) or evicted (offline)."""
         for lch in self._launches.values():
             if (
                 lch.session_id == session_id
                 and lch.participant_id == participant_id
                 and lch.status == "joined"
             ):
-                self._finish(lch, "stopped", reason="removed")
-                self._send_stop(lch, "removed")
-                self._account_event(lch, "agent.stopped", reason="removed")
+                self._finish(lch, "stopped", reason=reason)
+                self._send_stop(lch, reason)
+                self._account_event(lch, "agent.stopped", reason=reason)
 
     def session_ended(self, session_id: str, reason: str) -> None:
-        for lid, lch in list(self._launches.items()):
-            if lch.session_id != session_id:
-                continue
-            if lch.status in _ACTIVE:
+        # Records stay (final) until pruned, so a reconnecting launcher that
+        # still reports one is told session_ended.
+        for lch in list(self._launches.values()):
+            if lch.session_id == session_id and lch.status in _ACTIVE:
                 self._finish(lch, "stopped", reason="session_ended")
                 self._send_stop(lch, "session_ended")
                 self._account_event(lch, "agent.stopped", reason="session_ended")
-            self._launches.pop(lid, None)
 
     # --- internals ---
 
@@ -392,9 +480,11 @@ class LaunchManager:
 
     @staticmethod
     def _cancel_timer(lch: Launch) -> None:
-        if lch.timer is not None:
-            lch.timer.cancel()
-            lch.timer = None
+        for name in ("timer", "lost_timer"):
+            handle = getattr(lch, name)
+            if handle is not None:
+                handle.cancel()
+                setattr(lch, name, None)
 
     @staticmethod
     def _drop_credential(lch: Launch, sess: Session) -> None:
@@ -430,11 +520,22 @@ class LaunchManager:
         self._spawn(_emit())
 
     def _spawn(self, coro: Any) -> None:
+        """Run ``coro`` in the background; its failure is logged, never lost."""
+
+        async def _guarded() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("launch background task failed")
+
         try:
-            task = asyncio.get_running_loop().create_task(coro)
+            loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - no running loop
             coro.close()
             return
+        task = loop.create_task(_guarded())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
