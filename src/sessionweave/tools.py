@@ -86,6 +86,7 @@ class ToolDeps:
         "auth_limiter",
         "bounds",
         "events",
+        "launchers",
         "metrics",
         "registry",
         "relay_epoch",
@@ -120,6 +121,8 @@ class ToolDeps:
         # Set in the server lifespan once the persistence store exists.
         self.accounts: AccountStore | None = None
         self.events: EventLog | None = None
+        from sessionweave.launchers import LauncherRegistry
+        self.launchers = LauncherRegistry()
         self.session_creation: Literal["open", "account"] = "open"
         # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).
         self.account_max_sessions: int = 100
@@ -965,3 +968,44 @@ async def session_get_events(
         has_more=page.has_more,
         session_state=state,
     ).model_dump()
+
+
+COORDINATOR_ONLY_MESSAGE = (
+    "only the session's coordinator can request agents \u2014 ask the coordinator"
+)
+
+
+async def agents_discover(
+    deps: ToolDeps,
+    sid: str,
+    token: str,
+    domain: str | None = None,
+    role: str | None = None,
+    capability: str | None = None,
+    *,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Profiles (or, without ``domain``, the domains) the caller may launch.
+
+    Allowed to the session's coordinator or the creator/admin acting for it.
+    """
+    from sessionweave.access import is_coordinator, resolve_principal
+
+    principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
+    sess = await deps.registry.get_or_raise(sid)
+    if principal.role not in ("creator", "admin") and not is_coordinator(sess, principal):
+        raise ToolError(ErrorCode.PERMISSION_DENIED, COORDINATOR_ONLY_MESSAGE)
+    owner_name: str | None = None
+    owner_id = sess.auth.owner_account_id
+    if owner_id is not None and deps.accounts is not None:
+        try:
+            owner_name = (await deps.accounts.get(owner_id)).name
+        except Exception:
+            owner_name = None
+    if domain is None:
+        return {"domains": deps.launchers.domains_for(sess, owner_name=owner_name)}
+    return {
+        "agents": deps.launchers.profiles_for(
+            sess, domain, role, capability, owner_name=owner_name
+        )
+    }

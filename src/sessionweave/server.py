@@ -40,6 +40,8 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
+from sessionweave.launchers import launcher_token_from_env
+from sessionweave.launchers import routes as launcher_routes
 from sessionweave.limits import (
     McpNewSessionLimitMiddleware,
     RequestSizeLimitMiddleware,
@@ -59,6 +61,7 @@ from sessionweave.schemas import ReplyOutcome
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
+    agents_discover,
     session_check_inbox,
     session_create,
     session_delete,
@@ -1042,6 +1045,39 @@ def _build_fastmcp(
             source_ip=_client_ip(ctx),
         )
 
+    @_tool("agents_discover")
+    async def agents_discover_tool(
+        session_id: SessionIdArg,
+        domain: Annotated[str | None, Field(description=
+            "Application domain to list agent profiles for. Omit to list the "
+            "domains available to this session."
+        )] = None,
+        role: Annotated[str | None, Field(description=
+            "Only profiles with this role."
+        )] = None,
+        capability: Annotated[str | None, Field(description=
+            "Only profiles declaring this capability tag."
+        )] = None,
+        token: Annotated[str | None, Field(description=
+            "The coordinator's participant token (or the creator/admin credential). "
+            "May be omitted when it arrives as the MCP Authorization: Bearer header."
+        )] = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Find the agents you may start in this session.
+
+    Only the session's coordinator (its participant token) or the creator/admin
+    may call this; anyone else gets permission_denied and should ask the
+    coordinator. Without a domain, returns {"domains": [...]}; with one,
+    {"agents": [...]} where each item has launcher_id, machine, profile_id,
+    domain, role, capabilities, description, runtime, model, access_preset,
+    limits, online and free_slots.
+    """
+        return await agents_discover(
+            deps, session_id, _creator_cred(token, ctx), domain, role, capability,
+            source_ip=_client_ip(ctx),
+        )
+
     @_tool("session_post_order")
     async def session_post_order_tool(
         session_id: SessionIdArg,
@@ -1214,6 +1250,7 @@ def build_app() -> Starlette:
                     "firehose": True,
                     "supervisor_notes": True,
                     "session_delete": True,
+                    "launchers": True,
                 },
             }
         )
@@ -1340,6 +1377,7 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
+            *launcher_routes(),
             Mount("/", app=McpNewSessionLimitMiddleware(mcp_app)),
         ],
         middleware=[
@@ -1360,6 +1398,7 @@ def build_app() -> Starlette:
     # Relay-wide admin token (SW_ADMIN_TOKEN). Unset is a valid, closed
     # configuration: no admin access and no fallback.
     app.state.admin_token = admin_token
+    app.state.launcher_token = launcher_token_from_env()
     if admin_token is None:
         logging.getLogger(__name__).info("admin access disabled")
     app.state.supervisor_rate = note_limiter

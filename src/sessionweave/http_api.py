@@ -987,6 +987,31 @@ async def _set_coordinator_handler(request: Request) -> Response:
     return await _run_credential_call(request, call)
 
 
+async def _agents_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    q = request.query_params
+    sid = q.get("session_id")
+    domain = q.get("domain")
+    if not sid:
+        return _error_response(ToolError(ErrorCode.INVALID_REQUEST, "session_id is required"))
+    if request.url.path.endswith("/domains"):
+        domain = None
+    elif not domain:
+        return _error_response(
+            ToolError(ErrorCode.INVALID_REQUEST, "domain is required (see /v1/agents/domains)")
+        )
+    try:
+        out = await tools.agents_discover(
+            _deps(request), sid, _bearer(request) or "", domain,
+            q.get("role") or None, q.get("capability") or None,
+            source_ip=_request_source_ip(request),
+        )
+    except ToolError as exc:
+        return _error_response(exc)
+    return JSONResponse(out)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -1040,6 +1065,8 @@ def routes() -> list[Route]:
             delete_self,
             methods=["DELETE"],
         ),
+        Route("/v1/agents", _agents_handler, methods=["GET"]),
+        Route("/v1/agents/domains", _agents_handler, methods=["GET"]),
         Route(
             "/v1/sessions/{sid}/coordinator",
             _set_coordinator_handler,
