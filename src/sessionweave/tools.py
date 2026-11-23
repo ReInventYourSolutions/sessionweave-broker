@@ -540,6 +540,7 @@ async def session_resume(
         config=_int_config(asdict(sess.config)),
         purpose=sess.purpose,
         relay_epoch=deps.relay_epoch,
+        coordinator_id=sess.coordinator_id,
     ).model_dump()
 
 

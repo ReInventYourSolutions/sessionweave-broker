@@ -182,6 +182,7 @@ class SessionResumeOutput(_Strict):
     # if it changes the relay has restarted and the client's local seq
     # cursor refers to a now-empty buffer in a fresh process. Issue #65.
     relay_epoch: int = 0
+    coordinator_id: str | None = None
 
 
 class SessionUpdateSelfInput(_Strict):

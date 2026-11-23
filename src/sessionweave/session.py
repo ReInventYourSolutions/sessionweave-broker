@@ -442,6 +442,7 @@ class Session:
                 self._metrics.participants_active.labels(online="true").inc()
             if as_coordinator and self.coordinator_id is None:
                 self.coordinator_id = p.participant_id
+                self._coordinator_dirty = False
                 if self._store is not None:
                     await self._store.update_session_coordinator(
                         self.session_id, p.participant_id
@@ -1830,11 +1831,17 @@ class Session:
         if self._store is None:
             return
         left_at_ms = int(_utcnow().timestamp() * 1000)
+        clear_coordinator = self._coordinator_dirty
+        self._coordinator_dirty = False
+        store = self._store
+
+        async def _write() -> None:
+            await store.soft_delete_participant(self.session_id, pid, left_at=left_at_ms)
+            if clear_coordinator:
+                await store.update_session_coordinator(self.session_id, None)
+
         try:
-            task = asyncio.create_task(
-                self._store.soft_delete_participant(
-                    self.session_id, pid, left_at=left_at_ms)
-            )
+            task = asyncio.create_task(_write())
         except RuntimeError:  # pragma: no cover - no running loop
             return
         self._firehose_tasks.add(task)
