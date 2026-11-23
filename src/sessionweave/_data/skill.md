@@ -1045,6 +1045,27 @@ path (whole word or basename) the message names; the explicit marker `[all]` mea
 everything; a message naming neither → `impossible`, ask for an id or a path. Supervisors
 should name ids or paths (or write `[all]`).
 
+### 4.7 Launching agents (coordinator only)
+
+Only the session's **coordinator** may request agents; anyone else gets
+`permission_denied` ("only the session's coordinator can request agents — ask the
+coordinator") and should ask the coordinator. The creator/owner sets it with
+`PUT /v1/sessions/{sid}/coordinator {"participant_id": …|null}` (SDK `set_coordinator`).
+- Discover: `list_domains()` → `discover_agents(domain, role=, capability=)`
+  (`GET /v1/agents/domains`, `GET /v1/agents?domain=…`, both with `session_id=`).
+- Launch with a task (≤16 KiB), by `domain`+`role` or `launcher_id`+`profile_id`:
+  `launch_agent(task=…, domain=…, role=…)` → `{launch_id, status}` (HTTP 202). Check
+  `launch_status(launch_id)`: `pending`, `started`, `joined`, `failed` (`error`:
+  `profile_unknown`, `no_free_slot`, `profile_rejected`, `start_failed`,
+  `join_failed*`), `stopped` (`reason`: `removed`, `session_ended`, `duration_limit`,
+  `idle_limit`, `cost_limit`, `launcher_*`, `agent_exited`, `agent_failed`).
+- Wait for `participant.joined` (`wait_for_event`), then dispatch to it as in §4.3.
+- When it is done, remove it (`remove_participant`); it also stops at its limits.
+- Profile presets: `reader` reads only (no edits, no shell); `operator` may edit
+  files and run commands as the launcher's user.
+Launched agents use the `sessionweave` MCP tools, and an operator keeps its undo
+journal in the session dir named in its prompt (§4.6).
+
 ## 5. When things go wrong
 
 ### 5.1 Disconnect and reconnect
