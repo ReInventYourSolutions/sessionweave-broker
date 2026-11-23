@@ -87,6 +87,7 @@ class ToolDeps:
         "bounds",
         "events",
         "launchers",
+        "launches",
         "metrics",
         "registry",
         "relay_epoch",
@@ -122,7 +123,11 @@ class ToolDeps:
         self.accounts: AccountStore | None = None
         self.events: EventLog | None = None
         from sessionweave.launchers import LauncherRegistry
+        from sessionweave.launches import LaunchManager
         self.launchers = LauncherRegistry()
+        self.launches = LaunchManager(self.launchers, self)
+        self.launchers.launches = self.launches
+        registry.launch_hooks = self.launches
         self.session_creation: Literal["open", "account"] = "open"
         # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).
         self.account_max_sessions: int = 100
@@ -492,17 +497,34 @@ async def session_join(
         deps, inp.session_id, inp.join_token, source_ip=source_ip
     )
     require(principal, "joiner", "creator", "admin")
-    p = await sess.join(
-        handle,
-        role=inp.role,
-        objective=inp.objective,
-        capabilities=inp.capabilities,
-        metadata=inp.metadata,
-        delivery_mode=inp.delivery_mode,
-        # Joining with the creator credential (creator token or the owner's
-        # account token) makes this participant the coordinator, if none is set.
-        as_coordinator=principal.role == "creator",
-    )
+    from sessionweave.session import LAUNCH_METADATA_KEYS
+
+    metadata = {k: v for k, v in inp.metadata.items() if k not in LAUNCH_METADATA_KEYS}
+    role, capabilities = inp.role, inp.capabilities
+    launch = None
+    if principal.launch_token_id is not None:
+        # A launch credential: single use, and the join takes the launched
+        # profile's role and capabilities whatever the body says.
+        launch, role, capabilities = deps.launches.begin_join(sess, principal.launch_token_id)
+        metadata.update(deps.launches.join_metadata(launch))
+    try:
+        p = await sess.join(
+            handle,
+            role=role,
+            objective=inp.objective,
+            capabilities=capabilities,
+            metadata=metadata,
+            delivery_mode=inp.delivery_mode,
+            # Joining with the creator credential (creator token or the owner's
+            # account token) makes this participant the coordinator, if none is set.
+            as_coordinator=principal.role == "creator",
+        )
+    except BaseException:
+        if launch is not None:
+            deps.launches.abort_join(sess, launch)
+        raise
+    if launch is not None:
+        deps.launches.joined(sess, launch, p.participant_id)
     # The plaintext token leaves RAM here: only its hash stays on the Participant.
     token, p.issued_token = p.issued_token, None
     if token is None:
@@ -821,8 +843,25 @@ async def session_remove_participant(
     *,
     source_ip: str = "",
 ) -> dict[str, Any]:
-    """Remove one participant: creator or admin token only."""
-    sess = await _resolve_manager(deps, session_id, token, source_ip)
+    """Remove one participant: creator or admin token; the session's
+    coordinator may remove the agents it launched."""
+    from sessionweave.access import is_coordinator
+
+    principal = await resolve_principal(deps, session_id, token, source_ip=source_ip)
+    sess = await deps.registry.get_or_raise(session_id)
+    if principal.role not in ("creator", "admin"):
+        target = sess._participants.get(participant_id)
+        launched_by = target.metadata.get("launched_by") if target is not None else None
+        if not (
+            is_coordinator(sess, principal)
+            and launched_by is not None
+            and launched_by == principal.participant_id
+        ):
+            raise ToolError(
+                ErrorCode.PERMISSION_DENIED,
+                "requires one of: creator, admin (the coordinator may remove only "
+                "the agents it launched)",
+            )
     return await sess.remove_participant(participant_id)
 
 
@@ -975,6 +1014,56 @@ COORDINATOR_ONLY_MESSAGE = (
 )
 
 
+async def _coordinator_session(
+    deps: ToolDeps, sid: str, token: str, source_ip: str
+) -> tuple[Session, Principal]:
+    """The session, if the caller is its coordinator or the creator/admin."""
+    from sessionweave.access import is_coordinator
+
+    principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
+    sess = await deps.registry.get_or_raise(sid)
+    if principal.role not in ("creator", "admin") and not is_coordinator(sess, principal):
+        raise ToolError(ErrorCode.PERMISSION_DENIED, COORDINATOR_ONLY_MESSAGE)
+    return sess, principal
+
+
+async def _owner_name(deps: ToolDeps, sess: Session) -> str | None:
+    """The session owner's account name (for launchers' allowed_accounts)."""
+    owner_id = sess.auth.owner_account_id
+    if owner_id is None or deps.accounts is None:
+        return None
+    try:
+        return (await deps.accounts.get(owner_id)).name
+    except Exception:
+        return None
+
+
+async def agents_launch(
+    deps: ToolDeps,
+    sid: str,
+    token: str,
+    body: dict[str, Any],
+    *,
+    broker_url: str,
+    source_ip: str = "",
+) -> dict[str, Any]:
+    """Ask a launcher to start a profile in this session (coordinator or
+    creator/admin). Returns ``{"launch_id", "status"}``."""
+    sess, principal = await _coordinator_session(deps, sid, token, source_ip)
+    return await deps.launches.launch(
+        sess, principal, body, broker_url=broker_url,
+        owner_name=await _owner_name(deps, sess),
+    )
+
+
+async def agents_launch_status(
+    deps: ToolDeps, sid: str, token: str, launch_id: str, *, source_ip: str = ""
+) -> dict[str, Any]:
+    """The result of one launch (coordinator or creator/admin)."""
+    await _coordinator_session(deps, sid, token, source_ip)
+    return deps.launches.status(sid, launch_id)
+
+
 async def agents_discover(
     deps: ToolDeps,
     sid: str,
@@ -989,19 +1078,8 @@ async def agents_discover(
 
     Allowed to the session's coordinator or the creator/admin acting for it.
     """
-    from sessionweave.access import is_coordinator, resolve_principal
-
-    principal = await resolve_principal(deps, sid, token, source_ip=source_ip)
-    sess = await deps.registry.get_or_raise(sid)
-    if principal.role not in ("creator", "admin") and not is_coordinator(sess, principal):
-        raise ToolError(ErrorCode.PERMISSION_DENIED, COORDINATOR_ONLY_MESSAGE)
-    owner_name: str | None = None
-    owner_id = sess.auth.owner_account_id
-    if owner_id is not None and deps.accounts is not None:
-        try:
-            owner_name = (await deps.accounts.get(owner_id)).name
-        except Exception:
-            owner_name = None
+    sess, _principal = await _coordinator_session(deps, sid, token, source_ip)
+    owner_name = await _owner_name(deps, sess)
     if domain is None:
         return {"domains": deps.launchers.domains_for(sess, owner_name=owner_name)}
     return {

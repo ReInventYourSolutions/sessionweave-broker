@@ -124,6 +124,10 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.ACCOUNT_TOKEN_LIMIT: 409,
     ErrorCode.NETWORK_NOT_APPROVED: 403,
     ErrorCode.APPROVAL_NOT_FOUND: 404,
+    ErrorCode.PROFILE_NOT_FOUND: 404,
+    ErrorCode.NO_FREE_SLOT: 409,
+    ErrorCode.LAUNCH_LIMIT: 409,
+    ErrorCode.LAUNCH_NOT_FOUND: 404,
 }
 
 
@@ -1012,6 +1016,34 @@ async def _agents_handler(request: Request) -> Response:
     return JSONResponse(out)
 
 
+async def _launch_agent_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    try:
+        body = await _read_json_body(request)
+    except ToolError as exc:
+        return _error_response(exc)
+    base = _public_base_url(request)
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.agents_launch(
+            deps, sid, token, body, broker_url=base, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 202)
+
+
+async def _launch_status_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    launch_id = request.path_params["launch_id"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.agents_launch_status(deps, sid, token, launch_id, source_ip=source_ip)
+
+    return await _run_credential_call(request, call)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -1071,6 +1103,12 @@ def routes() -> list[Route]:
             "/v1/sessions/{sid}/coordinator",
             _set_coordinator_handler,
             methods=["PUT"],
+        ),
+        Route("/v1/sessions/{sid}/agents", _launch_agent_handler, methods=["POST"]),
+        Route(
+            "/v1/sessions/{sid}/agents/{launch_id}",
+            _launch_status_handler,
+            methods=["GET"],
         ),
         Route(
             "/v1/sessions/{sid}/participants/{pid}",

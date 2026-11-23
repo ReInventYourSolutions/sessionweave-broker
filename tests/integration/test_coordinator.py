@@ -250,6 +250,45 @@ async def test_evicted_coordinator_is_cleared_on_disk_and_not_clobbered(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_eviction_persist_does_not_clobber_a_newer_coordinator(tmp_path: Path) -> None:
+    """The eviction write re-checks the coordinator when it runs: a coordinator
+    named after the eviction (before the write task ran) is not overwritten."""
+    import asyncio
+
+    from sessionweave.access import generate_token, hash_token
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.persistence import PersistenceStore
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.schemas import PersistenceConfig
+    from tests.unit.fakes import FakeHandle
+
+    store = PersistenceStore(str(tmp_path / "evict2.db"))
+    await store.init(pool_size=2)
+    try:
+        reg = SessionRegistry(
+            defaults=load_deployment_defaults({}), connections=ConnectionManager(),
+            metrics=None, firehose=None, store=store,
+        )
+        sid, _, _, _, _ = await reg.create(
+            overrides={}, purpose=None,
+            persistence=PersistenceConfig(mode="ttl", ttl_seconds=3600),
+            creator_token_hash=hash_token(generate_token()),
+        )
+        sess = await reg.get_or_raise(sid)
+        c1 = await sess.join(FakeHandle(), role="c", as_coordinator=True)
+        other = await sess.join(FakeHandle(), role="o")
+        sess._evict(c1.participant_id, "offline_grace")
+        # A new coordinator is named before the eviction's write task runs.
+        sess.coordinator_id = other.participant_id
+        await store.update_session_coordinator(sid, other.participant_id)
+        await asyncio.sleep(0.3)
+        snap = await store.load_session(sid)
+        assert snap is not None and snap.coordinator_id == other.participant_id
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_admin_and_supervisor_join_never_coordinate_and_resume_reports_it() -> None:
     admin = "admin-token-for-coordinator-tests"
     async with relay_subprocess(env_overrides={"SW_ADMIN_TOKEN": admin}) as base:
@@ -287,5 +326,8 @@ async def test_concurrent_creator_joins_yield_one_coordinator() -> None:
             outs = await asyncio.gather(*(_join(c, sid, creator, f"c{i}") for i in range(5)))
             got = await _coord(c, sid, creator)
             assert got in {o["participant_id"] for o in outs}
+            # Exactly one join response names its own participant as coordinator.
+            own = [o for o in outs if o["coordinator_id"] == o["participant_id"]]
+            assert len(own) == 1 and own[0]["participant_id"] == got
             r = await c.get(f"/v1/sessions/{sid}/participants", headers=bearer(creator))
             assert len(r.json()["roster"]) == 5

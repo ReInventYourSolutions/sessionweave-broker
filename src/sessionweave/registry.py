@@ -16,7 +16,7 @@ from sessionweave.connections import ConnectionManager
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.metrics import Metrics
-from sessionweave.session import MAX_PURPOSE_BYTES, Session
+from sessionweave.session import MAX_PURPOSE_BYTES, LaunchHooks, Session
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,7 @@ class SessionRegistry:
         "_store",
         "_wake",
         "events",
+        "launch_hooks",
     )
 
     def __init__(
@@ -96,6 +97,8 @@ class SessionRegistry:
         self._store = store
         # Account event log (set when accounts are enabled): owned-session deletes are recorded.
         self.events: EventLog | None = None
+        # Launch bookkeeping (set by ToolDeps): handed to every live session.
+        self.launch_hooks: LaunchHooks | None = None
         # heap entries are (deadline_epoch_seconds, sid). A session may
         # appear multiple times after re-pushes; lazy invalidation drops
         # stale entries on pop.
@@ -188,6 +191,7 @@ class SessionRegistry:
                 persistence_mode=persistence.mode if persistence is not None else None,
             )
             sess.auth = SessionAuth(creator_token_hash, owner_account_id)
+            sess.launch_hooks = self.launch_hooks
             self._sessions[sid] = sess
             self._schedule(sess)
             if self._metrics is not None:
@@ -258,6 +262,7 @@ class SessionRegistry:
                 firehose=self._firehose,
                 on_deadline_shortened=self._schedule,
             )
+            sess.launch_hooks = self.launch_hooks
             self._sessions[session_id] = sess
             if self._metrics is not None:
                 # Cold → hot: balance the dec() the eviction path issued

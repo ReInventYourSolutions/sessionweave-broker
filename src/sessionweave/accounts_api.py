@@ -43,26 +43,36 @@ def _store(deps: ToolDeps) -> AccountStore:
 async def _cut_streams(
     request: Request, account_id: str, token_id: str | None = None, *, reason: str
 ) -> None:
-    """End live firehose streams opened with the account's (revoked) token(s)."""
+    """End live firehose streams and drop launchers opened with the account's
+    (revoked) token(s)."""
     firehose = getattr(request.app.state, "firehose", None)
     if firehose is not None:
         await firehose.close_for_account(account_id, token_id=token_id, reason=reason)
+    launchers = getattr(_deps(request), "launchers", None)
+    if launchers is not None:
+        await launchers.close_for_account(account_id, token_id, reason=reason)
 
 
 async def _cut_unapproved_streams(
     request: Request, store: AccountStore, account_id: str, token_id: str
 ) -> None:
-    """End streams opened with the token from addresses its policy no longer allows."""
-    firehose = getattr(request.app.state, "firehose", None)
-    if firehose is None:
-        return
+    """End streams (and drop launchers) opened with the token from addresses its
+    policy no longer allows."""
     token = await store.get_token(account_id, token_id)
-    await firehose.close_for_account(
-        account_id,
-        token_id=token_id,
-        reason="network not approved",
-        ip_filter=lambda ip: not store.network_allows(token, ip),
-    )
+
+    def unapproved(ip: str) -> bool:
+        return not store.network_allows(token, ip)
+
+    firehose = getattr(request.app.state, "firehose", None)
+    if firehose is not None:
+        await firehose.close_for_account(
+            account_id, token_id=token_id, reason="network not approved", ip_filter=unapproved,
+        )
+    launchers = getattr(_deps(request), "launchers", None)
+    if launchers is not None:
+        await launchers.close_for_account(
+            account_id, token_id, unapproved, reason="network not approved"
+        )
 
 
 def _unauthorized() -> JSONResponse:

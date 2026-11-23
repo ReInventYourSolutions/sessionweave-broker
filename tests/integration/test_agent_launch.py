@@ -1,0 +1,513 @@
+"""Launching agents through launchers: orders, credentials, results, lifecycle."""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+import pytest
+import websockets
+
+from tests.integration.accounts_fixtures import seeded_relay
+from tests.integration.client import bearer, sw_client
+from tests.integration.harness import relay_subprocess
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+DENIED = "only the session's coordinator can request agents — ask the coordinator"
+
+
+def _prof(pid: str = "p1", domain: str = "backend", role: str = "analyst",
+          max_instances: int = 2, **kw: Any) -> dict[str, Any]:
+    return {"id": pid, "domain": domain, "role": role, "capabilities": ["sql"],
+            "description": "d", "runtime": "claude", "model": "m",
+            "access": {"preset": "reader"}, "limits": {}, "max_instances": max_instances,
+            **kw}
+
+
+class FakeLauncher:
+    """A launcher client: registers, then records every non-ping frame."""
+
+    def __init__(self, ws: Any, welcome: dict[str, Any]) -> None:
+        self.ws = ws
+        self.welcome = welcome
+        self.launcher_id: str = welcome["launcher_id"]
+        self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._reader = asyncio.create_task(self._read())
+
+    async def _read(self) -> None:
+        with contextlib.suppress(Exception):
+            async for raw in self.ws:
+                msg = json.loads(raw)
+                if msg.get("type") != "ping":
+                    await self.inbox.put(msg)
+
+    async def expect(self, kind: str, timeout: float = 5.0) -> dict[str, Any]:
+        while True:
+            msg = await asyncio.wait_for(self.inbox.get(), timeout)
+            if msg.get("type") == kind:
+                return msg
+
+    async def send(self, msg: dict[str, Any]) -> None:
+        await self.ws.send(json.dumps(msg))
+
+    async def close(self) -> None:
+        await self.ws.close()
+        self._reader.cancel()
+        with contextlib.suppress(BaseException):
+            await self._reader
+
+
+@contextlib.asynccontextmanager
+async def launcher(
+    base: str, profiles: list[dict[str, Any]], token: str | None = None, **hello: Any
+) -> AsyncIterator[FakeLauncher]:
+    url = f"ws://{urlparse(base).netloc}/v1/launchers/connect"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    ws = await websockets.connect(url, additional_headers=headers)
+    await ws.send(json.dumps({"type": "hello", "machine": hello.pop("machine", "box"),
+                              "visibility": hello.pop("visibility", "personal"),
+                              "allowed_accounts": [], "profiles": profiles, **hello}))
+    welcome = json.loads(await ws.recv())
+    assert welcome["type"] == "welcome", welcome
+    fl = FakeLauncher(ws, welcome)
+    try:
+        yield fl
+    finally:
+        await fl.close()
+
+
+async def _session(c: httpx.AsyncClient, cred: str | None = None, **body: Any) -> dict[str, Any]:
+    r = await c.post("/v1/sessions", json=body, headers=bearer(cred) if cred else {})
+    assert r.status_code == 201, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+async def _join(c: httpx.AsyncClient, sid: str, cred: str, **body: Any) -> httpx.Response:
+    return await c.post(f"/v1/sessions/{sid}/participants", headers=bearer(cred),
+                        json={"role": "w", **body})
+
+
+async def _joined(c: httpx.AsyncClient, sid: str, cred: str, **body: Any) -> dict[str, Any]:
+    r = await _join(c, sid, cred, **body)
+    assert r.status_code == 201, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+async def _launch(c: httpx.AsyncClient, sid: str, cred: str, **body: Any) -> httpx.Response:
+    return await c.post(f"/v1/sessions/{sid}/agents", headers=bearer(cred),
+                        json={"task": "analyse the backend", **body})
+
+
+async def _status(c: httpx.AsyncClient, sid: str, cred: str, lid: str) -> dict[str, Any]:
+    r = await c.get(f"/v1/sessions/{sid}/agents/{lid}", headers=bearer(cred))
+    assert r.status_code == 200, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+async def _until(check: Callable[[], Awaitable[bool]], timeout: float = 5.0) -> None:
+    for _ in range(int(timeout / 0.05)):
+        if await check():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition not met in time")
+
+
+async def _drain(c: httpx.AsyncClient, sid: str, ptoken: str) -> list[dict[str, Any]]:
+    r = await c.post(f"/v1/sessions/{sid}/participants/me/inbox/drain",
+                     headers=bearer(ptoken), json={})
+    assert r.status_code == 200, r.text
+    items: list[dict[str, Any]] = r.json()["messages"]
+    return items
+
+
+class _Setup:
+    def __init__(self, c: httpx.AsyncClient, made: dict[str, Any], coord: dict[str, Any]):
+        self.c = c
+        self.sid: str = made["session_id"]
+        self.creator: str = made["creator_token"]
+        self.jt: str = made["join_token"]
+        self.supervisor: str = made["supervisor_token"]
+        self.coord_token: str = coord["participant_token"]
+        self.coord_pid: str = coord["participant_id"]
+
+
+async def _setup(c: httpx.AsyncClient, **config: Any) -> _Setup:
+    body: dict[str, Any] = {"config": config} if config else {}
+    made = await _session(c, None, **body)
+    coord = await _joined(c, made["session_id"], made["creator_token"], role="coord")
+    assert coord["coordinator_id"] == coord["participant_id"]
+    return _Setup(c, made, coord)
+
+
+async def test_launch_by_profile_join_bound_and_single_use() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.coord_token,
+                              launcher_id=fl.launcher_id, profile_id="p1")
+            assert r.status_code == 202, r.text
+            lid = r.json()["launch_id"]
+            assert r.json() == {"launch_id": lid, "status": "pending"}
+            assert lid.startswith("lch_") and len(lid) == 20
+            order = await fl.expect("launch")
+            assert order["launch_id"] == lid and order["session_id"] == s.sid
+            assert order["profile_id"] == "p1" and order["task"] == "analyse the backend"
+            assert order["broker_url"].startswith("http://127.0.0.1:")
+            cred = order["join_credential"]
+            assert isinstance(cred, str) and len(cred) > 20
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st == {"launch_id": lid, "status": "pending", "profile_id": "p1",
+                          "launcher_id": fl.launcher_id}
+            assert cred not in json.dumps(st)
+            await fl.send({"type": "launch_result", "launch_id": lid, "status": "started"})
+            await _until(lambda: _is_status(c, s, lid, "started"))
+            # one slot is reserved
+            r = await c.get("/v1/agents", params={"session_id": s.sid, "domain": "backend"},
+                            headers=bearer(s.coord_token))
+            assert r.json()["agents"][0]["free_slots"] == 1
+            # the bound role/capabilities win over the body (force-and-ignore)
+            agent = await _joined(c, s.sid, cred, role="admin", capabilities=["root"],
+                                  metadata={"launched_by": "me", "note": "hi"})
+            roster = (await c.get(f"/v1/sessions/{s.sid}/participants",
+                                  headers=bearer(s.creator))).json()["roster"]
+            me = next(p for p in roster if p["participant_id"] == agent["participant_id"])
+            assert me["role"] == "analyst" and me["capabilities"] == ["sql"]
+            assert me["metadata"]["launch_id"] == lid
+            assert me["metadata"]["launcher_id"] == fl.launcher_id
+            assert me["metadata"]["profile_id"] == "p1"
+            assert me["metadata"]["launched_by"] == s.coord_pid
+            assert me["metadata"]["note"] == "hi"
+            assert agent["coordinator_id"] == s.coord_pid
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["status"] == "joined" and st["participant_id"] == agent["participant_id"]
+            # single use
+            r = await _join(c, s.sid, cred)
+            assert r.status_code == 403, r.text
+            # the agent cannot rewrite its launch metadata
+            r = await c.patch(f"/v1/sessions/{s.sid}/participants/me",
+                              headers=bearer(agent["participant_token"]),
+                              json={"metadata": {"launched_by": "x", "k": 1}})
+            assert r.status_code == 200, r.text
+            md = r.json()["participant"]["metadata"]
+            assert md["launched_by"] == s.coord_pid and md["launch_id"] == lid and md["k"] == 1
+            # nor its bound role or capabilities
+            for change in ({"role": "admin"}, {"capabilities": ["root"]}):
+                r = await c.patch(f"/v1/sessions/{s.sid}/participants/me",
+                                  headers=bearer(agent["participant_token"]), json=change)
+                assert r.status_code == 403, r.text
+
+
+async def _is_status(c: httpx.AsyncClient, s: _Setup, lid: str, want: str) -> bool:
+    return bool((await _status(c, s.sid, s.coord_token, lid))["status"] == want)
+
+
+async def test_launch_credential_bound_to_its_session() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        other = await _session(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.creator, launcher_id=fl.launcher_id, profile_id="p1")
+            assert r.status_code == 202, r.text
+            cred = (await fl.expect("launch"))["join_credential"]
+            r = await _join(c, other["session_id"], cred)
+            assert r.status_code == 403, r.text
+            # still usable in its own session; launched by the creator, no launched_by
+            agent = await _joined(c, s.sid, cred)
+            roster = (await c.get(f"/v1/sessions/{s.sid}/participants",
+                                  headers=bearer(s.creator))).json()["roster"]
+            me = next(p for p in roster if p["participant_id"] == agent["participant_id"])
+            assert me["metadata"]["launched_by"] is None
+
+
+async def test_launch_by_domain_role_slots_and_errors() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        other = await _joined(c, s.sid, s.jt)
+        async with launcher(base, [_prof(max_instances=1)], machine="a") as a, \
+                launcher(base, [_prof(max_instances=1)], machine="b") as b:
+            first = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert first.status_code == 202, first.text
+            second = await _launch(c, s.sid, s.coord_token, domain="Backend", role="ANALYST")
+            assert second.status_code == 202, second.text
+            got = {(await a.expect("launch"))["launch_id"], (await b.expect("launch"))["launch_id"]}
+            assert got == {first.json()["launch_id"], second.json()["launch_id"]}
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 409 and r.json()["error"]["code"] == "no_free_slot"
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=a.launcher_id,
+                              profile_id="p1")
+            assert r.status_code == 409 and r.json()["error"]["code"] == "no_free_slot"
+            r = await _launch(c, s.sid, s.coord_token, domain="frontend", role="analyst")
+            assert r.status_code == 404 and r.json()["error"]["code"] == "profile_not_found"
+            r = await _launch(c, s.sid, s.coord_token, launcher_id="lnc_nope", profile_id="p1")
+            assert r.status_code == 404 and r.json()["error"]["code"] == "profile_not_found"
+            # body validation
+            for body in ({"domain": "backend"}, {"launcher_id": a.launcher_id},
+                         {"domain": "backend", "role": "analyst", "task": "x" * 16385},
+                         {"domain": "backend", "role": "analyst", "task": ""},
+                         {"domain": "backend", "role": "analyst", "task": 3}):
+                r = await c.post(f"/v1/sessions/{s.sid}/agents",
+                                 headers=bearer(s.coord_token), json=body)
+                assert r.status_code == 400, (body, r.text)
+            # only the coordinator (or creator/admin)
+            for cred in (other["participant_token"], s.supervisor, s.jt):
+                r = await _launch(c, s.sid, cred, domain="backend", role="analyst")
+                assert r.status_code == 403, r.text
+            r = await _launch(c, s.sid, other["participant_token"],
+                              domain="backend", role="analyst")
+            assert r.json()["error"] == {"code": "permission_denied", "message": DENIED}
+            r = await c.get(f"/v1/sessions/{s.sid}/agents/{first.json()['launch_id']}",
+                            headers=bearer(other["participant_token"]))
+            assert r.status_code == 403
+            r = await c.get(f"/v1/sessions/{s.sid}/agents/lch_0000000000000000",
+                            headers=bearer(s.creator))
+            assert r.status_code == 404 and r.json()["error"]["code"] == "launch_not_found"
+
+
+async def test_launch_cap_and_failed_result_releases() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c, max_launched_agents=1)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            lid = r.json()["launch_id"]
+            cred = (await fl.expect("launch"))["join_credential"]
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 409 and r.json()["error"]["code"] == "launch_limit"
+            await fl.send({"type": "launch_result", "launch_id": lid, "status": "failed",
+                           "error": "runtime not found"})
+            await _until(lambda: _is_status(c, s, lid, "failed"))
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["error"] == "runtime not found"
+            r = await _join(c, s.sid, cred)
+            assert r.status_code == 403  # credential invalidated
+            items = await _drain(c, s.sid, s.coord_token)
+            failed = [i for i in items if i["name"] == "agent.launch_failed"]
+            assert failed and failed[0]["payload"] == {"launch_id": lid,
+                                                       "error": "runtime not found"}
+            # cap and slot released
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 202, r.text
+
+
+async def test_launcher_offline_mid_launch_fails() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c, max_launched_agents=1)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            lid = r.json()["launch_id"]
+            cred = (await fl.expect("launch"))["join_credential"]
+        await _until(lambda: _is_status(c, s, lid, "failed"))
+        assert (await _status(c, s.sid, s.coord_token, lid))["error"] == "launcher_offline"
+        assert (await _join(c, s.sid, cred)).status_code == 403
+        async with launcher(base, [_prof()]):
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 202, r.text  # cap released
+
+
+async def test_join_timeout_fails_and_invalidates() -> None:
+    env = {"SW_LAUNCH_JOIN_TIMEOUT_S": "1"}
+    async with relay_subprocess(env_overrides=env) as base, \
+            httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            lid = r.json()["launch_id"]
+            cred = (await fl.expect("launch"))["join_credential"]
+            stop = await fl.expect("stop", timeout=5)
+            assert stop == {"type": "stop", "launch_id": lid, "reason": "join_timeout"}
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["status"] == "failed" and st["error"] == "join_timeout"
+            assert (await _join(c, s.sid, cred)).status_code == 403
+
+
+async def _launched_agent(
+    c: httpx.AsyncClient, s: _Setup, fl: FakeLauncher, cred_owner: str | None = None
+) -> tuple[str, dict[str, Any]]:
+    r = await _launch(c, s.sid, cred_owner or s.coord_token,
+                      launcher_id=fl.launcher_id, profile_id="p1")
+    assert r.status_code == 202, r.text
+    lid = r.json()["launch_id"]
+    cred = (await fl.expect("launch"))["join_credential"]
+    await fl.send({"type": "launch_result", "launch_id": lid, "status": "started"})
+    agent = await _joined(c, s.sid, cred)
+    return lid, agent
+
+
+async def test_coordinator_removes_only_its_launched_agents() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        plain = await _joined(c, s.sid, s.jt)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            lid2, by_creator = await _launched_agent(c, s, fl, cred_owner=s.creator)
+            for pid in (plain["participant_id"], by_creator["participant_id"]):
+                r = await c.delete(f"/v1/sessions/{s.sid}/participants/{pid}",
+                                   headers=bearer(s.coord_token))
+                assert r.status_code == 403, r.text
+            # another participant cannot remove it either
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                               headers=bearer(plain["participant_token"]))
+            assert r.status_code == 403
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                               headers=bearer(s.coord_token))
+            assert r.status_code == 200, r.text
+            assert r.json()["removed"] == [agent["participant_id"]]
+            stop = await fl.expect("stop")
+            assert stop == {"type": "stop", "launch_id": lid, "reason": "removed"}
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["status"] == "stopped" and st["participant_id"] == agent["participant_id"]
+            # the creator still removes anyone
+            r = await c.delete(
+                f"/v1/sessions/{s.sid}/participants/{by_creator['participant_id']}",
+                headers=bearer(s.creator))
+            assert r.status_code == 200
+            assert (await fl.expect("stop"))["launch_id"] == lid2
+
+
+async def test_launcher_stop_removes_participant_with_reason() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            await _drain(c, s.sid, s.coord_token)
+            await fl.send({"type": "stopped", "launch_id": lid, "reason": "max_idle_s"})
+            await _until(lambda: _is_status(c, s, lid, "stopped"))
+
+            async def gone() -> bool:
+                roster = (await c.get(f"/v1/sessions/{s.sid}/participants",
+                                      headers=bearer(s.creator))).json()["roster"]
+                return agent["participant_id"] not in {p["participant_id"] for p in roster}
+
+            await _until(gone)
+
+            async def has_event() -> bool:
+                items = await _drain(c, s.sid, s.coord_token)
+                has_event.items.extend(items)  # type: ignore[attr-defined]
+                return any(i["name"] == "agent.stopped" for i in has_event.items)  # type: ignore[attr-defined]
+
+            has_event.items = []  # type: ignore[attr-defined]
+            await _until(has_event)
+            ev = next(i for i in has_event.items  # type: ignore[attr-defined]
+                      if i["name"] == "agent.stopped")
+            assert ev["payload"]["participant_id"] == agent["participant_id"]
+            assert ev["payload"]["reason"] == "max_idle_s"
+            # no stop is echoed back to the launcher for its own stop
+            with pytest.raises(asyncio.TimeoutError):
+                await fl.expect("stop", timeout=0.5)
+            # a launcher cannot stop another launcher's launch
+            async with launcher(base, [_prof("p2")]) as fl2:
+                lid3, _agent3 = await _launched_agent(c, s, fl)
+                await fl2.send({"type": "stopped", "launch_id": lid3, "reason": "x"})
+                await asyncio.sleep(0.3)
+                assert (await _status(c, s.sid, s.coord_token, lid3))["status"] == "joined"
+
+
+async def test_session_delete_stops_launched_agents() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            lid, _agent = await _launched_agent(c, s, fl)
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=fl.launcher_id,
+                              profile_id="p1")
+            pending = r.json()["launch_id"]
+            await fl.expect("launch")
+            r = await c.delete(f"/v1/sessions/{s.sid}", headers=bearer(s.creator))
+            assert r.status_code == 200, r.text
+            stops = {(m := await fl.expect("stop"))["launch_id"]: m["reason"]
+                     for _ in range(2)}
+            assert stops == {lid: "session_ended", pending: "session_ended"}
+            # both slots are free again
+            made = await _session(c)
+            coord = await _joined(c, made["session_id"], made["creator_token"])
+            r = await c.get("/v1/agents", params={"session_id": made["session_id"],
+                                                  "domain": "backend"},
+                            headers=bearer(coord["participant_token"]))
+            assert r.json()["agents"][0]["free_slots"] == 2
+
+
+async def test_removed_coordinator_and_supervisor_denied() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]):
+            q = {"session_id": s.sid, "domain": "backend"}
+            r = await c.get("/v1/agents", params=q, headers=bearer(s.supervisor))
+            assert r.status_code == 403
+            r = await _launch(c, s.sid, s.supervisor, domain="backend", role="analyst")
+            assert r.status_code == 403
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{s.coord_pid}",
+                               headers=bearer(s.creator))
+            assert r.status_code == 200
+            r = await c.get("/v1/agents", params=q, headers=bearer(s.coord_token))
+            assert r.status_code == 403
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 403
+
+
+async def test_mcp_discover_launch_and_status() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        made = await _session(c)
+        sid = made["session_id"]
+        async with launcher(base, [_prof()]) as fl, sw_client(base) as agent:
+            joined = await agent.call_tool(
+                "session_join", {"session_id": sid, "join_token": made["creator_token"],
+                                 "role": "coord"})
+            tok = joined["participant_token"]
+            out = await agent.call_tool("agents_discover",
+                                        {"session_id": sid, "token": tok})
+            assert out == {"domains": ["backend"]}
+            out = await agent.call_tool("agents_discover",
+                                        {"session_id": sid, "domain": "backend", "token": tok})
+            assert out["agents"][0]["profile_id"] == "p1"
+            out = await agent.call_tool("agents_launch", {
+                "session_id": sid, "domain": "backend", "role": "analyst",
+                "task": "look", "token": tok})
+            assert out["status"] == "pending"
+            lid = out["launch_id"]
+            order = await fl.expect("launch")
+            assert order["launch_id"] == lid and order["task"] == "look"
+            st = await agent.call_tool("agents_launch_status",
+                                       {"session_id": sid, "launch_id": lid, "token": tok})
+            assert st["status"] == "pending" and st["launcher_id"] == fl.launcher_id
+
+
+async def test_account_events_on_launch_and_stop(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.token)
+        sid = made["session_id"]
+        coord = await _joined(c, sid, sd.token)
+        assert coord["coordinator_id"] == coord["participant_id"]
+        s = _Setup(c, {**made, "creator_token": sd.token}, coord)
+        async with launcher(sd.base, [_prof()], token=sd.token) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            r = await c.delete(f"/v1/sessions/{sid}/participants/{agent['participant_id']}",
+                               headers=bearer(coord["participant_token"]))
+            assert r.status_code == 200, r.text
+            await fl.expect("stop")
+
+            async def events() -> list[dict[str, Any]]:
+                r = await c.get("/v1/me/events", headers=bearer(sd.token))
+                assert r.status_code == 200, r.text
+                return [e for e in r.json()["events"] if e["kind"].startswith("agent.")]
+
+            async def both() -> bool:
+                return {e["kind"] for e in await events()} == {"agent.launched", "agent.stopped"}
+
+            await _until(both)
+            evs = {e["kind"]: e["data"] for e in await events()}
+            assert len(await events()) == 2  # same owner: recorded once
+            assert evs["agent.launched"]["session_id"] == sid
+            assert evs["agent.launched"]["launch_id"] == lid
+            assert evs["agent.launched"]["profile_id"] == "p1"
+            assert evs["agent.launched"]["launcher_id"] == fl.launcher_id
+            assert evs["agent.stopped"]["reason"] == "removed"
+            dumped = json.dumps(evs)
+            assert "join_credential" not in dumped and "credential" not in dumped

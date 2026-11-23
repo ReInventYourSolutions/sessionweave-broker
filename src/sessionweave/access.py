@@ -58,6 +58,9 @@ class Principal:
     # its account tokens, so live streams can be cut when that token or account dies.
     account_id: str | None = field(default=None, compare=False)
     account_token_id: str | None = field(default=None, compare=False)
+    # Set when a "joiner" presented a single-use launch credential (the issued
+    # token's id): its join is bound to that launch's role and capabilities.
+    launch_token_id: str | None = field(default=None, compare=False)
 
 
 def _now_ms() -> int:
@@ -77,11 +80,16 @@ def hash_token(token: str) -> bytes:
 @dataclass
 class IssuedToken:
     token_id: str
-    kind: Literal["join", "supervisor"]
+    kind: Literal["join", "supervisor", "launch"]
     token_hash: bytes
     created_at_ms: int
     expires_at_ms: int | None
     revoked_at_ms: int | None = None
+    # Launch credentials only (kind "launch"; RAM only, never persisted): the
+    # launch they belong to and the role/capabilities the join is bound to.
+    launch_id: str | None = None
+    role: str | None = None
+    capabilities: tuple[str, ...] = ()
 
 
 class SessionAuth:
@@ -106,7 +114,7 @@ class SessionAuth:
         return self._owner_account_id
 
     def _mint(
-        self, kind: Literal["join", "supervisor"], now_ms: int, ttl_ms: int | None
+        self, kind: Literal["join", "supervisor", "launch"], now_ms: int, ttl_ms: int | None
     ) -> tuple[str, IssuedToken]:
         token = generate_token()
         issued = IssuedToken(
@@ -123,13 +131,56 @@ class SessionAuth:
         cutoff = now_ms - JOIN_TOKEN_EXPIRED_GRACE_MS
         for digest in [
             d for d, t in self._issued.items()
-            if t.kind == "join" and t.expires_at_ms is not None and t.expires_at_ms < cutoff
+            if (t.kind == "join" and t.expires_at_ms is not None and t.expires_at_ms < cutoff)
+            or (t.kind == "launch" and t.expires_at_ms is not None and t.expires_at_ms < now_ms)
         ]:
             del self._issued[digest]
 
     def mint_join(self, now_ms: int) -> tuple[str, IssuedToken]:
         self.prune_expired_joins(now_ms)
         return self._mint("join", now_ms, JOIN_TOKEN_TTL_SECONDS * 1000)
+
+    def mint_launch(
+        self, now_ms: int, ttl_ms: int, *, launch_id: str, role: str,
+        capabilities: Iterable[str],
+    ) -> tuple[str, IssuedToken]:
+        """A single-use credential that joins this session as one launched
+        agent, bound to ``role`` and ``capabilities`` (kept in RAM only)."""
+        self.prune_expired_joins(now_ms)
+        token, issued = self._mint("launch", now_ms, ttl_ms)
+        issued.launch_id = launch_id
+        issued.role = role
+        issued.capabilities = tuple(capabilities)
+        return token, issued
+
+    def consume_launch(self, token_id: str, now_ms: int) -> IssuedToken | None:
+        """Mark a launch credential used; None when unknown, used or expired.
+
+        Synchronous, so two concurrent joins with the same credential cannot
+        both consume it.
+        """
+        for issued in self._issued.values():
+            if issued.kind == "launch" and issued.token_id == token_id:
+                if issued.revoked_at_ms is not None or (
+                    issued.expires_at_ms is not None and now_ms >= issued.expires_at_ms
+                ):
+                    return None
+                issued.revoked_at_ms = now_ms
+                return issued
+        return None
+
+    def unconsume_launch(self, token_id: str) -> None:
+        """Make a consumed launch credential usable again (its join failed)."""
+        for issued in self._issued.values():
+            if issued.kind == "launch" and issued.token_id == token_id:
+                issued.revoked_at_ms = None
+
+    def invalidate_launch(self, token_id: str) -> None:
+        """Forget a launch credential: it reads as an unknown token from now on."""
+        for digest in [
+            d for d, t in self._issued.items() if t.kind == "launch" and t.token_id == token_id
+        ]:
+            del self._issued[digest]
 
     def mint_supervisor(self, now_ms: int) -> tuple[str, IssuedToken]:
         return self._mint("supervisor", now_ms, None)
@@ -211,6 +262,14 @@ class SessionAuth:
             and now_ms < issued.expires_at_ms
         ):
             return Principal("joiner")
+        if (
+            issued is not None
+            and issued.kind == "launch"
+            and issued.revoked_at_ms is None
+            and issued.expires_at_ms is not None
+            and now_ms < issued.expires_at_ms
+        ):
+            return Principal("joiner", launch_token_id=issued.token_id)
         return None
 
     def join_token_expired(self, token: str, now_ms: int) -> bool:

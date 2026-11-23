@@ -13,7 +13,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from tests.integration.accounts_fixtures import ADMIN, seeded_relay
-from tests.integration.client import bearer
+from tests.integration.client import bearer, sw_client
 from tests.integration.harness import relay_subprocess
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -194,3 +194,144 @@ async def test_account_token_network_not_approved(tmp_path: Path) -> None:
     ) as base:
         code, reason = await _closed_code(base, token)
         assert code == 4403 and reason == "network not approved"
+
+
+async def _mint(c: httpx.AsyncClient, account_id: str, **body: Any) -> dict[str, Any]:
+    r = await c.post(f"/v1/accounts/{account_id}/tokens", headers=bearer(ADMIN),
+                     json={"label": "launcher", **body})
+    assert r.status_code == 201, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+async def _closed_by_broker(ws: Any) -> tuple[int | None, str]:
+    with pytest.raises(ConnectionClosed):
+        for _ in range(100):
+            await asyncio.wait_for(ws.recv(), 5)
+    return ws.close_code, ws.close_reason or ""
+
+
+async def _launch_pending(c: httpx.AsyncClient, base: str, cred: str, lnc_id: str) -> tuple[
+        str, str, str]:
+    sess = await _session(c, cred)
+    sid = sess["session_id"]
+    coord = await _join(c, sid, cred)
+    r = await c.post(f"/v1/sessions/{sid}/agents", headers=bearer(coord["participant_token"]),
+                     json={"launcher_id": lnc_id, "profile_id": "p1", "task": "t"})
+    assert r.status_code == 202, r.text
+    return sid, coord["participant_token"], r.json()["launch_id"]
+
+
+async def _launch_status(c: httpx.AsyncClient, sid: str, cred: str, lid: str) -> str:
+    for _ in range(100):
+        r = await c.get(f"/v1/sessions/{sid}/agents/{lid}", headers=bearer(cred))
+        if r.json()["status"] == "failed":
+            break
+        await asyncio.sleep(0.05)
+    assert r.json()["error"] == "launcher_offline", r.text
+    return str(r.json()["status"])
+
+
+async def test_launcher_dropped_when_token_revoked_or_account_disabled(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        minted = await _mint(c, s.acc.account_id)
+        keep = await _mint(c, s.acc.account_id)
+        ws, w = await _connect(s.base, minted["token"], _hello([_prof()]))
+        ws_keep, _ = await _connect(s.base, keep["token"], _hello([_prof("k")]))
+        sid, coord, lid = await _launch_pending(c, s.base, s.token, w["launcher_id"])
+        r = await c.delete(f"/v1/accounts/{s.acc.account_id}/tokens/{minted['token_id']}",
+                           headers=bearer(ADMIN))
+        assert r.status_code in (200, 204), r.text
+        code, reason = await _closed_by_broker(ws)
+        assert code == 4403 and reason == "account token revoked"
+        assert await _launch_status(c, sid, coord, lid) == "failed"
+        # the other token's launcher stays
+        r = await c.get("/v1/agents", params={"session_id": sid, "domain": "backend"},
+                        headers=bearer(coord))
+        assert [a["profile_id"] for a in r.json()["agents"]] == ["k"]
+        # disabling the account drops it too
+        r = await c.patch(f"/v1/accounts/{s.acc.account_id}", headers=bearer(ADMIN),
+                          json={"status": "disabled"})
+        assert r.status_code == 200, r.text
+        code, reason = await _closed_by_broker(ws_keep)
+        assert code == 4403 and reason == "account not active"
+
+
+async def test_launcher_dropped_when_account_deleted(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        ws, _ = await _connect(s.base, s.other_token, _hello([_prof()]))
+        r = await c.delete(f"/v1/accounts/{s.other.account_id}", headers=bearer(ADMIN))
+        assert r.status_code in (200, 204), r.text
+        code, reason = await _closed_by_broker(ws)
+        assert code == 4403 and reason == "account deleted"
+
+
+async def test_launcher_dropped_when_network_no_longer_approved(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        minted = await _mint(c, s.acc.account_id)
+        ws, _ = await _connect(s.base, minted["token"], _hello([_prof()]))
+        # a policy that still allows 127.0.0.1 keeps it
+        url = f"/v1/accounts/{s.acc.account_id}/tokens/{minted['token_id']}/networks"
+        r = await c.put(url, headers=bearer(ADMIN), json={
+            "network_policy": "approved_only", "approved_networks": ["127.0.0.0/8"]})
+        assert r.status_code == 200, r.text
+        await ws.send(json.dumps({"type": "pong"}))
+        r = await c.put(url, headers=bearer(ADMIN), json={
+            "network_policy": "approved_only", "approved_networks": ["10.99.0.0/16"]})
+        assert r.status_code == 200, r.text
+        code, reason = await _closed_by_broker(ws)
+        assert code == 4403 and reason == "network not approved"
+
+
+async def test_launcher_caps_per_account(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s:
+        conns = [await _connect(s.base, s.token, _hello([_prof()])) for _ in range(5)]
+        assert all(w["type"] == "welcome" for _, w in conns)
+        code, reason = await _closed_code(s.base, s.token)
+        assert code == 4429 and "5 launchers" in reason
+        # another account is not affected
+        ws, w = await _connect(s.base, s.other_token, _hello([_prof()]))
+        assert w["type"] == "welcome"
+        for c, _ in [*conns, (ws, None)]:
+            await c.close()
+
+
+async def test_failed_launcher_auth_is_throttled() -> None:
+    async with relay_subprocess(env_overrides={"SW_LAUNCHER_TOKEN": "lt-secret"}) as base:
+        for _ in range(5):
+            assert (await _closed_code(base, "wrong"))[0] == 4401
+        code, reason = await _closed_code(base, "wrong")
+        assert code == 4429 and reason == "too many failed attempts"
+        # a valid token still passes
+        ws, welcome = await _connect(base, "lt-secret", _hello([_prof()]))
+        async with ws:
+            assert welcome["type"] == "welcome"
+
+
+async def test_launcher_frame_too_large_closes_1009() -> None:
+    async with relay_subprocess() as base:
+        ws, _ = await _connect(base, None, _hello([_prof()]))
+        await ws.send(json.dumps({"type": "pong", "pad": "x" * (256 * 1024)}))
+        code, _reason = await _closed_by_broker(ws)
+        assert code == 1009
+
+
+async def test_mcp_agents_discover_end_to_end() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        made = await _session(c)
+        sid = made["session_id"]
+        ws, _ = await _connect(base, None, _hello([_prof()]))
+        async with ws, sw_client(base) as agent, sw_client(base) as other:
+            j = await agent.call_tool("session_join", {
+                "session_id": sid, "join_token": made["creator_token"], "role": "c"})
+            out = await agent.call_tool("agents_discover", {
+                "session_id": sid, "domain": "backend", "token": j["participant_token"]})
+            assert [a["profile_id"] for a in out["agents"]] == ["p1"]
+            j2 = await other.call_tool("session_join", {
+                "session_id": sid, "join_token": made["join_token"], "role": "w"})
+            with pytest.raises(RuntimeError, match="permission_denied"):
+                await other.call_tool("agents_discover", {
+                    "session_id": sid, "domain": "backend", "token": j2["participant_token"]})

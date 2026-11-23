@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     from sessionweave.connections import ConnectionHandle
@@ -45,6 +45,19 @@ MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
 _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
 # The halt note a participant receives just before the creator removes it.
 REMOVED_HALT_MESSAGE = "removed by the session creator"
+# Participant metadata keys only the broker sets (on a join with a launch
+# credential); a participant cannot set or change them.
+LAUNCH_METADATA_KEYS = frozenset(
+    {"launch_id", "launcher_id", "launcher_machine", "profile_id", "launched_by"}
+)
+
+
+class LaunchHooks(Protocol):
+    """Told synchronously (session lock held) when launched agents must stop."""
+
+    def participant_gone(self, session_id: str, participant_id: str) -> None: ...
+
+    def session_ended(self, session_id: str, reason: str) -> None: ...
 
 
 def _utcnow() -> datetime:
@@ -127,6 +140,7 @@ class Session:
         "auth",
         "config",
         "coordinator_id",
+        "launch_hooks",
         "lock",
         "purpose",
         "session_id",
@@ -181,6 +195,9 @@ class Session:
         # The one participant allowed to discover and launch agents (or None).
         self.coordinator_id: str | None = None
         self._coordinator_dirty = False
+        # Set by the registry: stops the launched agents of departed
+        # participants and of an ended session.
+        self.launch_hooks: LaunchHooks | None = None
         # Notify the registry whenever an internal event shortens
         # ``next_deadline`` so its min-heap doesn't sit on a stale,
         # later deadline. The lazy-invalidation path already absorbs
@@ -638,6 +655,14 @@ class Session:
             p = self._participants.get(participant_id)
             if p is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            if p.metadata.get("launch_id") and (
+                (role is not _UNSET and role != p.role)
+                or (capabilities is not None and list(capabilities) != p.capabilities)
+            ):
+                raise ToolError(
+                    ErrorCode.PERMISSION_DENIED,
+                    "a launched agent's role and capabilities are fixed by its profile",
+                )
             if role is not _UNSET:
                 p.role = role
             if objective is not _UNSET:
@@ -645,7 +670,11 @@ class Session:
             if capabilities is not None:
                 p.capabilities = list(capabilities)
             if metadata is not None:
-                p.metadata = dict(metadata)
+                kept = {k: v for k, v in p.metadata.items() if k in LAUNCH_METADATA_KEYS}
+                p.metadata = {
+                    **{k: v for k, v in metadata.items() if k not in LAUNCH_METADATA_KEYS},
+                    **kept,
+                }
             self.bump_activity()
             if self._store is not None:
                 snapshot = self._participant_snapshot(p)
@@ -808,6 +837,19 @@ class Session:
             self.bump_activity()
             self._mirror_firehose("supervisor.note_reply", payload)
             return payload
+
+    async def emit_event(
+        self, kind: str, payload: dict[str, Any], recipients: Iterable[str] | None = None
+    ) -> None:
+        """Record and deliver a broker event to ``recipients`` (current
+        participants only; None = everyone) and mirror it to the firehose."""
+        async with self.lock:
+            if recipients is None:
+                targets = list(self._participants)
+            else:
+                targets = [pid for pid in recipients if pid in self._participants]
+            await self._dispatch_event(kind=kind, payload=payload, recipients=targets)
+            self._mirror_firehose(kind, payload)
 
     async def _persist_coordinator_cleared(self) -> None:
         """Write a coordinator cleared by a departure (caller holds the lock)."""
@@ -1837,7 +1879,9 @@ class Session:
 
         async def _write() -> None:
             await store.soft_delete_participant(self.session_id, pid, left_at=left_at_ms)
-            if clear_coordinator:
+            # Re-check at write time: a coordinator named since the eviction
+            # (a creator join, set_coordinator) must not be overwritten.
+            if clear_coordinator and self.coordinator_id is None:
                 await store.update_session_coordinator(self.session_id, None)
 
         try:
@@ -1989,6 +2033,11 @@ class Session:
             # No promotion: the creator or admin names a new coordinator.
             self.coordinator_id = None
             self._coordinator_dirty = True
+        if self.launch_hooks is not None and p.metadata.get("launch_id"):
+            try:
+                self.launch_hooks.participant_gone(self.session_id, pid)
+            except Exception:
+                logger.exception("launch hook failed for %s", pid)
         self.auth.forget_participant(pid)
         if p.connection_ref is not None:
             # connection_ref is a ConnectionHandle (set by join/resume)
@@ -2195,6 +2244,12 @@ class Session:
         self._active_waits = 0
 
     def broadcast_session_ended(self, *, reason: str) -> None:
+        if self.launch_hooks is not None and reason != "server_shutdown":
+            # A persisted session outlives a restart; its launches do not.
+            try:
+                self.launch_hooks.session_ended(self.session_id, reason)
+            except Exception:
+                logger.exception("launch hook failed for session %s", self.session_id)
         # Wake any wait_for_event coroutines so they return ``session.ended``
         # rather than silently timing out on their full budget while the session
         # disappears under them. Must fire BEFORE _participants is cleared so the

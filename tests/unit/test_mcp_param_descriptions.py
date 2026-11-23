@@ -50,6 +50,8 @@ REQUIRED = {
     "session_reply_to_note": ["message", "note_id"],
     "session_set_coordinator": ["participant_id", "session_id"],
     "agents_discover": ["session_id"],
+    "agents_launch": ["session_id", "task"],
+    "agents_launch_status": ["launch_id", "session_id"],
 }
 
 # String parameters with a closed set of values.

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.33.1"
+  version: "0.34.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -55,6 +55,8 @@ tags:
     description: Account administration (relay admin token)
   - name: me
     description: Account self-service (account token)
+  - name: agents
+    description: Agent launchers, discovery and launches (session coordinator)
 
 components:
   securitySchemes:
@@ -414,6 +416,44 @@ components:
           type: object
           additionalProperties: true
 
+    AgentProfile:
+      type: object
+      description: A profile a launcher can start (never its workdir or start prompt).
+      properties:
+        launcher_id: { type: string, example: lnc_0123456789abcdef }
+        machine: { type: string }
+        profile_id: { type: string }
+        domain: { type: string }
+        role: { type: string }
+        capabilities: { type: array, items: { type: string } }
+        description: { type: string }
+        runtime: { type: string, enum: [claude, opencode, cline] }
+        model: { type: string }
+        access_preset: { type: string, enum: [reader, operator] }
+        limits: { type: object, additionalProperties: { type: number, nullable: true } }
+        online: { type: boolean }
+        free_slots: { type: integer }
+    LaunchRequest:
+      type: object
+      required: [task]
+      description: Give `launcher_id` + `profile_id`, or `domain` + `role` (the broker picks the first online launcher with a free slot).
+      properties:
+        launcher_id: { type: string }
+        profile_id: { type: string }
+        domain: { type: string }
+        role: { type: string }
+        task: { type: string, maxLength: 16384, description: "What the agent should do (at most 16 KiB UTF-8)" }
+    Launch:
+      type: object
+      required: [launch_id, status, profile_id, launcher_id]
+      properties:
+        launch_id: { type: string, example: lch_0123456789abcdef }
+        status: { type: string, enum: [pending, started, joined, failed, stopped] }
+        profile_id: { type: string }
+        launcher_id: { type: string }
+        participant_id: { type: string, description: Set once the agent joined }
+        error: { type: string, description: "Why it failed: launcher_offline, join_timeout, or the launcher's message" }
+        reason: { type: string, description: "Why it stopped: removed, session_ended, or the launcher's limit (e.g. max_idle_s)" }
     Error:
       type: object
       properties:
@@ -457,6 +497,10 @@ components:
                 - invalid_request
                 - network_not_approved
                 - approval_not_found
+                - profile_not_found
+                - no_free_slot
+                - launch_limit
+                - launch_not_found
             message:
               type: string
     Account:
@@ -538,6 +582,8 @@ components:
             - token.network_denied
             - token.rejected
             - account.status_changed
+            - agent.launched
+            - agent.stopped
         ts: { type: integer, format: int64, description: Unix epoch milliseconds }
         data: { type: object, additionalProperties: true, description: Never contains token values or join links }
     AccountEventsPage:
@@ -651,7 +697,7 @@ paths:
                 type: object
                 properties:
                   name: { type: string, example: sessionweave }
-                  version: { type: string, example: "0.33.1" }
+                  version: { type: string, example: "0.34.0" }
                   subproject: { type: string }
                   auth_model:
                     type: string
@@ -982,6 +1028,161 @@ paths:
         '401': { description: not_in_session, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '403': { description: "permission_denied; network_not_approved (an account token used here is not approved for the caller network)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '413': { description: "payload_too_large (request body over SW_MAX_REQUEST_BYTES, default 5 MiB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/agents:
+    get:
+      tags: [agents]
+      summary: Discover the agent profiles this session may launch
+      description: |
+        Bearer: the session coordinator's participant token, or the creator
+        token, the owning account's token or the admin token. Anyone else gets
+        `permission_denied` with the message `only the session's coordinator
+        can request agents — ask the coordinator`. In account mode only
+        launchers visible to the session's owner are listed (personal: same
+        account; general: any account or the listed account names).
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: session_id, required: true, schema: { type: string } }
+        - { in: query, name: domain, required: true, schema: { type: string }, description: "Case-insensitive; see /v1/agents/domains" }
+        - { in: query, name: role, schema: { type: string } }
+        - { in: query, name: capability, schema: { type: string } }
+      responses:
+        '200':
+          description: Matching profiles of the online launchers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents: { type: array, items: { $ref: '#/components/schemas/AgentProfile' } }
+        '400': { description: "invalid_request (session_id or domain missing)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "session_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/agents/domains:
+    get:
+      tags: [agents]
+      summary: List the application domains this session may launch agents from
+      description: Same credentials and visibility as `GET /v1/agents`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: session_id, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Domains
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  domains: { type: array, items: { type: string } }
+        '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/sessions/{sid}/agents:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [agents]
+      summary: Launch an agent profile into the session
+      description: |
+        Bearer: the session coordinator's participant token, or the creator
+        token, the owning account's token or the admin token (others:
+        `permission_denied`, "only the session's coordinator can request agents
+        — ask the coordinator"). The broker re-checks visibility, reserves a
+        slot of the profile, counts the launch against the session's
+        `max_launched_agents` (pending, started and joined launches count),
+        mints a single-use join credential bound to this session and to the
+        profile's role and capabilities, and sends the launch order to the
+        launcher. The credential is never returned here.
+
+        The agent joins by itself (`POST /v1/sessions/{sid}/participants` with
+        the credential as Bearer): its role and capabilities are forced to the
+        profile's (the body's are ignored), its metadata carries `launch_id`,
+        `launcher_id`, `launcher_machine`, `profile_id` and `launched_by` (the
+        coordinator's participant id, or null when the creator/admin launched),
+        and neither can be changed later. A second join with the credential, or
+        a join to another session, is refused. If the agent has not joined
+        within 120 s (`SW_LAUNCH_JOIN_TIMEOUT_S`) the launch fails with
+        `join_timeout`, the credential is invalidated and the launcher gets a
+        `stop` (reason `join_timeout`). Failures reach the coordinator as a
+        session event `agent.launch_failed {launch_id, error}`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LaunchRequest' }
+      responses:
+        '202':
+          description: Order sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  launch_id: { type: string, example: lch_0123456789abcdef }
+                  status: { type: string, enum: [pending, failed] }
+        '400': { description: "invalid_request (bad selection or task)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "session_not_found; profile_not_found (no visible online launcher offers it)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launch_limit (max_launched_agents reached); no_free_slot (every matching profile runs max_instances)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/sessions/{sid}/agents/{launch_id}:
+    parameters:
+      - { name: sid, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: launch_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [agents]
+      summary: Read the result of a launch
+      description: |
+        Same credentials as the launch. Records live in memory; a finished
+        launch stays readable for an hour (not across a relay restart).
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The launch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Launch' }
+        '403': { description: "permission_denied", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "session_not_found; launch_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers/connect:
+    get:
+      tags: [agents]
+      summary: Launcher WebSocket (upgrade)
+      description: |
+        A launcher keeps this WebSocket open; it is online while connected.
+        Auth: `Authorization: Bearer` — in account mode an account token (the
+        launcher belongs to that account), in open mode `SW_LAUNCHER_TOKEN`
+        when set (unset: any launcher may register; the broker logs a
+        warning). Close codes: 4401 invalid/missing token, 4403 network not
+        approved or token revoked / account not active / account deleted /
+        network no longer approved (live launchers are dropped), 4429 too many
+        failed attempts or too many launchers (5 per account; 50 in open mode),
+        4400 bad hello, 1009 frame over 256 KiB, 1011 accounts unavailable.
+
+        Frames (JSON text). Launcher → broker: first
+        `{"type":"hello","machine","visibility":"personal"|"general","allowed_accounts":[names],"profiles":[...]}`;
+        then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?}`
+        and `{"type":"stopped","launch_id","reason"}` (its own stop, e.g. a
+        limit: the broker removes the participant — halt first — and sends the
+        session event `agent.stopped {participant_id, launch_id, reason}`).
+        Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}]}`,
+        `{"type":"ping"}` every 20 s,
+        `{"type":"launch","launch_id","session_id","profile_id","task","broker_url","join_credential"}`
+        and `{"type":"stop","launch_id","reason":"removed"|"session_ended"|"join_timeout"}`.
+        A launcher that disconnects fails its launches not yet joined with
+        `launcher_offline` (slot and session cap released, credential
+        invalidated).
+      security:
+        - bearerAuth: []
+      responses:
+        '101': { description: Switching protocols }
 
   /v1/sessions/{sid}/coordinator:
     parameters:
@@ -1359,11 +1560,14 @@ paths:
       - { name: pid, in: path, required: true, schema: { type: string } }
     delete:
       tags: [participants]
-      summary: Remove an agent from the session (creator or admin)
+      summary: Remove an agent from the session (creator or admin; the coordinator for agents it launched)
       description: |
         Bearer: the creator token, the owning account's token or the admin
-        token; a supervisor token is
-        refused. The agent first receives a `supervisor.note` of kind `halt`
+        token; the session coordinator's participant token may remove only the
+        agents it launched (`metadata.launched_by` is its participant id); a
+        supervisor token is
+        refused. A launched agent's launcher receives a `stop` order (reason
+        `removed`). The agent first receives a `supervisor.note` of kind `halt`
         (message `removed by the session creator`); as with any halt, the
         other participants and the firehose then see `participant.updated`
         with `supervision_state: paused` for it (unless it was already

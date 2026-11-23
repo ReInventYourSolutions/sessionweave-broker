@@ -301,6 +301,7 @@ themselves. Recommended shape (per skill v0.11.0+):
 | `session_wait_for_event` | Blocking long-poll: drain pending events that match the optional `names` filter, or block until one arrives (or `timeout_seconds` elapses). Pull-mode only. Same `{messages, timed_out}` shape as REST. |
 | `session_send` | Dispatch a command (`all` / `any` / `specific`) to others. |
 | `session_respond` | Respond to a previously received command. |
+| `agents_discover`, `agents_launch`, `agents_launch_status` | Find and start agents through launchers (session coordinator only) — see [Agent launchers](#agent-launchers). |
 
 Server-emitted notifications: `participant.joined`, `participant.updated`,
 `participant.left`, `command.received`, `result.received`,
@@ -346,6 +347,7 @@ Configurable parameters:
 - `max_pending_notifications_per_participant`
 - `max_wait_seconds` (default 600) — clamps the `timeout_seconds` a caller may pass to `inbox/wait`
 - `max_concurrent_waits_total` (default 1000) — relay-wide cap on simultaneous long-poll waits
+- `max_launched_agents` (default 10, 0..100) — agents launched into one session at a time
 
 Process binding: `SW_HOST` (default `0.0.0.0`), `SW_PORT` (default `8765`).
 
@@ -526,6 +528,7 @@ default 30). Event data never contains token values or join links.
 | `token.network_denied` | token_id, label, ip |
 | `token.rejected` | a known token was refused (revoked, expired, account not active): token_id, label, reason, ip, client; at most one per token and reason per 10 min |
 | `account.status_changed` | from, to, by |
+| `agent.launched`, `agent.stopped` | session_id, launch_id, profile_id, launcher_id, machine; `agent.stopped` adds reason (`removed`, `session_ended`, a launcher limit, or the failure: `launcher_offline`, `join_timeout`, the launcher's error). Recorded on the launcher owner's and the session owner's account |
 
 Read them with `GET /v1/me/events` (own account) or, as admin,
 `GET /v1/accounts/events?account_id=...` (all accounts, or one). Parameters:
@@ -552,6 +555,78 @@ account; it never creates a pending approval or a network event, on either accou
 
 Actions a user performs in the Cockpit reach the broker from the Cockpit's server, so
 the event's `ip` is the Cockpit's and the token label is `cockpit`.
+
+## Agent launchers
+
+A **launcher** is a small always-on service on a machine (the Runner's `launcher`
+mode) that declares which agent **profiles** it can start: domain, role,
+capabilities, description, runtime, model, access preset, limits and
+`max_instances`. Workdir and start prompt stay on the machine. The session's
+**coordinator** finds profiles and launches them; the agent joins the session by
+itself, with no invite link handed around.
+
+**Who may ask.** Only the session's coordinator — the participant that joined with
+the creator credential (creator token or the owning account's token), or the one
+the creator assigned with `PUT /v1/sessions/{sid}/coordinator` — or the creator /
+admin acting for the session. Anyone else gets `permission_denied` ("only the
+session's coordinator can request agents — ask the coordinator").
+
+**Connecting a launcher.** WebSocket `/v1/launchers/connect` with
+`Authorization: Bearer <token>`: in `account` mode an account token (the launcher
+belongs to that account; bind it to the machine's network with `approved_only`),
+in `open` mode `SW_LAUNCHER_TOKEN` when set. Unset in open mode, any launcher that
+can reach the broker may register — fine on a private network; the broker logs a
+warning at startup. Limits: 5 launchers per account (50 in open mode), 256 KiB per
+frame; failed authentications are throttled per IP (close 4429). A launcher is
+dropped (close 4403) when its token is revoked, its account is disabled or
+deleted, or the token's networks no longer approve its address.
+
+**Discover and launch.**
+
+```bash
+H="Authorization: Bearer $COORDINATOR_PARTICIPANT_TOKEN"
+curl -s -H "$H" "$URL/v1/agents/domains?session_id=$SID"
+curl -s -H "$H" "$URL/v1/agents?session_id=$SID&domain=backend&role=analyst"
+# by launcher + profile, or by domain + role (first online launcher with a free slot)
+curl -s -H "$H" -X POST "$URL/v1/sessions/$SID/agents" \
+  -d '{"domain": "backend", "role": "analyst", "task": "map the payment flow"}'
+# -> 202 {"launch_id": "lch_...", "status": "pending"}
+curl -s -H "$H" "$URL/v1/sessions/$SID/agents/lch_..."
+```
+
+MCP: `agents_discover`, `agents_launch`, `agents_launch_status`. Errors:
+`launch_limit` (409, the session's `max_launched_agents`, default 10, counting
+pending, started and joined launches), `no_free_slot` (409), `profile_not_found`
+(404), `launch_not_found` (404).
+
+**What happens.** The broker reserves a slot, mints a **single-use join
+credential** bound to the session and to the profile's role and capabilities, and
+sends the launcher `{"type":"launch","launch_id","session_id","profile_id","task","broker_url","join_credential"}`
+— the only place the credential ever appears. The launcher answers
+`launch_result` (`started` | `failed` with `error`); the agent joins with the
+credential as Bearer on `POST /v1/sessions/{sid}/participants`. The join takes
+the profile's role and capabilities whatever the body says (they are forced, not
+compared), and the participant's metadata carries `launch_id`, `launcher_id`,
+`launcher_machine`, `profile_id` and `launched_by` (the coordinator's participant
+id, or null when the creator launched); the agent cannot change any of these
+later. A second join, or a join to another session, is refused. Status:
+`pending` → `started` → `joined`, or `failed` (`launcher_offline` when the
+launcher disconnects first, `join_timeout` after 120 s — `SW_LAUNCH_JOIN_TIMEOUT_S`
+— or the launcher's error; the credential is invalidated and the slot released).
+The coordinator receives the session event `agent.launch_failed {launch_id, error}`.
+
+**Lifecycle.** A launched agent stays until removed or the session ends. The
+coordinator may remove the agents it launched (`DELETE
+/v1/sessions/{sid}/participants/{pid}`, halt first), never others; the creator and
+admin remove anyone. The launcher then gets `{"type":"stop","launch_id","reason":"removed"}`;
+when the session ends or is deleted it gets reason `session_ended` (and
+`join_timeout` for a launch that timed out). When the launcher stops an agent
+itself (a profile limit), it sends `{"type":"stopped","launch_id","reason"}`; the
+broker removes the participant (halt first) and sends the session event
+`agent.stopped {participant_id, launch_id, reason}`. In account mode
+`agent.launched` / `agent.stopped` are recorded in the account event log.
+Launch records are kept in memory (a finished one for an hour); after a broker
+restart launches are forgotten, but joined agents remain participants.
 
 ## Architecture (sub-project #1)
 
