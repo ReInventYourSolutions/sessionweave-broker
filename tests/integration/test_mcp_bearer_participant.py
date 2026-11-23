@@ -89,3 +89,32 @@ async def test_non_participant_bearer_is_not_tried_as_participant_token() -> Non
         async with sw_client(base, headers=hdr) as p:
             ok = await p.call_tool("session_list_participants", {"session_id": sid})
             assert ok["roster"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_revoked_or_expired_session_credentials_are_not_tried() -> None:
+    """A revoked supervisor token or an expired join token of the session is
+    still not a participant token: no auth failure is counted for it, so the
+    caller keeps the plain not_in_session answer (never rate_limited)."""
+    async with relay_subprocess({"SW_ADMIN_TOKEN": ADMIN}) as base:
+        async with sw_client(base, headers={"Authorization": f"Bearer {ADMIN}"}) as a:
+            created = await a.call_tool("session_create", {})
+            sid = created["session_id"]
+            tokens = await a.call_tool("session_list_supervisor_tokens", {"session_id": sid})
+            await a.call_tool("session_revoke_supervisor_token", {
+                "session_id": sid,
+                "token_id": tokens["supervisor_tokens"][0]["token_id"]})
+            # Removing a participant expires every join token of the session.
+            joined = await a.call_tool(
+                "session_join", {"session_id": sid, "join_token": created["join_token"],
+                                 "role": "w", "delivery_mode": "pull"})
+        async with sw_client(base, headers={"Authorization": f"Bearer {ADMIN}"}) as a:
+            await a.call_tool("session_remove_participant",
+                              {"session_id": sid, "participant_id": joined["participant_id"]})
+        for cred in (created["supervisor_token"], created["join_token"]):
+            async with sw_client(base, headers={"Authorization": f"Bearer {cred}"}) as c:
+                # More calls than the per-(sid, ip) invalid-token budget.
+                for _ in range(8):
+                    with pytest.raises(RuntimeError, match="call session_join first"):
+                        await c.call_tool("session_list_participants", {"session_id": sid})

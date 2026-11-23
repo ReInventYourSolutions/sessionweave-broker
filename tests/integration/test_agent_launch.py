@@ -352,10 +352,9 @@ async def test_coordinator_removes_only_its_launched_agents() -> None:
         async with launcher(base, [_prof()]) as fl:
             lid, agent = await _launched_agent(c, s, fl)
             lid2, by_creator = await _launched_agent(c, s, fl, cred_owner=s.creator)
-            for pid in (plain["participant_id"], by_creator["participant_id"]):
-                r = await c.delete(f"/v1/sessions/{s.sid}/participants/{pid}",
-                                   headers=bearer(s.coord_token))
-                assert r.status_code == 403, r.text
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{plain['participant_id']}",
+                               headers=bearer(s.coord_token))
+            assert r.status_code == 403, r.text
             # another participant cannot remove it either
             r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
                                headers=bearer(plain["participant_token"]))
@@ -371,12 +370,97 @@ async def test_coordinator_removes_only_its_launched_agents() -> None:
             assert st["reason"] == "removed"
             assert r.json()["join_tokens_invalidated"] == 0
             await _joined(c, s.sid, s.jt)  # the invite link still works
-            # the creator still removes anyone
+            # an agent the creator launched (launched_by null) is removable too
             r = await c.delete(
                 f"/v1/sessions/{s.sid}/participants/{by_creator['participant_id']}",
-                headers=bearer(s.creator))
-            assert r.status_code == 200
+                headers=bearer(s.coord_token))
+            assert r.status_code == 200, r.text
             assert (await fl.expect("stop"))["launch_id"] == lid2
+            # the creator still removes anyone
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{plain['participant_id']}",
+                               headers=bearer(s.creator))
+            assert r.status_code == 200
+
+
+async def test_new_coordinator_removes_predecessors_agents() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        nxt = await _joined(c, s.sid, s.jt, role="coord2")
+        async with launcher(base, [_prof()]) as fl:
+            lid, agent = await _launched_agent(c, s, fl)
+            r = await c.put(f"/v1/sessions/{s.sid}/coordinator", headers=bearer(s.creator),
+                            json={"participant_id": nxt["participant_id"]})
+            assert r.status_code == 200, r.text
+            # the old coordinator lost the right
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                               headers=bearer(s.coord_token))
+            assert r.status_code == 403
+            # the new one may remove a launched agent, never a plain participant
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{s.coord_pid}",
+                               headers=bearer(nxt["participant_token"]))
+            assert r.status_code == 403
+            r = await c.delete(f"/v1/sessions/{s.sid}/participants/{agent['participant_id']}",
+                               headers=bearer(nxt["participant_token"]))
+            assert r.status_code == 200, r.text
+            assert await fl.expect("stop") == {"type": "stop", "launch_id": lid,
+                                               "reason": "removed"}
+
+
+async def test_order_names_coordinator_and_session_owner(tmp_path: Path) -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            assert fl.welcome["account"] is None  # open mode
+            r = await _launch(c, s.sid, s.coord_token, domain="backend", role="analyst")
+            assert r.json()["owner"] is None and r.json()["own"] is True
+            order = await fl.expect("launch")
+            assert order["coordinator_id"] == s.coord_pid
+            assert order["session_owner"] is None
+            # launched by the creator: the session's coordinator gets the result
+            r = await _launch(c, s.sid, s.creator, domain="backend", role="analyst")
+            assert (await fl.expect("launch"))["coordinator_id"] == s.coord_pid
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.other_token)  # Bob's session
+        coord = await _joined(c, made["session_id"], sd.other_token)
+        s = _Setup(c, {**made, "creator_token": sd.other_token}, coord)
+        async with launcher(sd.base, [_prof()], token=sd.token, machine="bob-box",
+                            visibility="general") as foreign, \
+                launcher(sd.base, [_prof()], token=sd.other_token, machine="own") as own:
+            assert foreign.welcome["account"] == "Alice"
+            assert own.welcome["account"] == "Bob"
+            r = await c.get("/v1/agents", params={"session_id": s.sid, "domain": "backend"},
+                            headers=bearer(s.coord_token))
+            items = [(a["machine"], a["owner"], a["own"]) for a in r.json()["agents"]]
+            assert items == [("own", "Bob", True), ("bob-box", "Alice", False)]
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=foreign.launcher_id,
+                              profile_id="p1")
+            assert r.status_code == 202, r.text
+            assert r.json()["owner"] == "Alice" and r.json()["own"] is False
+            order = await foreign.expect("launch")
+            assert order["session_owner"] == "Bob"
+            assert order["coordinator_id"] == s.coord_pid
+            st = await _status(c, s.sid, s.coord_token, r.json()["launch_id"])
+            assert st["owner"] == "Alice" and st["own"] is False
+
+
+async def test_launch_into_suspended_session_is_refused(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.token)  # Alice's session
+        coord = await _joined(c, made["session_id"], sd.token)
+        sid = made["session_id"]
+        async with launcher(sd.base, [_prof()], token=sd.other_token,
+                            visibility="general") as fl:
+            r = await c.patch(f"/v1/accounts/{sd.acc.account_id}", headers=bearer(ADMIN),
+                              json={"status": "disabled"})
+            assert r.status_code == 200, r.text
+            r = await _launch(c, sid, coord["participant_token"],
+                              launcher_id=fl.launcher_id, profile_id="p1")
+            assert r.status_code == 409, r.text
+            assert r.json()["error"]["code"] == "session_suspended"
+            with pytest.raises(asyncio.TimeoutError):
+                await fl.expect("launch", timeout=0.5)
 
 
 async def test_launcher_stop_removes_participant_with_reason() -> None:
@@ -469,20 +553,20 @@ async def test_mcp_discover_launch_and_status() -> None:
                                  "role": "coord"})
             tok = joined["participant_token"]
             out = await agent.call_tool("agents_discover",
-                                        {"session_id": sid, "token": tok})
+                                        {"session_id": sid, "participant_token": tok})
             assert out == {"domains": ["backend"]}
-            out = await agent.call_tool("agents_discover",
-                                        {"session_id": sid, "domain": "backend", "token": tok})
+            out = await agent.call_tool("agents_discover", {
+                "session_id": sid, "domain": "backend", "participant_token": tok})
             assert out["agents"][0]["profile_id"] == "p1"
             out = await agent.call_tool("agents_launch", {
                 "session_id": sid, "domain": "backend", "role": "analyst",
-                "task": "look", "token": tok})
+                "task": "look", "participant_token": tok})
             assert out["status"] == "pending"
             lid = out["launch_id"]
             order = await fl.expect("launch")
             assert order["launch_id"] == lid and order["task"] == "look"
-            st = await agent.call_tool("agents_launch_status",
-                                       {"session_id": sid, "launch_id": lid, "token": tok})
+            st = await agent.call_tool("agents_launch_status", {
+                "session_id": sid, "launch_id": lid, "participant_token": tok})
             assert st["status"] == "pending" and st["launcher_id"] == fl.launcher_id
 
 

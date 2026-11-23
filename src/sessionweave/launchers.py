@@ -134,7 +134,36 @@ def validate_profile(raw: Any) -> dict[str, Any]:
     if not isinstance(mi, int) or isinstance(mi, bool) or not 1 <= mi <= 32:
         raise ValueError("max_instances must be an integer from 1 to 32")
     out["max_instances"] = mi
+    # Per-profile visibility (account mode): overrides the launcher's when given.
+    vis = raw.get("visibility")
+    if vis is not None and vis not in _VISIBILITIES:
+        raise ValueError("visibility must be 'personal' or 'general'")
+    out["visibility"] = vis
+    allowed = raw.get("allowed_accounts")
+    if allowed is not None and not _account_names(allowed):
+        raise ValueError("allowed_accounts must be a list of account names")
+    out["allowed_accounts"] = (
+        None if allowed is None else frozenset(a.casefold() for a in allowed)
+    )
     return out
+
+
+def _account_names(v: Any) -> bool:
+    return (
+        isinstance(v, list)
+        and len(v) <= _MAX_ACCOUNTS
+        and all(isinstance(a, str) and 0 < len(a) <= 200 for a in v)
+    )
+
+
+@dataclass(frozen=True)
+class _Auth:
+    """Who a launcher connection authenticated as (account mode)."""
+
+    owner_account_id: str | None = None
+    owner_name: str | None = None
+    token_id: str | None = None
+    expires_at_ms: int | None = None
 
 
 @dataclass
@@ -153,6 +182,10 @@ class _Launcher:
     ip: str = ""
     # sha256 of the resume secret sent in welcome (the secret is not kept).
     resume_hash: bytes = b""
+    # The owner account's name (account mode), shown in discovery.
+    owner_name: str | None = None
+    # When the account token it connected with expires (ms), if it does.
+    expires_at_ms: int | None = None
 
 
 class LauncherRegistry:
@@ -170,6 +203,8 @@ class LauncherRegistry:
         token_id: str | None = None,
         ip: str = "",
         resume_hash: bytes = b"",
+        owner_name: str | None = None,
+        expires_at_ms: int | None = None,
     ) -> tuple[str, list[dict[str, str]]]:
         """Register a launcher from a validated-shape hello.
 
@@ -195,11 +230,7 @@ class LauncherRegistry:
         if visibility not in _VISIBILITIES:
             raise HelloError("visibility must be 'personal' or 'general'")
         allowed = hello.get("allowed_accounts", [])
-        if (
-            not isinstance(allowed, list)
-            or len(allowed) > _MAX_ACCOUNTS
-            or not all(isinstance(a, str) and 0 < len(a) <= 200 for a in allowed)
-        ):
+        if not _account_names(allowed):
             raise HelloError("allowed_accounts must be a list of account names")
         running = hello.get("running", [])
         if (
@@ -218,7 +249,7 @@ class LauncherRegistry:
         lnc = _Launcher(
             launcher_id, conn, owner_account_id, machine.strip(), visibility,
             frozenset(a.casefold() for a in allowed), token_id=token_id, ip=ip,
-            resume_hash=resume_hash,
+            resume_hash=resume_hash, owner_name=owner_name, expires_at_ms=expires_at_ms,
         )
         rejected: list[dict[str, str]] = []
         for raw in raw_profiles:
@@ -281,8 +312,6 @@ class LauncherRegistry:
         for lnc in self._launchers.values():
             if launcher_id is not None and lnc.launcher_id != launcher_id:
                 continue
-            if not self._visible(lnc, session, owner_name):
-                continue
             if (
                 launcher_id is None
                 and lnc.owner_account_id is not None
@@ -295,6 +324,8 @@ class LauncherRegistry:
                 if domain is not None and p["domain"].casefold() != domain.casefold():
                     continue
                 if role is not None and p["role"].casefold() != role.casefold():
+                    continue
+                if not self._visible(lnc, session, owner_name, p):
                     continue
                 matches.append((lnc, p))
         if not matches:
@@ -340,19 +371,40 @@ class LauncherRegistry:
         lnc = self._launchers.get(launcher_id)
         return lnc.conn if lnc is not None else None
 
-    def _visible(self, lnc: _Launcher, session: Session, owner_name: str | None) -> bool:
+    @staticmethod
+    def _visible(
+        lnc: _Launcher, session: Session, owner_name: str | None, prof: dict[str, Any]
+    ) -> bool:
+        """Whether ``session`` may see profile ``prof`` of ``lnc``: the
+        profile's own visibility/allowed_accounts when set, else the
+        launcher's."""
         if lnc.owner_account_id is None:
             return True  # open mode: the private network is the protection
         owner_id = session.auth.owner_account_id
         if owner_id is None:
             return False
-        if lnc.visibility == "personal":
-            return owner_id == lnc.owner_account_id
         if owner_id == lnc.owner_account_id:
             return True
-        if not lnc.allowed_accounts:
+        visibility = prof.get("visibility") or lnc.visibility
+        if visibility == "personal":
+            return False
+        allowed = prof.get("allowed_accounts")
+        if allowed is None:
+            allowed = lnc.allowed_accounts
+        if not allowed:
             return True
-        return owner_name is not None and owner_name.casefold() in lnc.allowed_accounts
+        return owner_name is not None and owner_name.casefold() in allowed
+
+    @staticmethod
+    def owner_fields(lnc_owner: str | None, lnc_owner_name: str | None,
+                     session: Session) -> dict[str, Any]:
+        """``owner`` (the launcher owner's account name, None in open mode)
+        and ``own`` (it belongs to the session owner's account, or both are
+        ownerless in open mode)."""
+        return {
+            "owner": lnc_owner_name,
+            "own": lnc_owner == session.auth.owner_account_id,
+        }
 
     def profiles_for(
         self,
@@ -367,10 +419,10 @@ class LauncherRegistry:
         session owner's account name, used for ``allowed_accounts``)."""
         out: list[dict[str, Any]] = []
         for lnc in self._launchers.values():
-            if not self._visible(lnc, session, owner_name):
-                continue
             for p in lnc.profiles.values():
                 if p["domain"].casefold() != domain.casefold():
+                    continue
+                if not self._visible(lnc, session, owner_name, p):
                     continue
                 if role is not None and p["role"].casefold() != role.casefold():
                     continue
@@ -381,6 +433,7 @@ class LauncherRegistry:
                 out.append({
                     "launcher_id": lnc.launcher_id,
                     "machine": lnc.machine,
+                    **self.owner_fields(lnc.owner_account_id, lnc.owner_name, session),
                     "profile_id": p["id"],
                     "domain": p["domain"],
                     "role": p["role"],
@@ -393,13 +446,15 @@ class LauncherRegistry:
                     "online": True,
                     "free_slots": max(0, p["max_instances"] - lnc.running.get(p["id"], 0)),
                 })
+        # The session owner's own launchers first (stable otherwise).
+        out.sort(key=lambda item: not item["own"])
         return out
 
     def domains_for(self, session: Session, *, owner_name: str | None = None) -> list[str]:
         seen: dict[str, str] = {}
         for lnc in self._launchers.values():
-            if self._visible(lnc, session, owner_name):
-                for p in lnc.profiles.values():
+            for p in lnc.profiles.values():
+                if self._visible(lnc, session, owner_name, p):
                     seen.setdefault(p["domain"].casefold(), p["domain"])
         return sorted(seen.values(), key=str.casefold)
 
@@ -434,59 +489,72 @@ async def _read_hello(websocket: WebSocket) -> dict[str, Any]:
     return body
 
 
-async def _ping_loop(websocket: WebSocket) -> None:
+async def _ping_loop(websocket: WebSocket, expires_at_ms: int | None = None) -> None:
+    """Ping every PING_INTERVAL_S; close with 4401 once the account token the
+    launcher connected with expires (checked at least every ping)."""
     while True:
-        await asyncio.sleep(PING_INTERVAL_S)
+        delay = PING_INTERVAL_S
+        if expires_at_ms is not None:
+            left = expires_at_ms / 1000 - time.time()
+            if left <= 0:
+                await websocket.close(code=_CLOSE_UNAUTHORIZED, reason="token expired")
+                return
+            delay = min(delay, left)
+        await asyncio.sleep(delay)
+        if expires_at_ms is not None and time.time() * 1000 >= expires_at_ms:
+            continue  # closed at the top of the loop
         await websocket.send_json({"type": "ping"})
 
 
-async def _authenticate(websocket: WebSocket, deps: Any) -> tuple[bool, str | None, str | None]:
-    """Check the launcher's credential; on refusal the socket is closed.
-
-    Returns ``(ok, owner_account_id, account_token_id)``.
-    """
+async def _authenticate(websocket: WebSocket, deps: Any) -> _Auth | None:
+    """Check the launcher's credential; on refusal the socket is closed and
+    None is returned."""
     header = websocket.headers.get("authorization") or ""
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
     source_ip = (websocket.client.host if websocket.client is not None else "") or ""
     limiter = deps.auth_limiter
 
-    async def refuse(reason: str) -> tuple[bool, None, None]:
+    async def refuse(reason: str) -> None:
         # A valid credential always passes; failures are counted per IP.
         if limiter.is_throttled(AUTH_LIMIT_KEY, source_ip):
             await websocket.close(code=_CLOSE_LIMITED, reason="too many failed attempts")
         else:
             limiter.record_failure(AUTH_LIMIT_KEY, source_ip)
             await websocket.close(code=_CLOSE_UNAUTHORIZED, reason=reason)
-        return False, None, None
+        return None
 
     if deps.session_creation == "account":
         if deps.accounts is None:  # fail closed
             await websocket.close(code=_CLOSE_INTERNAL, reason="accounts unavailable")
-            return False, None, None
+            return None
         if not token:
-            return await refuse("missing token")
+            await refuse("missing token")
+            return None
         res = await deps.accounts.authenticate(
             token, int(time.time() * 1000), Origin(source_ip, request_client.get())
         )
         if res.account is None:
             if res.refusal == "network":
                 await websocket.close(code=_CLOSE_FORBIDDEN, reason="network not approved")
-                return False, None, None
-            return await refuse("invalid token")
-        return True, res.account.account_id, res.token_id
+                return None
+            await refuse("invalid token")
+            return None
+        return _Auth(res.account.account_id, res.account.name, res.token_id, res.expires_at)
     required = websocket.app.state.launcher_token
     if required is not None and not admin_matches(token, required):
-        return await refuse("invalid token")
-    return True, None, None
+        await refuse("invalid token")
+        return None
+    return _Auth()
 
 
 async def launcher_ws(websocket: WebSocket) -> None:
     deps = websocket.app.state.tool_deps
     registry: LauncherRegistry = deps.launchers
     await websocket.accept()
-    ok, owner_account_id, token_id = await _authenticate(websocket, deps)
-    if not ok:
+    auth = await _authenticate(websocket, deps)
+    if auth is None:
         return
+    owner_account_id, token_id = auth.owner_account_id, auth.token_id
     source_ip = (websocket.client.host if websocket.client is not None else "") or ""
 
     try:
@@ -496,7 +564,8 @@ async def launcher_ws(websocket: WebSocket) -> None:
         resume_secret = secrets.token_urlsafe(32)
         launcher_id, rejected = registry.register(
             websocket, owner_account_id, hello, token_id=token_id, ip=source_ip,
-            resume_hash=hash_token(resume_secret),
+            resume_hash=hash_token(resume_secret), owner_name=auth.owner_name,
+            expires_at_ms=auth.expires_at_ms,
         )
     except FrameTooLargeError:
         await websocket.close(code=_CLOSE_TOO_BIG, reason="frame too large")
@@ -517,13 +586,15 @@ async def launcher_ws(websocket: WebSocket) -> None:
     pinger: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
     try:
+        # ``account``: the owner account's name (None in open mode), so the
+        # launcher can double-check the visibility of each order.
         await websocket.send_json(
             {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
-             "resume_secret": resume_secret}
+             "resume_secret": resume_secret, "account": auth.owner_name}
         )
         for stop in stops:
             await websocket.send_json(stop)
-        pinger = asyncio.create_task(_ping_loop(websocket))
+        pinger = asyncio.create_task(_ping_loop(websocket, auth.expires_at_ms))
         receiver = asyncio.create_task(_receive(websocket, launcher_id, deps.launches))
         await asyncio.wait({pinger, receiver}, return_when=asyncio.FIRST_COMPLETED)
     except (WebSocketDisconnect, RuntimeError):

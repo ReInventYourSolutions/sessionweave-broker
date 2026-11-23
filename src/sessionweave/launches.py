@@ -85,6 +85,10 @@ class Launch:
     launched_by: str | None
     accounts: tuple[str, ...]  # launcher owner + session owner (deduplicated)
     token_id: str | None  # the launch credential, until joined or invalidated
+    # The launcher owner's account name (None in open mode) and whether it is
+    # the session owner's own launcher.
+    owner: str | None = None
+    own: bool = True
     status: str = "pending"
     participant_id: str | None = None
     error: str | None = None
@@ -103,6 +107,8 @@ class Launch:
             "profile_id": self.profile_id,
             "launcher_id": self.launcher_id,
             "machine": self.machine,
+            "owner": self.owner,
+            "own": self.own,
         }
         if self.participant_id is not None:
             out["participant_id"] = self.participant_id
@@ -195,6 +201,8 @@ class LaunchManager:
         # take the same slot or overshoot the session cap.
         if self._deps.registry.get(sid) is not sess:
             raise ToolError(ErrorCode.SESSION_NOT_FOUND, "session not found")
+        # The agent could not join a suspended session: refuse up front.
+        sess._ensure_not_suspended()
         if self.active_count(sid) >= sess.config.max_launched_agents:
             raise ToolError(
                 ErrorCode.LAUNCH_LIMIT,
@@ -222,6 +230,7 @@ class LaunchManager:
             resume_hash=lnc.resume_hash,
             launched_by=principal.participant_id if is_coordinator(sess, principal) else None,
             accounts=accounts, token_id=issued.token_id,
+            **self._launchers.owner_fields(lnc.owner_account_id, lnc.owner_name, sess),
         )
         self._launches[launch_id] = lch
         lch.timer = asyncio.get_running_loop().call_later(
@@ -235,6 +244,12 @@ class LaunchManager:
             "profile_id": prof["id"],
             "task": task,
             "join_credential": token,
+            # Who to report the result to: the coordinator that asked, else the
+            # session's coordinator (None when there is none).
+            "coordinator_id": lch.launched_by or sess.coordinator_id,
+            # The session owner's account name (None in open mode), so the
+            # launcher can double-check its visibility rules.
+            "session_owner": owner_name,
         }
         # Only the operator-configured public URL: never one derived from
         # request headers (a spoofed Host must not redirect the credential).
@@ -252,6 +267,7 @@ class LaunchManager:
         return {
             "launch_id": launch_id, "status": lch.status,
             "launcher_id": lch.launcher_id, "machine": lch.machine,
+            "owner": lch.owner, "own": lch.own,
         }
 
     # --- join (called by session_join with a launch credential) ---

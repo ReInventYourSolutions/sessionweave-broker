@@ -25,7 +25,6 @@ from starlette.routing import Mount, Route
 
 from sessionweave import __version__
 from sessionweave.access import AuthFailureLimiter, admin_matches
-from sessionweave.access import _now_ms as access_now_ms
 from sessionweave.account_events import (
     EventLog,
     RequestClientMiddleware,
@@ -405,19 +404,20 @@ def _build_fastmcp(
         except Exception:
             return None
 
-    def _may_be_participant_token(bearer: str, session_id: str) -> bool:
+    async def _may_be_participant_token(bearer: str, session_id: str) -> bool:
         """False for a Bearer that is another kind of credential (admin, account,
-        or a creator/supervisor/join token of the session): it is the documented
-        header for session_create and manager tools, so it is never tried as a
-        participant token (which would count an auth failure and change the
-        error the caller gets)."""
+        or a creator/supervisor/join/launch token of the session, even revoked
+        or expired): it is the documented header for session_create and
+        manager tools, so it is never tried as a participant token (which would
+        count an auth failure and change the error the caller gets). A cold
+        (persisted) session is loaded to tell."""
         if admin_matches(bearer, deps.admin_token) or bearer.startswith(ACCOUNT_TOKEN_PREFIX):
             return False
-        sess = deps.registry.get(session_id)
-        if sess is None:
+        try:
+            sess = await deps.registry.get_or_raise(session_id)
+        except ToolError:
             return True  # the bind reports the unknown session
-        principal = sess.auth.match(bearer, access_now_ms())
-        return principal is None or principal.role == "participant"
+        return not sess.auth.is_session_credential(bearer)
 
     @asynccontextmanager
     async def _participant(
@@ -462,7 +462,7 @@ def _build_fastmcp(
         token = participant_token
         if not token and session_id:
             bearer = _bearer_of(ctx)
-            if bearer and _may_be_participant_token(bearer, session_id):
+            if bearer and await _may_be_participant_token(bearer, session_id):
                 token = bearer
         if not (session_id and token):
             # No binding and no explicit identity: let the normal
@@ -1043,7 +1043,8 @@ def _build_fastmcp(
     the session is invalidated, so mint a new one to invite again. Only
     the named participant is affected. Fails with participant_not_found
     for an unknown participant_id. The session's coordinator (its participant
-    token) may remove the agents it launched, and only those. Returns removed
+    token) may remove launched agents (metadata.launch_id set, whoever
+    launched them), and only those. Returns removed
     (the removed ids) and join_tokens_invalidated.
     """
         return await session_remove_participant(
@@ -1088,9 +1089,10 @@ def _build_fastmcp(
         capability: Annotated[str | None, Field(description=
             "Only profiles declaring this capability tag."
         )] = None,
-        token: Annotated[str | None, Field(description=
-            "The coordinator's participant token (or the creator/admin credential). "
-            "May be omitted when it arrives as the MCP Authorization: Bearer header."
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -1099,12 +1101,18 @@ def _build_fastmcp(
     Only the session's coordinator (its participant token) or the creator/admin
     may call this; anyone else gets permission_denied and should ask the
     coordinator. Without a domain, returns {"domains": [...]}; with one,
-    {"agents": [...]} where each item has launcher_id, machine, profile_id,
+    {"agents": [...]} where each item has launcher_id, machine, owner (the
+    launcher owner's account name, null in open mode), own, profile_id,
     domain, role, capabilities, description, runtime, model, access_preset,
-    limits, online and free_slots.
+    limits, online and free_slots. Own launchers (own: true, the session
+    owner's account) come first: prefer them. The machine name and
+    description are chosen by the launcher's owner; launch a foreign launcher
+    (own: false) only when the user asked for it — it receives the task and
+    its agent reads the whole session.
     """
         return await agents_discover(
-            deps, session_id, _creator_cred(token, ctx), domain, role, capability,
+            deps, session_id, _creator_cred(participant_token, ctx), domain, role,
+            capability,
             source_ip=_client_ip(ctx),
         )
 
@@ -1128,9 +1136,10 @@ def _build_fastmcp(
         role: Annotated[str | None, Field(description=
             "The profile role to start, with domain."
         )] = None,
-        token: Annotated[str | None, Field(description=
-            "The coordinator's participant token (or the creator/admin credential). "
-            "May be omitted when it arrives as the MCP Authorization: Bearer header."
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -1140,15 +1149,20 @@ def _build_fastmcp(
     anyone else gets permission_denied and should ask the coordinator. Give
     launcher_id + profile_id, or domain + role. Returns {"launch_id",
     "status": "pending"}; the agent then joins by itself and you see a normal
-    participant.joined. Read the result with agents_launch_status; a failure
-    also arrives as an agent.launch_failed event. Errors: launch_limit (the
-    session's max_launched_agents reached), no_free_slot, profile_not_found.
-    Remove the agent with session_remove_participant when done.
+    participant.joined. When the task is done the agent sends its result
+    with session_send to the coordinator that launched it (else the
+    session's coordinator), and then stays in the session for more work.
+    Read the launch with agents_launch_status; a failure also arrives as
+    an agent.launch_failed event. The response says owner and own (see
+    agents_discover). Errors: launch_limit (the session's
+    max_launched_agents reached), no_free_slot, profile_not_found,
+    session_suspended. Remove the agent with session_remove_participant
+    when done.
     """
         body = {"task": task, "launcher_id": launcher_id, "profile_id": profile_id,
                 "domain": domain, "role": role}
         return await agents_launch(
-            deps, session_id, _creator_cred(token, ctx), body,
+            deps, session_id, _creator_cred(participant_token, ctx), body,
             # Only the configured public URL, never one derived from headers.
             broker_url=os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/") or None,
             source_ip=_client_ip(ctx),
@@ -1158,21 +1172,27 @@ def _build_fastmcp(
     async def agents_launch_status_tool(
         session_id: SessionIdArg,
         launch_id: Annotated[str, Field(description="The launch_id agents_launch returned.")],
-        token: Annotated[str | None, Field(description=
-            "The coordinator's participant token (or the creator/admin credential). "
-            "May be omitted when it arrives as the MCP Authorization: Bearer header."
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
         )] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Read the result of one launch.
 
     Returns launch_id, status (pending | started | joined | failed | stopped),
-    profile_id, launcher_id, and when known participant_id, error (why it
-    failed: launcher_offline, join_timeout, or the launcher's message) and
-    reason (why it stopped). Coordinator or creator/admin only.
+    profile_id, launcher_id, machine, owner, own, and when known
+    participant_id, error (why it failed: launcher_offline, join_timeout,
+    cancelled, or the launcher's error such as profile_unknown, no_free_slot,
+    visibility_refused, profile_rejected, start_failed, join_failed*) and
+    reason (why it stopped: removed, left, evicted, session_ended,
+    launcher_lost, or the launcher's reason such as idle_limit). Coordinator
+    or creator/admin only.
     """
         return await agents_launch_status(
-            deps, session_id, _creator_cred(token, ctx), launch_id, source_ip=_client_ip(ctx),
+            deps, session_id, _creator_cred(participant_token, ctx), launch_id,
+            source_ip=_client_ip(ctx),
         )
 
     @_tool("session_post_order")

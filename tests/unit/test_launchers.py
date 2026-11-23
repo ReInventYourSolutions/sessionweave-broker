@@ -119,3 +119,51 @@ def test_unregister_removes_profiles() -> None:
     assert reg.profiles_for(_sess(None), "backend") == []
     assert reg.domains_for(_sess(None)) == []
     assert reg.get_conn(lid) is None
+
+
+def test_profile_visibility_overrides_launcher() -> None:
+    reg = LauncherRegistry()
+    reg.register(_Conn(), "a1", _hello(
+        [_prof(id="open"), _prof(id="mine", visibility="personal"),
+         _prof(id="bob", allowed_accounts=["Bob"])],
+        visibility="general", machine="gen",
+    ), owner_name="alice")
+    reg.register(_Conn(), "a1", _hello(
+        [_prof(id="pub", visibility="general")], machine="pers"), owner_name="alice")
+
+    def ids(owner: str | None, name: str | None) -> set[str]:
+        return {i["profile_id"] for i in reg.profiles_for(
+            _sess(owner), "backend", owner_name=name)}
+
+    assert ids("a1", "alice") == {"open", "mine", "bob", "pub"}
+    assert ids("a2", "carol") == {"open", "pub"}
+    assert ids("a3", "bob") == {"open", "bob", "pub"}
+    assert reg.domains_for(_sess("a2"), owner_name="carol") == ["backend"]
+    # select applies the profile's visibility too
+    with pytest.raises(Exception, match="no online launcher"):
+        reg.select(_sess("a2"), "carol", launcher_id=next(
+            i["launcher_id"] for i in reg.profiles_for(_sess("a1"), "backend", owner_name="a")
+            if i["profile_id"] == "mine"), profile_id="mine")
+
+
+@pytest.mark.parametrize("bad", [
+    {"visibility": "secret"}, {"allowed_accounts": "bob"}, {"allowed_accounts": [""]},
+])
+def test_validate_rejects_bad_profile_visibility(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        validate_profile(_prof(**bad))
+
+
+def test_discovery_says_owner_and_own_first() -> None:
+    reg = LauncherRegistry()
+    reg.register(_Conn(), "a2", _hello([_prof(id="foreign")], visibility="general",
+                                       machine="alice-box"), owner_name="mallory")
+    reg.register(_Conn(), "a1", _hello([_prof(id="mine")], machine="m"), owner_name="alice")
+    items = reg.profiles_for(_sess("a1"), "backend", owner_name="alice")
+    assert [(i["profile_id"], i["owner"], i["own"]) for i in items] == [
+        ("mine", "alice", True), ("foreign", "mallory", False)]
+    # open mode: no owner, always own
+    reg2 = LauncherRegistry()
+    reg2.register(_Conn(), None, _hello([_prof()]))
+    (item,) = reg2.profiles_for(_sess(None), "backend")
+    assert item["owner"] is None and item["own"] is True

@@ -175,7 +175,8 @@ you re-call it on your next turn. This keeps you responsive.
    answer people in the language of the request.
    If the creator removes you (a 403 `participant_removed`), stop your work and your
    sub-agents. If a wait returns `session.ended`, the session is over: stop. Sub-agents never
-   join the session.
+   join the session. Need another agent started? Only the session's coordinator
+   (`coordinator_id` in the join response) can request agents — ask it with a command.
    Keep `timeout_seconds` (and your client's read timeout) below your runtime's
    per-command time limit — e.g. at most 90 under a 120-second shell limit. If a call is
    cut off, the relay keeps that wait open until its timeout and the next call gets

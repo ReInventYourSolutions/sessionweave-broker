@@ -188,3 +188,19 @@ def test_mint_join_prunes_long_expired_join_tokens() -> None:
     assert auth.join_token_expired(old, later) is False
     assert hash_token(recent) in auth._issued  # expired less than the grace ago
     assert auth.match(sup, later) == Principal("supervisor")
+
+
+def test_is_session_credential_includes_revoked_and_expired() -> None:
+    from sessionweave.access import SessionAuth, hash_token
+
+    auth = SessionAuth(hash_token("creator-tok"))
+    join, _ = auth.mint_join(1_000)
+    sup, issued = auth.mint_supervisor(1_000)
+    auth.revoke_supervisor(issued.token_id, 2_000)
+    auth.invalidate_join_tokens(2_000)
+    auth.register_participant("p1", hash_token("part-tok"))
+    assert auth.is_session_credential("creator-tok")
+    assert auth.is_session_credential(join)  # expired
+    assert auth.is_session_credential(sup)  # revoked
+    assert not auth.is_session_credential("part-tok")
+    assert not auth.is_session_credential("unknown")

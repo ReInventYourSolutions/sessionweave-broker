@@ -328,13 +328,15 @@ async def test_mcp_agents_discover_end_to_end() -> None:
             j = await agent.call_tool("session_join", {
                 "session_id": sid, "join_token": made["creator_token"], "role": "c"})
             out = await agent.call_tool("agents_discover", {
-                "session_id": sid, "domain": "backend", "token": j["participant_token"]})
+                "session_id": sid, "domain": "backend",
+                "participant_token": j["participant_token"]})
             assert [a["profile_id"] for a in out["agents"]] == ["p1"]
             j2 = await other.call_tool("session_join", {
                 "session_id": sid, "join_token": made["join_token"], "role": "w"})
             with pytest.raises(RuntimeError, match="permission_denied"):
                 await other.call_tool("agents_discover", {
-                    "session_id": sid, "domain": "backend", "token": j2["participant_token"]})
+                    "session_id": sid, "domain": "backend",
+                    "participant_token": j2["participant_token"]})
 
 
 async def test_launcher_hello_too_large_closes_1009() -> None:
@@ -343,3 +345,22 @@ async def test_launcher_hello_too_large_closes_1009() -> None:
         await ws.send(_hello([], pad="x" * (256 * 1024)))
         code, _reason = await _closed_by_broker(ws)
         assert code == 1009
+
+
+async def test_launcher_closed_when_account_token_expires(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        soon = (datetime.now(UTC) + timedelta(seconds=3)).isoformat()
+        minted = await _mint(c, s.acc.account_id, expires_at=soon)
+        ws, w = await _connect(s.base, minted["token"], _hello([_prof()]))
+        assert w["type"] == "welcome" and w["account"] == "Alice"
+        code, reason = await _closed_by_broker(ws)
+        assert code == 4401 and reason == "token expired"
+        sess = await _session(c, s.token)
+        coord = await _join(c, sess["session_id"], s.token)
+        r = await c.get("/v1/agents", params={"session_id": sess["session_id"],
+                                              "domain": "backend"},
+                        headers=bearer(coord["participant_token"]))
+        assert r.json()["agents"] == []

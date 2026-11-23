@@ -844,7 +844,8 @@ async def session_remove_participant(
     source_ip: str = "",
 ) -> dict[str, Any]:
     """Remove one participant: creator or admin token; the session's
-    coordinator may remove the agents it launched."""
+    coordinator may remove launched agents (its own and those its
+    predecessors launched), never other participants."""
     from sessionweave.access import is_coordinator
     from sessionweave.session import COORDINATOR_REMOVED_HALT_MESSAGE, REMOVED_HALT_MESSAGE
 
@@ -854,16 +855,12 @@ async def session_remove_participant(
     if principal.role not in ("creator", "admin"):
         halt_message = COORDINATOR_REMOVED_HALT_MESSAGE
         target = sess._participants.get(participant_id)
-        launched_by = target.metadata.get("launched_by") if target is not None else None
-        if not (
-            is_coordinator(sess, principal)
-            and launched_by is not None
-            and launched_by == principal.participant_id
-        ):
+        launch_id = target.metadata.get("launch_id") if target is not None else None
+        if not (is_coordinator(sess, principal) and launch_id is not None):
             raise ToolError(
                 ErrorCode.PERMISSION_DENIED,
                 "requires one of: creator, admin (the coordinator may remove only "
-                "the agents it launched)",
+                "launched agents)",
             )
     return await sess.remove_participant(participant_id, halt_message=halt_message)
 

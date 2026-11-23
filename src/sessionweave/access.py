@@ -272,6 +272,15 @@ class SessionAuth:
             return Principal("joiner", launch_token_id=issued.token_id)
         return None
 
+    def is_session_credential(self, token: str) -> bool:
+        """Whether ``token`` is this session's creator token or one it issued
+        (join, supervisor or launch), even revoked or expired: a credential
+        that is never a participant token."""
+        digest = hash_token(token)
+        if self._creator_hash is not None and hmac.compare_digest(digest, self._creator_hash):
+            return True
+        return digest in self._issued
+
     def join_token_expired(self, token: str, now_ms: int) -> bool:
         issued = self._issued.get(hash_token(token))
         return (
