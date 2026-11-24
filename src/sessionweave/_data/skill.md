@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.25.0
+version: 0.25.1
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.25.0** — when reporting your behaviour or filing
+> **Skill version: 0.25.1** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -1047,8 +1047,9 @@ should name ids or paths (or write `[all]`).
 
 ### 4.7 Launching agents (the coordinator)
 
-Only the session's **coordinator** may request agents (the creator, owning account or
-admin credential may too, acting for the session); any other participant gets
+Only the session's **coordinator** may request agents. By design the creator, owning
+account or admin credential may too, acting for the session (also on an MCP connection
+whose Authorization header carries one of them, whoever calls); any other participant gets
 `permission_denied` ("only the session's coordinator can request agents — ask the
 coordinator") and should ask the coordinator with a command. The coordinator is
 `coordinator_id` in the join answer and the roster (whoever first joined with the
@@ -1070,23 +1071,32 @@ creator credential); the creator/owner moves it with
   payload; answer it with `session_respond` to close it). Then it stays in the
   session: dispatch more work to it as in §4.3.
 - `launch_status(launch_id)`: `pending`, `started`, `joined`, `failed` or `stopped`. A
-  failure also arrives as the event `agent.launch_failed {launch_id, error}`; a stop of
-  a joined agent by its launcher as `agent.stopped {participant_id, launch_id, reason}`
-  (a Runner coordinator is woken by both).
+  failure also arrives as the event `agent.launch_failed {launch_id, error, message?}`;
+  a stop of a joined agent by its launcher as
+  `agent.stopped {participant_id, launch_id, reason}` (a Runner coordinator is woken by
+  both).
   - `error` (failed) — broker: `launcher_offline`, `join_timeout`, `cancelled`;
     launcher: `invalid_order`, `launcher_shutting_down`, `profile_unknown`,
-    `no_free_slot`, `visibility_refused`, `profile_rejected`, `start_failed`,
-    `join_failed`, `join_failed_<http status>`.
-  - `reason` (stopped) — broker: `removed`, `left`, `evicted`, `session_ended`,
-    `launcher_lost`; launcher: `duration_limit`, `idle_limit`,
-    `cost_limit`, `agent_exited`, `agent_failed`, `start_failed`,
-    `launcher_shutdown`, `launcher_disconnected`, `launcher_unauthorized`,
-    `launcher_restarted`, `launcher_error`.
+    `no_free_slot`, `visibility_refused`, `profile_rejected`, `runtime_unavailable`
+    (the launcher's runtime check failed before the agent joined: binary missing,
+    unsupported version, unsafe workdir; `message` says which), `start_failed`,
+    `join_failed`, `join_failed_<http status>`. `message` (when present) is the
+    launcher's explanation, at most 300 characters.
+  - `reason` (stopped) — broker: `removed`, `left`, `evicted`, `session_ended` (the
+    session ended or was deleted, also when an in-memory session ends at its idle TTL —
+    default 1800 s, raise `idle_ttl_seconds` for long work), `session_cold` (a persisted
+    session left memory at its idle TTL: it can be resumed, launch again then),
+    `launcher_lost`; launcher: `duration_limit`, `idle_limit`, `cost_limit`,
+    `runtime_failed` (the runtime kept failing, or no longer passes its check),
+    `agent_exited`, `agent_failed`, `start_failed`, `launcher_shutdown`,
+    `launcher_disconnected`, `launcher_unauthorized`, `launcher_restarted`,
+    `launcher_error`.
   - Launch refusals: `launch_limit`, `no_free_slot`, `profile_not_found`,
     `session_suspended`.
-- When it is done, remove it (`remove_participant`): the coordinator may remove any
-  launched agent (also those the creator or a previous coordinator launched), never
-  other participants. It also stops at its limits.
+- When it is done, remove it (`remove_participant` with your participant token; MCP
+  `session_remove_participant`, passing it in the argument named `creator_token`): the
+  coordinator may remove any launched agent (also those the creator or a previous
+  coordinator launched), never other participants. It also stops at its limits.
 - Profile presets: `reader` reads only (no edits, no shell); `operator` may edit
   files and run commands as the launcher's user.
 Launched agents use the `sessionweave` MCP tools, and an operator keeps its undo
@@ -1246,7 +1256,7 @@ token named in their row.
 | *(none)* | `GET /v1/info` | Unauthenticated pre-flight — see [§6.5](#65-get-v1info). |
 | `session_post_order` | `POST /v1/sessions/{sid}/supervisor/notes` | `{kind, target, message?}` (MCP: `session_id, token, kind, target, message?`) — Bearer is a supervisor, creator or admin token; `kind` is `note` \| `halt` \| `continue` \| `redirect` \| `undo`; `note`, `redirect` and `undo` need a `message` (undo: name ids or paths, or `[all]`). See [§4.4](#44-supervisor-notes). |
 | `session_reply_to_note` | `POST /v1/sessions/{sid}/supervisor/notes/{note_id}/replies` | `{message, outcome?}` (outcome: `{status: done|partial|impossible, undone, not_reversible}`) with a participant Bearer (MCP: `note_id, message, outcome?, session_id?, participant_token?`). See [§4.4](#44-supervisor-notes). |
-| `session_remove_participant` | `DELETE /v1/sessions/{sid}/participants/{pid}` | Creator or admin. Halts the target, removes it, invalidates every join token; `participant.left` with `reason: removed`. See [§4.4](#44-supervisor-notes). |
+| `session_remove_participant` | `DELETE /v1/sessions/{sid}/participants/{pid}` | Creator, owning account or admin (anyone); the coordinator's participant token for launched agents (MCP: in `creator_token`, kept for compatibility). Halts the target, removes it, invalidates every join token; `participant.left` with `reason: removed`. See [§4.4](#44-supervisor-notes). |
 | *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |
 | *(none)* | `WS /v1/sessions/{sid}/firehose?token=…` | Every event in the session, for a supervisor. `token` is a supervisor, creator or admin token — [§6.6](#66-persistence-and-ownership). |
@@ -1785,5 +1795,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.25.0 — joined as
+> "I'm acting under `sessionweave-participant` v0.25.1 — joined as
 > observer, long-polling on every turn."

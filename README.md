@@ -570,6 +570,11 @@ the creator credential (creator token or the owning account's token), or the one
 the creator assigned with `PUT /v1/sessions/{sid}/coordinator` — or the creator /
 admin acting for the session. Anyone else gets `permission_denied` ("only the
 session's coordinator can request agents — ask the coordinator").
+The creator credential (creator token, owning account's token) and the admin token
+act for the coordinator **by design**: they may discover, launch, read launch status
+and remove launched agents themselves. On MCP this also holds for every participant
+of a connection whose `Authorization` header carries one of those credentials, so do
+not share such a connection with agents that should not launch.
 
 **Connecting a launcher.** WebSocket `/v1/launchers/connect` with
 `Authorization: Bearer <token>`: in `account` mode an account token (the launcher
@@ -586,7 +591,13 @@ when the account token it connected with expires. `welcome` carries `account`
 **Visibility** (account mode) is per launcher (`visibility`: `personal` or
 `general`, `allowed_accounts`), and each profile in `hello` may override it with
 its own `visibility` / `allowed_accounts`. The session owner's own launchers are
-always visible to it.
+always visible to it. `allowed_accounts` empty on a profile means every account,
+while omitting it inherits the launcher's list. A session without an owner account
+(created with the admin token and no `owner_account_id`) sees only `general`
+profiles whose effective `allowed_accounts` is empty (and open-mode launchers);
+never `personal` ones nor lists naming accounts. Such a session has no own
+launcher, so a `domain` + `role` launch finds none: name `launcher_id` +
+`profile_id`.
 
 **Discover and launch.**
 
@@ -630,7 +641,12 @@ else the session's coordinator; `null` if there is none); `session_owner` is the
 session owner's account name (`null` in open mode), so the launcher can
 double-check its visibility rules (it refuses with `visibility_refused`). The
 launcher answers
-`launch_result` (`started` | `failed` with `error`); the agent joins with the
+`launch_result` (`started` | `failed` with `error` and, optionally, `message`: at
+most 300 printable characters, kept in the launch status and sent in
+`agent.launch_failed`). Before it joins, the Runner launcher checks the profile's
+runtime (binary on `PATH`, opencode 2.x, Cline 3.0.75, workdir and git checks) and
+answers `failed` with `runtime_unavailable` and a `message` naming the problem, so the
+credential is not spent on an agent that could never run. The agent joins with the
 credential as Bearer on `POST /v1/sessions/{sid}/participants`. The join takes
 the profile's role and capabilities whatever the body says (they are forced, not
 compared), and the participant's metadata carries `launch_id`, `launcher_id`,
@@ -643,7 +659,8 @@ a launcher reconnect the launch status shows the current launcher. A second join
 `pending` → `started` → `joined`, or `failed` (`launcher_offline` when the
 launcher disconnects first, `join_timeout` after 120 s — `SW_LAUNCH_JOIN_TIMEOUT_S`
 — or the launcher's error; the credential is invalidated and the slot released).
-The coordinator receives the session event `agent.launch_failed {launch_id, error}`.
+The coordinator receives the session event
+`agent.launch_failed {launch_id, error, message?}`.
 
 **Lifecycle.** A launched agent stays until removed or the session ends. The
 coordinator may remove launched agents (`DELETE
@@ -655,9 +672,15 @@ not invalidate the session's join tokens (it never held the invite link); its ha
 reads "removed by the coordinator" when the coordinator removed it. The launcher
 then gets `{"type":"stop","launch_id","reason":"removed"}` — `left` when the agent
 left by itself, `evicted` when it stayed offline past the grace period — and
-`session_ended` when the session ends or is deleted (also while it is cold), and
-`join_timeout` for a launch that timed out. When the launcher stops an agent
-itself (a profile limit), it sends `{"type":"stopped","launch_id","reason"}`; the
+`session_ended` when the session ends or is deleted (also while it is cold),
+`session_cold` when a persisted session leaves memory at its idle TTL (it can be
+resumed; launch the agents again then: nobody would supervise them meanwhile), and
+`join_timeout` for a launch that timed out. **Idle TTL:** an in-memory session ends
+after `idle_ttl_seconds` without activity (default 1800 s), which stops every
+launched agent with `session_ended`; raise `idle_ttl_seconds` (session `config`) for
+long-running work, or use a persisted session (then `session_cold`). When the launcher stops an agent
+itself (a profile limit, or `runtime_failed` when the runtime keeps failing or no
+longer passes its checks), it sends `{"type":"stopped","launch_id","reason"}`; the
 broker removes the participant (halt "stopped by its launcher: <reason>") and sends
 the session event `agent.stopped {participant_id, launch_id, reason}`.
 
@@ -673,7 +696,9 @@ immediate `stop` (its final reason, or `unknown_launch`).
 Joined agents whose launcher has not come back within 300 s
 (`SW_LAUNCHER_RECONNECT_GRACE_S`) are removed (halt first) with the session event
 `agent.stopped` reason `launcher_lost`. In account mode
-`agent.launched` / `agent.stopped` are recorded in the account event log.
+`agent.launched` / `agent.stopped` are recorded in the account event log
+(`agent.stopped` carries `status`: `failed` for a launch that never joined, with its
+`message` when there is one, else `stopped`).
 Launch records are kept in memory (a finished one for an hour). After a broker
 restart launches are forgotten: a reconnecting launcher is told to stop its
 agents (`unknown_launch`), and it makes each one leave the session with the
@@ -783,7 +808,8 @@ from sessionweave_client import SessionWeaveClient
 async def main():
     async with SessionWeaveClient() as c:           # default: broker.sessionweave.com
         sess = await c.create_session(purpose={"kind": "demo"})
-        me = await c.join(sess["session_id"], role="worker", capabilities=["respond"])
+        me = await c.join(sess["session_id"], join_token=sess["join_token"],
+                          role="worker", capabilities=["respond"])
         async with me.events() as stream:           # live WS push
             async for evt in stream:
                 if evt.name == "command.received":
