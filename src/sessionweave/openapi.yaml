@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.34.0"
+  version: "0.34.1"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -459,8 +459,9 @@ components:
         owner: { type: string, nullable: true, description: "The launcher owner's account name (null in open mode)" }
         own: { type: boolean, description: "The launcher belongs to the session owner's account (true in open mode)" }
         participant_id: { type: string, description: Set once the agent joined }
-        error: { type: string, description: "Why it failed. Broker: launcher_offline, join_timeout, cancelled. Launcher: invalid_order, launcher_shutting_down, profile_unknown, no_free_slot, visibility_refused, profile_rejected, start_failed, join_failed, join_failed_<http status>, or its stop reason when stopped before joining" }
-        reason: { type: string, description: "Why it stopped. Broker: removed, left, evicted, session_ended, launcher_lost. Launcher: duration_limit, idle_limit, cost_limit, agent_exited, agent_failed, launcher_shutdown, launcher_disconnected, launcher_unauthorized, launcher_restarted, launcher_error" }
+        error: { type: string, description: "Why it failed. Broker: launcher_offline, join_timeout, cancelled. Launcher: invalid_order, launcher_shutting_down, profile_unknown, no_free_slot, visibility_refused, profile_rejected, runtime_unavailable (the runtime failed its preflight: binary missing, unsupported version, unsafe workdir), start_failed, join_failed, join_failed_<http status>, or its stop reason when stopped before joining" }
+        message: { type: string, maxLength: 300, description: "The launcher's explanation of a failure (e.g. the runtime version it requires); never local paths or secrets" }
+        reason: { type: string, description: "Why it stopped. Broker: removed, left, evicted, session_ended, session_cold (a persisted session left memory after its idle TTL; it can be resumed, launch again then), launcher_lost. Launcher: duration_limit, idle_limit, cost_limit, runtime_failed (the runtime kept failing or no longer passes its preflight), agent_exited, agent_failed, launcher_shutdown, launcher_disconnected, launcher_unauthorized, launcher_restarted, launcher_error" }
     Error:
       type: object
       properties:
@@ -1193,7 +1194,9 @@ paths:
         `{"type":"hello","machine","visibility":"personal"|"general","allowed_accounts":[names],"profiles":[...]}`
         (a profile may carry its own `visibility` and `allowed_accounts`,
         overriding the launcher's for that profile);
-        then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?}`
+        then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?,"message"?}`
+        (`message`: at most 300 printable characters, kept with the launch
+        and sent in `agent.launch_failed`)
         and `{"type":"stopped","launch_id","reason"}` (its own stop, e.g. a
         limit: the broker removes the participant — halt first — and sends the
         session event `agent.stopped {participant_id, launch_id, reason}`).
@@ -1207,8 +1210,8 @@ paths:
         for the launcher's own visibility check; `broker_url` only when `SW_PUBLIC_BASE_URL` is configured — never from
         request headers; otherwise the launcher uses the URL it connected to)
         and `{"type":"stop","launch_id","reason"}` with reason `removed`, `left`,
-        `evicted`, `session_ended`, `join_timeout`, `launcher_lost` or
-        `unknown_launch`. `welcome` carries `resume_secret` (only its hash is
+        `evicted`, `session_ended`, `session_cold`, `join_timeout`,
+        `launcher_lost` or `unknown_launch`. `welcome` carries `resume_secret` (only its hash is
         kept). On reconnect the hello may carry `"resume_secret"` and
         `"running": [launch_id, ...]`: joined launches whose secret matches
         (account mode: and the same owner account) are re-attached, replacing

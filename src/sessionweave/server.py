@@ -291,6 +291,14 @@ ManagerTokenArg = Annotated[str | None, Field(
                 "or the relay operator's admin token. May be omitted when it "
                 "arrives as the MCP Authorization: Bearer header.")]
 
+RemoveTokenArg = Annotated[str | None, Field(
+    description="Named creator_token for compatibility; it takes any credential that "
+                "may remove participants: the one-time creator_token, the token of the "
+                "account that owns the session or the relay admin token (anyone), or "
+                "the session coordinator's participant_token (launched agents only). "
+                "May be omitted when it arrives as the MCP Authorization: Bearer "
+                "header.")]
+
 AccessTokenArg = Annotated[str | None, Field(
     description="Any credential that may read the session: the join token "
                 "from the invite link, your participant_token, a "
@@ -1029,14 +1037,15 @@ def _build_fastmcp(
         participant_id: Annotated[str, Field(description=
             "The participant_id of the agent to remove, as shown in the roster."
         )],
-        creator_token: ManagerTokenArg = None,
+        creator_token: RemoveTokenArg = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Remove one agent from a session.
 
     Requires the creator_token (or the relay admin token, or
     the owning account's token, also accepted from the MCP
-    Authorization: Bearer header); a supervisor
+    Authorization: Bearer header), or the coordinator's participant token
+    for launched agents (pass it in creator_token); a supervisor
     token is refused. The agent first receives a halt order, then leaves
     the session: its token stops working and the others see
     participant.left with reason removed. Every still-valid join token of
@@ -1185,9 +1194,11 @@ def _build_fastmcp(
     profile_id, launcher_id, machine, owner, own, and when known
     participant_id, error (why it failed: launcher_offline, join_timeout,
     cancelled, or the launcher's error such as profile_unknown, no_free_slot,
-    visibility_refused, profile_rejected, start_failed, join_failed*) and
-    reason (why it stopped: removed, left, evicted, session_ended,
-    launcher_lost, or the launcher's reason such as idle_limit). Coordinator
+    visibility_refused, profile_rejected, runtime_unavailable, start_failed,
+    join_failed*), message (the launcher's explanation, e.g. which runtime
+    version is required) and reason (why it stopped: removed, left, evicted,
+    session_ended, session_cold, launcher_lost, or the launcher's reason such
+    as idle_limit, cost_limit, duration_limit or runtime_failed). Coordinator
     or creator/admin only.
     """
         return await agents_launch_status(

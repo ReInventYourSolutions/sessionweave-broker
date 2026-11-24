@@ -105,7 +105,9 @@ def test_visibility_matrix() -> None:
     assert ids("a2", "Carol", "other") == set()  # not on allowed list
     assert ids("a3", "bob", "other") == {"lim"}  # case-insensitive name match
     assert ids("a1", "Alice", "other") == {"lim"}
-    assert ids(None, None, "backend") == set()  # account launcher, ownerless session
+    # ownerless (admin-created) session: general profiles open to every account only
+    assert ids(None, None, "backend") == {"gen"}
+    assert ids(None, None, "other") == set()
     assert reg.domains_for(_sess("a2"), owner_name="Carol") == ["backend"]
     assert reg.domains_for(_sess("a3"), owner_name="bob") == ["backend", "other"]
 
