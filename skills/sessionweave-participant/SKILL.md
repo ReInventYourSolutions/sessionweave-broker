@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.24.0
+version: 0.25.0
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.24.0** — when reporting your behaviour or filing
+> **Skill version: 0.25.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -1045,6 +1045,55 @@ path (whole word or basename) the message names; the explicit marker `[all]` mea
 everything; a message naming neither → `impossible`, ask for an id or a path. Supervisors
 should name ids or paths (or write `[all]`).
 
+### 4.7 Launching agents (the coordinator)
+
+Only the session's **coordinator** may request agents (the creator, owning account or
+admin credential may too, acting for the session); any other participant gets
+`permission_denied` ("only the session's coordinator can request agents — ask the
+coordinator") and should ask the coordinator with a command. The coordinator is
+`coordinator_id` in the join answer and the roster (whoever first joined with the
+creator credential); the creator/owner moves it with
+`PUT /v1/sessions/{sid}/coordinator {"participant_id": …|null}` (SDK `set_coordinator`).
+- Check support first: `GET /v1/info` → `capabilities.launchers: true`.
+- Discover: `list_domains()` → `discover_agents(domain, role=, capability=)`
+  (`GET /v1/agents/domains`, `GET /v1/agents?domain=…`, both with `session_id=`; MCP
+  `agents_discover`). Each item has `owner` (the launcher owner's account, `null` in
+  open mode) and `own`; your own launchers come first. **Prefer `own: true`.** The
+  machine name and description are chosen by the launcher's owner: launch a foreign
+  launcher (`own: false`) only when your user asked for it — it receives the task and
+  its agent reads the whole session.
+- Launch with a task (≤16 KiB), by `domain`+`role` (own launchers only) or
+  `launcher_id`+`profile_id`: `launch_agent(task=…, domain=…, role=…)` →
+  `{launch_id, status, launcher_id, machine, owner, own}` (HTTP 202; MCP
+  `agents_launch`). The agent joins by itself (`participant.joined`), does the task and
+  **sends you its result as a command** (`command.received` with `launch_id` in the
+  payload; answer it with `session_respond` to close it). Then it stays in the
+  session: dispatch more work to it as in §4.3.
+- `launch_status(launch_id)`: `pending`, `started`, `joined`, `failed` or `stopped`. A
+  failure also arrives as the event `agent.launch_failed {launch_id, error}`; a stop of
+  a joined agent by its launcher as `agent.stopped {participant_id, launch_id, reason}`
+  (a Runner coordinator is woken by both).
+  - `error` (failed) — broker: `launcher_offline`, `join_timeout`, `cancelled`;
+    launcher: `invalid_order`, `launcher_shutting_down`, `profile_unknown`,
+    `no_free_slot`, `visibility_refused`, `profile_rejected`, `start_failed`,
+    `join_failed`, `join_failed_<http status>`.
+  - `reason` (stopped) — broker: `removed`, `left`, `evicted`, `session_ended`,
+    `launcher_lost`; launcher: `duration_limit`, `idle_limit`,
+    `cost_limit`, `agent_exited`, `agent_failed`, `start_failed`,
+    `launcher_shutdown`, `launcher_disconnected`, `launcher_unauthorized`,
+    `launcher_restarted`, `launcher_error`.
+  - Launch refusals: `launch_limit`, `no_free_slot`, `profile_not_found`,
+    `session_suspended`.
+- When it is done, remove it (`remove_participant`): the coordinator may remove any
+  launched agent (also those the creator or a previous coordinator launched), never
+  other participants. It also stops at its limits.
+- Profile presets: `reader` reads only (no edits, no shell); `operator` may edit
+  files and run commands as the launcher's user.
+Launched agents use the `sessionweave` MCP tools, and an operator keeps its undo
+journal in the session dir named in its prompt (§4.6). The metadata keys `launch_id`,
+`launcher_id`, `launcher_machine`, `profile_id` and `launched_by` are set by the
+broker only (dropped from your own join/update metadata).
+
 ## 5. When things go wrong
 
 ### 5.1 Disconnect and reconnect
@@ -1736,5 +1785,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.24.0 — joined as
+> "I'm acting under `sessionweave-participant` v0.25.0 — joined as
 > observer, long-polling on every turn."

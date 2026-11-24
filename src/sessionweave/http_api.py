@@ -124,6 +124,10 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.ACCOUNT_TOKEN_LIMIT: 409,
     ErrorCode.NETWORK_NOT_APPROVED: 403,
     ErrorCode.APPROVAL_NOT_FOUND: 404,
+    ErrorCode.PROFILE_NOT_FOUND: 404,
+    ErrorCode.NO_FREE_SLOT: 409,
+    ErrorCode.LAUNCH_LIMIT: 409,
+    ErrorCode.LAUNCH_NOT_FOUND: 404,
 }
 
 
@@ -968,6 +972,79 @@ async def _remove_participant_handler(request: Request) -> Response:
     return await _run_credential_call(request, call)
 
 
+async def _set_coordinator_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    try:
+        body = await _read_json_body(request)
+    except ToolError as exc:
+        return _error_response(exc)
+    pid = body.get("participant_id")
+    if pid is not None and not isinstance(pid, str):
+        return _error_response(
+            ToolError(ErrorCode.INVALID_REQUEST, "participant_id must be a string or null")
+        )
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.session_set_coordinator(deps, sid, token, pid, source_ip=source_ip)
+
+    return await _run_credential_call(request, call)
+
+
+async def _agents_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    q = request.query_params
+    sid = q.get("session_id")
+    domain = q.get("domain")
+    if not sid:
+        return _error_response(ToolError(ErrorCode.INVALID_REQUEST, "session_id is required"))
+    if request.url.path.endswith("/domains"):
+        domain = None
+    elif not domain:
+        return _error_response(
+            ToolError(ErrorCode.INVALID_REQUEST, "domain is required (see /v1/agents/domains)")
+        )
+    try:
+        out = await tools.agents_discover(
+            _deps(request), sid, _bearer(request) or "", domain,
+            q.get("role") or None, q.get("capability") or None,
+            source_ip=_request_source_ip(request),
+        )
+    except ToolError as exc:
+        return _error_response(exc)
+    return JSONResponse(out)
+
+
+async def _launch_agent_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    try:
+        body = await _read_json_body(request)
+    except ToolError as exc:
+        return _error_response(exc)
+    # Only the configured SW_PUBLIC_BASE_URL: never the request's Host header.
+    base = getattr(request.app.state, "public_base_url", None)
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.agents_launch(
+            deps, sid, token, body, broker_url=base, source_ip=source_ip
+        )
+
+    return await _run_credential_call(request, call, 202)
+
+
+async def _launch_status_handler(request: Request) -> Response:
+    from sessionweave import tools
+
+    launch_id = request.path_params["launch_id"]
+
+    async def call(deps: ToolDeps, sid: str, token: str, *, source_ip: str) -> Any:
+        return await tools.agents_launch_status(deps, sid, token, launch_id, source_ip=source_ip)
+
+    return await _run_credential_call(request, call)
+
+
 async def _access_handler(request: Request) -> Response:
     from sessionweave import tools
 
@@ -1020,6 +1097,19 @@ def routes() -> list[Route]:
             "/v1/sessions/{sid}/participants/me",
             delete_self,
             methods=["DELETE"],
+        ),
+        Route("/v1/agents", _agents_handler, methods=["GET"]),
+        Route("/v1/agents/domains", _agents_handler, methods=["GET"]),
+        Route(
+            "/v1/sessions/{sid}/coordinator",
+            _set_coordinator_handler,
+            methods=["PUT"],
+        ),
+        Route("/v1/sessions/{sid}/agents", _launch_agent_handler, methods=["POST"]),
+        Route(
+            "/v1/sessions/{sid}/agents/{launch_id}",
+            _launch_status_handler,
+            methods=["GET"],
         ),
         Route(
             "/v1/sessions/{sid}/participants/{pid}",

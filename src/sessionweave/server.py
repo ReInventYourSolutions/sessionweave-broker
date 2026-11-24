@@ -31,6 +31,7 @@ from sessionweave.account_events import (
     client_label,
     request_client,
 )
+from sessionweave.accounts import TOKEN_PREFIX as ACCOUNT_TOKEN_PREFIX
 from sessionweave.accounts import AccountStore, session_creation_mode
 from sessionweave.brief import BriefUpgrades
 from sessionweave.config import load_deployment_defaults
@@ -40,6 +41,8 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
+from sessionweave.launchers import launcher_token_from_env
+from sessionweave.launchers import routes as launcher_routes
 from sessionweave.limits import (
     McpNewSessionLimitMiddleware,
     RequestSizeLimitMiddleware,
@@ -59,6 +62,9 @@ from sessionweave.schemas import ReplyOutcome
 from sessionweave.supervisor import NoteRateLimiter
 from sessionweave.tools import (
     ToolDeps,
+    agents_discover,
+    agents_launch,
+    agents_launch_status,
     session_check_inbox,
     session_create,
     session_delete,
@@ -77,6 +83,7 @@ from sessionweave.tools import (
     session_resume,
     session_revoke_supervisor_token,
     session_send,
+    session_set_coordinator,
     session_update_purpose,
     session_update_self,
     session_wait_for_event,
@@ -266,9 +273,10 @@ SessionIdArg = Annotated[str, Field(
                 "session_id returned by session_create.")]
 
 OptSessionIdArg = Annotated[str | None, Field(
-    description="Only together with participant_token, for a runtime that "
-                "opens a new connection per tool call. Leave unset if you "
-                "joined on this same connection.")]
+    description="Only together with participant_token (or a participant "
+                "token sent as the Authorization: Bearer header), for a "
+                "runtime that opens a new connection per tool call. Leave "
+                "unset if you joined on this same connection.")]
 
 ParticipantTokenArg = Annotated[str | None, Field(
     description="The participant_token session_join returned — not your "
@@ -396,6 +404,21 @@ def _build_fastmcp(
         except Exception:
             return None
 
+    async def _may_be_participant_token(bearer: str, session_id: str) -> bool:
+        """False for a Bearer that is another kind of credential (admin, account,
+        or a creator/supervisor/join/launch token of the session, even revoked
+        or expired): it is the documented header for session_create and
+        manager tools, so it is never tried as a participant token (which would
+        count an auth failure and change the error the caller gets). A cold
+        (persisted) session is loaded to tell."""
+        if admin_matches(bearer, deps.admin_token) or bearer.startswith(ACCOUNT_TOKEN_PREFIX):
+            return False
+        try:
+            sess = await deps.registry.get_or_raise(session_id)
+        except ToolError:
+            return True  # the bind reports the unknown session
+        return not sess.auth.is_session_credential(bearer)
+
     @asynccontextmanager
     async def _participant(
         ctx: Context,
@@ -431,14 +454,24 @@ def _build_fastmcp(
             if bound is not None:
                 yield _handle_for(ctx)
                 return
-        if not (session_id and participant_token):
+        # A launched agent's runtime carries its participant token only as
+        # the Authorization: Bearer header of the MCP request (it never
+        # appears in the agent's prompt), so the header stands in for an
+        # absent explicit token. The session still has to be named: the
+        # relay keeps no token -> session index.
+        token = participant_token
+        if not token and session_id:
+            bearer = _bearer_of(ctx)
+            if bearer and await _may_be_participant_token(bearer, session_id):
+                token = bearer
+        if not (session_id and token):
             # No binding and no explicit identity: let the normal
             # not_in_session error come from the tool itself.
             yield _handle_for(ctx)
             return
         from sessionweave.http_api import _bind_participant, _unbind_participant
         handle = await _bind_participant(
-            deps, session_id, participant_token, source_ip=_client_ip(ctx)
+            deps, session_id, token, source_ip=_client_ip(ctx)
         )
         try:
             yield handle
@@ -1009,11 +1042,156 @@ def _build_fastmcp(
     participant.left with reason removed. Every still-valid join token of
     the session is invalidated, so mint a new one to invite again. Only
     the named participant is affected. Fails with participant_not_found
-    for an unknown participant_id. Returns removed (the removed ids) and
-    join_tokens_invalidated.
+    for an unknown participant_id. The session's coordinator (its participant
+    token) may remove launched agents (metadata.launch_id set, whoever
+    launched them), and only those. Returns removed
+    (the removed ids) and join_tokens_invalidated.
     """
         return await session_remove_participant(
             deps, session_id, _creator_cred(creator_token, ctx), participant_id,
+            source_ip=_client_ip(ctx),
+        )
+
+    @_tool("session_set_coordinator")
+    async def session_set_coordinator_tool(
+        session_id: SessionIdArg,
+        participant_id: Annotated[str | None, Field(description=
+            "The participant_id (from the roster) to make the session's coordinator, "
+            "or null to clear the role."
+        )],
+        creator_token: ManagerTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Assign, move or clear the session's coordinator.
+
+    The coordinator is the one participant allowed to discover and launch
+    agents; it is whoever first joined with the creator credential until you
+    change it here. Requires the creator_token (or the relay admin token, or
+    the owning account's token, also accepted from the MCP Authorization:
+    Bearer header). The target must be a current participant, else
+    participant_not_found. Returns coordinator_id.
+    """
+        return await session_set_coordinator(
+            deps, session_id, _creator_cred(creator_token, ctx), participant_id,
+            source_ip=_client_ip(ctx),
+        )
+
+    @_tool("agents_discover")
+    async def agents_discover_tool(
+        session_id: SessionIdArg,
+        domain: Annotated[str | None, Field(description=
+            "Application domain to list agent profiles for. Omit to list the "
+            "domains available to this session."
+        )] = None,
+        role: Annotated[str | None, Field(description=
+            "Only profiles with this role."
+        )] = None,
+        capability: Annotated[str | None, Field(description=
+            "Only profiles declaring this capability tag."
+        )] = None,
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
+        )] = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Find the agents you may start in this session.
+
+    Only the session's coordinator (its participant token) or the creator/admin
+    may call this; anyone else gets permission_denied and should ask the
+    coordinator. Without a domain, returns {"domains": [...]}; with one,
+    {"agents": [...]} where each item has launcher_id, machine, owner (the
+    launcher owner's account name, null in open mode), own, profile_id,
+    domain, role, capabilities, description, runtime, model, access_preset,
+    limits, online and free_slots. Own launchers (own: true, the session
+    owner's account) come first: prefer them. The machine name and
+    description are chosen by the launcher's owner; launch a foreign launcher
+    (own: false) only when the user asked for it — it receives the task and
+    its agent reads the whole session.
+    """
+        return await agents_discover(
+            deps, session_id, _creator_cred(participant_token, ctx), domain, role,
+            capability,
+            source_ip=_client_ip(ctx),
+        )
+
+    @_tool("agents_launch")
+    async def agents_launch_tool(
+        session_id: SessionIdArg,
+        task: Annotated[str, Field(description=
+            "What the new agent should do (at most 16 KiB); added to the profile's "
+            "start prompt."
+        )],
+        launcher_id: Annotated[str | None, Field(description=
+            "Launcher of the profile to start (from agents_discover); use with profile_id."
+        )] = None,
+        profile_id: Annotated[str | None, Field(description=
+            "Profile to start on launcher_id."
+        )] = None,
+        domain: Annotated[str | None, Field(description=
+            "Instead of launcher_id + profile_id: the domain, with role, letting the "
+            "broker pick the first online launcher with a free slot."
+        )] = None,
+        role: Annotated[str | None, Field(description=
+            "The profile role to start, with domain."
+        )] = None,
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
+        )] = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Start an agent profile in this session through its launcher.
+
+    Only the session's coordinator (or the creator/admin) may call this;
+    anyone else gets permission_denied and should ask the coordinator. Give
+    launcher_id + profile_id, or domain + role. Returns {"launch_id",
+    "status": "pending"}; the agent then joins by itself and you see a normal
+    participant.joined. When the task is done the agent sends its result
+    with session_send to the coordinator that launched it (else the
+    session's coordinator), and then stays in the session for more work.
+    Read the launch with agents_launch_status; a failure also arrives as
+    an agent.launch_failed event. The response says owner and own (see
+    agents_discover). Errors: launch_limit (the session's
+    max_launched_agents reached), no_free_slot, profile_not_found,
+    session_suspended. Remove the agent with session_remove_participant
+    when done.
+    """
+        body = {"task": task, "launcher_id": launcher_id, "profile_id": profile_id,
+                "domain": domain, "role": role}
+        return await agents_launch(
+            deps, session_id, _creator_cred(participant_token, ctx), body,
+            # Only the configured public URL, never one derived from headers.
+            broker_url=os.environ.get("SW_PUBLIC_BASE_URL", "").rstrip("/") or None,
+            source_ip=_client_ip(ctx),
+        )
+
+    @_tool("agents_launch_status")
+    async def agents_launch_status_tool(
+        session_id: SessionIdArg,
+        launch_id: Annotated[str, Field(description="The launch_id agents_launch returned.")],
+        participant_token: Annotated[str | None, Field(description=
+            "The coordinator's participant token, or the creator token / owning "
+            "account's token / admin token acting for the session. May be omitted "
+            "when it arrives as the MCP Authorization: Bearer header."
+        )] = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Read the result of one launch.
+
+    Returns launch_id, status (pending | started | joined | failed | stopped),
+    profile_id, launcher_id, machine, owner, own, and when known
+    participant_id, error (why it failed: launcher_offline, join_timeout,
+    cancelled, or the launcher's error such as profile_unknown, no_free_slot,
+    visibility_refused, profile_rejected, start_failed, join_failed*) and
+    reason (why it stopped: removed, left, evicted, session_ended,
+    launcher_lost, or the launcher's reason such as idle_limit). Coordinator
+    or creator/admin only.
+    """
+        return await agents_launch_status(
+            deps, session_id, _creator_cred(participant_token, ctx), launch_id,
             source_ip=_client_ip(ctx),
         )
 
@@ -1189,6 +1367,7 @@ def build_app() -> Starlette:
                     "firehose": True,
                     "supervisor_notes": True,
                     "session_delete": True,
+                    "launchers": True,
                 },
             }
         )
@@ -1315,6 +1494,7 @@ def build_app() -> Starlette:
             Route("/metrics", metrics_endpoint),
             *http_api_routes(),
             *events_ws_routes(),
+            *launcher_routes(),
             Mount("/", app=McpNewSessionLimitMiddleware(mcp_app)),
         ],
         middleware=[
@@ -1335,6 +1515,11 @@ def build_app() -> Starlette:
     # Relay-wide admin token (SW_ADMIN_TOKEN). Unset is a valid, closed
     # configuration: no admin access and no fallback.
     app.state.admin_token = admin_token
+    app.state.launcher_token = launcher_token_from_env()
+    if creation_mode == "open" and app.state.launcher_token is None:
+        logging.getLogger(__name__).warning(
+            "launchers can register without a token; set SW_LAUNCHER_TOKEN to restrict"
+        )
     if admin_token is None:
         logging.getLogger(__name__).info("admin access disabled")
     app.state.supervisor_rate = note_limiter

@@ -41,6 +41,10 @@ class ErrorCode(StrEnum):
     ACCOUNT_TOKEN_LIMIT = "account_token_limit"
     NETWORK_NOT_APPROVED = "network_not_approved"
     APPROVAL_NOT_FOUND = "approval_not_found"
+    PROFILE_NOT_FOUND = "profile_not_found"
+    NO_FREE_SLOT = "no_free_slot"
+    LAUNCH_LIMIT = "launch_limit"
+    LAUNCH_NOT_FOUND = "launch_not_found"
 
 
 @dataclass(slots=True)

@@ -129,6 +129,8 @@ class AuthResult:
     approval_id: str | None = None
     token_label: str | None = None
     account_id: str | None = None
+    # When the token expires (ms since the epoch), if it does.
+    expires_at: int | None = None
 
 
 def _parse_ip(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -527,7 +529,8 @@ class AccountStore:
         if origin is not None:
             await self._touch(token_id, row[12], now_ms, origin)
         return AuthResult(
-            account, token_id, token_label=label, account_id=account.account_id
+            account, token_id, token_label=label, account_id=account.account_id,
+            expires_at=row[9],
         )
 
     async def _reject(

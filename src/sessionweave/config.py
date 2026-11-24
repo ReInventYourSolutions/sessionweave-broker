@@ -19,6 +19,8 @@ class SessionConfig:
     max_wait_seconds: int = 600
     max_concurrent_waits_total: int = 1000
     max_wait_seconds_mcp: int = 20
+    # Cap on agents launched into one session through launchers (0 = none).
+    max_launched_agents: int = 10
     # Aggregate byte budget for all buffered notifications across all
     # participants in this session. Defeats the OOM vector where a
     # compromised participant pushes ``count_cap x payload_cap`` bytes
@@ -56,6 +58,8 @@ class ConfigBounds:
     max_concurrent_waits_total_max: int = 100_000
     max_wait_seconds_mcp_min: int = 1
     max_wait_seconds_mcp_max: int = 60
+    max_launched_agents_min: int = 0
+    max_launched_agents_max: int = 100
     # Bytes; lower bound forces operators to plan at least 1 MiB
     # headroom, upper bound caps a single session at 4 GiB before the
     # operator has to think about cgroup memory pressure.
@@ -126,6 +130,12 @@ def _validate(cfg: SessionConfig, b: ConfigBounds, *, overridden: set[str] | Non
             )
 
     check("max_participants", cfg.max_participants, b.max_participants_min, b.max_participants_max)
+    check(
+        "max_launched_agents",
+        cfg.max_launched_agents,
+        b.max_launched_agents_min,
+        b.max_launched_agents_max,
+    )
     check(
         "max_payload_bytes",
         cfg.max_payload_bytes,
@@ -252,6 +262,7 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_wait_seconds=env_int("SW_DEFAULT_MAX_WAIT_SECONDS", 600),
         max_concurrent_waits_total=env_int("SW_DEFAULT_MAX_CONCURRENT_WAITS_TOTAL", 1000),
         max_wait_seconds_mcp=env_int("SW_DEFAULT_MAX_WAIT_SECONDS_MCP", 20),
+        max_launched_agents=env_int("SW_DEFAULT_MAX_LAUNCHED_AGENTS", 10),
         max_buffer_bytes_per_session=env_int(
             "SW_DEFAULT_MAX_BUFFER_BYTES_PER_SESSION", 50 * 1024 * 1024
         ),
@@ -286,6 +297,8 @@ def load_deployment_defaults(env: Mapping[str, str]) -> DeploymentDefaults:
         max_concurrent_waits_total_max=env_int("SW_MAX_MAX_CONCURRENT_WAITS_TOTAL", 100_000),
         max_wait_seconds_mcp_min=env_int("SW_MIN_MAX_WAIT_SECONDS_MCP", 1),
         max_wait_seconds_mcp_max=env_int("SW_MAX_MAX_WAIT_SECONDS_MCP", 60),
+        max_launched_agents_min=env_int("SW_MIN_MAX_LAUNCHED_AGENTS", 0),
+        max_launched_agents_max=env_int("SW_MAX_MAX_LAUNCHED_AGENTS", 100),
         max_buffer_bytes_per_session_min=env_int(
             "SW_MIN_MAX_BUFFER_BYTES_PER_SESSION", 1 * 1024 * 1024
         ),

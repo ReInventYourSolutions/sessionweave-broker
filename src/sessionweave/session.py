@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     from sessionweave.connections import ConnectionHandle
@@ -45,6 +45,20 @@ MAX_PURPOSE_BYTES = 16 * 1024  # 16 KiB JSON cap for the session purpose blob
 _MAX_PURPOSE_BYTES = MAX_PURPOSE_BYTES  # internal alias used in this module
 # The halt note a participant receives just before the creator removes it.
 REMOVED_HALT_MESSAGE = "removed by the session creator"
+COORDINATOR_REMOVED_HALT_MESSAGE = "removed by the coordinator"
+# Participant metadata keys only the broker sets (on a join with a launch
+# credential); a participant cannot set or change them.
+LAUNCH_METADATA_KEYS = frozenset(
+    {"launch_id", "launcher_id", "launcher_machine", "profile_id", "launched_by"}
+)
+
+
+class LaunchHooks(Protocol):
+    """Told synchronously (session lock held) when launched agents must stop."""
+
+    def participant_gone(self, session_id: str, participant_id: str, reason: str) -> None: ...
+
+    def session_ended(self, session_id: str, reason: str) -> None: ...
 
 
 def _utcnow() -> datetime:
@@ -108,6 +122,7 @@ class Session:
         "_buffered_bytes",
         "_buffers",
         "_connections",
+        "_coordinator_dirty",
         "_created_at",
         "_event_seq",
         "_firehose",
@@ -125,6 +140,8 @@ class Session:
         "_wait_in_flight",
         "auth",
         "config",
+        "coordinator_id",
+        "launch_hooks",
         "lock",
         "purpose",
         "session_id",
@@ -176,6 +193,12 @@ class Session:
         self._connections = connections
         self._metrics = metrics
         self.purpose: dict[str, Any] | None = purpose
+        # The one participant allowed to discover and launch agents (or None).
+        self.coordinator_id: str | None = None
+        self._coordinator_dirty = False
+        # Set by the registry: stops the launched agents of departed
+        # participants and of an ended session.
+        self.launch_hooks: LaunchHooks | None = None
         # Notify the registry whenever an internal event shortens
         # ``next_deadline`` so its min-heap doesn't sit on a stale,
         # later deadline. The lazy-invalidation path already absorbs
@@ -246,6 +269,8 @@ class Session:
             )
             if token_hash:
                 sess.auth.register_participant(p["participant_id"], token_hash)
+        if snap.coordinator_id in sess._participants:
+            sess.coordinator_id = snap.coordinator_id
         if metrics is not None and sess._participants:
             # Cold -> hot: balance the dec() ``release_participant_metrics``
             # issued when this session left RAM. Restored participants are
@@ -409,6 +434,7 @@ class Session:
         capabilities: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         delivery_mode: str = "push",
+        as_coordinator: bool = False,
     ) -> Participant:
         async with self.lock:
             self._ensure_not_suspended()
@@ -432,6 +458,13 @@ class Session:
             self.bump_activity()
             if self._metrics is not None:
                 self._metrics.participants_active.labels(online="true").inc()
+            if as_coordinator and self.coordinator_id is None:
+                self.coordinator_id = p.participant_id
+                self._coordinator_dirty = False
+                if self._store is not None:
+                    await self._store.update_session_coordinator(
+                        self.session_id, p.participant_id
+                    )
             if self._store is not None:
                 snapshot = self._participant_snapshot(p)
                 joined_at_ms = int(p.joined_at.timestamp() * 1000)
@@ -504,10 +537,11 @@ class Session:
         if feedback is not None:
             self._enforce_feedback_size(feedback)
         async with self.lock:
-            if self._drop_participant(participant_id) is None:
+            if self._drop_participant(participant_id, reason="left") is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
             self.bump_activity()
             self._close_subscribers(participant_id, reason="left")
+            await self._persist_coordinator_cleared()
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "left"}
             if feedback is not None:
                 payload["feedback"] = feedback
@@ -524,7 +558,9 @@ class Session:
             )
             self._mirror_firehose("participant.left", payload)
 
-    async def remove_participant(self, participant_id: str) -> dict[str, Any]:
+    async def remove_participant(
+        self, participant_id: str, *, halt_message: str = REMOVED_HALT_MESSAGE
+    ) -> dict[str, Any]:
         """Remove one participant on the creator's (or admin's) order.
 
         The target first receives a ``halt`` supervisor note through the
@@ -547,11 +583,12 @@ class Session:
                     ErrorCode.PARTICIPANT_NOT_FOUND,
                     f"{participant_id!r} is not a participant of this session",
                 )
-            await self._apply_order(
-                new_note("halt", participant_id, REMOVED_HALT_MESSAGE)
-            )
+            await self._apply_order(new_note("halt", participant_id, halt_message))
             now_ms = _now_ms()
-            to_expire = self.auth.valid_join_tokens(now_ms)
+            # A launched agent never held the invite link: removing it leaves
+            # the session's join tokens alone.
+            launched = bool(target.metadata.get("launch_id"))
+            to_expire = [] if launched else self.auth.valid_join_tokens(now_ms)
             if self._store is not None:
                 if to_expire:
                     await self._store.expire_tokens(
@@ -562,10 +599,11 @@ class Session:
                 )
             # Disk holds the cut-off; RAM follows and nothing below can fail
             # before the participant is gone.
-            invalidated = self.auth.invalidate_join_tokens(now_ms)
+            invalidated = [] if launched else self.auth.invalidate_join_tokens(now_ms)
             self.auth.tombstone_participant(target.token_hash, now_ms)
-            self._drop_participant(participant_id)
+            self._drop_participant(participant_id, reason="removed")
             self._close_subscribers(participant_id, reason="removed")
+            await self._persist_coordinator_cleared()
             self.bump_activity()
             payload: dict[str, Any] = {"participant_id": participant_id, "reason": "removed"}
             others = list(self._participants)
@@ -621,6 +659,14 @@ class Session:
             p = self._participants.get(participant_id)
             if p is None:
                 raise ToolError(ErrorCode.NOT_IN_SESSION, "participant not in session")
+            if p.metadata.get("launch_id") and (
+                (role is not _UNSET and role != p.role)
+                or (capabilities is not None and list(capabilities) != p.capabilities)
+            ):
+                raise ToolError(
+                    ErrorCode.PERMISSION_DENIED,
+                    "a launched agent's role and capabilities are fixed by its profile",
+                )
             if role is not _UNSET:
                 p.role = role
             if objective is not _UNSET:
@@ -628,7 +674,11 @@ class Session:
             if capabilities is not None:
                 p.capabilities = list(capabilities)
             if metadata is not None:
-                p.metadata = dict(metadata)
+                kept = {k: v for k, v in p.metadata.items() if k in LAUNCH_METADATA_KEYS}
+                p.metadata = {
+                    **{k: v for k, v in metadata.items() if k not in LAUNCH_METADATA_KEYS},
+                    **kept,
+                }
             self.bump_activity()
             if self._store is not None:
                 snapshot = self._participant_snapshot(p)
@@ -791,6 +841,49 @@ class Session:
             self.bump_activity()
             self._mirror_firehose("supervisor.note_reply", payload)
             return payload
+
+    async def emit_event(
+        self, kind: str, payload: dict[str, Any], recipients: Iterable[str] | None = None
+    ) -> None:
+        """Record and deliver a broker event to ``recipients`` (current
+        participants only; None = everyone) and mirror it to the firehose."""
+        async with self.lock:
+            if recipients is None:
+                targets = list(self._participants)
+            else:
+                targets = [pid for pid in recipients if pid in self._participants]
+            await self._dispatch_event(kind=kind, payload=payload, recipients=targets)
+            self._mirror_firehose(kind, payload)
+
+    async def _persist_coordinator_cleared(self) -> None:
+        """Write a coordinator cleared by a departure (caller holds the lock)."""
+        if self._coordinator_dirty:
+            self._coordinator_dirty = False
+            if self._store is not None:
+                await self._store.update_session_coordinator(self.session_id, None)
+
+    async def set_coordinator(self, participant_id: str | None) -> str | None:
+        """Assign, move or clear (None) the coordinator. Authorization is the
+        caller's job (creator/owner/admin). The target must be a participant."""
+        async with self.lock:
+            if participant_id is not None and participant_id not in self._participants:
+                raise ToolError(
+                    ErrorCode.PARTICIPANT_NOT_FOUND,
+                    f"{participant_id!r} is not a participant of this session",
+                )
+            self.coordinator_id = participant_id
+            self._coordinator_dirty = False
+            self.bump_activity()
+            if self._store is not None:
+                await self._store.update_session_coordinator(self.session_id, participant_id)
+            payload = {"coordinator_id": participant_id}
+            await self._dispatch_event(
+                kind="session.coordinator_changed",
+                payload=payload,
+                recipients=list(self._participants),
+            )
+            self._mirror_firehose("session.coordinator_changed", payload)
+            return participant_id
 
     async def update_purpose(
         self,
@@ -1784,11 +1877,19 @@ class Session:
         if self._store is None:
             return
         left_at_ms = int(_utcnow().timestamp() * 1000)
+        clear_coordinator = self._coordinator_dirty
+        self._coordinator_dirty = False
+        store = self._store
+
+        async def _write() -> None:
+            await store.soft_delete_participant(self.session_id, pid, left_at=left_at_ms)
+            # Re-check at write time: a coordinator named since the eviction
+            # (a creator join, set_coordinator) must not be overwritten.
+            if clear_coordinator and self.coordinator_id is None:
+                await store.update_session_coordinator(self.session_id, None)
+
         try:
-            task = asyncio.create_task(
-                self._store.soft_delete_participant(
-                    self.session_id, pid, left_at=left_at_ms)
-            )
+            task = asyncio.create_task(_write())
         except RuntimeError:  # pragma: no cover - no running loop
             return
         self._firehose_tasks.add(task)
@@ -1920,7 +2021,7 @@ class Session:
             if self._metrics is not None:
                 self._metrics.command_cancelled_total.labels(reason=reason).inc()
 
-    def _drop_participant(self, pid: str) -> Participant | None:
+    def _drop_participant(self, pid: str, *, reason: str) -> Participant | None:
         """Take a participant out of the session's RAM state.
 
         Shared by leave, eviction and removal: the roster entry, its token,
@@ -1932,6 +2033,15 @@ class Session:
         p = self._participants.pop(pid, None)
         if p is None:
             return None
+        if self.coordinator_id == pid:
+            # No promotion: the creator or admin names a new coordinator.
+            self.coordinator_id = None
+            self._coordinator_dirty = True
+        if self.launch_hooks is not None and p.metadata.get("launch_id"):
+            try:
+                self.launch_hooks.participant_gone(self.session_id, pid, reason)
+            except Exception:
+                logger.exception("launch hook failed for %s", pid)
         self.auth.forget_participant(pid)
         if p.connection_ref is not None:
             # connection_ref is a ConnectionHandle (set by join/resume)
@@ -1958,7 +2068,7 @@ class Session:
                 pass
 
     def _evict(self, pid: str, reason: str) -> None:
-        if self._drop_participant(pid) is None:
+        if self._drop_participant(pid, reason="evicted") is None:
             return
         self._persist_left(pid)
         self._notify_others(
@@ -2138,6 +2248,12 @@ class Session:
         self._active_waits = 0
 
     def broadcast_session_ended(self, *, reason: str) -> None:
+        if self.launch_hooks is not None and reason != "server_shutdown":
+            # A persisted session outlives a restart; its launches do not.
+            try:
+                self.launch_hooks.session_ended(self.session_id, reason)
+            except Exception:
+                logger.exception("launch hook failed for session %s", self.session_id)
         # Wake any wait_for_event coroutines so they return ``session.ended``
         # rather than silently timing out on their full budget while the session
         # disappears under them. Must fire BEFORE _participants is cleared so the

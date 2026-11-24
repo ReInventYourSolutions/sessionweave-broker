@@ -130,3 +130,9 @@ def test_brief_has_journal_undo_lines_and_stays_small():
     assert "language of the request" in out
     # Baseline before phase 3 was 5810 bytes for this render; budget is +1 KB.
     assert len(out.encode()) <= 5810 + 1024
+
+
+def test_brief_says_only_the_coordinator_requests_agents() -> None:
+    out = _render({"kind": "demo"})
+    assert "Only the session's coordinator" in out
+    assert "ask it" in out

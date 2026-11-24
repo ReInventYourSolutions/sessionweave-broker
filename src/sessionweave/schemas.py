@@ -157,6 +157,7 @@ class SessionJoinOutput(_Strict):
     # time and compare on resume to detect relay restart. See #65.
     relay_epoch: int = 0
     persistence: PersistenceStatePublic | None = None
+    coordinator_id: str | None = None
 
 
 class SessionResumeInput(_Strict):
@@ -181,6 +182,7 @@ class SessionResumeOutput(_Strict):
     # if it changes the relay has restarted and the client's local seq
     # cursor refers to a now-empty buffer in a fresh process. Issue #65.
     relay_epoch: int = 0
+    coordinator_id: str | None = None
 
 
 class SessionUpdateSelfInput(_Strict):
@@ -196,6 +198,7 @@ class SessionUpdateSelfOutput(_Strict):
 
 class SessionListParticipantsOutput(_Strict):
     roster: list[ParticipantPublic]
+    coordinator_id: str | None = None
 
 
 class SessionDescribeInput(_Strict):
@@ -226,6 +229,7 @@ class SessionDescribeOutput(_Strict):
     roster: list[ParticipantPublic]
     persistence: PersistenceStatePublic | None = None
     suspended: bool = False
+    coordinator_id: str | None = None
 
 
 class InboxMessage(_Strict):
