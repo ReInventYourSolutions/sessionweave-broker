@@ -597,7 +597,8 @@ while omitting it inherits the launcher's list. A session without an owner accou
 profiles whose effective `allowed_accounts` is empty (and open-mode launchers);
 never `personal` ones nor lists naming accounts. Such a session has no own
 launcher, so a `domain` + `role` launch finds none: name `launcher_id` +
-`profile_id`.
+`profile_id`. Launching from such a session needs Runner >= 0.8.2 launchers: a 0.8.1
+launcher refuses the order with `visibility_refused`.
 
 **Discover and launch.**
 
@@ -678,7 +679,9 @@ resumed; launch the agents again then: nobody would supervise them meanwhile), a
 `join_timeout` for a launch that timed out. **Idle TTL:** an in-memory session ends
 after `idle_ttl_seconds` without activity (default 1800 s), which stops every
 launched agent with `session_ended`; raise `idle_ttl_seconds` (session `config`) for
-long-running work, or use a persisted session (then `session_cold`). When the launcher stops an agent
+long-running work. A persisted session goes cold at the same idle TTL and its agents
+are stopped just the same (reason `session_cold`); it only lets the session itself be
+resumed afterwards. When the launcher stops an agent
 itself (a profile limit, or `runtime_failed` when the runtime keeps failing or no
 longer passes its checks), it sends `{"type":"stopped","launch_id","reason"}`; the
 broker removes the participant (halt "stopped by its launcher: <reason>") and sends

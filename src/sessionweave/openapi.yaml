@@ -460,7 +460,7 @@ components:
         own: { type: boolean, description: "The launcher belongs to the session owner's account (true in open mode)" }
         participant_id: { type: string, description: Set once the agent joined }
         error: { type: string, description: "Why it failed. Broker: launcher_offline, join_timeout, cancelled. Launcher: invalid_order, launcher_shutting_down, profile_unknown, no_free_slot, visibility_refused, profile_rejected, runtime_unavailable (the runtime failed its preflight: binary missing, unsupported version, unsafe workdir), start_failed, join_failed, join_failed_<http status>, or its stop reason when stopped before joining" }
-        message: { type: string, maxLength: 300, description: "The launcher's explanation of a failure (e.g. the runtime version it requires); never local paths or secrets" }
+        message: { type: string, maxLength: 300, description: "The launcher's explanation of a failure (e.g. the runtime version it requires); never local paths or secrets. ASCII printable only: any other character is replaced with '?'" }
         reason: { type: string, description: "Why it stopped. Broker: removed, left, evicted, session_ended, session_cold (a persisted session left memory after its idle TTL; it can be resumed, launch again then), launcher_lost. Launcher: duration_limit, idle_limit, cost_limit, runtime_failed (the runtime kept failing or no longer passes its preflight), agent_exited, agent_failed, launcher_shutdown, launcher_disconnected, launcher_unauthorized, launcher_restarted, launcher_error" }
     Error:
       type: object

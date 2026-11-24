@@ -1043,8 +1043,13 @@ async def test_session_going_cold_stops_launched_agents(tmp_path: Path) -> None:
                 {"launcher_id": lnc_id, "profile_id": "p1", "task": "t"},
                 broker_url=None, owner_name=None)
             lids[kind] = out["launch_id"]
+        events: list[tuple[str, str, dict[str, Any]]] = []
+        deps.launches._account_event = (  # type: ignore[method-assign]
+            lambda lch, kind, **extra: events.append((lch.launch_id, kind, extra)))
         reg.tick(now=datetime.now(UTC) + timedelta(days=2))
         await asyncio.sleep(0.05)
+        assert (lids["persisted"], "agent.stopped", {"reason": "session_cold"}) in events
+        assert (lids["ephemeral"], "agent.stopped", {"reason": "session_ended"}) in events
         assert {"type": "stop", "launch_id": lids["persisted"],
                 "reason": "session_cold"} in sent
         assert {"type": "stop", "launch_id": lids["ephemeral"],

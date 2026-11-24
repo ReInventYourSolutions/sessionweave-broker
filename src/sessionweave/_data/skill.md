@@ -1087,7 +1087,9 @@ creator credential); the creator/owner moves it with
     default 1800 s, raise `idle_ttl_seconds` for long work), `session_cold` (a persisted
     session left memory at its idle TTL: it can be resumed, launch again then),
     `launcher_lost`; launcher: `duration_limit`, `idle_limit`, `cost_limit`,
-    `runtime_failed` (the runtime kept failing, or no longer passes its check),
+    `runtime_failed` (its start failed twice, or its runs kept failing for at least
+    the launcher's failure window, default 10 min, or the runtime no longer passes its
+    check),
     `agent_exited`, `agent_failed`, `start_failed`, `launcher_shutdown`,
     `launcher_disconnected`, `launcher_unauthorized`, `launcher_restarted`,
     `launcher_error`.
