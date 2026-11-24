@@ -330,6 +330,8 @@ class SessionRegistry:
                         _t.add_done_callback(self._background_tasks.discard)
                     except Exception:
                         pass
+                    # Resumable, but nobody supervises its launched agents: stop them.
+                    self._launches_cold(sid)
                     sess.broadcast_to_subscribers("session.cold", {})
                     sess.close_all_subscribers()
                     sess.release_participant_metrics()
@@ -467,6 +469,14 @@ class SessionRegistry:
             return
         try:
             self.launch_hooks.session_ended(sid, reason)
+        except Exception:
+            logger.exception("launch hook failed for session %s", sid)
+
+    def _launches_cold(self, sid: str) -> None:
+        if self.launch_hooks is None:
+            return
+        try:
+            self.launch_hooks.session_cold(sid)
         except Exception:
             logger.exception("launch hook failed for session %s", sid)
 

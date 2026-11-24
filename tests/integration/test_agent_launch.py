@@ -603,6 +603,7 @@ async def test_account_events_on_launch_and_stop(tmp_path: Path) -> None:
             assert evs["agent.launched"]["profile_id"] == "p1"
             assert evs["agent.launched"]["launcher_id"] == fl.launcher_id
             assert evs["agent.stopped"]["reason"] == "removed"
+            assert evs["agent.stopped"]["status"] == "stopped"
             dumped = json.dumps(await events())
             assert "join_credential" not in dumped and fl.last_credential not in dumped
 
@@ -931,3 +932,174 @@ async def test_launcher_dropping_during_join_arms_lost_timer() -> None:
         await asyncio.sleep(0.05)
     assert lch.status == "stopped" and lch.reason == "launcher_lost"
     assert p.participant_id not in sess._participants
+
+
+async def test_failed_result_message_and_runtime_failed_stop() -> None:
+    """A launcher's preflight refusal carries a message; a runtime that fails
+    later stops the agent with runtime_failed."""
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        s = await _setup(c)
+        async with launcher(base, [_prof()]) as fl:
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=fl.launcher_id,
+                              profile_id="p1")
+            lid = r.json()["launch_id"]
+            await fl.expect("launch")
+            await fl.send({"type": "launch_result", "launch_id": lid, "status": "failed",
+                           "error": "runtime_unavailable",
+                           "message": "opencode 2.x or later is required\n" + "x" * 400})
+            await _until(lambda: _is_status(c, s, lid, "failed"))
+            st = await _status(c, s.sid, s.coord_token, lid)
+            assert st["error"] == "runtime_unavailable"
+            assert st["message"].startswith("opencode 2.x or later is required?x")
+            assert len(st["message"]) == 300
+            items = await _drain(c, s.sid, s.coord_token)
+            failed = [i for i in items if i["name"] == "agent.launch_failed"]
+            assert failed[0]["payload"] == {"launch_id": lid, "error": "runtime_unavailable",
+                                            "message": st["message"]}
+
+            lid2, _agent = await _launched_agent(c, s, fl)
+            assert "message" not in await _status(c, s.sid, s.coord_token, lid2)
+            await fl.send({"type": "stopped", "launch_id": lid2, "reason": "runtime_failed"})
+            await _until(lambda: _is_status(c, s, lid2, "stopped"))
+            assert (await _status(c, s.sid, s.coord_token, lid2))["reason"] == "runtime_failed"
+
+            async def stopped_event() -> bool:
+                items = await _drain(c, s.sid, s.coord_token)
+                return any(i["name"] == "agent.stopped"
+                           and i["payload"]["reason"] == "runtime_failed" for i in items)
+
+            await _until(stopped_event)
+
+
+async def test_failed_launch_account_event_has_status_and_message(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, sd.token)
+        coord = await _joined(c, made["session_id"], sd.token)
+        s = _Setup(c, {**made, "creator_token": sd.token}, coord)
+        async with launcher(sd.base, [_prof()], token=sd.token) as fl:
+            r = await _launch(c, s.sid, s.coord_token, launcher_id=fl.launcher_id,
+                              profile_id="p1")
+            lid = r.json()["launch_id"]
+            await fl.expect("launch")
+            await fl.send({"type": "launch_result", "launch_id": lid, "status": "failed",
+                           "error": "runtime_unavailable", "message": "cline missing"})
+
+            async def stopped() -> list[dict[str, Any]]:
+                r = await c.get("/v1/me/events", headers=bearer(sd.token))
+                return [e["data"] for e in r.json()["events"] if e["kind"] == "agent.stopped"]
+
+            async def has() -> bool:
+                return bool(await stopped())
+
+            await _until(has)
+            [data] = await stopped()
+            assert data["status"] == "failed" and data["reason"] == "runtime_unavailable"
+            assert data["message"] == "cline missing" and data["launch_id"] == lid
+
+
+async def test_session_going_cold_stops_launched_agents(tmp_path: Path) -> None:
+    """A persisted session evicted from RAM by the idle TTL (cold, resumable)
+    stops its launched agents with session_cold; an ephemeral one that idles
+    out ends, and its agents stop with session_ended."""
+    from datetime import UTC, datetime, timedelta
+
+    from sessionweave.access import Principal, generate_token, hash_token
+    from sessionweave.config import load_deployment_defaults
+    from sessionweave.connections import ConnectionManager
+    from sessionweave.persistence import PersistenceStore
+    from sessionweave.registry import SessionRegistry
+    from sessionweave.schemas import PersistenceConfig
+    from sessionweave.tools import ToolDeps
+    from tests.unit.fakes import FakeHandle
+
+    sent: list[dict[str, Any]] = []
+
+    class Conn:
+        async def send_json(self, data: Any) -> None:
+            sent.append(data)
+
+    store = PersistenceStore(str(tmp_path / "cold.db"))
+    await store.init(pool_size=2)
+    try:
+        reg = SessionRegistry(defaults=load_deployment_defaults({}),
+                              connections=ConnectionManager(), store=store)
+        deps = ToolDeps(reg)
+        lnc_id, _ = deps.launchers.register(Conn(), None, {
+            "machine": "m", "profiles": [_prof()]})
+        lids: dict[str, str] = {}
+        for kind, persistence in (
+            ("persisted", PersistenceConfig(mode="ttl", ttl_seconds=86400)),
+            ("ephemeral", None),
+        ):
+            sid, _, _, _, _ = await reg.create(
+                overrides={}, purpose=None, persistence=persistence,
+                creator_token_hash=hash_token(generate_token()),
+            )
+            sess = await reg.get_or_raise(sid)
+            coord = await sess.join(FakeHandle(), role="c", as_coordinator=True)
+            out = await deps.launches.launch(
+                sess, Principal("participant", coord.participant_id),
+                {"launcher_id": lnc_id, "profile_id": "p1", "task": "t"},
+                broker_url=None, owner_name=None)
+            lids[kind] = out["launch_id"]
+        events: list[tuple[str, str, dict[str, Any]]] = []
+        deps.launches._account_event = (  # type: ignore[method-assign]
+            lambda lch, kind, **extra: events.append((lch.launch_id, kind, extra)))
+        reg.tick(now=datetime.now(UTC) + timedelta(days=2))
+        await asyncio.sleep(0.05)
+        assert (lids["persisted"], "agent.stopped", {"reason": "session_cold"}) in events
+        assert (lids["ephemeral"], "agent.stopped", {"reason": "session_ended"}) in events
+        assert {"type": "stop", "launch_id": lids["persisted"],
+                "reason": "session_cold"} in sent
+        assert {"type": "stop", "launch_id": lids["ephemeral"],
+                "reason": "session_ended"} in sent
+        cold = deps.launches.get(lids["persisted"])
+        assert cold is not None and cold.status == "stopped"
+        assert cold.reason == "session_cold"
+        assert deps.launchers._launchers[lnc_id].running["p1"] == 0
+    finally:
+        await store.close()
+
+
+async def test_ownerless_session_sees_only_profiles_open_to_everyone(
+    tmp_path: Path,
+) -> None:
+    """Account mode, a session created with the admin token and no owner:
+    general profiles whose allowed_accounts is empty (everyone) are visible
+    and launchable by id; personal ones and lists naming accounts are not."""
+    async with seeded_relay(tmp_path, mode="account") as sd, \
+            httpx.AsyncClient(base_url=sd.base) as c:
+        made = await _session(c, ADMIN)
+        sid = made["session_id"]
+        coord = await _joined(c, sid, made["creator_token"])
+        s = _Setup(c, made, coord)
+        async with launcher(sd.base, [_prof("pers")], token=sd.token,
+                            machine="personal") as pers, \
+                launcher(sd.base, [_prof("open"), _prof("bobonly", allowed_accounts=["bob"]),
+                                   _prof("own-personal", visibility="personal")],
+                         token=sd.token, machine="general", visibility="general") as gen, \
+                launcher(sd.base, [_prof("carol"), _prof("override", allowed_accounts=[])],
+                         token=sd.other_token, machine="carol", visibility="general",
+                         allowed_accounts=["carol"]) as carol:
+            r = await c.get("/v1/agents", params={"session_id": sid, "domain": "backend"},
+                            headers=bearer(s.coord_token))
+            assert r.status_code == 200, r.text
+            seen = {(i["machine"], i["profile_id"]) for i in r.json()["agents"]}
+            assert seen == {("general", "open"), ("carol", "override")}
+            r = await c.get("/v1/agents/domains", params={"session_id": sid},
+                            headers=bearer(s.coord_token))
+            assert r.json()["domains"] == ["backend"]
+            r = await _launch(c, sid, s.coord_token, launcher_id=gen.launcher_id,
+                              profile_id="open")
+            assert r.status_code == 202, r.text
+            order = await gen.expect("launch")
+            assert order["session_owner"] is None
+            for lnc, pid in ((pers, "pers"), (gen, "bobonly"), (gen, "own-personal"),
+                             (carol, "carol")):
+                r = await _launch(c, sid, s.coord_token, launcher_id=lnc.launcher_id,
+                                  profile_id=pid)
+                assert r.status_code == 404, (pid, r.text)
+            # no own launcher: a domain + role launch auto-picks nothing
+            r = await _launch(c, sid, s.coord_token, domain="backend", role="analyst")
+            assert r.status_code == 404, r.text

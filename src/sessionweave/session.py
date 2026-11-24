@@ -60,6 +60,8 @@ class LaunchHooks(Protocol):
 
     def session_ended(self, session_id: str, reason: str) -> None: ...
 
+    def session_cold(self, session_id: str) -> None: ...
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)

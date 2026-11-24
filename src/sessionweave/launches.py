@@ -92,6 +92,8 @@ class Launch:
     status: str = "pending"
     participant_id: str | None = None
     error: str | None = None
+    # The launcher's human-readable explanation of a failure (no secrets).
+    message: str | None = None
     reason: str | None = None
     slot_held: bool = True
     joining: bool = False
@@ -114,6 +116,8 @@ class Launch:
             out["participant_id"] = self.participant_id
         if self.error is not None:
             out["error"] = self.error
+        if self.message is not None:
+            out["message"] = self.message
         if self.reason is not None:
             out["reason"] = self.reason
         return out
@@ -332,6 +336,7 @@ class LaunchManager:
             lch.status = "started"
         elif msg.get("status") == "failed" and lch.status in ("pending", "started"):
             if not lch.joining:
+                lch.message = _short_text(msg.get("message"), "", 300) or None
                 self._fail(lch, _short_text(msg.get("error"), "start_failed"))
 
     def on_stopped(self, launcher_id: str, msg: dict[str, Any]) -> None:
@@ -458,11 +463,19 @@ class LaunchManager:
     def session_ended(self, session_id: str, reason: str) -> None:
         # Records stay (final) until pruned, so a reconnecting launcher that
         # still reports one is told session_ended.
+        self._stop_session(session_id, "session_ended")
+
+    def session_cold(self, session_id: str) -> None:
+        """A persisted session left RAM (idle TTL): it can be resumed, but its
+        launched agents are stopped rather than left running unsupervised."""
+        self._stop_session(session_id, "session_cold")
+
+    def _stop_session(self, session_id: str, reason: str) -> None:
         for lch in list(self._launches.values()):
             if lch.session_id == session_id and lch.status in _ACTIVE:
-                self._finish(lch, "stopped", reason="session_ended")
-                self._send_stop(lch, "session_ended")
-                self._account_event(lch, "agent.stopped", reason="session_ended")
+                self._finish(lch, "stopped", reason=reason)
+                self._send_stop(lch, reason)
+                self._account_event(lch, "agent.stopped", reason=reason)
 
     # --- internals ---
 
@@ -479,7 +492,8 @@ class LaunchManager:
     def _fail(self, lch: Launch, error: str) -> None:
         """Mark a not-yet-joined launch failed and tell the coordinator."""
         self._finish(lch, "failed", error=error)
-        self._account_event(lch, "agent.stopped", reason=error)
+        extra = {"message": lch.message} if lch.message is not None else {}
+        self._account_event(lch, "agent.stopped", reason=error, **extra)
         self._spawn(self._notify_failed(lch))
 
     async def _notify_failed(self, lch: Launch) -> None:
@@ -489,11 +503,11 @@ class LaunchManager:
         recipients = {p for p in (lch.launched_by, sess.coordinator_id) if p is not None}
         if not recipients:
             return
+        payload: dict[str, Any] = {"launch_id": lch.launch_id, "error": lch.error}
+        if lch.message is not None:
+            payload["message"] = lch.message
         try:
-            await sess.emit_event(
-                "agent.launch_failed", {"launch_id": lch.launch_id, "error": lch.error},
-                recipients,
-            )
+            await sess.emit_event("agent.launch_failed", payload, recipients)
         except Exception:
             log.exception("could not deliver agent.launch_failed for %s", lch.launch_id)
 
@@ -551,6 +565,9 @@ class LaunchManager:
             return
         from sessionweave.tools import emit_account_event
 
+        if kind == "agent.stopped":
+            # failed (never joined) or stopped: set by _finish before every call
+            extra.setdefault("status", lch.status)
         data = lch.event_data(**extra)
 
         async def _emit() -> None:

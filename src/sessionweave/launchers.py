@@ -381,9 +381,7 @@ class LauncherRegistry:
         if lnc.owner_account_id is None:
             return True  # open mode: the private network is the protection
         owner_id = session.auth.owner_account_id
-        if owner_id is None:
-            return False
-        if owner_id == lnc.owner_account_id:
+        if owner_id is not None and owner_id == lnc.owner_account_id:
             return True
         visibility = prof.get("visibility") or lnc.visibility
         if visibility == "personal":
@@ -392,8 +390,10 @@ class LauncherRegistry:
         if allowed is None:
             allowed = lnc.allowed_accounts
         if not allowed:
-            return True
-        return owner_name is not None and owner_name.casefold() in allowed
+            return True  # general, open to every account (and to ownerless sessions)
+        # A session without an owner account (admin-created) matches no list.
+        return (owner_id is not None and owner_name is not None
+                and owner_name.casefold() in allowed)
 
     @staticmethod
     def owner_fields(lnc_owner: str | None, lnc_owner_name: str | None,
