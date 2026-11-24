@@ -5,7 +5,7 @@ builds wheels + the container and creates a GitHub Release.
 
 ## Runner-facing surface checklist (do this on EVERY release)
 
-The standalone `sessionweave-runner` package (companion repo `EnzinoBB/SessionWeave`, `Runner/`)
+The standalone `sessionweave-runner` package (companion repo `ReInventYourSolutions/SessionWeave`, `Runner/`)
 tests against an **in-process fake relay** pinned to a relay version
 (`Runner/tests/_fakerelay.py` → `REPRODUCES_RELAY_VERSION`, contract in
 `Runner/tests/FAKE_RELAY_FIDELITY.md`).

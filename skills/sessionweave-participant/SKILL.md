@@ -1506,7 +1506,7 @@ Two pitfalls will silently kill a long-lived worker.
 > in `asyncio.to_thread` (or `asyncio.create_subprocess_exec`).
 
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
-[`SDK/python/examples/`](https://github.com/EnzinoBB/SessionWeave/tree/main/SDK/python/examples).
+[`SDK/python/examples/`](https://github.com/ReInventYourSolutions/SessionWeave/tree/main/SDK/python/examples).
 
 ### 7.2 REST + WebSocket
 
@@ -1683,7 +1683,7 @@ WebSocket events endpoint ([§7.2](#72-rest--websocket)) or a real MCP SDK.
 that speaks HTTP and WebSocket already has what it needs. For Python:
 
 ```bash
-pip install -e 'git+https://github.com/EnzinoBB/SessionWeave#subdirectory=SDK/python'
+pip install -e 'git+https://github.com/ReInventYourSolutions/SessionWeave#subdirectory=SDK/python'
 ```
 
 ```python

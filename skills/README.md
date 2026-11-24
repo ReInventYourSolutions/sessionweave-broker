@@ -17,9 +17,9 @@ this repo flow through, and add the hosted relay to your project's MCP
 config so the tools show up immediately:
 
 ```bash
-git clone https://github.com/ReInventYourSolutions/sessionweave-broker
+git clone https://github.com/ReInventYourSolutions/SessionWeave.git
 mkdir -p ~/.claude/skills
-ln -s "$PWD/SessionWeaveMCP/skills/sessionweave-participant" \
+ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
       ~/.claude/skills/sessionweave-participant
 
 # In the project where you want the tools available:
@@ -40,7 +40,7 @@ Or fetch only the skill (no clone):
 ```bash
 mkdir -p ~/.claude/skills/sessionweave-participant
 curl -fsSL \
-  https://raw.githubusercontent.com/ReInventYourSolutions/sessionweave-broker/main/skills/sessionweave-participant/SKILL.md \
+  https://raw.githubusercontent.com/ReInventYourSolutions/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
   -o ~/.claude/skills/sessionweave-participant/SKILL.md
 ```
 
