@@ -289,7 +289,7 @@ async def test_eviction_persist_does_not_clobber_a_newer_coordinator(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_admin_and_supervisor_join_never_coordinate_and_resume_reports_it() -> None:
+async def test_supervisor_never_joins_admin_join_coordinates_and_resume_reports_it() -> None:
     admin = "admin-token-for-coordinator-tests"
     async with relay_subprocess(env_overrides={"SW_ADMIN_TOKEN": admin}) as base:
         async with httpx.AsyncClient(base_url=base) as c:
@@ -300,13 +300,19 @@ async def test_admin_and_supervisor_join_never_coordinate_and_resume_reports_it(
                 headers=bearer(made["supervisor_token"]), json={"role": "s"},
             )
             assert r.status_code == 403, r.text
-            await _join(c, sid, admin, "admin")
             assert await _coord(c, sid, creator) is None
         async with sw_client(base) as agent:
+            # Over MCP too: an admin-token join takes the vacant role ...
             joined = await agent.call_tool(
-                "session_join", {"session_id": sid, "join_token": creator, "role": "c"}
+                "session_join", {"session_id": sid, "join_token": admin, "role": "op"}
             )
             assert joined["coordinator_id"] == joined["participant_id"]
+        async with sw_client(base) as other:
+            # ... and a later creator join does not replace it.
+            later = await other.call_tool(
+                "session_join", {"session_id": sid, "join_token": creator, "role": "c"}
+            )
+            assert later["coordinator_id"] == joined["participant_id"]
         async with sw_client(base) as again:
             resumed = await again.call_tool(
                 "session_resume",
@@ -331,3 +337,115 @@ async def test_concurrent_creator_joins_yield_one_coordinator() -> None:
             assert len(own) == 1 and own[0]["participant_id"] == got
             r = await c.get(f"/v1/sessions/{sid}/participants", headers=bearer(creator))
             assert len(r.json()["roster"]) == 5
+
+
+# ── Admin-token joins (in-process) ─────────────────────────────────────────
+# Rule: a participant join with the relay admin token becomes coordinator under
+# the same condition as a creator-credential join — only when the session has no
+# coordinator yet. Observers (firehose, supervisor notes, supervisor token) never
+# join, so they never take the role.
+
+ADMIN = "admin-secret-for-coordinator-tests"
+
+
+@pytest.fixture
+def admin_client(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from starlette.testclient import TestClient
+
+    from sessionweave.server import build_app
+
+    monkeypatch.setenv("SW_ADMIN_TOKEN", ADMIN)
+    with TestClient(build_app()) as c:
+        yield c
+
+
+def _sync_session(c: Any) -> dict[str, Any]:
+    r = c.post("/v1/sessions", json={})
+    assert r.status_code == 201, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+def _sync_join(c: Any, sid: str, cred: str, role: str = "w") -> dict[str, Any]:
+    r = c.post(f"/v1/sessions/{sid}/participants", headers=bearer(cred), json={"role": role})
+    assert r.status_code == 201, r.text
+    out: dict[str, Any] = r.json()
+    return out
+
+
+def _sync_coord(c: Any, sid: str) -> str | None:
+    r = c.get(f"/v1/sessions/{sid}", headers=bearer(ADMIN))
+    assert r.status_code == 200, r.text
+    got: str | None = r.json()["coordinator_id"]
+    return got
+
+
+def test_admin_join_becomes_coordinator_when_none(admin_client: Any) -> None:
+    made = _sync_session(admin_client)
+    sid = made["session_id"]
+    _sync_join(admin_client, sid, made["join_token"], "plain")
+    assert _sync_coord(admin_client, sid) is None
+    joined = _sync_join(admin_client, sid, ADMIN, "op")
+    assert joined["coordinator_id"] == joined["participant_id"]
+    assert _sync_coord(admin_client, sid) == joined["participant_id"]
+    # a second admin join does not replace it, nor does a later creator join
+    _sync_join(admin_client, sid, ADMIN, "op2")
+    _sync_join(admin_client, sid, made["creator_token"], "creator")
+    assert _sync_coord(admin_client, sid) == joined["participant_id"]
+
+
+def test_admin_join_does_not_replace_existing_coordinator(admin_client: Any) -> None:
+    made = _sync_session(admin_client)
+    sid, creator = made["session_id"], made["creator_token"]
+    coord = _sync_join(admin_client, sid, creator, "coord")
+    admin = _sync_join(admin_client, sid, ADMIN, "op")
+    assert admin["coordinator_id"] == coord["participant_id"]
+    assert _sync_coord(admin_client, sid) == coord["participant_id"]
+    # also when the coordinator was assigned explicitly to a join-token participant
+    made2 = _sync_session(admin_client)
+    sid2 = made2["session_id"]
+    worker = _sync_join(admin_client, sid2, made2["join_token"], "worker")
+    r = admin_client.put(
+        f"/v1/sessions/{sid2}/coordinator", headers=bearer(made2["creator_token"]),
+        json={"participant_id": worker["participant_id"]},
+    )
+    assert r.status_code == 200, r.text
+    _sync_join(admin_client, sid2, ADMIN, "op")
+    assert _sync_coord(admin_client, sid2) == worker["participant_id"]
+
+
+def test_creator_join_unchanged_with_admin_configured(admin_client: Any) -> None:
+    made = _sync_session(admin_client)
+    sid = made["session_id"]
+    first = _sync_join(admin_client, sid, made["creator_token"], "coord")
+    assert _sync_coord(admin_client, sid) == first["participant_id"]
+    _sync_join(admin_client, sid, made["creator_token"], "coord2")
+    assert _sync_coord(admin_client, sid) == first["participant_id"]
+
+
+def test_supervisor_and_observers_never_become_coordinator(admin_client: Any) -> None:
+    made = _sync_session(admin_client)
+    sid, sup = made["session_id"], made["supervisor_token"]
+    # The supervisor token cannot join at all.
+    r = admin_client.post(
+        f"/v1/sessions/{sid}/participants", headers=bearer(sup), json={"role": "sup"}
+    )
+    assert r.status_code == 403, r.text
+    # Observing with the admin or supervisor token (firehose, notes, reads) joins nobody.
+    for tok in (ADMIN, sup):
+        with admin_client.websocket_connect(f"/v1/sessions/{sid}/firehose?token={tok}"):
+            pass
+        r = admin_client.post(
+            f"/v1/sessions/{sid}/supervisor/notes", headers=bearer(tok),
+            json={"kind": "note", "target": "all", "message": "m"},
+        )
+        assert r.status_code < 300, r.text
+        assert admin_client.get(
+            f"/v1/sessions/{sid}/participants", headers=bearer(tok)
+        ).status_code == 200
+    assert _sync_coord(admin_client, sid) is None
+    r = admin_client.get(f"/v1/sessions/{sid}/participants", headers=bearer(ADMIN))
+    assert r.json()["roster"] == []
+    # A later participant join with the admin token still takes the vacant role.
+    joined = _sync_join(admin_client, sid, ADMIN, "op")
+    assert _sync_coord(admin_client, sid) == joined["participant_id"]

@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.25.2
+version: 0.25.3
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.25.2** — when reporting your behaviour or filing
+> **Skill version: 0.25.3** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -1053,7 +1053,9 @@ whose Authorization header carries one of them, whoever calls); any other partic
 `permission_denied` ("only the session's coordinator can request agents — ask the
 coordinator") and should ask the coordinator with a command. The coordinator is
 `coordinator_id` in the join answer and the roster (whoever first joined with the
-creator credential); the creator/owner moves it with
+creator credential or the admin token while there was none; a join never replaces an
+existing coordinator, and supervisors/observers never take it); the creator/owner/admin
+moves it with
 `PUT /v1/sessions/{sid}/coordinator {"participant_id": …|null}` (SDK `set_coordinator`).
 - Check support first: `GET /v1/info` → `capabilities.launchers: true`.
 - Discover: `list_domains()` → `discover_agents(domain, role=, capability=)`
@@ -1797,5 +1799,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.25.2 — joined as
+> "I'm acting under `sessionweave-participant` v0.25.3 — joined as
 > observer, long-polling on every turn."

@@ -373,8 +373,8 @@ Environment (all three are required together):
 - `SW_PERSISTENCE_DB_PATH` (accounts live in the persistence DB)
 - `SW_ADMIN_TOKEN` (the only way to create accounts)
 
-Administer accounts with the `sessionweave-accounts` CLI (`--url` or `SW_URL`,
-`--admin-token` or `SW_ADMIN_TOKEN`; it prints JSON, and a non-2xx answer exits 1):
+Administer accounts with the `sessionweave-accounts` CLI (`--url` or `SW_URL`, default
+`http://127.0.0.1:8765`; `--admin-token` or `SW_ADMIN_TOKEN`; it prints JSON, and a non-2xx answer exits 1):
 
 ```bash
 sessionweave-accounts create alice --contact alice@example.com
@@ -573,9 +573,9 @@ capabilities, description, runtime, model, access preset, limits and
 **coordinator** finds profiles and launches them; the agent joins the session by
 itself, with no invite link handed around.
 
-**Who may ask.** Only the session's coordinator — the participant that joined with
-the creator credential (creator token or the owning account's token), or the one
-the creator assigned with `PUT /v1/sessions/{sid}/coordinator` — or the creator /
+**Who may ask.** Only the session's coordinator — the first participant that joined
+with the creator credential (creator token or the owning account's token) or the admin
+token while the role was vacant, or the one the creator assigned with `PUT /v1/sessions/{sid}/coordinator` — or the creator /
 admin acting for the session. Anyone else gets `permission_denied` ("only the
 session's coordinator can request agents — ask the coordinator").
 The creator credential (creator token, owning account's token) and the admin token

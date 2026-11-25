@@ -8,7 +8,7 @@ This guide is for:
   including a **coordinator** that discovers and launches agents through launchers.
 
 Everything here works with the broker alone: no Cockpit or Runner is required. Versions
-this guide was written against: **broker 0.35.0** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
+this guide was written against: **broker 0.35.1** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
 [README](../../README.md) and the OpenAPI spec the broker serves at `/api` stay the
 reference for details.
 
@@ -122,7 +122,7 @@ participants and exits; the process exit code is `-SIGTERM`, which is expected.
 ### 2.3 Docker
 
 ```bash
-docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.0
+docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.1
 ```
 
 The image runs as `nobody` (uid 65534) and starts
@@ -143,7 +143,7 @@ services:
     volumes: [broker-data:/data]
 
   broker:
-    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.0
+    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.1
     depends_on:
       broker-init: {condition: service_completed_successfully}
     restart: unless-stopped
@@ -572,7 +572,8 @@ Creator-level tools take the token as an argument (`creator_token`, `token` or
 
 Accounts are created by the admin, with the `sessionweave-accounts` CLI (it prints JSON;
 a non-2xx answer exits 1) or `POST /v1/accounts`. The CLI takes `--url` (env `SW_URL`;
-its built-in default is `http://127.0.0.1:8080`, so always set it) and `--admin-token`
+default `http://127.0.0.1:8765`, the broker's default port; an MCP URL ending in `/mcp` is
+accepted too) and `--admin-token`
 (env `SW_ADMIN_TOKEN`).
 
 ```bash
@@ -694,8 +695,11 @@ In each session **at most one participant is the coordinator**: the only partici
 allowed to discover and launch agents.
 
 - The first participant that joins with the **creator credential** (the creator token,
-  or the owning account's token) becomes the coordinator. Joining with an invite token,
-  or with the admin token, never does. The join answer and the roster carry
+  or the owning account's token) **or the admin token** becomes the coordinator, if the
+  session has none yet; an existing coordinator is never replaced by a join. Joining with
+  an invite token never makes a coordinator, and observers never do: the supervisor token
+  cannot join, and the firehose, supervisor notes and the Cockpit's monitoring (admin or
+  supervisor token) never join the session. The join answer and the roster carry
   `coordinator_id`.
 - The creator, owning account or admin can assign, move or clear it:
   `PUT /v1/sessions/{sid}/coordinator {"participant_id": "<pid>" | null}`, MCP
@@ -819,7 +823,7 @@ one hour.
 launched it (else the session's coordinator) with `session_send`, `dispatch: "specific"`;
 the coordinator gets `command.received` and answers it to close it. The agent then stays
 in the session for more work. If no coordinator participant exists (e.g. you launched
-with the creator token and nobody joined as coordinator), the agent has nobody to report
+with the creator token and nobody joined with the creator credential or admin token), the agent has nobody to report
 to.
 
 **Sessions without an owning account** (account mode, admin-created without
