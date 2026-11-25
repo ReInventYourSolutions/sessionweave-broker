@@ -1,6 +1,11 @@
-# SessionWeaveMCP
+# SessionWeave broker (`sessionweave-broker`)
 
-> The MCP relay (broker) in the [SessionWeave monorepo](../).
+> **Guide:** [SessionWeave broker guide](docs/guide/README.md) — running the broker, open and
+> account mode, configuration, accounts and tokens, sessions, roles, invite links, the
+> coordinator and the agent registry, error codes and troubleshooting.
+> Other guides: [Runner](https://github.com/ReInventYourSolutions/sessionweave-runner/blob/main/docs/guide/README.md) ·
+> [Cockpit](https://github.com/ReInventYourSolutions/sessionweave-cockpit/blob/main/docs/guide/README.md) ·
+> Python SDK: [`sessionweave-sdk`](https://github.com/ReInventYourSolutions/sessionweave-sdk).
 
 SessionWeave lets two or more AI agents work together inside a shared **session**
 without any of them having to know about the others up front. An agent connects
@@ -12,7 +17,6 @@ The relay only brokers messages. It never holds an agent's history.
 > **Status.** Sub-project **#1 — MCP core + session relay** is implemented:
 > in-memory, anonymous, transient sessions over MCP Streamable HTTP. Persistence,
 > accounts, and the dashboard land in later sub-projects (see [roadmap](#roadmap)).
-> See [`docs/VISION.md`](docs/VISION.md) for the broader project intent.
 
 ## Why
 
@@ -29,24 +33,26 @@ share what you choose to share, ignore everything else.
   anonymously today; persistence and richer services land in later sub-projects.
 
 The public broker is in production at [`broker.sessionweave.com`](https://broker.sessionweave.com)
-(version surfaced at `GET /v1/info`). The Python client SDK lives in
-[`SDK/python/`](../SDK/python/).
+(version surfaced at `GET /v1/info`). The Python client SDK is
+[`sessionweave-sdk`](https://github.com/ReInventYourSolutions/sessionweave-sdk) (`pip install sessionweave-sdk`, `import sessionweave_client`).
 
 ## Quick start
 
-Install in editable mode and run the relay locally:
+Install from PyPI and run the broker locally:
 
 ```bash
-pip install -e '.[dev]'
+pipx install sessionweave-broker        # or: pip install sessionweave-broker
 sessionweave --host 127.0.0.1 --port 8765
 ```
 
-…or run the prebuilt container:
+…or run the released container image (tags `vX.Y.Z` and `latest`):
 
 ```bash
-docker build -t sessionweave:dev .
-docker run --rm -p 8765:8765 sessionweave:dev
+docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:latest
 ```
+
+From a checkout: `pip install -e '.[dev]'` (see [Development](#development)), or
+`docker build -t sessionweave-broker:dev .`.
 
 The relay exposes:
 
@@ -57,7 +63,7 @@ The relay exposes:
 - `GET /` — **docs hub**: a self-serve HTML page indexing everything the broker
   serves over GET (below), all pinned to this broker's reachable address
 - `GET /api` — Swagger UI rendering this broker's own `openapi.yaml` (offline)
-- `GET /sdk` — Python SDK docs + offline `pip install` line; `GET /sdk.md` is the
+- `GET /sdk` — Python SDK docs + the `pip install sessionweave-sdk==<version>` line; `GET /sdk.md` is the
   raw README and `GET /sdk/sessionweave-client.tar.gz` is the pip-installable SDK
 - `GET /skill.md` — the participant skill, parametrized on this broker's address
   (`?download=1` for a file attachment); offline, bundled in the wheel
@@ -82,16 +88,18 @@ endpoint catalogue. The MCP tool catalogue is documented further down.
 ## Built-in docs hub
 
 The relay serves its own small, **offline-capable** docs hub — no external
-service or internet required, which matters for private or air-gapped
-deployments. Open the broker's base URL in a browser:
+service or internet required (except installing the SDK, which comes from PyPI),
+which matters for private or air-gapped deployments. Open the broker's base URL in a browser:
 
 - `GET /` — index of everything the broker serves over GET, pinned to this
   broker's reachable address (see `SW_PUBLIC_BASE_URL` in [`.env.example`](.env.example)).
 - `GET /api` — **Swagger UI** rendering this broker's own `openapi.yaml`. All
   assets are bundled in the package, so it works with no CDN.
-- `GET /sdk` — Python SDK docs with an offline `pip install` line pinned to this
-  broker; `GET /sdk/sessionweave-client.tar.gz` is the pip-installable SDK source
-  and `GET /sdk.md` is the raw README.
+- `GET /sdk` — Python SDK docs (the README of the installed `sessionweave-sdk`) with
+  a `pip install sessionweave-sdk==<version>` line pinned to the SDK version this
+  broker runs with; `GET /sdk.md` is the raw README. The legacy
+  `GET /sdk/sessionweave-client.tar.gz` (a bundled SDK copy before the repository
+  split) now redirects (`307`) to that version's sdist on PyPI.
 - `GET /skill.md` — the participant skill, rewritten to this broker's address
   (`?download=1` to save it); `GET /connect.mcp.json` — a ready `.mcp.json` snippet.
 
@@ -194,7 +202,7 @@ The recipient's decision tree on `desc["purpose"]`:
 
 For known protocols an agent dispatches by `purpose.kind`; for unknown
 kinds it falls back to `purpose.instructions`. The
-[`sessionweave-participant`](../skills/sessionweave-participant/)
+[`sessionweave-participant`](skills/sessionweave-participant/)
 skill documents the full receive-side flow.
 
 Legacy links carrying a base64url JSON fragment
@@ -263,7 +271,7 @@ curl -sS -X POST "$RELAY/v1/sessions/$SID/participants/me/inbox/drain" \
   -H "authorization: Bearer $TOK"
 ```
 
-The Python SDK in [`SDK/python/`](../SDK/python/)
+The Python SDK [`sessionweave-sdk`](https://github.com/ReInventYourSolutions/sessionweave-sdk)
 wraps every endpoint with typed exceptions and an async event stream.
 
 ### Exit feedback (mandatory convention, relay 0.10.0+)
@@ -801,7 +809,7 @@ Two paths — pick whichever matches your runtime.
 ### Path A — Python SDK (recommended for non-MCP runtimes)
 
 ```bash
-pip install -e '../SDK/python'
+pip install sessionweave-sdk          # import sessionweave_client
 ```
 
 ```python
@@ -824,7 +832,7 @@ asyncio.run(main())
 ```
 
 Vendor-neutral examples (Anthropic, OpenAI, plain) live under
-[`SDK/python/examples/`](../SDK/python/examples/).
+[`examples/`](https://github.com/ReInventYourSolutions/sessionweave-sdk/tree/main/examples) in the SDK repository.
 For other languages, point any HTTP+WS client at the
 [REST + WebSocket surface](#rest--websocket-surface) above.
 
@@ -850,14 +858,14 @@ Restart the client so the catalog refreshes. The tools appear as
 
 ### Path B (cont.) — Install the participation skill
 
-The skill lives in [`skills/sessionweave-participant/`](../skills/sessionweave-participant/).
+The skill lives in [`skills/sessionweave-participant/`](skills/sessionweave-participant/).
 Symlink (or copy) it into `~/.claude/skills/` so the agent learns *how*
 to use the relay (modes, dispatch, invite links, recovery):
 
 ```bash
-git clone https://github.com/ReInventYourSolutions/SessionWeave.git
+git clone https://github.com/ReInventYourSolutions/sessionweave-broker.git
 mkdir -p ~/.claude/skills
-ln -s "$PWD/SessionWeave/skills/sessionweave-participant" \
+ln -s "$PWD/sessionweave-broker/skills/sessionweave-participant" \
       ~/.claude/skills/sessionweave-participant
 ```
 
@@ -866,7 +874,7 @@ Or fetch the file directly:
 ```bash
 mkdir -p ~/.claude/skills/sessionweave-participant
 curl -fsSL \
-  https://raw.githubusercontent.com/ReInventYourSolutions/SessionWeave/main/skills/sessionweave-participant/SKILL.md \
+  https://raw.githubusercontent.com/ReInventYourSolutions/sessionweave-broker/main/skills/sessionweave-participant/SKILL.md \
   -o ~/.claude/skills/sessionweave-participant/SKILL.md
 ```
 
@@ -879,7 +887,7 @@ helpers (`sessionweave.invite.parse_link` / `create_link`) and the
 `sessionweave-join` CLI:
 
 ```bash
-pip install -e .
+pip install sessionweave-broker
 
 sessionweave-join "swv://127.0.0.1:8765/<sid>"
 # Prints relay url, session id, purpose kind, role assignment, and
@@ -901,7 +909,7 @@ Once these three are in place an agent can:
 ### agent-runner moved
 
 The turn-based **agent-runner** side-car is the standalone **`sessionweave-runner`**
-package in [`Runner/`](../Runner/). Install it where the agent
+package ([Runner guide](https://github.com/ReInventYourSolutions/sessionweave-runner/blob/main/docs/guide/README.md)). Install it where the agent
 runs — it is a relay *client*, not part of the relay. The `sessionweave-agent-runner` command
 lives there.
 
@@ -925,6 +933,6 @@ its own implementation plan.
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 [spec]: docs/superpowers/specs/2026-05-06-mcp-core-session-relay-design.md

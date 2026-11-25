@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import io
-import tarfile
+from importlib import metadata
 
 import httpx
 import pytest
@@ -44,32 +43,43 @@ async def test_static_assets_and_traversal_guard() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_sdk_page_pins_install_to_broker() -> None:
+async def test_sdk_page_pins_install_to_sdk_version() -> None:
+    v = metadata.version("sessionweave-sdk")
     async with relay_subprocess({"SW_PUBLIC_BASE_URL": PUBLIC}) as base:
         async with httpx.AsyncClient(base_url=base, timeout=5) as c:
             r = await c.get("/sdk")
             assert r.status_code == 200
             body = r.text
             assert (
-                f"pip install {PUBLIC}/sdk/sessionweave-client.tar.gz" in body
+                f"pip install sessionweave-sdk=={v}" in body
             )
+            assert f'SessionWeaveClient(base_url="{PUBLIC}")' in body
             assert "/_static/vendor/marked.min.js" in body
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_sdk_tarball_is_a_valid_archive() -> None:
+async def test_legacy_sdk_tarball_redirects_to_pypi_sdist() -> None:
+    v = metadata.version("sessionweave-sdk")
     async with relay_subprocess() as base:
         async with httpx.AsyncClient(base_url=base, timeout=5) as c:
             r = await c.get("/sdk/sessionweave-client.tar.gz")
-            assert r.status_code == 200
-            assert r.headers["content-type"] == "application/gzip"
-            tf = tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz")
-            names = tf.getnames()
-            assert "sessionweave-client/pyproject.toml" in names
-            assert (
-                "sessionweave-client/src/sessionweave_client/__init__.py" in names
+            assert r.status_code == 307
+            assert r.headers["location"] == (
+                "https://files.pythonhosted.org/packages/source/s/sessionweave-sdk/"
+                f"sessionweave_sdk-{v}.tar.gz"
             )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sdk_readme_is_the_installed_package_readme() -> None:
+    async with relay_subprocess() as base:
+        async with httpx.AsyncClient(base_url=base, timeout=5) as c:
+            r = await c.get("/sdk.md")
+            assert r.status_code == 200
+            assert r.headers["content-type"].startswith("text/markdown")
+            assert "pip install sessionweave-sdk" in r.text
 
 
 @pytest.mark.integration
@@ -82,7 +92,6 @@ async def test_landing_indexes_every_resource() -> None:
                 "/api",
                 "/sdk",
                 "/sdk.md",
-                "/sdk/sessionweave-client.tar.gz",
                 "/skill.md",
                 "/connect.mcp.json",
                 "/openapi.yaml",

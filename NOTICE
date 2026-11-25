@@ -1,0 +1,7 @@
+SessionWeave broker (sessionweave-broker)
+Copyright 2026 ReInventYourSolutions
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party assets bundled under src/sessionweave/_data/ keep their own licenses;
+see src/sessionweave/_data/VENDORED.md.

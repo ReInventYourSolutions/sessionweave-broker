@@ -1,11 +1,10 @@
 """Guards that the skill bundled into the broker package does not drift from
-the canonical skill at the repo root (``skills/sessionweave-participant/``).
+the canonical skill in this repo (``skills/sessionweave-participant/``).
 
 The broker ships its own copy under ``src/sessionweave/_data/skill.md`` so a
-``pip install sessionweave`` is self-contained and offline (mirrors how
+``pip install sessionweave-broker`` is self-contained and offline (mirrors how
 ``openapi.yaml`` is shipped). This test keeps the two byte-identical. It skips
-when the canonical source is absent (e.g. broker built/tested in isolation
-without the monorepo checkout).
+when the canonical source is absent (e.g. an sdist built without ``skills/``).
 """
 from __future__ import annotations
 
@@ -20,9 +19,7 @@ def _broker_root() -> Path:
 
 def test_bundled_skill_matches_canonical_source() -> None:
     bundled = _broker_root() / "src" / "sessionweave" / "_data" / "skill.md"
-    canonical = (
-        _broker_root().parent / "skills" / "sessionweave-participant" / "SKILL.md"
-    )
+    canonical = _broker_root() / "skills" / "sessionweave-participant" / "SKILL.md"
     if not canonical.exists():
         pytest.skip("canonical skill source not present (isolated build)")
     assert bundled.read_text(encoding="utf-8") == canonical.read_text(

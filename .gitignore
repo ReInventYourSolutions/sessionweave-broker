@@ -1,20 +1,18 @@
 __pycache__/
-.env
 *.py[cod]
 .venv/
+.env
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
 *.egg-info/
 build/
 dist/
 .coverage
 htmlcov/
-
-# Local artefacts dropped in the repo root by tooling
-SessionWeave-handoff*.zip
-*.handoff.zip
+.DS_Store
+.idea/
+.vscode/
+*.swp
 .claude/
-report-test.md
-.playwright-mcp/
-cockpit-empty.png

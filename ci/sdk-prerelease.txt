@@ -1,0 +1,10 @@
+# TODO(sdk-on-pypi): TEMPORARY until sessionweave-sdk is published on PyPI.
+# Until then the name "sessionweave-sdk" is claimable on PyPI by anyone, so the
+# SDK is installed from a direct reference pinned to a full commit SHA (never a
+# mutable tag), and always in the SAME pip command as the package that needs it,
+# so the resolver uses this reference instead of looking the name up on PyPI.
+# Commit = sessionweave-sdk 0.13.0 (tag v0.13.0 once pushed). If the SDK history is
+# rewritten before publishing, update the SHA.
+# After the first PyPI release: delete this file and every line marked
+# "sdk-prerelease" (.github/workflows/*.yml, Dockerfile).
+sessionweave-sdk @ git+https://github.com/ReInventYourSolutions/sessionweave-sdk@7806c1dfc7d5e75f535a0a070f3b2830956ba3d3

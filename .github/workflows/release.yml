@@ -1,12 +1,18 @@
 name: release
+# Tag vX.Y.Z (matching pyproject.toml) to release the broker:
+#   - PyPI `sessionweave-broker` (trusted publishing: a (pending) publisher for this
+#     repository, workflow `release.yml`, environment `pypi`)
+#   - GitHub release with the wheel and sdist
+#   - ghcr.io/reinventyoursolutions/sessionweave-broker:<tag> and :latest
+#   - optional: repository_dispatch to sessionweave-e2e (secret E2E_DISPATCH_TOKEN)
+# No upload-artifact: Actions artifact storage shares the account quota with GHCR.
 on:
   push:
     tags: ['v*.*.*']
 permissions:
-  contents: write
-  packages: write
+  contents: read
 jobs:
-  release:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,11 +20,55 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      - run: pip install -e '.[dev]' build
+      - name: Verify tag matches pyproject version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pyproject_version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          [ "$tag_version" = "$pyproject_version" ] || { echo "::error::tag $GITHUB_REF_NAME != pyproject.toml $pyproject_version"; exit 1; }
+      # sdk-prerelease: drop `-r ci/sdk-prerelease.txt` once sessionweave-sdk is on PyPI
+      # (one pip command, so the pinned SDK reference wins over a PyPI name lookup).
+      - run: pip install -r ci/sdk-prerelease.txt -e '.[dev]'
       - run: playwright install chromium --with-deps
       - run: ruff check . && mypy . && pytest -q -m "not fuzz and not e2e"
       - run: pytest tests/e2e -v -m e2e
+
+  pypi-and-release:
+    needs: checks
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sessionweave-broker/
+    permissions:
+      id-token: write   # trusted publishing (OIDC)
+      contents: write   # GitHub release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      # build only: the wheel declares sessionweave-sdk by name; it is installed
+      # from PyPI by users, so publish the SDK to PyPI before this release.
       - run: python -m build
+      - run: twine check dist/*
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "Broker ${{ github.ref_name }}"
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true
+
+  image:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -32,11 +82,18 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/enzinobb/sessionweave:${{ github.ref_name }}
-            ghcr.io/enzinobb/sessionweave:latest
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.whl
-            dist/*.tar.gz
-          generate_release_notes: true
+            ghcr.io/reinventyoursolutions/sessionweave-broker:${{ github.ref_name }}
+            ghcr.io/reinventyoursolutions/sessionweave-broker:latest
+
+  notify-e2e:
+    needs: [pypi-and-release, image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the cross-module e2e (skipped without E2E_DISPATCH_TOKEN)
+        env:
+          GH_TOKEN: ${{ secrets.E2E_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "E2E_DISPATCH_TOKEN not set; skipping"; exit 0; fi
+          gh api repos/ReInventYourSolutions/sessionweave-e2e/dispatches \
+            -f event_type=module-release \
+            -f "client_payload[module]=broker" -f "client_payload[ref]=$GITHUB_REF_NAME"

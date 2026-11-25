@@ -22,7 +22,7 @@ from typing import Any
 
 from pydantic import ValidationError
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from sessionweave.access import participant_id_for_token
@@ -364,18 +364,19 @@ async def serve_api_docs(request: Request) -> HTMLResponse:
 
 
 async def serve_sdk_docs(request: Request) -> Response:
-    """SDK docs page: offline pip-install line + rendered README."""
-    from sessionweave.docs_hub import load_sdk_readme, render_sdk_page
+    """SDK docs page: pinned ``pip install sessionweave-sdk==<v>`` + README."""
+    from sessionweave.docs_hub import load_sdk_readme, render_sdk_page, sdk_version
 
     try:
+        version = sdk_version()
         readme = load_sdk_readme()
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
+    except (LookupError, OSError):  # PackageNotFoundError is a LookupError
         return Response(
-            "SDK docs missing from this broker build",
+            "SDK docs missing: the sessionweave-sdk package is not installed",
             status_code=500,
             media_type="text/plain; charset=utf-8",
         )
-    return HTMLResponse(render_sdk_page(_public_base_url(request), readme))
+    return HTMLResponse(render_sdk_page(_public_base_url(request), readme, version))
 
 
 async def serve_sdk_readme(request: Request) -> Response:
@@ -384,32 +385,28 @@ async def serve_sdk_readme(request: Request) -> Response:
 
     try:
         readme = load_sdk_readme()
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
+    except (LookupError, OSError):
         return Response("not found", status_code=500, media_type="text/plain")
     return Response(readme, media_type="text/markdown; charset=utf-8")
 
 
 async def serve_sdk_tarball(request: Request) -> Response:
-    """Pip-installable .tar.gz of the vendored SDK source."""
-    from sessionweave.docs_hub import SDK_TARBALL_ROOT, build_sdk_tarball
+    """Legacy SDK download: redirect to the matching sdist on PyPI.
+
+    Brokers before 0.35 served a vendored copy of the SDK source here; pip
+    follows the redirect, so ``pip install <broker>/sdk/sessionweave-client.tar.gz``
+    keeps working (it now needs access to PyPI)."""
+    from sessionweave.docs_hub import sdk_sdist_url, sdk_version
 
     try:
-        blob = build_sdk_tarball()
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        version = sdk_version()
+    except LookupError:
         return Response(
-            "SDK source missing from this broker build",
+            "SDK missing: the sessionweave-sdk package is not installed",
             status_code=500,
             media_type="text/plain; charset=utf-8",
         )
-    return Response(
-        blob,
-        media_type="application/gzip",
-        headers={
-            "content-disposition": (
-                f'attachment; filename="{SDK_TARBALL_ROOT}.tar.gz"'
-            )
-        },
-    )
+    return RedirectResponse(sdk_sdist_url(version), status_code=307)
 
 
 async def serve_static(request: Request) -> Response:

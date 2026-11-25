@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import io
-import tarfile
-
 import pytest
 
 from sessionweave.docs_hub import (
-    build_sdk_tarball,
     load_sdk_readme,
     render_api_page,
     render_sdk_page,
+    sdk_sdist_url,
+    sdk_version,
     static_asset,
 )
 
@@ -28,9 +26,10 @@ def test_render_api_page_is_offline_and_points_at_local_spec() -> None:
     assert "https://cdn" not in html
 
 
-def test_render_sdk_page_pins_install_to_broker_and_embeds_readme() -> None:
-    html = render_sdk_page(BASE, "# SessionWeave SDK\ninstall me")
-    assert f"pip install {BASE}/sdk/sessionweave-client.tar.gz" in html
+def test_render_sdk_page_pins_install_to_sdk_version_and_embeds_readme() -> None:
+    html = render_sdk_page(BASE, "# SessionWeave SDK\ninstall me", "0.13.0")
+    assert "pip install sessionweave-sdk==0.13.0" in html
+    assert f'SessionWeaveClient(base_url="{BASE}")' in html
     assert "/_static/vendor/marked.min.js" in html
     assert "SessionWeave SDK" in html  # README content embedded
     assert "jsdelivr" not in html
@@ -40,28 +39,33 @@ def test_render_sdk_page_escapes_malicious_base_url() -> None:
     # base_url reflects the Host header; a crafted host must not break out of
     # the HTML attribute / text context (reflected XSS).
     evil = 'https://x"/><script>alert(1)</script>'
-    html = render_sdk_page(evil, "# readme")
+    html = render_sdk_page(evil, "# readme", "0.13.0")
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
 
 
 def test_render_sdk_page_readme_cannot_break_out_of_script() -> None:
-    html = render_sdk_page(BASE, "stuff </script><script>alert(1)</script>")
+    html = render_sdk_page(BASE, "stuff </script><script>alert(1)</script>", "0.13.0")
     # the closing tag from the README must be neutralised inside the JS string
     assert "</script><script>alert(1)" not in html
 
 
-def test_build_sdk_tarball_is_a_valid_pip_installable_archive() -> None:
-    blob = build_sdk_tarball()
-    tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
-    names = tf.getnames()
-    assert "sessionweave-client/pyproject.toml" in names
-    assert "sessionweave-client/src/sessionweave_client/__init__.py" in names
+def test_sdk_sdist_url_points_at_pypi() -> None:
+    assert sdk_sdist_url("0.13.0") == (
+        "https://files.pythonhosted.org/packages/source/s/sessionweave-sdk/"
+        "sessionweave_sdk-0.13.0.tar.gz"
+    )
 
 
-def test_load_sdk_readme_returns_bundled_readme() -> None:
+def test_sdk_version_is_the_installed_distribution() -> None:
+    from importlib import metadata
+
+    assert sdk_version() == metadata.version("sessionweave-sdk")
+
+
+def test_load_sdk_readme_returns_installed_readme() -> None:
     md = load_sdk_readme()
-    assert "sessionweave" in md.lower()
+    assert "sessionweave_client" in md
 
 
 def test_static_asset_serves_known_assets_with_content_type() -> None:

@@ -3,12 +3,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sessionweave"
+name = "sessionweave-broker"
 version = "0.34.1"
-description = "MCP-native session relay for multi-agent collaboration"
+description = "MCP-native session broker for multi-agent collaboration"
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 readme = "README.md"
+authors = [{ name = "ReInventYourSolutions" }]
+keywords = ["sessionweave", "multi-agent", "mcp", "broker"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+]
 dependencies = [
     # Migrated to the 2.x API (MCPServer, streamable_http_client, unions that
     # are no longer RootModels). The code will not run on 1.x, and 3.x will be
@@ -29,6 +38,10 @@ dependencies = [
     # which requires one (mcp 2.x depends on httpx2).
     "httpx2>=2.16,<3",
     "aiosqlite>=0.20.0",
+    # Python SDK: /sdk and /sdk.md render its README, /sdk shows its version.
+    # Until sessionweave-sdk is on PyPI, CI and the Dockerfile install it from
+    # ci/sdk-prerelease.txt (see that file).
+    "sessionweave-sdk>=0.13.0,<0.14",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +62,12 @@ sessionweave-host = "sessionweave.host_cli:main"
 sessionweave-poller = "sessionweave.poller:main"
 sessionweave-accounts = "sessionweave.accounts_cli:main"
 
+[project.urls]
+Homepage = "https://github.com/ReInventYourSolutions/sessionweave-broker"
+Source = "https://github.com/ReInventYourSolutions/sessionweave-broker"
+Guide = "https://github.com/ReInventYourSolutions/sessionweave-broker/blob/main/docs/guide/README.md"
+SDK = "https://github.com/ReInventYourSolutions/sessionweave-sdk"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -59,7 +78,7 @@ artifacts = ["src/sessionweave/persistence_migrations/*.sql"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# Vendored data shipped as package assets (SDK source, web assets) — not the
+# Vendored data shipped as package assets (web assets, the skill) — not the
 # broker's own code; don't lint/format it.
 extend-exclude = ["src/sessionweave/_data"]
 
@@ -70,7 +89,7 @@ select = ["E", "F", "I", "B", "UP", "RUF", "N"]
 python_version = "3.12"
 strict = true
 mypy_path = "src"
-# Vendored SDK source under _data/ is shipped as data, not type-checked here.
+# Vendored assets under _data/ are shipped as data, not type-checked here.
 exclude = ["src/sessionweave/_data/"]
 namespace_packages = true
 explicit_package_bases = true

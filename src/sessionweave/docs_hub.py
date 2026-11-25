@@ -1,22 +1,21 @@
 """Broker-hosted, offline-capable docs hub: API docs (Swagger UI over the
-broker's own openapi.yaml), SDK docs, and the SDK source as a pip-installable
-tarball.
+broker's own openapi.yaml) and the Python SDK docs.
 
-All assets are bundled as package data (shipped in the wheel), so nothing here
-touches the network — the air-gapped broker is the design target. Rendering
-functions are pure; ``build_sdk_tarball`` / ``load_*`` / ``static_asset`` read
-bundled resources.
+The API docs assets are bundled as package data (shipped in the wheel), so they
+work on an air-gapped broker. The SDK is not bundled: the broker depends on the
+``sessionweave-sdk`` distribution, renders its README from the installed
+package metadata and points ``pip install`` at the same version on PyPI.
+Rendering functions are pure; ``load_*`` / ``sdk_version`` / ``static_asset``
+read installed resources.
 """
 from __future__ import annotations
 
 import html
-import io
 import json
-import tarfile
-from importlib import resources
+from importlib import metadata, resources
 
 # Static assets reachable via GET /_static/<path>. Only these roots are served;
-# everything else under _data (the skill, the SDK source) has its own route.
+# everything else under _data (the skill) has its own route.
 _ALLOWED_ASSET_ROOTS = ("swagger-ui", "vendor")
 
 _CONTENT_TYPES = {
@@ -30,8 +29,13 @@ _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
 }
 
-#: Top-level directory inside the served SDK tarball (pip extracts and builds it).
-SDK_TARBALL_ROOT = "sessionweave-client"
+#: The Python SDK distribution the broker depends on (import package
+#: ``sessionweave_client``).
+SDK_DISTRIBUTION = "sessionweave-sdk"
+
+#: Legacy route that served the vendored SDK source (broker < 0.35); it now
+#: redirects to the matching sdist on PyPI, so old ``pip install`` lines work.
+SDK_LEGACY_TARBALL_PATH = "/sdk/sessionweave-client.tar.gz"
 
 
 def _data() -> resources.abc.Traversable:
@@ -68,14 +72,38 @@ def render_api_page() -> str:
 """
 
 
-def render_sdk_page(base_url: str, readme_md: str) -> str:
-    """SDK docs page: an offline ``pip install`` line pinned to this broker's
-    tarball, plus the README rendered client-side with the bundled marked.js."""
+def sdk_version() -> str:
+    """Version of the installed ``sessionweave-sdk`` distribution.
+
+    Raises ``importlib.metadata.PackageNotFoundError`` when it is missing."""
+    return metadata.version(SDK_DISTRIBUTION)
+
+
+def sdk_install_line(version: str) -> str:
+    return f"pip install {SDK_DISTRIBUTION}=={version}"
+
+
+def sdk_sdist_url(version: str) -> str:
+    """PyPI download URL of the SDK sdist for ``version``.
+
+    ``files.pythonhosted.org/packages/source/<initial>/<project>/<file>`` is
+    PyPI's stable redirect to the real file, so it needs no hash."""
+    filename = f"{SDK_DISTRIBUTION.replace('-', '_')}-{version}.tar.gz"
+    return (
+        "https://files.pythonhosted.org/packages/source/"
+        f"{SDK_DISTRIBUTION[0]}/{SDK_DISTRIBUTION}/{filename}"
+    )
+
+
+def render_sdk_page(base_url: str, readme_md: str, version: str) -> str:
+    """SDK docs page: the ``pip install`` line pinned to the SDK version this
+    broker runs with, plus the README rendered client-side with the bundled
+    marked.js."""
     base = base_url.rstrip("/")
     # base_url reflects the Host header — escape before interpolating into HTML
     # (attribute + text contexts), mirroring landing.py's convention.
     base_h = html.escape(base, quote=True)
-    install_url_h = html.escape(f"{base}/sdk/{SDK_TARBALL_ROOT}.tar.gz", quote=True)
+    install_h = html.escape(sdk_install_line(version), quote=True)
     # README is trusted repo content, but it lands inside a <script> string —
     # neutralise any "</script>" so it can't break out of the JS context.
     readme_json = json.dumps(readme_md).replace("</", "<\\/")
@@ -98,8 +126,9 @@ def render_sdk_page(base_url: str, readme_md: str) -> str:
 </head>
 <body>
 <h1>SessionWeave Python SDK</h1>
-<p>Install it offline, straight from this broker:</p>
-<pre><code>pip install {install_url_h}</code></pre>
+<p>Install the version this broker runs with (the distribution is
+<code>sessionweave-sdk</code>, the import package <code>sessionweave_client</code>):</p>
+<pre><code>{install_h}</code></pre>
 <p>Then point the client at this broker:</p>
 <pre><code>SessionWeaveClient(base_url="{base_h}")</code></pre>
 <hr>
@@ -114,38 +143,18 @@ def render_sdk_page(base_url: str, readme_md: str) -> str:
 
 
 def load_sdk_readme() -> str:
-    return _data().joinpath("sdk/README.md").read_text(encoding="utf-8")
+    """README of the installed ``sessionweave-sdk`` (its PyPI long description).
 
-
-def build_sdk_tarball() -> bytes:
-    """Generate a pip-installable ``.tar.gz`` of the vendored SDK source.
-
-    Every file lives under a single top-level ``sessionweave-client/`` directory
-    with ``pyproject.toml`` at its root, so ``pip install <tarball>`` extracts and
-    builds it like any source archive."""
-    root = _data().joinpath("sdk")
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        _add_tree(tar, root, SDK_TARBALL_ROOT)
-    return buf.getvalue()
-
-
-def _add_tree(tar: tarfile.TarFile, node: resources.abc.Traversable, arc: str) -> None:
-    for child in sorted(node.iterdir(), key=lambda c: c.name):
-        # Skip caches / hidden tooling dirs so the served tarball is just source.
-        if child.name.startswith(".") or child.name == "__pycache__":
-            continue
-        if child.name.endswith(".pyc"):
-            continue
-        child_arc = f"{arc}/{child.name}"
-        if child.is_dir():
-            _add_tree(tar, child, child_arc)
-        else:
-            blob = child.read_bytes()
-            info = tarfile.TarInfo(name=child_arc)
-            info.size = len(blob)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(blob))
+    Raises ``importlib.metadata.PackageNotFoundError`` when the SDK is missing
+    and ``LookupError`` when its metadata carries no description."""
+    meta = metadata.metadata(SDK_DISTRIBUTION)
+    body = meta.get_payload()  # type: ignore[attr-defined]
+    if isinstance(body, str) and body.strip():
+        return body
+    description = meta.get("Description")
+    if description:
+        return str(description)
+    raise LookupError(f"{SDK_DISTRIBUTION} metadata has no description")
 
 
 def static_asset(rel_path: str) -> tuple[bytes, str]:
