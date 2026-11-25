@@ -12,8 +12,13 @@ which the release workflow sends when the `E2E_DISPATCH_TOKEN` secret is set).
 
 The broker depends on `sessionweave-sdk` (`pyproject.toml`, range `>=0.13.0,<0.14`); `/sdk`
 renders the installed SDK's README. Until the SDK is on PyPI, CI and the Dockerfile
-install it from `ci/sdk-prerelease.txt` (a pinned SDK release tag). A new SDK minor needs
-the range bumped here.
+install it from `ci/sdk-prerelease.txt` (a direct reference pinned to a full SDK commit
+SHA, installed in the same pip command). A new SDK minor needs the range bumped here.
+
+**Release guard:** `release.yml` runs `ci/check-sdk-on-pypi.py` first and fails unless PyPI
+lists a `sessionweave-sdk` release that satisfies the pin and points at our SDK repository:
+users install this package from PyPI and pip resolves the SDK by name, so the broker must
+never be released before the SDK is published (dependency confusion).
 
 ## Runner-facing surface checklist (do this on EVERY release)
 
