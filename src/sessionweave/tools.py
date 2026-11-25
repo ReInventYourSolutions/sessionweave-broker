@@ -516,8 +516,11 @@ async def session_join(
             metadata=metadata,
             delivery_mode=inp.delivery_mode,
             # Joining with the creator credential (creator token or the owner's
-            # account token) makes this participant the coordinator, if none is set.
-            as_coordinator=principal.role == "creator",
+            # account token) or the relay admin token makes this participant the
+            # coordinator, if none is set (an existing one is never replaced).
+            # Supervisor tokens cannot join, and the firehose / supervisor notes /
+            # Cockpit monitoring never join, so observers never become coordinator.
+            as_coordinator=principal.role in ("creator", "admin"),
         )
     except BaseException:
         if launch is not None:

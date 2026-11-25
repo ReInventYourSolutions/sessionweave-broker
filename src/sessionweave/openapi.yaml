@@ -1237,7 +1237,8 @@ paths:
       description: |
         The coordinator is the only participant allowed to discover and launch agents.
         It is the participant that first joined presenting the creator credential (the
-        creator token or the owning account's token); this route assigns another current
+        creator token or the owning account's token) or the admin token while the role was
+        vacant (a join never replaces a coordinator); this route assigns another current
         participant, or clears the role with ``participant_id: null``. When the coordinator
         leaves or is removed the role becomes null (no promotion).
         Bearer: the creator token, the owning account's token or the admin token.

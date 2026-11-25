@@ -1074,8 +1074,9 @@ def _build_fastmcp(
         """Assign, move or clear the session's coordinator.
 
     The coordinator is the one participant allowed to discover and launch
-    agents; it is whoever first joined with the creator credential until you
-    change it here. Requires the creator_token (or the relay admin token, or
+    agents; it is whoever first joined with the creator credential (or the
+    relay admin token) while the role was vacant, until you change it here.
+    Requires the creator_token (or the relay admin token, or
     the owning account's token, also accepted from the MCP Authorization:
     Bearer header). The target must be a current participant, else
     participant_not_found. Returns coordinator_id.

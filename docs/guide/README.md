@@ -695,8 +695,11 @@ In each session **at most one participant is the coordinator**: the only partici
 allowed to discover and launch agents.
 
 - The first participant that joins with the **creator credential** (the creator token,
-  or the owning account's token) becomes the coordinator. Joining with an invite token,
-  or with the admin token, never does. The join answer and the roster carry
+  or the owning account's token) **or the admin token** becomes the coordinator, if the
+  session has none yet; an existing coordinator is never replaced by a join. Joining with
+  an invite token never makes a coordinator, and observers never do: the supervisor token
+  cannot join, and the firehose, supervisor notes and the Cockpit's monitoring (admin or
+  supervisor token) never join the session. The join answer and the roster carry
   `coordinator_id`.
 - The creator, owning account or admin can assign, move or clear it:
   `PUT /v1/sessions/{sid}/coordinator {"participant_id": "<pid>" | null}`, MCP
@@ -820,7 +823,7 @@ one hour.
 launched it (else the session's coordinator) with `session_send`, `dispatch: "specific"`;
 the coordinator gets `command.received` and answers it to close it. The agent then stays
 in the session for more work. If no coordinator participant exists (e.g. you launched
-with the creator token and nobody joined as coordinator), the agent has nobody to report
+with the creator token and nobody joined with the creator credential or admin token), the agent has nobody to report
 to.
 
 **Sessions without an owning account** (account mode, admin-created without
