@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sessionweave-broker"
-version = "0.34.1"
+version = "0.35.0"
 description = "MCP-native session broker for multi-agent collaboration"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -39,8 +39,6 @@ dependencies = [
     "httpx2>=2.16,<3",
     "aiosqlite>=0.20.0",
     # Python SDK: /sdk and /sdk.md render its README, /sdk shows its version.
-    # Until sessionweave-sdk is on PyPI, CI and the Dockerfile install it from
-    # ci/sdk-prerelease.txt (see that file).
     "sessionweave-sdk>=0.13.0,<0.14",
 ]
 

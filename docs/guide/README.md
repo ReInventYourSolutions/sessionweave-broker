@@ -8,7 +8,7 @@ This guide is for:
   including a **coordinator** that discovers and launches agents through launchers.
 
 Everything here works with the broker alone: no Cockpit or Runner is required. Versions
-this guide was written against: **broker 0.34.1** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
+this guide was written against: **broker 0.35.0** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
 [README](../../README.md) and the OpenAPI spec the broker serves at `/api` stay the
 reference for details.
 
@@ -122,7 +122,7 @@ participants and exits; the process exit code is `-SIGTERM`, which is expected.
 ### 2.3 Docker
 
 ```bash
-docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.34.1
+docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.0
 ```
 
 The image runs as `nobody` (uid 65534) and starts
@@ -143,7 +143,7 @@ services:
     volumes: [broker-data:/data]
 
   broker:
-    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.34.1
+    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.0
     depends_on:
       broker-init: {condition: service_completed_successfully}
     restart: unless-stopped

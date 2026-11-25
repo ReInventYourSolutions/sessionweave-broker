@@ -12,19 +12,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      # sdk-prerelease: while the module repositories are private, the optional secret
-      # MODULES_READ_TOKEN (read access to them) lets pip clone the commit-pinned
-      # modules. Not needed once they are public; remove with the other sdk-prerelease lines.
-      - name: Git credentials for the private module repositories (optional)
-        env:
-          MODULES_READ_TOKEN: ${{ secrets.MODULES_READ_TOKEN }}
-        run: |
-          if [ -n "$MODULES_READ_TOKEN" ]; then
-            git config --global url."https://x-access-token:${MODULES_READ_TOKEN}@github.com/ReInventYourSolutions/".insteadOf "https://github.com/ReInventYourSolutions/"
-          fi
-      # sdk-prerelease: drop `-r ci/sdk-prerelease.txt` once sessionweave-sdk is on PyPI
-      # (one pip command, so the pinned SDK reference wins over a PyPI name lookup).
-      - run: pip install -r ci/sdk-prerelease.txt -e '.[dev]'
+      - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: mypy .
       - run: pytest -q -m "not fuzz and not e2e"
@@ -37,19 +25,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      # sdk-prerelease: while the module repositories are private, the optional secret
-      # MODULES_READ_TOKEN (read access to them) lets pip clone the commit-pinned
-      # modules. Not needed once they are public; remove with the other sdk-prerelease lines.
-      - name: Git credentials for the private module repositories (optional)
-        env:
-          MODULES_READ_TOKEN: ${{ secrets.MODULES_READ_TOKEN }}
-        run: |
-          if [ -n "$MODULES_READ_TOKEN" ]; then
-            git config --global url."https://x-access-token:${MODULES_READ_TOKEN}@github.com/ReInventYourSolutions/".insteadOf "https://github.com/ReInventYourSolutions/"
-          fi
-      # sdk-prerelease: drop `-r ci/sdk-prerelease.txt` once sessionweave-sdk is on PyPI
-      # (one pip command, so the pinned SDK reference wins over a PyPI name lookup).
-      - run: pip install -r ci/sdk-prerelease.txt -e '.[dev]'
+      - run: pip install -e '.[dev]'
       - run: playwright install chromium --with-deps
       - run: pytest tests/e2e -v -m e2e
 
@@ -63,7 +39,4 @@ jobs:
         with:
           context: .
           push: false
-          # sdk-prerelease: optional token for the private module repositories
-          secrets: |
-            git_token=${{ secrets.MODULES_READ_TOKEN }}
           tags: sessionweave-broker:ci

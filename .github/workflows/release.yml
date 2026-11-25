@@ -29,9 +29,7 @@ jobs:
         run: |
           python -m pip install packaging
           python ci/check_sdk_on_pypi.py
-      # sdk-prerelease: drop `-r ci/sdk-prerelease.txt` once sessionweave-sdk is on PyPI
-      # (one pip command, so the pinned SDK reference wins over a PyPI name lookup).
-      - run: pip install -r ci/sdk-prerelease.txt -e '.[dev]'
+      - run: pip install -e '.[dev]'
       - run: playwright install chromium --with-deps
       - run: ruff check . && mypy . && pytest -q -m "not fuzz and not e2e"
       - run: pytest tests/e2e -v -m e2e
