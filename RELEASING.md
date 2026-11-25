@@ -15,8 +15,9 @@ renders the installed SDK's README. Until the SDK is on PyPI, CI and the Dockerf
 install it from `ci/sdk-prerelease.txt` (a direct reference pinned to a full SDK commit
 SHA, installed in the same pip command). A new SDK minor needs the range bumped here.
 
-**Release guard:** `release.yml` runs `ci/check-sdk-on-pypi.py` first and fails unless PyPI
-lists a `sessionweave-sdk` release that satisfies the pin and points at our SDK repository:
+**Release guard:** `release.yml` runs `ci/check_sdk_on_pypi.py` first and fails unless PyPI
+lists a `sessionweave-sdk` release that satisfies the pin and whose files carry PEP 740
+provenance from the `ReInventYourSolutions/sessionweave-sdk` trusted publisher (`release.yml`):
 users install this package from PyPI and pip resolves the SDK by name, so the broker must
 never be released before the SDK is published (dependency confusion).
 

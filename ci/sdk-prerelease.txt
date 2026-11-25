@@ -7,4 +7,4 @@
 # rewritten before publishing, update the SHA.
 # After the first PyPI release: delete this file and every line marked
 # "sdk-prerelease" (.github/workflows/*.yml, Dockerfile).
-sessionweave-sdk @ git+https://github.com/ReInventYourSolutions/sessionweave-sdk@0bc8228be5b1afe83274aec0b4d9e38d4a010c02
+sessionweave-sdk @ git+https://github.com/ReInventYourSolutions/sessionweave-sdk@bd082550f8ff94d27cbe239c6e7791d0e1746bd9
