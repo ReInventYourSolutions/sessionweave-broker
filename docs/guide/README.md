@@ -572,7 +572,8 @@ Creator-level tools take the token as an argument (`creator_token`, `token` or
 
 Accounts are created by the admin, with the `sessionweave-accounts` CLI (it prints JSON;
 a non-2xx answer exits 1) or `POST /v1/accounts`. The CLI takes `--url` (env `SW_URL`;
-its built-in default is `http://127.0.0.1:8080`, so always set it) and `--admin-token`
+default `http://127.0.0.1:8765`, the broker's default port; an MCP URL ending in `/mcp` is
+accepted too) and `--admin-token`
 (env `SW_ADMIN_TOKEN`).
 
 ```bash

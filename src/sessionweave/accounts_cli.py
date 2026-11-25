@@ -15,7 +15,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-DEFAULT_URL = "http://127.0.0.1:8080"
+DEFAULT_URL = "http://127.0.0.1:8765"  # the broker's default SW_PORT
 POLICIES = ("any", "first_use", "approved_only")
 
 

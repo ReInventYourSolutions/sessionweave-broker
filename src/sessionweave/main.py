@@ -29,8 +29,9 @@ def cli() -> None:
         default=None,
         help=(
             "Override SW_PERSISTENCE_DB_PATH. Use an empty string to disable "
-            "persistence. When unset, falls back to the env var (default: "
-            "data/sessionweave.db)."
+            "persistence. When unset, falls back to the env var, which is unset "
+            "by default (persistence disabled, in-memory only). Example: "
+            "data/sessionweave.db."
         ),
     )
     parser.add_argument(

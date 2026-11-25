@@ -373,8 +373,8 @@ Environment (all three are required together):
 - `SW_PERSISTENCE_DB_PATH` (accounts live in the persistence DB)
 - `SW_ADMIN_TOKEN` (the only way to create accounts)
 
-Administer accounts with the `sessionweave-accounts` CLI (`--url` or `SW_URL`,
-`--admin-token` or `SW_ADMIN_TOKEN`; it prints JSON, and a non-2xx answer exits 1):
+Administer accounts with the `sessionweave-accounts` CLI (`--url` or `SW_URL`, default
+`http://127.0.0.1:8765`; `--admin-token` or `SW_ADMIN_TOKEN`; it prints JSON, and a non-2xx answer exits 1):
 
 ```bash
 sessionweave-accounts create alice --contact alice@example.com

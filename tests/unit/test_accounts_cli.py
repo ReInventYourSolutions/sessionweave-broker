@@ -216,3 +216,42 @@ def test_invalid_policy_and_scope_rejected(monkeypatch: pytest.MonkeyPatch) -> N
     ):
         with pytest.raises(SystemExit):
             _run(argv, handler, monkeypatch)
+
+
+def test_default_url_is_the_broker_default_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without --url / SW_URL the CLI talks to the broker's default address (SW_PORT 8765)."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json={"accounts": []})
+
+    assert accounts_cli.DEFAULT_URL == "http://127.0.0.1:8765"
+    assert _run(["list"], handler, monkeypatch) == 0
+    assert str(seen[0].url) == "http://127.0.0.1:8765/v1/accounts"
+
+
+def test_url_from_sw_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json={"accounts": []})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        accounts_cli, "_client",
+        lambda url, token: httpx.Client(base_url=url, transport=transport),
+    )
+    monkeypatch.setenv("SW_URL", "https://broker.example/mcp")
+    assert accounts_cli.main(["--admin-token", "adm", "list"]) == 0
+    assert str(seen[0].url) == "https://broker.example/v1/accounts"
+
+
+def test_help_names_the_default_url(capsys: pytest.CaptureFixture[str],
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SW_URL", raising=False)
+    with pytest.raises(SystemExit):
+        accounts_cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "http://127.0.0.1:8765" in out and "8080" not in out
