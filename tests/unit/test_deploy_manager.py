@@ -119,3 +119,56 @@ def test_describe_exposes_identity_flags_and_profile_warnings() -> None:
             assert agents["local1"]["run_as"] is None
             assert agents["local1"]["warnings"] == ["shared runtime state"]
         assert agents["rootobs"]["warnings"] == []
+
+
+class _FastLauncherConn:
+    """Answers every definition_put at once, while the broker is still inside
+    the send: the status is handled concurrently with the rest of the put."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        self.dm: DeployManager | None = None
+        self.launcher_id = ""
+        self.tasks: list[asyncio.Task[None]] = []
+
+    async def send_json(self, frame: dict[str, object]) -> None:
+        if frame.get("type") != "definition_put" or self.dm is None:
+            return
+        d = frame["definition"]
+        assert isinstance(d, dict)
+        task = asyncio.create_task(self.dm.on_status(self.launcher_id, {
+            "id": d["id"], "revision": d["revision"], "state": self.state,
+            "problems": ["p"] if self.state == "rejected" else [], "warnings": []}))
+        self.tasks.append(task)
+        # Let the status go as far as it can (to the end, unless it must wait
+        # for the machine lock the broker holds while it sends).
+        await asyncio.wait({task}, timeout=0.3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["applied", "rejected", "pending_in_use"])
+async def test_fast_status_is_never_overwritten_by_sent(tmp_path: Path, state: str) -> None:
+    """A launcher status that races the put (on reconnect and on a live deploy)
+    is recorded after the broker's own ``sent``: the state never moves back."""
+    store, machines, dm = await _setup(tmp_path)
+    try:
+        assert (await dm.deploy(OPEN_OWNER, KEY, "obs", dict(_DEF)))["state"] == "queued"
+        conn = _FastLauncherConn(state)
+        v2 = parse_hello_v2({"protocol": 2, "launcher_key": KEY, "mode": "local",
+                             "ceiling": "/srv/app", "capabilities": ["definitions"]},
+                            deploy_allowed=True)
+        lid, _ = dm._launchers.register(
+            conn, None, {"machine": "box", "profiles": []}, v2=v2)
+        conn.dm, conn.launcher_id = dm, lid
+        # reconnect: queued -> put (status races) -> sent
+        await dm.on_connected(dm._launchers.get(lid))  # type: ignore[arg-type]
+        await asyncio.gather(*conn.tasks)
+        row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
+        assert (row.revision, row.state) == (1, state)
+        # live deploy: stored as sent -> put (status races)
+        out = await dm.deploy(OPEN_OWNER, KEY, "obs", {**_DEF, "description": "v2"})
+        await asyncio.gather(*conn.tasks)
+        row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
+        assert (out["revision"], row.revision, row.state) == (2, 2, state)
+    finally:
+        await store.close()
