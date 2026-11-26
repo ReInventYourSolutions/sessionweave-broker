@@ -36,3 +36,14 @@ CREATE TABLE agent_definitions (
     updated_at        INTEGER NOT NULL,
     PRIMARY KEY (account_id, launcher_key, def_id)
 ) STRICT;
+
+-- The last revision of a purged definition (removed by its launcher), so a
+-- later deploy with the same id continues from there: (def_id, revision)
+-- never names two different contents. Dropped with the machine.
+CREATE TABLE agent_definition_revisions (
+    account_id    TEXT NOT NULL,
+    launcher_key  TEXT NOT NULL,
+    def_id        TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    PRIMARY KEY (account_id, launcher_key, def_id)
+) STRICT;

@@ -60,6 +60,9 @@ _MAX_ALLOW = 100
 _MAX_PRIVILEGED = 50
 _MAX_PATTERNS = 100
 _DEFAULT_INTERVAL_S = 60
+# Brace expansion ({..,x}) and escapes (\.\.) could rebuild a '..' that the
+# component check does not see, in matchers that support them.
+_GLOB_FORBIDDEN = ("{", "}", "\\")
 
 
 class DefinitionError(ValueError):
@@ -129,9 +132,11 @@ def _glob(v: str, where: str) -> str:
     if (
         not v or len(v) > _MAX_GLOB or not v.isprintable()
         or v.startswith(("/", "~")) or ".." in v.split("/")
+        or any(c in v for c in _GLOB_FORBIDDEN)
     ):
         raise DefinitionError(
-            f"{where}: {v!r} must be a glob relative to the workdir (no '/', '~' or '..')"
+            f"{where}: {v!r} must be a glob relative to the workdir (no leading '/' or '~',"
+            " no '..', no braces or backslashes)"
         )
     return v
 
@@ -194,7 +199,10 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
     if kind == "observer" and out_files["write"]:
         raise DefinitionError("an observer never writes files: access.files.write must be empty")
     network = acc.get("network")
-    if network is not None and not _valid_network(network):
+    if network is not None and not (
+        _valid_network(network)
+        and (not isinstance(network, list) or all(h.isprintable() for h in network))
+    ):
         raise DefinitionError("access.network must be 'none', 'any' or a list of hosts")
     cmds = _obj(acc.get("commands"), "access.commands", _COMMANDS_KEYS)
     mode = cmds.get("mode", "list" if kind == "observer" else "shell")
@@ -211,6 +219,11 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
         _str_list(cmds.get("privileged"), "access.commands.privileged", _MAX_PRIVILEGED),
         "access.commands.privileged",
     )
+    if privileged and kind == "observer":
+        raise DefinitionError(
+            "an observer gets no privileged (root-delegated) commands:"
+            " access.commands.privileged must be empty"
+        )
     if privileged and machine.mode != "root":
         raise DefinitionError(
             "access.commands.privileged needs a machine whose launcher runs with --root",
@@ -225,10 +238,14 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
 
 def _limits(raw: Any) -> dict[str, Any]:
     limits = _obj(raw, "limits", _LIMITS_KEYS)
-    if not _valid_limits(limits) or not all(
-        v is None or (math.isfinite(v) and v > 0) for v in limits.values()
-    ):
-        raise DefinitionError("limits must be positive numbers (or null)")
+    try:
+        ok = _valid_limits(limits) and all(
+            v is None or (math.isfinite(v) and v > 0) for v in limits.values()
+        )
+    except (OverflowError, ValueError):  # an int too large for a float
+        ok = False
+    if not ok:
+        raise DefinitionError("limits must be positive finite numbers (or null)")
     return dict(limits)
 
 
@@ -279,10 +296,10 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     caps = raw.get("capabilities", [])
     if (
         not isinstance(caps, list) or len(caps) > 32
-        or not all(isinstance(c, str) and 0 < len(c) <= 64 for c in caps)
+        or not all(isinstance(c, str) and 0 < len(c) <= 64 and c.isprintable() for c in caps)
     ):
         raise DefinitionError(
-            "capabilities must be at most 32 non-empty strings of at most 64 chars"
+            "capabilities must be at most 32 non-empty printable strings of at most 64 chars"
         )
     out["capabilities"] = list(caps)
     out["description"] = _text(raw, "description", 1000)
@@ -332,7 +349,13 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
         raise DefinitionError("visibility must be 'personal' or 'general'")
     out["visibility"] = vis
     allowed = raw.get("allowed_accounts")
-    if allowed is not None and not _account_names(allowed):
+    if allowed is not None and not (
+        _account_names(allowed) and all(a.isprintable() for a in allowed)
+    ):
         raise DefinitionError("allowed_accounts must be a list of account names")
     out["allowed_accounts"] = None if allowed is None else list(allowed)
+    # The defaults add a few hundred bytes: what is stored and sent obeys the
+    # same limit as the input (the launcher re-checks the definition it gets).
+    if len(json.dumps(out).encode()) > DEFINITION_MAX_BYTES:
+        raise DefinitionError("definition must be at most 64 KiB of JSON (with its defaults)")
     return out

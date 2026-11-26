@@ -1,6 +1,7 @@
 """MachineStore: the persisted machine descriptor of each v2 launcher."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -293,3 +294,41 @@ async def test_definitions_scoped_by_owner_and_key(store: PersistenceStore) -> N
     # Forgetting the machine drops its definitions.
     await ms.forget_machine("acc_1", KEY)
     assert await ms.list_definitions("acc_1", KEY, include_deleted=True) == []
+
+
+async def test_revisions_never_repeat_after_purge(store: PersistenceStore) -> None:
+    ms = await _with_machine(store)
+    await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 1)
+    await ms.mark_deleted("acc_1", KEY, "obs", 2)
+    await ms.purge_definition("acc_1", KEY, "obs")
+    again = await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 3)
+    assert again.revision == 3 and again.applied_revision is None
+    # Forgetting the machine resets everything, the high-water mark included.
+    await ms.forget_machine("acc_1", KEY)
+    await ms.claim_machine("acc_1", "box", parse_hello_v2(V2, deploy_allowed=True), 4)
+    assert (await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 5)).revision == 1
+
+
+async def test_open_owner_definitions(store: PersistenceStore) -> None:
+    ms = MachineStore(store)
+    await ms.claim_machine(OPEN_OWNER, "box", parse_hello_v2(V2, deploy_allowed=True), 0)
+    await ms.claim_machine("acc_1", "box", parse_hello_v2(V2, deploy_allowed=True), 0)
+    await ms.put_definition(OPEN_OWNER, KEY, {"id": "obs"}, "queued", 1)
+    assert [d.def_id for d in await ms.list_definitions(OPEN_OWNER, KEY)] == ["obs"]
+    assert await ms.list_definitions("acc_1", KEY) == []
+    s = await ms.set_status(OPEN_OWNER, KEY, "obs", 1, "applied", [], [], 2)
+    assert s is not None and s.applied_revision == 1
+    assert (await ms.mark_deleted(OPEN_OWNER, KEY, "obs", 3)).deleted is True
+    await ms.purge_definition(OPEN_OWNER, KEY, "obs")
+    assert await ms.list_definitions(OPEN_OWNER, KEY, include_deleted=True) == []
+
+
+async def test_concurrent_puts_get_distinct_revisions(store: PersistenceStore) -> None:
+    ms = await _with_machine(store)
+    got = await asyncio.gather(
+        *(ms.put_definition("acc_1", KEY, {"id": "obs", "n": i}, "sent", i) for i in range(5))
+    )
+    assert sorted(d.revision for d in got) == [1, 2, 3, 4, 5]
+    final = await ms.get_definition("acc_1", KEY, "obs")
+    assert final.revision == 5
+    assert final.definition == next(d.definition for d in got if d.revision == 5)

@@ -310,7 +310,10 @@ class AccountStore:
         async with self._store._write_tx_lock:
             await conn.execute("BEGIN IMMEDIATE")
             try:
-                for table in ("agent_definitions", "launcher_machines", "accounts"):
+                for table in (
+                    "agent_definitions", "agent_definition_revisions",
+                    "launcher_machines", "accounts",
+                ):
                     await conn.execute(
                         f"DELETE FROM {table} WHERE account_id = ?", (account_id,)
                     )

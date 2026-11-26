@@ -37,6 +37,10 @@ _DEF_COLUMNS = (
     " warnings_json, deleted, updated_at"
 )
 _T = TypeVar("_T")
+# Everything stored per machine, deleted together when it is forgotten.
+_MACHINE_TABLES = (
+    "agent_definitions", "agent_definition_revisions", "launcher_machines",
+)
 
 
 class MachineLimitError(Exception):
@@ -233,7 +237,7 @@ class MachineStore:
             await conn.execute("BEGIN IMMEDIATE")
             try:
                 for key in stale:
-                    for table in ("agent_definitions", "launcher_machines"):
+                    for table in _MACHINE_TABLES:
                         await conn.execute(
                             f"DELETE FROM {table} WHERE account_id = ? AND launcher_key = ?",
                             (OPEN_OWNER, key),
@@ -268,8 +272,8 @@ class MachineStore:
         async with self._store._write_tx_lock:
             await conn.execute("BEGIN IMMEDIATE")
             try:
-                await conn.execute(f"DELETE FROM agent_definitions WHERE {where}", params)
-                await conn.execute(f"DELETE FROM launcher_machines WHERE {where}", params)
+                for table in _MACHINE_TABLES:
+                    await conn.execute(f"DELETE FROM {table} WHERE {where}", params)
                 await conn.execute("COMMIT")
             except BaseException:
                 await conn.execute("ROLLBACK")
@@ -317,9 +321,19 @@ class MachineStore:
         revision = previous + 1 (1 for a new one), ``deleted`` cleared,
         problems/warnings reset; ``applied_revision`` is kept."""
         def_id = str(definition["id"])
+        key = (account_id, launcher_key, def_id)
 
         async def put(conn: Any) -> StoredDefinition:
             prev = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            last = prev.revision if prev is not None else 0
+            if prev is None:  # purged before? continue its revisions
+                async with conn.execute(
+                    "SELECT revision FROM agent_definition_revisions"
+                    " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+                    key,
+                ) as cur:
+                    hwm = await cur.fetchone()
+                last = hwm[0] if hwm is not None else 0
             await conn.execute(
                 f"INSERT INTO agent_definitions ({_DEF_COLUMNS}, account_id, launcher_key)"
                 " VALUES (?, ?, ?, ?, ?, '[]', '[]', 0, ?, ?, ?)"
@@ -328,7 +342,7 @@ class MachineStore:
                 " state = excluded.state, problems_json = '[]', warnings_json = '[]',"
                 " deleted = 0, updated_at = excluded.updated_at",
                 (
-                    def_id, 1 if prev is None else prev.revision + 1, json.dumps(definition),
+                    def_id, last + 1, json.dumps(definition),
                     state, None, now_ms, account_id, launcher_key,
                 ),
             )
@@ -412,10 +426,25 @@ class MachineStore:
         return await self._in_tx(delete)
 
     async def purge_definition(self, account_id: str, launcher_key: str, def_id: str) -> None:
-        """Delete the definition's row (idempotent)."""
-        async with self._store._write_tx_lock:
-            await self._write().execute(
+        """Delete the definition's row (idempotent). Its revision is kept as a
+        high-water mark: a later put of the same id continues from it."""
+        key = (account_id, launcher_key, def_id)
+
+        async def purge(conn: Any) -> None:
+            prev = await self._fetch_def(conn, *key)
+            if prev is None:
+                return
+            await conn.execute(
+                "INSERT INTO agent_definition_revisions"
+                " (account_id, launcher_key, def_id, revision) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(account_id, launcher_key, def_id)"
+                " DO UPDATE SET revision = excluded.revision",
+                (*key, prev.revision),
+            )
+            await conn.execute(
                 "DELETE FROM agent_definitions"
                 " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
-                (account_id, launcher_key, def_id),
+                key,
             )
+
+        await self._in_tx(purge)

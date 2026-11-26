@@ -167,6 +167,16 @@ def test_rejects(bad: dict[str, Any], why: str) -> None:
     (_def(visibility="public"), "visibility"),
     (_def(allowed_accounts="bob"), "allowed_accounts"),
     (_def(run_as="Root!"), "run_as"),
+    # Fix round 1
+    (_def(limits={"max_cost_usd": 10**400}), "limits"),                 # OverflowError
+    (_def(limits={"max_duration_s": float("inf")}), "limits"),
+    (_def(access={"files": {"read": ["{..,x}/etc/*"]}}), "glob"),       # brace expansion
+    (_def(access={"files": {"deny": ["a{b,c}"]}}), "glob"),
+    (_def(access={"files": {"read": ["\\.\\./etc"]}}), "glob"),       # escaped dots
+    (_def(capabilities=["a\x00b"]), "capabilities"),
+    (_def(capabilities=["a\nb"]), "capabilities"),
+    (_def(access={"network": ["ok.com", "bad\x00host"]}), "network"),
+    (_def(allowed_accounts=["bob\n"]), "allowed_accounts"),
 ])
 def test_rejects_more(bad: Any, why: str) -> None:
     with pytest.raises(DefinitionError, match=why):
@@ -221,3 +231,24 @@ def test_total_size_limit() -> None:
 ])
 def test_inside(path: str, root: str, expected: bool) -> None:
     assert inside(path, root) is expected
+
+
+def test_observer_never_gets_privileged_commands() -> None:
+    with pytest.raises(DefinitionError, match="observer"):
+        validate_definition(
+            _def(run_as="deploy", access={"commands": {"mode": "list", "privileged": ["ls"]}}),
+            ROOT,
+        )
+
+
+def test_normalised_output_size_limit() -> None:
+    # A raw definition just under the limit whose defaults push it over.
+    raw = _def(observe={"sources": []})
+    base = len(json.dumps(raw).encode())
+    room = DEFINITION_MAX_BYTES - base - 50
+    n = 40
+    path_len = (room - 4 * n) // n  # each entry: quotes, comma, space
+    raw["observe"]["sources"] = ["/srv/app/" + "x" * (path_len - 9)] * n
+    assert len(json.dumps(raw).encode()) <= DEFINITION_MAX_BYTES
+    with pytest.raises(DefinitionError, match="64 KiB"):
+        validate_definition(raw, LOCAL)
