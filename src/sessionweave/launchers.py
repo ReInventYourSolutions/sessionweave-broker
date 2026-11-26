@@ -955,7 +955,10 @@ async def launcher_ws(websocket: WebSocket) -> None:
             else:
                 issued_secret = registry.claim_key(lnc, presented_secret)
         except LauncherKeyInUseError:
-            log.info("launcher key in use: refused a connection without its secret")
+            log.info(
+                "launcher key in use: refused a connection without its secret"
+                " (if its secret was lost, forget the machine in the Cockpit)"
+            )
             await websocket.close(code=_CLOSE_REPLACED, reason=KEY_IN_USE_REASON)
             return
         except MachineLimitError:
@@ -1005,6 +1008,14 @@ async def launcher_ws(websocket: WebSocket) -> None:
                     await close(code=_CLOSE_REPLACED, reason="replaced by a newer connection")
         for stop in stops:
             await websocket.send_json(stop)
+        # Converge its deployed definitions (index, removals, puts) before
+        # reading its frames.
+        try:
+            await deps.deploys.on_connected(lnc)
+        except (WebSocketDisconnect, RuntimeError):
+            raise
+        except Exception:
+            log.exception("could not send the launcher its definitions")
         pinger = asyncio.create_task(_ping_loop(websocket, auth.expires_at_ms))
         receiver = asyncio.create_task(_receive(websocket, launcher_id, deps))
         await asyncio.wait({pinger, receiver}, return_when=asyncio.FIRST_COMPLETED)
@@ -1023,6 +1034,7 @@ async def launcher_ws(websocket: WebSocket) -> None:
                 # dead socket is noticed) so it is never reported unretrieved.
                 await task
         registry.unregister(launcher_id)
+        deps.deploys.on_disconnected(launcher_id)
         if machines is not None and v2.launcher_key is not None:
             # last_seen = when it went offline (open-mode retention counts from it)
             with contextlib.suppress(Exception):
@@ -1032,8 +1044,8 @@ async def launcher_ws(websocket: WebSocket) -> None:
 
 
 async def _receive(websocket: WebSocket, launcher_id: str, deps: Any) -> None:
-    """Handle launcher frames (launch results, stops, profiles, prereqs)
-    until the socket closes."""
+    """Handle launcher frames (launch results, stops, profiles, prereqs,
+    definition statuses) until the socket closes."""
     launches: LaunchManager | None = deps.launches
     registry: LauncherRegistry = deps.launchers
     with contextlib.suppress(WebSocketDisconnect, RuntimeError):
@@ -1058,6 +1070,11 @@ async def _receive(websocket: WebSocket, launcher_id: str, deps: Any) -> None:
                     log.info("launcher %s: profiles rejected: %s", launcher_id, rejected)
             elif kind == "prereqs":
                 await _on_prereqs(registry, deps.machines, launcher_id, body.get("prereqs"))
+            elif kind == "definition_status":
+                try:
+                    await deps.deploys.on_status(launcher_id, body)
+                except Exception:
+                    log.exception("could not record a definition status")
             elif launches is None:
                 continue
             elif kind == "launch_result":

@@ -86,6 +86,7 @@ class ToolDeps:
         "admin_token",
         "auth_limiter",
         "bounds",
+        "deploys",
         "events",
         "launchers",
         "launches",
@@ -132,6 +133,9 @@ class ToolDeps:
         self.launchers = LauncherRegistry()
         self.launches = LaunchManager(self.launchers, self)
         self.launchers.launches = self.launches
+        from sessionweave.deploy import DeployManager
+        # Deployed agent definitions; its store is set with ``machines``.
+        self.deploys = DeployManager(self.launchers, None, self)
         registry.launch_hooks = self.launches
         self.session_creation: Literal["open", "account"] = "open"
         # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).

@@ -245,6 +245,12 @@ reaches the broker can register a launcher, advertise a convincing domain and ro
 receive tasks, launch credentials and session content. `SW_LAUNCHER_TOKEN` restricts
 **registration only**: anybody who can create a session can still launch any launcher's
 profiles, including ones that run shell commands on those machines.
+With a persistence DB, an open-mode broker also lets **any client** that reaches it,
+with no credential, list every machine, deploy agent definitions to launchers started with
+`--local` or `--root`, and forget an offline machine together with its definitions and its
+launcher key (`/v1/launchers…`; LAN-only trust). `SW_LAUNCHER_TOKEN` does not restrict
+these routes. In account mode only the launcher owner's account token can do this
+(`/v1/me/launchers…`).
 
 **Account mode** is the public setup (it is how `broker.sessionweave.com` runs).
 

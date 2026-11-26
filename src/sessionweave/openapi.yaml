@@ -515,6 +515,12 @@ components:
                 - launcher_not_found
                 - definition_not_found
                 - outside_ceiling
+                - definitions_unavailable
+                - launcher_capability_missing
+                - definition_in_use
+                - definition_id_conflict
+                - definition_limit
+                - launcher_online
             message:
               type: string
     Account:
@@ -1224,6 +1230,10 @@ paths:
         4429. Later frames `{"type":"profiles","profiles":[...]}` replace the
         published profiles and `{"type":"prereqs","prereqs":[...]}` the
         prerequisite report;
+        `{"type":"definition_status","id","revision","state":"applied"|"pending_in_use"|"rejected"|"removed","problems":[str],"warnings":[str]}`
+        reports a deployed definition (at most 20 texts of 300 printable chars
+        kept; a status for an older revision is ignored; `removed` confirms a
+        removal whatever its revision);
         then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?,"message"?}`
         (`message`: at most 300 printable characters, kept with the launch
         and sent in `agent.launch_failed`)
@@ -1233,6 +1243,14 @@ paths:
         Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}],"resume_secret","account","protocol":2,"key_secret"}`
         (`account`: the owner account's name, null in open mode),
         `{"type":"ping"}` every 20 s,
+        to a launcher with the `definitions` capability, right after `welcome`,
+        `{"type":"definitions_index","definitions":[{"id","revision"}]}` (the
+        definitions it must hold: it removes any other remote one), then
+        `{"type":"definition_delete","id","revision"}` for each removal not yet
+        confirmed (also sent for an id it may not hold: answer `removed`) and
+        `{"type":"definition_put","definition":{...,"revision"}}` for each
+        definition not applied at its revision (not one it rejected at that
+        revision); later puts and deletes as they are deployed,
         `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","coordinator_id","session_owner","broker_url"?}`
         (`coordinator_id`: who the agent reports its result to — the
         launching coordinator, else the session's coordinator, or null;

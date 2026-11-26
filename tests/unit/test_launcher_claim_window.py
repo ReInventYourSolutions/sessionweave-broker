@@ -15,6 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from sessionweave import launchers
 from sessionweave.access import AuthFailureLimiter
+from sessionweave.deploy import DeployManager
 from sessionweave.launchers import OPEN_OWNER, LauncherKeyInUseError, LauncherRegistry
 
 KEY = "lk_" + "ab" * 16
@@ -54,6 +55,8 @@ def _app(machines: Any) -> Starlette:
         session_creation="open", accounts=None, launchers=LauncherRegistry(),
         launches=None, auth_limiter=AuthFailureLimiter(), machines=machines,
     )
+    deps = app.state.tool_deps
+    deps.deploys = DeployManager(deps.launchers, None, deps)
     app.state.launcher_token = None
     return app
 

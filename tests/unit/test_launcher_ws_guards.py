@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from sessionweave import launchers
 from sessionweave.access import AuthFailureLimiter
+from sessionweave.deploy import DeployManager
 from sessionweave.launchers import LauncherRegistry
 
 
@@ -23,6 +24,8 @@ def _app(mode: str = "open", accounts: Any = None) -> Starlette:
         session_creation=mode, accounts=accounts, launchers=LauncherRegistry(),
         launches=None, auth_limiter=AuthFailureLimiter(), machines=None,
     )
+    deps = app.state.tool_deps
+    deps.deploys = DeployManager(deps.launchers, None, deps)
     app.state.launcher_token = None
     return app
 

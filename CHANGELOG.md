@@ -34,6 +34,31 @@ All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions
   a shell, command entries are plain command prefixes (no shell syntax). Deployed
   definitions are stored revisioned per machine with the launcher's last status. New
   error codes `definition_not_found` (404) and `outside_ceiling` (400).
+- **Deploying agent definitions.** `GET /v1/me/launchers` lists the caller account's
+  machines (online or not; keyless v1 launchers with `launcher_key: null`) with their
+  mode, ceiling, sandbox, prerequisites and agents (`status` `idle`, `in_session`,
+  `offline` or `not_deployed`, plus the `deploy` state). `GET /v1/me/launchers/{key}` adds
+  the stored definitions. `PUT /v1/me/launchers/{key}/definitions/{id}` validates and
+  stores a definition and sends it to the launcher (`state: sent`) or queues it while the
+  machine is offline (`queued`); `DELETE …/definitions/{id}` asks the launcher to remove
+  it (refused 409 `definition_in_use` while the agent runs in a session).
+  `DELETE /v1/me/launchers/{key}` forgets an offline machine with its definitions and its
+  key secret (the reset for a launcher that lost its `key_secret`). The relay admin token
+  cannot use these routes. Over the launcher socket the broker sends `definitions_index`
+  right after `welcome`, then `definition_delete` for unconfirmed removals and
+  `definition_put` for every definition not applied at its revision; the launcher answers
+  `definition_status` (`applied`, `pending_in_use`, `rejected`, `removed`). Account events
+  `definition.deployed`, `definition.applied`, `definition.rejected`,
+  `definition.removed`. New error codes `definitions_unavailable` (503),
+  `launcher_capability_missing`, `definition_in_use`, `definition_id_conflict`,
+  `definition_limit` and `launcher_online` (409).
+- **Open-mode deploy (LAN-only trust).** On an open-mode broker with a persistence DB the
+  same routes exist under `/v1/launchers` without any credential: any client that reaches
+  the broker may list every machine, deploy to launchers started with `--local` or
+  `--root`, and forget an offline machine (freeing its launcher key). In account mode they
+  answer 403; without a persistence DB the write routes answer 503 and the list shows live
+  launchers only. `GET /v1/info` → `capabilities.agent_definitions`, `open_deploy` and
+  `launcher_protocol: 2`.
 
 ## 0.35.1
 
