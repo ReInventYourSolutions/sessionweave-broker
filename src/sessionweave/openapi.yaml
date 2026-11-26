@@ -1207,7 +1207,13 @@ paths:
         in `config` mode and on an open-mode broker without a persistence DB),
         `"sandbox"`, `"run_as"` (root mode only), `"platform"` and `"prereqs"`
         (at most 32 `{name, state: ok|installed|missing|wrong_version|not_logged_in,
-        version, required, needed_by, command}`). A newer connection with the
+        version, required, needed_by, command}`) and `"key_secret"`. The first
+        registration of a launcher key (per owner) gets a secret in
+        `welcome.key_secret` (sent once, only its hash is kept; null on every
+        later welcome); a later hello with that key must present it as
+        `key_secret`, else it is closed 4409 `launcher_key_in_use` and nothing
+        is replaced or updated (reset a lost secret by deleting the machine).
+        With the secret, a newer connection with the
         same owner and launcher key replaces the old one (closed 4409); a new
         key over the machine limit (20 per account; 100 in open mode) closes
         4429. Later frames `{"type":"profiles","profiles":[...]}` replace the
@@ -1219,7 +1225,7 @@ paths:
         and `{"type":"stopped","launch_id","reason"}` (its own stop, e.g. a
         limit: the broker removes the participant — halt first — and sends the
         session event `agent.stopped {participant_id, launch_id, reason}`).
-        Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}],"resume_secret","account","protocol":2}`
+        Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}],"resume_secret","account","protocol":2,"key_secret"}`
         (`account`: the owner account's name, null in open mode),
         `{"type":"ping"}` every 20 s,
         `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","coordinator_id","session_owner","broker_url"?}`

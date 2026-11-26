@@ -12,12 +12,16 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from sessionweave.access import hash_token
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.launchers import (
     MAX_MACHINES_OPEN,
     MAX_MACHINES_PER_ACCOUNT,
     OPEN_OWNER,
     HelloV2,
+    LauncherKeyInUseError,
+    key_secret_matches,
+    new_key_secret,
 )
 from sessionweave.persistence import PersistenceStore
 
@@ -67,41 +71,69 @@ class MachineStore:
         return self._store._read_pool[0]
 
     async def upsert_machine(
-        self, account_id: str, machine: str, hello: HelloV2, now_ms: int
+        self, account_id: str, machine: str, hello: HelloV2, now_ms: int,
+        *, key_secret: str | None = None, token_id: str | None = None,
     ) -> Machine:
-        """Record (or refresh) the machine of a v2 hello; ``first_seen`` is
-        kept. Raises ``MachineLimitError`` for a new key over the owner's
-        limit (``MAX_MACHINES_OPEN`` for ``OPEN_OWNER``)."""
+        """``claim_machine`` without the issued secret (see there)."""
+        m, _issued = await self.claim_machine(
+            account_id, machine, hello, now_ms, key_secret=key_secret, token_id=token_id
+        )
+        return m
+
+    async def claim_machine(
+        self, account_id: str, machine: str, hello: HelloV2, now_ms: int,
+        *, key_secret: str | None = None, token_id: str | None = None,
+    ) -> tuple[Machine, str | None]:
+        """Record (or refresh) the machine of a v2 hello; ``first_seen`` is kept.
+
+        A new key gets a secret, returned once (only its sha256 is stored,
+        with ``token_id``, the account token that registered it). An existing
+        key is refreshed only when ``key_secret`` matches its stored hash,
+        else ``LauncherKeyInUseError`` and nothing changes (reset: forget the
+        machine). Raises ``MachineLimitError`` for a new key over the owner's
+        limit (``MAX_MACHINES_OPEN`` for ``OPEN_OWNER``).
+        """
         key = hello.launcher_key
         if key is None:
             raise ValueError("a machine needs a launcher_key")
         limit = MAX_MACHINES_OPEN if account_id == OPEN_OWNER else MAX_MACHINES_PER_ACCOUNT
         conn = self._write()
+        issued: str | None = None
         async with self._store._write_tx_lock:
             await conn.execute("BEGIN IMMEDIATE")
             try:
                 async with conn.execute(
-                    "SELECT launcher_key = ? FROM launcher_machines WHERE account_id = ?",
-                    (key, account_id),
+                    "SELECT launcher_key, key_secret_hash FROM launcher_machines"
+                    " WHERE account_id = ?",
+                    (account_id,),
                 ) as cur:
-                    rows = [r[0] async for r in cur]
-                if not any(rows) and len(rows) >= limit:
-                    raise MachineLimitError(f"at most {limit} machines")
+                    rows = {r[0]: r[1] async for r in cur}
+                if rows.get(key):
+                    if not key_secret_matches(key_secret, rows[key]):
+                        raise LauncherKeyInUseError("launcher_key_in_use")
+                    secret_hash = rows[key]
+                else:
+                    if key not in rows and len(rows) >= limit:
+                        raise MachineLimitError(f"at most {limit} machines")
+                    issued = new_key_secret()
+                    secret_hash = hash_token(issued)
                 await conn.execute(
-                    f"INSERT INTO launcher_machines ({_COLUMNS})"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    f"INSERT INTO launcher_machines ({_COLUMNS}, key_secret_hash, token_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(account_id, launcher_key) DO UPDATE SET"
                     " machine = excluded.machine, mode = excluded.mode,"
                     " ceiling = excluded.ceiling,"
                     " capabilities_json = excluded.capabilities_json,"
                     " sandbox = excluded.sandbox, run_as = excluded.run_as,"
                     " platform = excluded.platform, prereqs_json = excluded.prereqs_json,"
-                    " last_seen = excluded.last_seen",
+                    " last_seen = excluded.last_seen,"
+                    " key_secret_hash = excluded.key_secret_hash,"
+                    " token_id = COALESCE(launcher_machines.token_id, excluded.token_id)",
                     (
                         account_id, key, machine, hello.mode, hello.ceiling,
                         json.dumps(sorted(hello.capabilities)), hello.sandbox,
                         int(hello.run_as), hello.platform, json.dumps(list(hello.prereqs)),
-                        now_ms, now_ms,
+                        now_ms, now_ms, secret_hash, token_id,
                     ),
                 )
                 async with conn.execute(
@@ -115,7 +147,7 @@ class MachineStore:
                 await conn.execute("ROLLBACK")
                 raise
         assert row is not None
-        return _row(row)
+        return _row(row), issued
 
     async def set_prereqs(
         self, account_id: str, launcher_key: str, prereqs: list[dict[str, Any]]

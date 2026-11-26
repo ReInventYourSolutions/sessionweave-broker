@@ -348,3 +348,31 @@ def test_prereqs_accept_not_logged_in_and_optional_runtimes() -> None:
                 "required": False, "needed_by": [], "command": None}
     v2 = parse_hello_v2({**V2, "prereqs": [claude, opencode]}, deploy_allowed=True)
     assert v2.prereqs == (claude, opencode)
+
+
+def test_claim_key_without_db() -> None:
+    from sessionweave.launchers import LauncherKeyInUseError
+
+    reg = LauncherRegistry()
+    a, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    secret = reg.claim_key(a, None)
+    assert secret is not None
+    b, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    for bad in (None, "lks_wrong"):
+        with pytest.raises(LauncherKeyInUseError):
+            reg.claim_key(b, bad)
+    assert reg.claim_key(b, secret) is None  # holder's secret: claim ok, no new secret
+    # nobody holds the key any more: a new secret
+    reg.unregister(a)
+    reg.unregister(b)
+    c, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    assert reg.claim_key(c, None) not in (None, secret)
+
+
+@pytest.mark.parametrize("bad", ["", 3, "x" * 201])
+def test_hello_key_secret_validated(bad: Any) -> None:
+    from sessionweave.launchers import hello_key_secret
+
+    with pytest.raises(HelloError):
+        hello_key_secret({"key_secret": bad})
+    assert hello_key_secret({}) is None

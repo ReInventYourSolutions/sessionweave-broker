@@ -392,7 +392,10 @@ async def test_v2_welcome_and_same_key_replaces_old_connection(tmp_path: Path) -
     async with seeded_relay(tmp_path, mode="account") as s:
         ws1, w1 = await _connect(s.base, s.token, _hello([_prof()], **V2))
         assert w1["type"] == "welcome" and w1["protocol"] == 2
-        ws2, w2 = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        assert isinstance(w1["key_secret"], str)
+        ws2, w2 = await _connect(s.base, s.token, _hello(
+            [_prof()], **V2, key_secret=w1["key_secret"]))
+        assert w2["key_secret"] is None
         async with ws2:
             code, reason = await _closed_by_broker(ws1)
             assert code == 4409 and reason == "replaced by a newer connection"
@@ -406,6 +409,7 @@ async def test_v2_welcome_and_same_key_replaces_old_connection(tmp_path: Path) -
         ws3, w3 = await _connect(s.base, s.token, _hello([_prof()]))
         async with ws3:
             assert w3["type"] == "welcome" and w3["protocol"] == 2
+            assert w3["key_secret"] is None
 
 
 async def test_v2_bad_hello_closes_4400() -> None:
@@ -454,10 +458,12 @@ async def test_open_mode_v2_launcher_recorded_under_open_owner(
 
 async def test_too_many_machines_closes_4429(tmp_path: Path) -> None:
     async with seeded_relay(tmp_path, mode="account") as s:
+        secrets_by_key: dict[str, str] = {}
         for i in range(20):
             ws, w = await _connect(s.base, s.token, _hello(
                 [_prof()], **{**V2, "launcher_key": f"lk_{i:032x}"}))
             assert w["type"] == "welcome", w
+            secrets_by_key[f"lk_{i:032x}"] = w["key_secret"]
             await ws.close()
         ws = await websockets.connect(
             _ws(s.base), additional_headers={"Authorization": f"Bearer {s.token}"})
@@ -466,7 +472,8 @@ async def test_too_many_machines_closes_4429(tmp_path: Path) -> None:
         assert code == 4429 and reason == "too many machines; forget one in the Cockpit"
         # a known key still connects; another account is not affected
         ws, w = await _connect(s.base, s.token, _hello(
-            [_prof()], **{**V2, "launcher_key": f"lk_{0:032x}"}))
+            [_prof()], **{**V2, "launcher_key": f"lk_{0:032x}"},
+            key_secret=secrets_by_key[f"lk_{0:032x}"]))
         async with ws:
             assert w["type"] == "welcome"
         ws, w = await _connect(s.base, s.other_token, _hello([_prof()], **V2))
@@ -514,3 +521,83 @@ async def test_profiles_frame_updates_discovery() -> None:
             item = r.json()["agents"][0]
             assert (item["source"], item["kind"], item["coordinator_capable"]) == (
                 "remote", "observer", False)
+
+
+async def _assert_key_in_use(base: str, token: str | None, hello: str) -> None:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    ws = await websockets.connect(_ws(base), additional_headers=headers)
+    await ws.send(hello)
+    code, reason = await _closed_by_broker(ws)
+    assert (code, reason) == (4409, "launcher_key_in_use")
+
+
+async def _still_open(ws: Any) -> None:
+    await ws.send(json.dumps({"type": "pong"}))
+    await ws.ping()
+
+
+async def test_key_secret_required_to_replace_account_mode(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        db = str(tmp_path / "acc-account.db")
+        ws1, w1 = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        secret = w1["key_secret"]
+        assert isinstance(secret, str) and secret.startswith("lks_")
+        before = _machine_rows(db, s.acc.account_id)
+        assert before[0]["token_id"] is not None
+        assert bytes(before[0]["key_secret_hash"]) != secret.encode()
+        # another token of the same account, without / with a wrong secret: refused
+        minted = await _mint(c, s.acc.account_id)
+        for kw in ({}, {"key_secret": "lks_wrong"}):
+            await _assert_key_in_use(s.base, minted["token"], _hello(
+                [_prof("evil")], **{**V2, "mode": "root", "ceiling": "/"}, **kw))
+        await _still_open(ws1)
+        assert _machine_rows(db, s.acc.account_id) == before
+        sess = await _session(c, s.token)
+        r = await c.get("/v1/agents", params={"session_id": sess["session_id"],
+                                              "domain": "backend"}, headers=bearer(s.token))
+        assert [a["launcher_id"] for a in r.json()["agents"]] == [w1["launcher_id"]]
+        # with the secret: replaces the old connection
+        ws2, w2 = await _connect(s.base, minted["token"], _hello(
+            [_prof()], **V2, key_secret=secret))
+        async with ws2:
+            assert w2["type"] == "welcome" and w2["key_secret"] is None
+            code, _ = await _closed_by_broker(ws1)
+            assert code == 4409
+        # offline machine: the secret is still required
+        await _assert_key_in_use(s.base, s.token, _hello([_prof()], **V2))
+
+
+async def test_key_secret_required_to_replace_open_mode_without_db() -> None:
+    async with relay_subprocess() as base:
+        ws1, w1 = await _connect(base, None, _hello([_prof()], **V2))
+        secret = w1["key_secret"]
+        assert isinstance(secret, str)
+        for kw in ({}, {"key_secret": "lks_wrong"}):
+            await _assert_key_in_use(base, None, _hello([_prof()], **V2, **kw))
+        await _still_open(ws1)
+        ws2, w2 = await _connect(base, None, _hello([_prof()], **V2, key_secret=secret))
+        async with ws2:
+            assert w2["type"] == "welcome"
+            code, _ = await _closed_by_broker(ws1)
+            assert code == 4409
+
+
+async def test_key_secret_required_open_mode_with_db(tmp_path: Path) -> None:
+    db = str(tmp_path / "open.db")
+    async with relay_subprocess(persistence_db_path=db) as base:
+        ws1, w1 = await _connect(base, None, _hello([_prof()], **V2))
+        secret = w1["key_secret"]
+        assert isinstance(secret, str)
+        before = _machine_rows(db, "")
+        await _assert_key_in_use(base, None, _hello(
+            [_prof()], **{**V2, "ceiling": "/etc"}))
+        await _still_open(ws1)
+        assert _machine_rows(db, "") == before
+        await ws1.close()
+    # the key survives a broker restart: still claimed
+    async with relay_subprocess(persistence_db_path=db) as base:
+        await _assert_key_in_use(base, None, _hello([_prof()], **V2))
+        ws, w = await _connect(base, None, _hello([_prof()], **V2, key_secret=secret))
+        async with ws:
+            assert w["type"] == "welcome" and w["key_secret"] is None

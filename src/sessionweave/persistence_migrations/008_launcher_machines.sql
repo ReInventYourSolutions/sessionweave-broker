@@ -1,5 +1,8 @@
 -- Machines: the descriptor of each v2 launcher (stable launcher_key), per
--- owner account; account_id '' is the open-mode owner key.
+-- owner account; account_id '' is the open-mode owner key. key_secret_hash is
+-- the sha256 of the secret issued on the key's first registration: a later
+-- connection with the key must present that secret. token_id: the account
+-- token that first registered the key (account mode).
 CREATE TABLE launcher_machines (
     account_id         TEXT NOT NULL,
     launcher_key       TEXT NOT NULL,
@@ -13,6 +16,8 @@ CREATE TABLE launcher_machines (
     prereqs_json       TEXT NOT NULL DEFAULT '[]',
     first_seen         INTEGER NOT NULL,
     last_seen          INTEGER NOT NULL,
+    key_secret_hash    BLOB,
+    token_id           TEXT,
     PRIMARY KEY (account_id, launcher_key)
 ) STRICT;
 

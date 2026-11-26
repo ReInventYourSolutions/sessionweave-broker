@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -104,6 +105,36 @@ class HelloError(ValueError):
 
 class LauncherLimitError(Exception):
     """Too many launchers connected for this owner (or in all)."""
+
+
+class LauncherKeyInUseError(Exception):
+    """A launcher key is already claimed and the hello did not present its
+    ``key_secret``."""
+
+
+# Close reason when a hello reuses a claimed launcher key without its secret.
+KEY_IN_USE_REASON = "launcher_key_in_use"
+_MAX_KEY_SECRET = 200
+
+
+def new_key_secret() -> str:
+    """A fresh per-key secret (sent once in ``welcome``; only its hash is kept)."""
+    return "lks_" + secrets.token_urlsafe(32)
+
+
+def key_secret_matches(presented: str | None, stored_hash: bytes | None) -> bool:
+    """Constant-time check of a presented ``key_secret`` against a stored hash."""
+    if presented is None or not stored_hash:
+        return False
+    return hmac.compare_digest(hash_token(presented), stored_hash)
+
+
+def hello_key_secret(hello: dict[str, Any]) -> str | None:
+    """The ``key_secret`` of a hello (None when absent); raises HelloError."""
+    v = hello.get("key_secret")
+    if v is not None and (not isinstance(v, str) or not 0 < len(v) <= _MAX_KEY_SECRET):
+        raise HelloError("key_secret must be a non-empty string")
+    return v
 
 
 @dataclass(frozen=True)
@@ -361,6 +392,8 @@ class _Launcher:
     expires_at_ms: int | None = None
     # Protocol v2 fields of its hello (LEGACY_HELLO for a v1 launcher).
     v2: HelloV2 = LEGACY_HELLO
+    # sha256 of its launcher key's secret (used without a persistence DB).
+    key_hash: bytes = b""
 
 
 def owner_key(lnc: _Launcher) -> str:
@@ -496,6 +529,31 @@ class LauncherRegistry:
                      f"profiles must be a list of at most {_MAX_PROFILES} entries"}]
         lnc.profiles, rejected = _load_profiles(raw)
         return rejected
+
+    def claim_key(self, launcher_id: str, presented: str | None) -> str | None:
+        """Claim the launcher key of ``launcher_id`` without a persistence DB.
+
+        While another connection of the same owner holds the key, the hello
+        must present that connection's ``key_secret`` (else
+        ``LauncherKeyInUseError``, nothing changed); the secret is kept and
+        None returned. A key nobody holds gets a new secret, returned so it
+        is sent in ``welcome`` (only its hash is kept).
+        """
+        lnc = self._launchers[launcher_id]
+        key, owner = lnc.v2.launcher_key, owner_key(lnc)
+        holders = [
+            o for o in self._launchers.values()
+            if o.launcher_id != launcher_id and o.v2.launcher_key == key
+            and owner_key(o) == owner
+        ]
+        if holders:
+            if not all(key_secret_matches(presented, o.key_hash) for o in holders):
+                raise LauncherKeyInUseError(KEY_IN_USE_REASON)
+            lnc.key_hash = holders[0].key_hash
+            return None
+        secret = new_key_secret()
+        lnc.key_hash = hash_token(secret)
+        return secret
 
     def set_prereqs(self, launcher_id: str, prereqs: tuple[dict[str, Any], ...]) -> None:
         lnc = self._launchers.get(launcher_id)
@@ -804,6 +862,7 @@ async def launcher_ws(websocket: WebSocket) -> None:
         v2 = parse_hello_v2(
             hello, deploy_allowed=owner_account_id is not None or machines is not None
         )
+        presented_secret = hello_key_secret(hello)
         # Lets this launcher reclaim its running agents after a reconnect;
         # only its hash is kept, and it is never logged.
         resume_secret = secrets.token_urlsafe(32)
@@ -824,11 +883,26 @@ async def launcher_ws(websocket: WebSocket) -> None:
     lnc = registry.get(launcher_id)
     assert lnc is not None
     owner = owner_key(lnc)
-    if machines is not None and v2.launcher_key is not None:
+    # Proof of possession of the launcher key: its first registration gets a
+    # secret (sent once in welcome); a later hello with the key must present
+    # it, else nothing is replaced or updated. Never logged.
+    issued_secret: str | None = None
+    if v2.launcher_key is not None:
         from sessionweave.machines import MachineLimitError
 
         try:
-            await machines.upsert_machine(owner, lnc.machine, v2, int(time.time() * 1000))
+            if machines is not None:
+                _machine, issued_secret = await machines.claim_machine(
+                    owner, lnc.machine, v2, int(time.time() * 1000),
+                    key_secret=presented_secret, token_id=token_id,
+                )
+            else:
+                issued_secret = registry.claim_key(launcher_id, presented_secret)
+        except LauncherKeyInUseError:
+            registry.unregister(launcher_id)
+            log.info("launcher key in use: refused a connection without its secret")
+            await websocket.close(code=_CLOSE_REPLACED, reason=KEY_IN_USE_REASON)
+            return
         except MachineLimitError:
             registry.unregister(launcher_id)
             await websocket.close(
@@ -865,7 +939,7 @@ async def launcher_ws(websocket: WebSocket) -> None:
         await websocket.send_json(
             {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
              "resume_secret": resume_secret, "account": auth.owner_name,
-             "protocol": PROTOCOL_VERSION}
+             "protocol": PROTOCOL_VERSION, "key_secret": issued_secret}
         )
         for stop in stops:
             await websocket.send_json(stop)

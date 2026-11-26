@@ -14,6 +14,7 @@ from sessionweave.launchers import (
     MAX_MACHINES_OPEN,
     MAX_MACHINES_PER_ACCOUNT,
     OPEN_OWNER,
+    LauncherKeyInUseError,
     parse_hello_v2,
 )
 from sessionweave.machines import Machine, MachineLimitError, MachineStore
@@ -41,10 +42,13 @@ def _key(i: int) -> str:
 
 async def test_upsert_list_forget(store: PersistenceStore) -> None:
     ms = MachineStore(store)
-    m = await ms.upsert_machine("acc_1", "box", parse_hello_v2(V2, deploy_allowed=True), 1000)
+    m, secret = await ms.claim_machine(
+        "acc_1", "box", parse_hello_v2(V2, deploy_allowed=True), 1000)
+    assert secret is not None
     assert (m.first_seen, m.last_seen, m.mode) == (1000, 1000, "local")
     assert m.capabilities == ["browse", "definitions", "processes"]
-    m = await ms.upsert_machine("acc_1", "box2", parse_hello_v2(V2, deploy_allowed=True), 2000)
+    m = await ms.upsert_machine(
+        "acc_1", "box2", parse_hello_v2(V2, deploy_allowed=True), 2000, key_secret=secret)
     assert (m.first_seen, m.last_seen, m.machine) == (1000, 2000, "box2")
     assert [x.launcher_key for x in await ms.list_machines("acc_1")] == [KEY]
     assert await ms.list_machines("acc_2") == []
@@ -96,9 +100,11 @@ async def test_machine_limit(store: PersistenceStore) -> None:
         await ms.upsert_machine(
             "acc_1", "m",
             parse_hello_v2({**V2, "launcher_key": "lk_" + "f" * 32}, deploy_allowed=True), 1)
-    # an existing key is still updated; another account is not affected
-    await ms.upsert_machine(
-        "acc_1", "m2", parse_hello_v2({**V2, "launcher_key": _key(0)}, deploy_allowed=True), 2)
+    # an existing key is still checked (not counted); another account is not affected
+    with pytest.raises(LauncherKeyInUseError):
+        await ms.upsert_machine(
+            "acc_1", "m2",
+            parse_hello_v2({**V2, "launcher_key": _key(0)}, deploy_allowed=True), 2)
     await ms.upsert_machine("acc_2", "m", parse_hello_v2(V2, deploy_allowed=True), 1)
 
 
@@ -158,3 +164,42 @@ async def test_account_delete_drops_machines_and_definitions(store: PersistenceS
     await accounts.delete(acc.account_id)
     assert await ms.list_machines(acc.account_id) == []
     assert await _definition_rows(store, acc.account_id) == 0
+
+
+async def _secret_row(store: PersistenceStore, account_id: str) -> tuple[Any, Any]:
+    async with store._read_pool[0].execute(
+        "SELECT key_secret_hash, token_id FROM launcher_machines WHERE account_id = ?",
+        (account_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    return row[0], row[1]
+
+
+async def test_key_secret_issued_once_and_required(store: PersistenceStore) -> None:
+    from sessionweave.access import hash_token
+
+    ms = MachineStore(store)
+    hello = parse_hello_v2(V2, deploy_allowed=True)
+    _m, secret = await ms.claim_machine("acc_1", "box", hello, 1, token_id="tok_1")
+    assert secret is not None and secret.startswith("lks_")
+    stored, token_id = await _secret_row(store, "acc_1")
+    assert stored == hash_token(secret) and token_id == "tok_1"  # only the hash is kept
+    # the right secret refreshes without a new one; the token that registered it stays
+    m, again = await ms.claim_machine(
+        "acc_1", "box2", hello, 2, key_secret=secret, token_id="tok_2")
+    assert again is None and m.machine == "box2"
+    assert await _secret_row(store, "acc_1") == (hash_token(secret), "tok_1")
+    # without or with a wrong secret: refused, row untouched
+    for bad in (None, "lks_wrong", secret + "x"):
+        with pytest.raises(LauncherKeyInUseError):
+            await ms.claim_machine("acc_1", "evil", hello, 3, key_secret=bad)
+    m = await ms.get_machine("acc_1", KEY)
+    assert (m.machine, m.last_seen) == ("box2", 2)
+    # the key is per owner: another owner registering it gets its own secret
+    _m, other = await ms.claim_machine(OPEN_OWNER, "box", hello, 1)
+    assert other is not None and other != secret
+    # reset path: forgetting the machine lets the key be registered afresh
+    await ms.forget_machine("acc_1", KEY)
+    _m, fresh = await ms.claim_machine("acc_1", "box", hello, 4)
+    assert fresh is not None and fresh != secret
