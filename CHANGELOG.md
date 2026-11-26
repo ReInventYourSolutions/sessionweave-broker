@@ -17,7 +17,8 @@ lists are relayed, never stored.
   open mode with a persistence DB: `/v1/launchers/{key}/…` without a credential) relay a
   `browse` / `processes` request over the launcher socket and return the launcher's
   `browse_result` / `processes_result` after checking it (entries at most the requested
-  limit, names at most 255 characters without `/` or NUL, known kinds). `path` defaults to
+  limit, names of 1–255 characters, not `.` or `..`, without `/` or NUL, known kinds; process
+  command lines at most 400 characters; `limit` digits only). `path` defaults to
   the machine's ceiling; `limit` defaults to 100 and is capped at 300 (browse) and 200
   (processes). The launcher's refusals map to `outside_ceiling` (400), `path_not_found`
   (404), `invalid_request` (400) and `permission_denied` (403). New error codes

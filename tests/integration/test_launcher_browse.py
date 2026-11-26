@@ -93,6 +93,8 @@ async def test_browse_relayed_to_owner_launcher(tmp_path: Path) -> None:
                 # query validation never reaches the launcher
                 for bad in ({"path": "relative"}, {"path": "/" + "x" * 4096},
                             {"path": "/a\x00b"}, {"limit": "0"}, {"limit": "x"},
+                            {"limit": "1_000"}, {"limit": " 5"}, {"limit": "+5"},
+                            {"limit": "5 "}, {"limit": "-1"}, {"limit": "\u0665"},
                             {"cursor": "c" * 513}, {"hidden": "yes"}):
                     r = await c.get(url, headers=bearer(s.token), params=bad)
                     assert r.status_code == 400 and _code(r) == "invalid_request", bad
@@ -109,6 +111,7 @@ async def test_browse_reply_is_validated(tmp_path: Path) -> None:
             for entries in ([{"name": "a/b", "kind": "dir"}], [{"name": "", "kind": "dir"}],
                             [{"name": "x" * 256, "kind": "file"}],
                             [{"name": "a", "kind": "socket"}],
+                            [{"name": ".", "kind": "dir"}], [{"name": "..", "kind": "dir"}],
                             [{"name": "a", "kind": "file", "size": -1}],
                             [{"name": str(i), "kind": "file"} for i in range(3)]):
                 async with _answering(ws, _ok_browse(entries)):
@@ -207,10 +210,18 @@ async def test_processes_relayed_and_limit_capped(tmp_path: Path) -> None:
                 assert seen[0]["type"] == "processes"
                 assert {k: seen[0][k] for k in ("limit", "query", "cursor")} == {
                     "limit": 200, "query": "nginx", "cursor": 7}
-                for bad in ({"q": "x" * 101}, {"cursor": "abc"}, {"cursor": "-1"}):
+                for bad in ({"q": "x" * 101}, {"cursor": "abc"}, {"cursor": "-1"},
+                            {"limit": "1_000"}, {"limit": "+5"}):
                     r = await c.get(url, headers=bearer(s.token), params=bad)
                     assert r.status_code == 400 and _code(r) == "invalid_request", bad
                 assert len(seen) == 1
+            # command lines are at most 400 characters (the Runner's CMDLINE_MAX)
+            for cmdline, status in (("c" * 400, 200), ("c" * 401, 502)):
+                procs[0]["cmdline"] = cmdline
+                async with _answering(ws, answer):
+                    r = await c.get(f"/v1/me/launchers/{KEY}/processes",
+                                    headers=bearer(s.token))
+                    assert r.status_code == status, (len(cmdline), r.text)
             # a browse_result does not answer a processes request
             async with _answering(ws, _fail("not_found", kind="processes_result")):
                 r = await c.get(f"/v1/me/launchers/{KEY}/processes", headers=bearer(s.token))

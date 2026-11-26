@@ -674,7 +674,7 @@ components:
         ppid: { type: integer, nullable: true }
         user: { type: string, nullable: true }
         name: { type: string }
-        cmdline: { type: string, nullable: true, description: Redacted on the machine before it is sent }
+        cmdline: { type: string, nullable: true, maxLength: 400, description: Redacted on the machine before it is sent }
         started_at: { type: number, nullable: true, description: Unix epoch seconds }
     ProcessesResult:
       type: object
@@ -1568,7 +1568,7 @@ paths:
       parameters:
         - { name: path, in: query, schema: { type: string, maxLength: 4096 }, description: "Absolute path; default: the machine's ceiling" }
         - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 300 are capped to 300" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Digits only; values over 300 are capped to 300" }
         - { name: hidden, in: query, schema: { type: string, enum: ['0', '1'], default: '0' }, description: Include dot files }
       responses:
         '200':
@@ -1598,7 +1598,7 @@ paths:
       parameters:
         - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: Filter }
         - { name: cursor, in: query, schema: { type: string, pattern: "^[0-9]{1,10}$" }, description: "The previous page's next_cursor (the last pid)" }
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 200 are capped to 200" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Digits only; values over 200 are capped to 200" }
       responses:
         '200':
           description: One page of processes
@@ -1631,7 +1631,6 @@ paths:
                 properties:
                   launchers: { type: array, items: { $ref: '#/components/schemas/Machine' } }
         '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/launchers/{key}:
     parameters:
@@ -1724,7 +1723,7 @@ paths:
       parameters:
         - { name: path, in: query, schema: { type: string, maxLength: 4096 }, description: "Absolute path; default: the machine's ceiling" }
         - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 300 are capped to 300" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Digits only; values over 300 are capped to 300" }
         - { name: hidden, in: query, schema: { type: string, enum: ['0', '1'], default: '0' }, description: Include dot files }
       responses:
         '200':
@@ -1753,7 +1752,7 @@ paths:
       parameters:
         - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: Filter }
         - { name: cursor, in: query, schema: { type: string, pattern: "^[0-9]{1,10}$" }, description: "The previous page's next_cursor (the last pid)" }
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 200 are capped to 200" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Digits only; values over 200 are capped to 200" }
       responses:
         '200':
           description: One page of processes

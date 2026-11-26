@@ -49,7 +49,9 @@ _MAX_NAME = 255
 _ENTRY_KINDS = frozenset({"dir", "file", "symlink", "other"})
 _MAX_USER = 64
 _MAX_PROC_NAME = 255
-_MAX_CMDLINE = 4096
+# The Runner truncates redacted command lines to CMDLINE_MAX = 400.
+_MAX_CMDLINE = 400
+_LIMIT_RE = re.compile(r"^[0-9]{1,9}$")
 # A process-list cursor is the last pid returned (sent to the launcher as an int).
 _PID_CURSOR_RE = re.compile(r"^[0-9]{1,10}$")
 # A launcher's ``ok: false`` error -> what the client gets.
@@ -164,10 +166,10 @@ def _query_limit(request: Request, maximum: int) -> int:
     raw = request.query_params.get("limit")
     if raw is None or raw == "":
         return min(DEFAULT_PAGE_LIMIT, maximum)
-    try:
-        value = int(raw)
-    except ValueError:
-        raise _bad("limit must be an integer") from None
+    # Digits only: int() would also take "1_000", " 5", "+5" and non-ASCII digits.
+    if not _LIMIT_RE.fullmatch(raw):
+        raise _bad("limit must be a positive integer")
+    value = int(raw)
     if value < 1:
         raise _bad("limit must be at least 1")
     return min(value, maximum)
@@ -226,7 +228,8 @@ def _entry(raw: Any) -> dict[str, Any]:
         raise _bad_reply("entry")
     name, kind = raw.get("name"), raw.get("kind")
     if (not isinstance(name, str) or not 1 <= len(name) <= _MAX_NAME
-            or "/" in name or "\x00" in name or kind not in _ENTRY_KINDS):
+            or name in (".", "..") or "/" in name or "\x00" in name
+            or kind not in _ENTRY_KINDS):
         raise _bad_reply("entry")
     out: dict[str, Any] = {"name": name, "kind": kind}
     for opt in ("size", "mtime"):

@@ -986,14 +986,15 @@ curl -s -H "Authorization: Bearer $ACCOUNT_TOKEN" \
 
 - `browse` query: `path` (absolute, at most 4096 characters; default: the machine's
   ceiling, `/` in root mode), `cursor` (the previous page's `next_cursor`, at most 512),
-  `limit` (default 100, at most 300: larger values are capped), `hidden` (`0` or `1`:
-  include dot files). Entry `kind` is `dir`, `file`, `symlink` or `other`; `inside` says
+  `limit` (digits only, default 100, at most 300: larger values are capped), `hidden` (`0` or `1`:
+  include dot files). Entry names are 1–255 characters, never `.`, `..` or containing
+  `/`; `kind` is `dir`, `file`, `symlink` or `other`; `inside` says
   whether a symlink stays inside the ceiling. The launcher never lists or follows
   anything outside its ceiling.
-- `processes` query: `q` (a filter, at most 100 characters), `cursor` (the previous page's `next_cursor`: the last pid, digits), `limit` (default
-  100, at most 200, capped). A `--local` launcher lists only its own user's processes, a
+- `processes` query: `q` (a filter, at most 100 characters), `cursor` (the previous page's `next_cursor`: the last pid, digits), `limit` (digits
+  only, default 100, at most 200, capped). A `--local` launcher lists only its own user's processes, a
   `--root` launcher all of them; command lines are redacted on the machine before they
-  are sent.
+  are sent and are at most 400 characters.
 - The machine needs the `browse` / `processes` capability (409
   `launcher_capability_missing`) and must be connected (409 `launcher_offline`). The broker
   waits `SW_LAUNCHER_RELAY_TIMEOUT_S` (default 10 s) for the answer (504
