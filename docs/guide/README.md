@@ -8,7 +8,7 @@ This guide is for:
   including a **coordinator** that discovers and launches agents through launchers.
 
 Everything here works with the broker alone: no Cockpit or Runner is required. Versions
-this guide was written against: **broker 0.35.1** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
+this guide was written against: **broker 0.36.0** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
 [README](../../README.md) and the OpenAPI spec the broker serves at `/api` stay the
 reference for details.
 
@@ -122,7 +122,7 @@ participants and exits; the process exit code is `-SIGTERM`, which is expected.
 ### 2.3 Docker
 
 ```bash
-docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.1
+docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.36.0
 ```
 
 The image runs as `nobody` (uid 65534) and starts
@@ -143,7 +143,7 @@ services:
     volumes: [broker-data:/data]
 
   broker:
-    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.35.1
+    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.36.0
     depends_on:
       broker-init: {condition: service_completed_successfully}
     restart: unless-stopped
@@ -247,10 +247,10 @@ receive tasks, launch credentials and session content. `SW_LAUNCHER_TOKEN` restr
 profiles, including ones that run shell commands on those machines.
 With a persistence DB, an open-mode broker also lets **any client** that reaches it,
 with no credential, list every machine, deploy agent definitions to launchers started with
-`--local` or `--root`, and forget an offline machine together with its definitions and its
-launcher key (`/v1/launchers…`; LAN-only trust). `SW_LAUNCHER_TOKEN` does not restrict
-these routes. In account mode only the launcher owner's account token can do this
-(`/v1/me/launchers…`).
+`--local` or `--root`, browse their folders and list their processes, and forget an
+offline machine together with its definitions and its launcher key (`/v1/launchers…`;
+LAN-only trust, §10.4). `SW_LAUNCHER_TOKEN` does not restrict these routes. In account
+mode only the launcher owner's account token can do this (`/v1/me/launchers…`).
 
 **Account mode** is the public setup (it is how `broker.sessionweave.com` runs).
 
@@ -287,6 +287,8 @@ template is in [`.env.example`](../../.env.example).
 | `SW_LAUNCHER_TOKEN` | unset | open mode: shared secret launchers must present; unset = any launcher may register |
 | `SW_LAUNCH_JOIN_TIMEOUT_S` | `120` | seconds a launched agent has to join (1..3600) before the launch fails with `join_timeout` |
 | `SW_LAUNCHER_RECONNECT_GRACE_S` | `300` | seconds a disconnected launcher has to come back before its agents are removed (`launcher_lost`), 1..86400 |
+| `SW_LAUNCHER_RELAY_TIMEOUT_S` | `10` | seconds the broker waits for a launcher's answer to a remote browse or process list (0.1..60) before answering 504 `launcher_timeout` |
+| `SW_OPEN_MACHINES_RETENTION_DAYS` | `30` | open mode with a persistence DB: an offline machine is forgotten, with its deployed definitions, after this many days |
 
 ### 4.3 MCP transport and rate limits
 
@@ -676,6 +678,7 @@ Events never contain token values or join links.
 | `token.rejected` | a known token was refused (revoked, expired, account not active): token_id, label, reason, ip, client; at most one per token and reason per 10 min |
 | `account.status_changed` | from, to, by |
 | `agent.launched`, `agent.stopped` | session_id, launch_id, profile_id, launcher_id, machine; `agent.stopped` adds `reason` and `status` (`failed` for a launch that never joined, with its `message`, else `stopped`). Recorded on the launcher owner's and the session owner's account |
+| `definition.deployed`, `definition.applied`, `definition.rejected`, `definition.removed` | launcher_key, machine, definition_id, revision; `deployed` adds `queued` (the machine was offline), `rejected` adds `problems` (§10.4) |
 
 Read with `GET /v1/me/events` or, as admin, `GET /v1/accounts/events?account_id=...`
 (omit `account_id` for all accounts). Parameters: `after` (event id cursor), `limit`
@@ -864,10 +867,10 @@ frame. Failed authentications are throttled per IP.
 | `4400` | bad `hello` (e.g. malformed machine name) |
 | `4401` | credential refused, or the account token it connected with expired |
 | `4403` | token revoked, account disabled or deleted, or network not approved |
-| `4409` | replaced by a newer connection of the same launcher (half-open socket) |
-| `4429` | too many failed authentications from this IP, or too many launchers |
-| `1009` | frame too large |
-| `1011` | accounts unavailable (broker-side error) |
+| `4409` | replaced by a newer connection of the same launcher (half-open socket); or reason `launcher_key_in_use`: its launcher key is held and the hello did not present the key's secret (§10.4) |
+| `4429` | too many failed authentications from this IP, too many launchers, or too many machines (`forget one in the Cockpit`) |
+| `1009` | frame too large (over 256 KiB) |
+| `1011` | accounts unavailable, or `definitions sync failed; reconnect` (broker-side error) |
 
 **Reconnects.** A launcher that loses the connection keeps its agents running and
 reclaims them on reconnect with a resume secret (in account mode only for the same
@@ -888,6 +891,119 @@ Keep the launchers' own reconnect grace equal to this value.
   `allowed_accounts` is empty (and open-mode launchers).
 
 In open mode visibility is ignored: every session sees every launcher.
+
+### 10.3 Launcher modes
+
+A launcher (Runner 0.9.0 or later) speaks launcher protocol v2: its `hello` carries
+`"protocol": 2`, a stable `launcher_key` (`lk_` + 32 hex), its start mode and what it
+offers. The mode is chosen on the machine and is the **ceiling** of everything deployed
+to it remotely:
+
+| mode | started with | ceiling | remote definitions, browse, processes |
+|---|---|---|---|
+| `config` | `--config` only (the behaviour before protocol v2) | none | no: its profiles come from its TOML file; the Cockpit shows it as "config only" |
+| `local` | `--local <folder>` | that folder and below, enforced with an OS sandbox (bubblewrap on Linux); the agents run as the user who started the launcher | yes |
+| `root` | `--root` | the whole machine; a definition may pick another machine user (`run_as`) | yes |
+
+The `hello` also reports the `capabilities` it offers (`definitions`, `browse`,
+`processes`), its `sandbox` (`bwrap` or null), `run_as` (root mode), `platform` and
+`prereqs`: what the launcher needs (bubblewrap, git, node, the agent runtimes) with a
+state each (`ok`, `installed`, `missing`, `wrong_version`, `not_logged_in`) and, when
+missing, the command to run by hand. A launcher re-sends that list after a later install.
+The broker keeps capabilities only in account mode, and in open mode only with a
+persistence DB; without one, an open-mode launcher is listed read-only. Launchers that do
+not speak v2 (keyless) keep working as before and are listed with `launcher_key: null`.
+
+### 10.4 Machines and remote definitions
+
+With a persistence DB the broker keeps, per owner (the account, or the whole broker in
+open mode) and launcher key, a **machine** descriptor (name, mode, ceiling, sandbox,
+platform, capabilities, prerequisites, last seen) and the **deployed agent definitions**
+of that machine (revisioned, with the launcher's last status). That is all it stores:
+browse listings, process lists and what agents produce are never stored by the broker.
+Caps: 20 machines per account (100 in open mode), 50 definitions per machine.
+
+| route (account mode: account token) | what it does |
+|---|---|
+| `GET /v1/me/launchers` | the caller's machines, online or not, with their agents (`status` `idle`, `in_session`, `offline`, `not_deployed`; `deploy` state) |
+| `GET /v1/me/launchers/{key}` | one machine plus its stored definitions |
+| `PUT /v1/me/launchers/{key}/definitions/{id}` | body `{"definition": {...}}`: validate against the machine's ceiling, store, send now (`sent`) or queue while offline (`queued`) |
+| `DELETE /v1/me/launchers/{key}/definitions/{id}` | ask the launcher to remove it (`removing`; 409 `definition_in_use` while the agent is in a session) |
+| `DELETE /v1/me/launchers/{key}` | forget an offline machine: descriptor, definitions and key secret (409 `launcher_online` while connected) |
+| `GET /v1/me/launchers/{key}/browse`, `…/processes` | remote folder and process pickers (§10.5) |
+
+The relay admin token cannot use these routes, and another account's machine answers
+404. Deploy, apply, reject and remove are account events (`definition.deployed`,
+`definition.applied`, `definition.rejected`, `definition.removed`; metadata only).
+
+**Open mode.** The same routes exist under `/v1/launchers…` with **no credential**, over
+every machine of the broker, when the broker has a persistence DB. Any client that
+reaches the broker may then deploy to launchers started with `--local` or `--root`, browse
+their folders, list their processes and forget an offline machine (which also frees its
+launcher key): this is **LAN-only trust**. `SW_LAUNCHER_TOKEN`, when set, still gates the
+launchers' own connections, not these routes. Without a persistence DB the write, browse
+and process routes answer 503 `definitions_unavailable` and the list shows live launchers
+only (queued deploys and offline machines must survive a broker restart). In account mode
+`/v1/launchers…` answers 403 `permission_denied`. Open-mode deploys are logged at INFO
+with the client address; open-mode machines offline longer than
+`SW_OPEN_MACHINES_RETENTION_DAYS` (default 30) are forgotten with their definitions.
+
+**Over the launcher socket** the broker sends `definitions_index` right after `welcome`,
+then `definition_delete` for removals the launcher has not confirmed and
+`definition_put` for every definition not applied at its revision; the launcher answers
+`definition_status` (`applied`, `pending_in_use`, `rejected`, `removed`). A deploy to an
+offline machine is queued and sent when it reconnects, so the launcher always converges
+to the broker's stored state. A redeploy while the agent is in a session is applied when
+that session ends.
+
+**Launcher keys and their secret.** The first registration of a launcher key gets a
+`key_secret` in `welcome` (the broker keeps only its hash); every later hello with that
+key must present it. A connection without it is closed 4409 `launcher_key_in_use` and
+nothing is replaced. If the launcher never stored its secret (for example the `welcome`
+was lost), its key stays locked until the machine is **forgotten**: stop the launcher
+and forget the machine in the Cockpit (`DELETE …/launchers/{key}`); its next connection
+registers the key afresh. Forgetting also deletes the machine's deployed definitions. In
+open mode any LAN client can forget an offline machine and so reclaim its key (LAN trust).
+
+### 10.5 Remote browse and process list
+
+The Cockpit's folder and process pickers ask the broker, which relays the request to
+the machine's connected launcher and returns its answer. Nothing is stored, and the
+broker logs these requests at INFO without paths or process data (they are not account
+events). Account mode: the owner's account token only; open mode with a persistence DB:
+any client (§10.4).
+
+```bash
+curl -s -H "Authorization: Bearer $ACCOUNT_TOKEN" \
+  "$RELAY/v1/me/launchers/$KEY/browse?path=/srv/app&limit=100"
+# {"path": "/srv/app", "entries": [{"name": "logs", "kind": "dir", "size": 4096,
+#   "mtime": 1764150000.0, "inside": true}], "next_cursor": "logs"}
+curl -s -H "Authorization: Bearer $ACCOUNT_TOKEN" \
+  "$RELAY/v1/me/launchers/$KEY/processes?q=nginx&limit=50"
+# {"processes": [{"pid": 42, "ppid": 1, "user": "www-data", "name": "nginx",
+#   "cmdline": "nginx: master process", "started_at": 1764150000}], "next_cursor": null}
+```
+
+- `browse` query: `path` (absolute, at most 4096 characters; default: the machine's
+  ceiling, `/` in root mode), `cursor` (the previous page's `next_cursor`, at most 512),
+  `limit` (default 100, at most 300: larger values are capped), `hidden` (`0` or `1`:
+  include dot files). Entry `kind` is `dir`, `file`, `symlink` or `other`; `inside` says
+  whether a symlink stays inside the ceiling. The launcher never lists or follows
+  anything outside its ceiling.
+- `processes` query: `q` (a filter, at most 100 characters), `cursor` (the previous page's `next_cursor`: the last pid, digits), `limit` (default
+  100, at most 200, capped). A `--local` launcher lists only its own user's processes, a
+  `--root` launcher all of them; command lines are redacted on the machine before they
+  are sent.
+- The machine needs the `browse` / `processes` capability (409
+  `launcher_capability_missing`) and must be connected (409 `launcher_offline`). The broker
+  waits `SW_LAUNCHER_RELAY_TIMEOUT_S` (default 10 s) for the answer (504
+  `launcher_timeout`), keeps at most 8 requests in flight per launcher (429
+  `rate_limited`) and checks the answer before returning it (502 `launcher_bad_reply`).
+  A launcher answer over the 256 KiB frame limit closes its connection (1009) and the
+  request fails with `launcher_offline`.
+- The launcher's refusals: `outside_ceiling` → 400 `outside_ceiling`, `not_found` → 404
+  `path_not_found`, `not_a_directory` / `bad_request` → 400 `invalid_request`,
+  `permission_denied` → 403 `permission_denied`.
 
 ---
 
@@ -991,6 +1107,25 @@ REST errors are `{"error": {"code", "message"}}`; MCP tools return the same code
 
 On failure the credential is invalidated and the slot released.
 
+### 12.4 Machines, definitions, browse
+
+| code | HTTP | cause |
+|---|---|---|
+| `launcher_not_found` | 404 | no such machine for this owner (another account's machine also answers 404) |
+| `definition_not_found` | 404 | no such definition on the machine (or it is being removed) |
+| `path_not_found` | 404 | browse: the launcher found no such path |
+| `outside_ceiling` | 400 | a definition path, or a browsed path, is outside the machine's ceiling |
+| `launcher_capability_missing` | 409 | the launcher was started without `--local`/`--root` (or is too old) |
+| `definition_in_use` | 409 | removal refused while the agent runs in a session |
+| `definition_id_conflict` | 409 | the launcher has a local (TOML) profile with that id |
+| `definition_limit` | 409 | already 50 definitions on the machine |
+| `launcher_online` | 409 | forget refused while the launcher is connected |
+| `launcher_offline` | 409 | browse/processes: the machine is not connected (or went away before answering) |
+| `rate_limited` | 429 | browse/processes: 8 requests already waiting on that launcher |
+| `launcher_bad_reply` | 502 | the launcher's answer failed the broker's checks |
+| `definitions_unavailable` | 503 | the broker has no persistence DB |
+| `launcher_timeout` | 504 | no answer within `SW_LAUNCHER_RELAY_TIMEOUT_S` |
+
 ---
 
 ## 13. Troubleshooting
@@ -1014,6 +1149,10 @@ On failure the credential is invalidated and the slot released.
 | launched agents vanish after a while | idle TTL (`session_ended` / `session_cold`): raise `idle_ttl_seconds` |
 | launch status `launch_not_found` after a broker restart | launch records are in memory only; launch again |
 | `/metrics` answers 401 / 403 | `SW_METRICS_TOKEN` is set: send it (or the admin token) as Bearer |
+| a launcher is refused with 4409 `launcher_key_in_use` | its key secret was lost: stop it, forget the machine in the Cockpit, start it again (§10.4) |
+| deploy answers 409 `launcher_capability_missing` | start the launcher with `--local <folder>` or `--root` (Runner 0.9.0+); in open mode set `SW_PERSISTENCE_DB_PATH` |
+| browse or deploy on an open-mode broker answers 503 `definitions_unavailable` | set `SW_PERSISTENCE_DB_PATH` |
+| browse answers 504 `launcher_timeout` | the launcher is overloaded or its link is slow; retry, or raise `SW_LAUNCHER_RELAY_TIMEOUT_S` |
 
 ---
 
@@ -1047,6 +1186,9 @@ reverse proxy in front of it does not log `Authorization` headers or query strin
 - **No per-action scopes for participants**: a participant may do everything a
   participant may do.
 - **Open mode trusts the network**: `SW_LAUNCHER_TOKEN` restricts launcher registration,
-  not who may launch.
-- **Launchers are configured on their machines**: the broker has no API to edit a
-  launcher's profiles; the launcher re-registers them when it restarts.
+  not who may launch, deploy, browse or list processes.
+- **A `config` launcher is configured on its machine**: its TOML profiles are read-only
+  from the broker. Remote definitions reach only launchers started with `--local` or
+  `--root`, and a local profile always wins an id clash.
+- **Remote browse and process lists are relayed live**: an offline machine cannot be
+  browsed, and nothing is cached.

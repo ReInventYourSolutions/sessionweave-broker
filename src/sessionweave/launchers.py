@@ -82,6 +82,15 @@ MAX_MACHINES_OPEN = 100
 KNOWN_CAPABILITIES = frozenset({"definitions", "browse", "processes"})
 # Owner key of open-mode (ownerless) launchers, machines and definitions.
 OPEN_OWNER = ""
+# Requests relayed to a launcher (remote browse, process list): how long the
+# broker waits for the answer (SW_LAUNCHER_RELAY_TIMEOUT_S), how many may be
+# in flight per launcher, and the largest page a client may ask for.
+RELAY_TIMEOUT_S = 10.0
+MAX_INFLIGHT = 8
+BROWSE_MAX_LIMIT = 300
+PROCESSES_MAX_LIMIT = 200
+# The reply frame type of each relayed request kind.
+_REPLY_TYPES = {"browse": "browse_result", "processes": "processes_result"}
 
 _MODES = {"config", "local", "root"}
 _KEY_RE = re.compile(r"^lk_[0-9a-f]{32}$")
@@ -433,9 +442,25 @@ def _load_profiles(
     return profiles, rejected
 
 
+def relay_timeout_from_env() -> float:
+    """SW_LAUNCHER_RELAY_TIMEOUT_S (seconds, 0.1..60), default 10."""
+    raw = os.environ.get("SW_LAUNCHER_RELAY_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw) if raw else RELAY_TIMEOUT_S
+    except ValueError:
+        value = RELAY_TIMEOUT_S
+    if value != value:  # NaN
+        value = RELAY_TIMEOUT_S
+    return min(max(value, 0.1), 60.0)
+
+
 class LauncherRegistry:
     def __init__(self) -> None:
         self._launchers: dict[str, _Launcher] = {}
+        # Relayed requests waiting for their reply, per launcher:
+        # request_id -> (reply frame type, future).
+        self._pending: dict[str, dict[str, tuple[str, asyncio.Future[dict[str, Any]]]]] = {}
+        self.relay_timeout = relay_timeout_from_env()
         # Set by ToolDeps: told when a launcher goes away.
         self.launches: LaunchManager | None = None
 
@@ -617,9 +642,72 @@ class LauncherRegistry:
             lnc.v2 = replace(lnc.v2, prereqs=prereqs)
 
     def unregister(self, launcher_id: str) -> None:
-        """Forget a launcher; its launches not yet joined fail (idempotent)."""
+        """Forget a launcher; its launches not yet joined and its relayed
+        requests still waiting fail (idempotent)."""
+        for _kind, fut in self._pending.pop(launcher_id, {}).values():
+            if not fut.done():
+                fut.set_exception(ToolError(ErrorCode.LAUNCHER_OFFLINE, "the launcher went away"))
         if self._launchers.pop(launcher_id, None) is not None and self.launches is not None:
             self.launches.launcher_gone(launcher_id)
+
+    def pending_count(self, launcher_id: str) -> int:
+        """Relayed requests of a launcher still waiting for their reply."""
+        return len(self._pending.get(launcher_id, {}))
+
+    async def request(
+        self, launcher_id: str, kind: str, payload: dict[str, Any], *,
+        timeout: float = RELAY_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        """Send ``{"type": kind, "request_id": ..., **payload}`` to a launcher
+        and return its reply frame (``<kind>_result`` with that request id).
+
+        Raises ``LAUNCHER_OFFLINE`` (not connected, the send failed, or it
+        went away before answering), ``LAUNCHER_TIMEOUT`` (no answer within
+        ``timeout`` seconds) and ``RATE_LIMITED`` (``MAX_INFLIGHT`` requests
+        already waiting on it). The reply is not validated here.
+        """
+        lnc = self._launchers.get(launcher_id)
+        if lnc is None:
+            raise ToolError(ErrorCode.LAUNCHER_OFFLINE, "the machine is offline")
+        pending = self._pending.setdefault(launcher_id, {})
+        if len(pending) >= MAX_INFLIGHT:
+            raise ToolError(
+                ErrorCode.RATE_LIMITED, "too many requests waiting on this machine; retry"
+            )
+        request_id = "req_" + secrets.token_hex(8)
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        pending[request_id] = (_REPLY_TYPES.get(kind, kind + "_result"), fut)
+        try:
+            try:
+                await lnc.conn.send_json({"type": kind, "request_id": request_id, **payload})
+            except Exception as exc:
+                raise ToolError(ErrorCode.LAUNCHER_OFFLINE, "the machine is offline") from exc
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except TimeoutError as exc:
+                raise ToolError(
+                    ErrorCode.LAUNCHER_TIMEOUT, "the machine did not answer in time"
+                ) from exc
+        finally:
+            current = self._pending.get(launcher_id)
+            if current is not None:
+                current.pop(request_id, None)
+                if not current:
+                    del self._pending[launcher_id]
+
+    def on_reply(self, launcher_id: str, body: dict[str, Any]) -> None:
+        """A ``browse_result``/``processes_result`` frame: resolve the request
+        of this launcher it answers. An unknown request id, one of another
+        launcher or a reply of the wrong type is ignored."""
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str):
+            return
+        entry = self._pending.get(launcher_id, {}).get(request_id)
+        if entry is None or entry[0] != body.get("type"):
+            return
+        fut = entry[1]
+        if not fut.done():
+            fut.set_result(body)
 
     def resume_hash(self, launcher_id: str) -> bytes | None:
         lnc = self._launchers.get(launcher_id)
@@ -1082,6 +1170,8 @@ async def _receive(websocket: WebSocket, launcher_id: str, deps: Any) -> None:
                     await deps.deploys.on_status(launcher_id, body)
                 except Exception:
                     log.exception("could not record a definition status")
+            elif kind in ("browse_result", "processes_result"):
+                registry.on_reply(launcher_id, body)
             elif launches is None:
                 continue
             elif kind == "launch_result":

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.35.1"
+  version: "0.36.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -57,6 +57,13 @@ tags:
     description: Account self-service (account token)
   - name: agents
     description: Agent launchers, discovery and launches (session coordinator)
+  - name: machines
+    description: |
+      Machines (protocol v2 launchers), their deployed agent definitions, remote
+      browse and process list. `/v1/me/launchers...`: the launcher owner's account
+      token (account mode). `/v1/launchers...`: no credential, every machine of an
+      open-mode broker (LAN-only trust; 403 in account mode). Browse and process
+      results are relayed, never stored.
 
 components:
   securitySchemes:
@@ -521,8 +528,159 @@ components:
                 - definition_id_conflict
                 - definition_limit
                 - launcher_online
+                - launcher_offline
+                - launcher_timeout
+                - launcher_bad_reply
+                - path_not_found
             message:
               type: string
+    Prereq:
+      type: object
+      description: One prerequisite a launcher checked (bubblewrap, git, node, an agent runtime)
+      properties:
+        name: { type: string, maxLength: 32 }
+        state: { type: string, enum: [ok, installed, missing, wrong_version, not_logged_in] }
+        version: { type: string, nullable: true }
+        required: { type: boolean }
+        needed_by: { type: array, items: { type: string } }
+        command: { type: string, nullable: true, description: "What to run by hand when it is missing" }
+    DeployState:
+      type: object
+      properties:
+        revision: { type: integer, description: "The stored (desired) revision" }
+        applied_revision: { type: integer, nullable: true, description: "The revision the launcher last applied" }
+        state: { type: string, enum: [queued, sent, pending_in_use, applied, rejected, removing] }
+        problems: { type: array, items: { type: string }, maxItems: 20 }
+        warnings: { type: array, items: { type: string }, maxItems: 20 }
+    MachineAgent:
+      type: object
+      properties:
+        profile_id: { type: string }
+        source: { type: string, enum: [local, remote] }
+        kind: { type: string, enum: [observer, operator], nullable: true }
+        domain: { type: string, nullable: true }
+        role: { type: string, nullable: true }
+        runtime: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        max_instances: { type: integer, nullable: true }
+        running: { type: integer }
+        status: { type: string, enum: [idle, in_session, offline, not_deployed] }
+        approval_policy: { type: string, enum: [auto, listed, always], nullable: true }
+        deploy: { allOf: [{ $ref: '#/components/schemas/DeployState' }], nullable: true, description: "Null for a profile that was not deployed remotely" }
+    Machine:
+      type: object
+      properties:
+        launcher_key: { type: string, nullable: true, example: lk_0123456789abcdef0123456789abcdef, description: "Null for a keyless (protocol v1) launcher, listed while connected" }
+        launcher_id: { type: string, nullable: true, description: "The current connection; null while offline" }
+        machine: { type: string }
+        online: { type: boolean }
+        mode: { type: string, enum: [config, local, root] }
+        ceiling: { type: string, nullable: true, description: "The folder of a --local launcher, / for --root, null in config mode" }
+        sandbox: { type: string, nullable: true, enum: [bwrap] }
+        run_as: { type: boolean }
+        platform: { type: string, nullable: true }
+        capabilities: { type: array, items: { type: string, enum: [definitions, browse, processes] } }
+        prereqs: { type: array, items: { $ref: '#/components/schemas/Prereq' } }
+        last_seen: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
+        agents: { type: array, items: { $ref: '#/components/schemas/MachineAgent' } }
+    AgentDefinition:
+      type: object
+      additionalProperties: false
+      description: |
+        An agent definition (at most 64 KiB of JSON; unknown keys refused at every
+        level). Validated against the target machine: paths absolute, normalised and
+        inside its ceiling; `run_as` only on a `--root` launcher offering it; an
+        observer never writes files nor gets a shell; `privileged` commands only on a
+        root machine. Never carries secrets.
+      required: [domain, role, runtime, kind, workdir, max_instances]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it" }
+        domain: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' }
+        role: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' }
+        capabilities: { type: array, maxItems: 32, items: { type: string, maxLength: 64 } }
+        description: { type: string, maxLength: 1000 }
+        runtime: { type: string, enum: [claude, opencode, cline] }
+        model: { type: string, maxLength: 200 }
+        kind: { type: string, enum: [observer, operator] }
+        coordinator_capable: { type: boolean, default: false }
+        workdir: { type: string, description: Absolute path inside the ceiling }
+        run_as: { type: string, nullable: true, pattern: '^[a-z_][a-z0-9_-]{0,31}$' }
+        observe:
+          type: object
+          description: "sources, logs (absolute paths), processes ({name, pid?}) and metrics ({enabled, interval_s 5..3600, kinds: cpu|memory|disk|load}); each list at most 50"
+          additionalProperties: true
+        access:
+          type: object
+          description: "files {read, write, deny: globs relative to workdir}; network none|any|[hosts]; commands {mode: none|list|shell, allow (<=100), privileged (<=50)}"
+          additionalProperties: true
+        limits:
+          type: object
+          properties:
+            max_duration_s: { type: number }
+            max_idle_s: { type: number }
+            max_cost_usd: { type: number }
+        approval:
+          type: object
+          properties:
+            policy: { type: string, enum: [auto, listed, always], default: auto }
+            patterns: { type: array, maxItems: 100, items: { type: string, maxLength: 200 } }
+        instructions: { type: string, description: Standing instructions (at most 16 KiB UTF-8) }
+        max_instances: { type: integer, minimum: 1, maximum: 32 }
+        visibility: { type: string, enum: [personal, general], nullable: true }
+        allowed_accounts: { type: array, items: { type: string }, nullable: true }
+    MachineDetail:
+      allOf:
+        - $ref: '#/components/schemas/Machine'
+        - type: object
+          properties:
+            definitions:
+              type: array
+              items:
+                type: object
+                properties:
+                  definition: { $ref: '#/components/schemas/AgentDefinition' }
+                  deploy: { $ref: '#/components/schemas/DeployState' }
+    DeployRequest:
+      type: object
+      required: [definition]
+      additionalProperties: false
+      properties:
+        definition: { $ref: '#/components/schemas/AgentDefinition' }
+    DeployResult:
+      type: object
+      properties:
+        definition_id: { type: string }
+        revision: { type: integer }
+        state: { type: string, enum: [queued, sent, removing, removed] }
+    BrowseEntry:
+      type: object
+      required: [name, kind]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255, description: "Never contains / or NUL" }
+        kind: { type: string, enum: [dir, file, symlink, other] }
+        size: { type: integer, minimum: 0 }
+        mtime: { type: number, description: Unix epoch seconds }
+        inside: { type: boolean, description: "For a symlink: whether its target stays inside the ceiling (it is never followed outside)" }
+    BrowseResult:
+      type: object
+      properties:
+        path: { type: string }
+        entries: { type: array, items: { $ref: '#/components/schemas/BrowseEntry' } }
+        next_cursor: { type: string, nullable: true, description: "Pass as cursor for the next page; null on the last page" }
+    MachineProcess:
+      type: object
+      properties:
+        pid: { type: integer }
+        ppid: { type: integer, nullable: true }
+        user: { type: string, nullable: true }
+        name: { type: string }
+        cmdline: { type: string, nullable: true, description: Redacted on the machine before it is sent }
+        started_at: { type: number, nullable: true, description: Unix epoch seconds }
+    ProcessesResult:
+      type: object
+      properties:
+        processes: { type: array, items: { $ref: '#/components/schemas/MachineProcess' } }
+        next_cursor: { type: string, nullable: true, description: "The last pid of this page (digits; the launcher may send it as an integer); null on the last page" }
     Account:
       type: object
       properties:
@@ -604,6 +762,10 @@ components:
             - account.status_changed
             - agent.launched
             - agent.stopped
+            - definition.deployed
+            - definition.applied
+            - definition.rejected
+            - definition.removed
         ts: { type: integer, format: int64, description: Unix epoch milliseconds }
         data: { type: object, additionalProperties: true, description: Never contains token values or join links }
     AccountEventsPage:
@@ -752,6 +914,9 @@ paths:
                       firehose: { type: boolean }
                       supervisor_notes: { type: boolean }
                       session_delete: { type: boolean }
+                      agent_definitions: { type: boolean, description: "The broker stores machines and deployed agent definitions (it has a persistence DB)" }
+                      open_deploy: { type: boolean, description: "Open mode with a persistence DB: /v1/launchers... deploy, browse and process routes need no credential" }
+                      launcher_protocol: { type: integer, description: "The launcher protocol version the broker speaks (2)" }
                   session_creation:
                     type: string
                     enum: [open, account]
@@ -1200,7 +1365,8 @@ paths:
         network no longer approved (live launchers are dropped), 4401 also
         when the account token expires while connected, 4429 too many
         failed attempts or too many launchers (5 per account; 50 in open mode),
-        4400 bad hello, 1009 frame over 256 KiB, 1011 accounts unavailable.
+        4400 bad hello, 1009 frame over 256 KiB, 1011 accounts unavailable or
+        definitions sync failed (reconnect).
 
         Frames (JSON text). Launcher → broker: first
         `{"type":"hello","machine","visibility":"personal"|"general","allowed_accounts":[names],"profiles":[...]}`
@@ -1234,6 +1400,10 @@ paths:
         reports a deployed definition (at most 20 texts of 300 printable chars
         kept; a status for an older revision is ignored; `removed` confirms a
         removal whatever its revision);
+        `{"type":"browse_result","request_id","ok":true,"path","entries":[{"name","kind":"dir"|"file"|"symlink"|"other","size"?,"mtime"?,"inside"?}],"next_cursor"}`
+        and `{"type":"processes_result","request_id","ok":true,"processes":[{"pid","ppid","user","name","cmdline","started_at"}],"next_cursor"}`
+        answer a relayed request (or `"ok":false,"error":"outside_ceiling"|"not_found"|"not_a_directory"|"permission_denied"|"bad_request"`;
+        a reply to an unknown or another launcher's `request_id` is ignored);
         then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?,"message"?}`
         (`message`: at most 300 printable characters, kept with the launch
         and sent in `agent.launch_failed`)
@@ -1251,6 +1421,12 @@ paths:
         `{"type":"definition_put","definition":{...,"revision"}}` for each
         definition not applied at its revision (not one it rejected at that
         revision); later puts and deletes as they are deployed,
+        `{"type":"browse","request_id","path","cursor","limit","hidden"}` and
+        `{"type":"processes","request_id","cursor","limit","query"}` (`cursor`:
+        the last pid of the previous page, an integer, or null; relayed
+        from the browse / processes routes; `request_id` = `req_` + 16 hex; at
+        most 8 in flight per launcher; the broker waits
+        `SW_LAUNCHER_RELAY_TIMEOUT_S`, default 10 s),
         `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","coordinator_id","session_owner","broker_url"?}`
         (`coordinator_id`: who the agent reports its result to — the
         launching coordinator, else the session's coordinator, or null;
@@ -1275,6 +1451,321 @@ paths:
         - bearerAuth: []
       responses:
         '101': { description: Switching protocols }
+
+  /v1/me/launchers:
+    get:
+      tags: [machines]
+      summary: List machines and their agents
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Stored machines (online or not) first, then live launchers
+        without a stored row (keyless v1 launchers).
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: Machines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  launchers: { type: array, items: { $ref: '#/components/schemas/Machine' } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/me/launchers/{key}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: One machine with its stored definitions
+      description: "Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404)."
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: The machine
+          content: { application/json: { schema: { $ref: '#/components/schemas/MachineDetail' } } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [machines]
+      summary: Forget an offline machine
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Deletes the machine's descriptor, its deployed definitions and
+        its launcher key secret: the reset for a launcher whose key secret was
+        lost (refused 4409 `launcher_key_in_use`); its next connection registers
+        the key afresh.
+      security: [{ accountAuth: [] }]
+      responses:
+        '204': { description: Forgotten }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_online (stop the launcher first)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/me/launchers/{key}/definitions/{def_id}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+      - { name: def_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' } }
+    put:
+      tags: [machines]
+      summary: Deploy (create or update) an agent definition
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Validates the definition against the machine, stores it as a new
+        revision and sends it to the launcher (`sent`), or queues it while the
+        machine is offline (`queued`); the launcher reports back with
+        `definition_status`. Records `definition.deployed` (account mode).
+      security: [{ accountAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeployRequest' }
+      responses:
+        '200':
+          description: Stored
+          content: { application/json: { schema: { $ref: '#/components/schemas/DeployResult' } } }
+        '400': { description: "invalid_request (unknown keys, id mismatch, invalid definition); outside_ceiling", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '413': { description: "payload_too_large", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [machines]
+      summary: Remove an agent definition
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Marks it for removal and asks the launcher (`removing`; the row
+        goes when the launcher answers `removed`). A definition the launcher
+        never held is removed at once (`removed`).
+      security: [{ accountAuth: [] }]
+      responses:
+        '200':
+          description: Removal accepted
+          content: { application/json: { schema: { $ref: '#/components/schemas/DeployResult' } } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "launcher_not_found; definition_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "definition_in_use (the agent runs in a session; remove it after the session ends)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/me/launchers/{key}/browse:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: List a folder on the machine (relayed to its launcher)
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Relayed live to the connected launcher, which never lists or
+        follows anything outside its ceiling; the result is checked and
+        returned, never stored. Paged by name: pass `next_cursor` back as
+        `cursor`.
+      security: [{ accountAuth: [] }]
+      parameters:
+        - { name: path, in: query, schema: { type: string, maxLength: 4096 }, description: "Absolute path; default: the machine's ceiling" }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 300 are capped to 300" }
+        - { name: hidden, in: query, schema: { type: string, enum: ['0', '1'], default: '0' }, description: Include dot files }
+      responses:
+        '200':
+          description: One page of entries
+          content: { application/json: { schema: { $ref: '#/components/schemas/BrowseResult' } } }
+        '400': { description: "invalid_request (bad query, not a directory); outside_ceiling", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved; permission_denied (the launcher may not read the path)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "launcher_not_found; path_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_offline (not connected, or went away before answering); launcher_capability_missing", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: "rate_limited (8 requests already waiting on this launcher)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '502': { description: "launcher_bad_reply", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '504': { description: "launcher_timeout (no answer within SW_LAUNCHER_RELAY_TIMEOUT_S, default 10 s)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/me/launchers/{key}/processes:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: List the machine's processes (relayed to its launcher)
+      description: |
+        Account mode: the launcher owner's account token (the relay admin token is refused; another account's machine is 404). Relayed live to the connected launcher: a `--local` launcher lists
+        its own user's processes, a `--root` launcher all of them; command lines
+        are redacted on the machine. Never stored.
+      security: [{ accountAuth: [] }]
+      parameters:
+        - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: Filter }
+        - { name: cursor, in: query, schema: { type: string, pattern: "^[0-9]{1,10}$" }, description: "The previous page's next_cursor (the last pid)" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 200 are capped to 200" }
+      responses:
+        '200':
+          description: One page of processes
+          content: { application/json: { schema: { $ref: '#/components/schemas/ProcessesResult' } } }
+        '400': { description: invalid_request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "network_not_approved; permission_denied (refused by the launcher)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_offline; launcher_capability_missing", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: rate_limited, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '502': { description: "launcher_bad_reply", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '504': { description: launcher_timeout, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers:
+    get:
+      tags: [machines]
+      summary: List machines and their agents
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Stored machines (online or not) first, then live launchers
+        without a stored row (keyless v1 launchers, or every launcher of a broker without a persistence DB).
+      security: [{}]
+      responses:
+        '200':
+          description: Machines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  launchers: { type: array, items: { $ref: '#/components/schemas/Machine' } }
+        '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers/{key}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: One machine with its stored definitions
+      description: "Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`."
+      security: [{}]
+      responses:
+        '200':
+          description: The machine
+          content: { application/json: { schema: { $ref: '#/components/schemas/MachineDetail' } } }
+        '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [machines]
+      summary: Forget an offline machine
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Deletes the machine's descriptor, its deployed definitions and
+        its launcher key secret: the reset for a launcher whose key secret was
+        lost (refused 4409 `launcher_key_in_use`); its next connection registers
+        the key afresh. Any LAN client may do this (LAN trust).
+      security: [{}]
+      responses:
+        '204': { description: Forgotten }
+        '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_online (stop the launcher first)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers/{key}/definitions/{def_id}:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+      - { name: def_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' } }
+    put:
+      tags: [machines]
+      summary: Deploy (create or update) an agent definition
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Validates the definition against the machine, stores it as a new
+        revision and sends it to the launcher (`sent`), or queues it while the
+        machine is offline (`queued`); the launcher reports back with
+        `definition_status`. Records `definition.deployed` (account mode).
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeployRequest' }
+      responses:
+        '200':
+          description: Stored
+          content: { application/json: { schema: { $ref: '#/components/schemas/DeployResult' } } }
+        '400': { description: "invalid_request (unknown keys, id mismatch, invalid definition); outside_ceiling", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '413': { description: "payload_too_large", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [machines]
+      summary: Remove an agent definition
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Marks it for removal and asks the launcher (`removing`; the row
+        goes when the launcher answers `removed`). A definition the launcher
+        never held is removed at once (`removed`).
+      security: [{}]
+      responses:
+        '200':
+          description: Removal accepted
+          content: { application/json: { schema: { $ref: '#/components/schemas/DeployResult' } } }
+        '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "launcher_not_found; definition_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "definition_in_use (the agent runs in a session; remove it after the session ends)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers/{key}/browse:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: List a folder on the machine (relayed to its launcher)
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Relayed live to the connected launcher, which never lists or
+        follows anything outside its ceiling; the result is checked and
+        returned, never stored. Paged by name: pass `next_cursor` back as
+        `cursor`.
+      security: [{}]
+      parameters:
+        - { name: path, in: query, schema: { type: string, maxLength: 4096 }, description: "Absolute path; default: the machine's ceiling" }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 300 are capped to 300" }
+        - { name: hidden, in: query, schema: { type: string, enum: ['0', '1'], default: '0' }, description: Include dot files }
+      responses:
+        '200':
+          description: One page of entries
+          content: { application/json: { schema: { $ref: '#/components/schemas/BrowseResult' } } }
+        '400': { description: "invalid_request (bad query, not a directory); outside_ceiling", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied (the launcher may not read the path; or the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: "launcher_not_found; path_not_found", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_offline (not connected, or went away before answering); launcher_capability_missing", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: "rate_limited (8 requests already waiting on this launcher)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '502': { description: "launcher_bad_reply", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '504': { description: "launcher_timeout (no answer within SW_LAUNCHER_RELAY_TIMEOUT_S, default 10 s)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/launchers/{key}/processes:
+    parameters:
+      - { name: key, in: path, required: true, schema: { type: string, pattern: '^lk_[0-9a-f]{32}$' } }
+    get:
+      tags: [machines]
+      summary: List the machine's processes (relayed to its launcher)
+      description: |
+        Open mode only, no credential (LAN-only trust: any client that reaches the broker). Every machine of the broker. In account mode 403 `permission_denied`. Relayed live to the connected launcher: a `--local` launcher lists
+        its own user's processes, a `--root` launcher all of them; command lines
+        are redacted on the machine. Never stored.
+      security: [{}]
+      parameters:
+        - { name: q, in: query, schema: { type: string, maxLength: 100 }, description: Filter }
+        - { name: cursor, in: query, schema: { type: string, pattern: "^[0-9]{1,10}$" }, description: "The previous page's next_cursor (the last pid)" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, default: 100 }, description: "Values over 200 are capped to 200" }
+      responses:
+        '200':
+          description: One page of processes
+          content: { application/json: { schema: { $ref: '#/components/schemas/ProcessesResult' } } }
+        '400': { description: invalid_request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { description: "permission_denied (refused by the launcher; or the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_offline; launcher_capability_missing", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: rate_limited, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '502': { description: "launcher_bad_reply", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '504': { description: launcher_timeout, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /v1/sessions/{sid}/coordinator:
     parameters:

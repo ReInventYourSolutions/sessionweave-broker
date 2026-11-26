@@ -137,6 +137,10 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.DEFINITION_ID_CONFLICT: 409,
     ErrorCode.DEFINITION_LIMIT: 409,
     ErrorCode.LAUNCHER_ONLINE: 409,
+    ErrorCode.LAUNCHER_OFFLINE: 409,
+    ErrorCode.LAUNCHER_TIMEOUT: 504,
+    ErrorCode.LAUNCHER_BAD_REPLY: 502,
+    ErrorCode.PATH_NOT_FOUND: 404,
 }
 
 

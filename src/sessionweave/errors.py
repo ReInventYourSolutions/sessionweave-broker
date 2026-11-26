@@ -54,6 +54,10 @@ class ErrorCode(StrEnum):
     DEFINITION_ID_CONFLICT = "definition_id_conflict"
     DEFINITION_LIMIT = "definition_limit"
     LAUNCHER_ONLINE = "launcher_online"
+    LAUNCHER_OFFLINE = "launcher_offline"
+    LAUNCHER_TIMEOUT = "launcher_timeout"
+    LAUNCHER_BAD_REPLY = "launcher_bad_reply"
+    PATH_NOT_FOUND = "path_not_found"
 
 
 @dataclass(slots=True)

@@ -401,3 +401,110 @@ def test_hello_key_secret_validated(bad: Any) -> None:
 def test_sandbox_none_means_no_sandbox() -> None:
     assert parse_hello_v2({**V2, "sandbox": "none"}, deploy_allowed=True).sandbox is None
     assert parse_hello_v2({**V2, "sandbox": None}, deploy_allowed=True).sandbox is None
+
+
+# --- relayed requests (browse / processes) -----------------------------------
+
+
+class _SilentConn:
+    """A launcher connection that records frames and never answers."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_json(self, data: Any) -> None:
+        self.sent.append(data)
+
+
+class _BrokenConn:
+    async def send_json(self, data: Any) -> None:
+        raise RuntimeError("socket closed")
+
+
+async def test_request_adds_request_id_and_resolves_on_reply() -> None:
+    import asyncio
+
+    reg, conn = LauncherRegistry(), _SilentConn()
+    lid, _ = reg.register(conn, "acc_1", _hello([], **V2))
+    task = asyncio.create_task(reg.request(lid, "browse", {"path": "/srv/app"}))
+    await asyncio.sleep(0)
+    (frame,) = conn.sent
+    assert frame["type"] == "browse" and frame["path"] == "/srv/app"
+    rid = frame["request_id"]
+    assert rid.startswith("req_") and len(rid) == 20
+    int(rid[4:], 16)
+    # a reply of the wrong kind, an unknown id and another launcher's id are ignored
+    other, _ = reg.register(_SilentConn(), "acc_1", _hello([], **{
+        **V2, "launcher_key": "lk_" + "ef" * 16}))
+    reg.on_reply(lid, {"type": "processes_result", "request_id": rid, "ok": True})
+    reg.on_reply(lid, {"type": "browse_result", "request_id": "req_" + "0" * 16})
+    reg.on_reply(other, {"type": "browse_result", "request_id": rid, "ok": True})
+    reg.on_reply(lid, {"type": "browse_result", "request_id": 3})
+    await asyncio.sleep(0)
+    assert not task.done()
+    reply = {"type": "browse_result", "request_id": rid, "ok": True, "entries": []}
+    reg.on_reply(lid, reply)
+    assert await task == reply
+    # the pending entry is gone: a late duplicate is ignored
+    reg.on_reply(lid, reply)
+    assert reg.pending_count(lid) == 0
+
+
+async def test_unregister_fails_pending_requests() -> None:
+    import asyncio
+
+    from sessionweave.errors import ErrorCode, ToolError
+
+    reg = LauncherRegistry()
+    lid, _ = reg.register(_SilentConn(), "acc_1", _hello([], **V2))
+    task = asyncio.create_task(reg.request(lid, "browse", {"path": "/srv/app"}))
+    await asyncio.sleep(0)
+    reg.unregister(lid)
+    with pytest.raises(ToolError) as e:
+        await task
+    assert e.value.code is ErrorCode.LAUNCHER_OFFLINE
+    assert reg.pending_count(lid) == 0
+
+
+async def test_request_offline_timeout_and_inflight_limit() -> None:
+    import asyncio
+
+    from sessionweave.errors import ErrorCode, ToolError
+    from sessionweave.launchers import MAX_INFLIGHT
+
+    reg = LauncherRegistry()
+    with pytest.raises(ToolError) as e:
+        await reg.request("lnc_missing", "browse", {})
+    assert e.value.code is ErrorCode.LAUNCHER_OFFLINE
+    broken, _ = reg.register(_BrokenConn(), "acc_2", _hello([], **V2))
+    with pytest.raises(ToolError) as e:
+        await reg.request(broken, "browse", {})
+    assert e.value.code is ErrorCode.LAUNCHER_OFFLINE
+    assert reg.pending_count(broken) == 0
+
+    lid, _ = reg.register(_SilentConn(), "acc_1", _hello([], **V2))
+    with pytest.raises(ToolError) as e:
+        await reg.request(lid, "processes", {}, timeout=0.05)
+    assert e.value.code is ErrorCode.LAUNCHER_TIMEOUT
+    assert reg.pending_count(lid) == 0
+
+    tasks = [asyncio.create_task(reg.request(lid, "browse", {}, timeout=5))
+             for _ in range(MAX_INFLIGHT)]
+    await asyncio.sleep(0)
+    with pytest.raises(ToolError) as e:
+        await reg.request(lid, "browse", {})
+    assert e.value.code is ErrorCode.RATE_LIMITED
+    reg.unregister(lid)
+    for t in tasks:
+        with pytest.raises(ToolError):
+            await t
+
+
+def test_relay_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sessionweave.launchers import RELAY_TIMEOUT_S, relay_timeout_from_env
+
+    monkeypatch.delenv("SW_LAUNCHER_RELAY_TIMEOUT_S", raising=False)
+    assert relay_timeout_from_env() == RELAY_TIMEOUT_S == 10.0
+    for raw, want in (("0.2", 0.2), ("0", 0.1), ("999", 60.0), ("junk", 10.0)):
+        monkeypatch.setenv("SW_LAUNCHER_RELAY_TIMEOUT_S", raw)
+        assert relay_timeout_from_env() == want

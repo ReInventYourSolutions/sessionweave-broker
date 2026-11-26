@@ -5,6 +5,35 @@ All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions
 
 ## [Unreleased]
 
+## [0.36.0]
+
+Machines and remote deploy: the Cockpit (0.22.0) defines agents and deploys them through
+the broker to launchers started with `--local <folder>` or `--root` (Runner 0.9.0). The
+broker stores agent definitions and machine descriptors only; remote browse and process
+lists are relayed, never stored.
+
+- **Remote browse and process list.** `GET /v1/me/launchers/{key}/browse?path=&cursor=&limit=&hidden=`
+  and `GET /v1/me/launchers/{key}/processes?q=&cursor=&limit=` (owner's account token only;
+  open mode with a persistence DB: `/v1/launchers/{key}/…` without a credential) relay a
+  `browse` / `processes` request over the launcher socket and return the launcher's
+  `browse_result` / `processes_result` after checking it (entries at most the requested
+  limit, names at most 255 characters without `/` or NUL, known kinds). `path` defaults to
+  the machine's ceiling; `limit` defaults to 100 and is capped at 300 (browse) and 200
+  (processes). The launcher's refusals map to `outside_ceiling` (400), `path_not_found`
+  (404), `invalid_request` (400) and `permission_denied` (403). New error codes
+  `launcher_offline` (409), `launcher_timeout` (504), `launcher_bad_reply` (502) and
+  `path_not_found` (404); at most 8 requests in flight per launcher (429 `rate_limited`).
+  A request waiting on a launcher that disconnects (including one closed 1009 for an
+  oversized answer) fails with `launcher_offline`. New setting
+  `SW_LAUNCHER_RELAY_TIMEOUT_S` (default 10 s, 0.1..60). Browse and process requests are
+  logged at INFO without paths and are not account events.
+- OpenAPI documents the `/v1/me/launchers…` and `/v1/launchers…` routes (new tag
+  `machines`; schemas `Machine`, `MachineDetail`, `AgentDefinition`, `DeployState`,
+  `BrowseResult`, `ProcessesResult`, …), the relayed frames, the `definition.*` account
+  events and the new `/v1/info` capabilities. The guide gains §10.3 (launcher modes),
+  §10.4 (machines and remote definitions, open-mode LAN trust, lost key secrets) and §10.5
+  (remote browse), and §12.4 (error codes); the README a "Machines and remote deploy"
+  section.
 - **Launcher protocol v2.** A launcher's `hello` may carry `"protocol": 2`, a stable
   `launcher_key` (`lk_` + 32 hex), its start `mode` (`config`, `local`, `root`) and
   `ceiling`, the remote `capabilities` it offers (`definitions`, `browse`, `processes`;
@@ -59,6 +88,12 @@ All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions
   answer 403; without a persistence DB the write routes answer 503 and the list shows live
   launchers only. `GET /v1/info` → `capabilities.agent_definitions`, `open_deploy` and
   `launcher_protocol: 2`.
+- **Lost key secrets.** A launcher that never stored its `key_secret` (for example a lost
+  `welcome`) is refused 4409 `launcher_key_in_use` until its machine is forgotten
+  (`DELETE …/launchers/{key}`, offline only): the messages say "forget the machine in the
+  Cockpit". In open mode any LAN client can forget an offline machine and reclaim its key.
+- A launcher whose definitions could not be sent after `welcome` is closed 1011
+  (`definitions sync failed; reconnect`) so it converges when it reconnects.
 
 ## 0.35.1
 
