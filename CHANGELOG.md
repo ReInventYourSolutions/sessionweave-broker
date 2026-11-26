@@ -3,6 +3,31 @@
 All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions follow
 [Semantic Versioning](https://semver.org/); releases are tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+- **Launcher protocol v2.** A launcher's `hello` may carry `"protocol": 2`, a stable
+  `launcher_key` (`lk_` + 32 hex), its start `mode` (`config`, `local`, `root`) and
+  `ceiling`, the remote `capabilities` it offers (`definitions`, `browse`, `processes`;
+  kept in account mode, and in open mode only with a persistence DB), `sandbox`
+  (`bwrap` or null), `run_as`, `platform` and `prereqs`. `welcome` carries
+  `"protocol": 2`. v1 launchers are unaffected.
+- **Launcher keys need proof of possession.** The first registration of a key gets a
+  `key_secret` in `welcome` (only its hash is stored); later hellos with that key must
+  present it, else the connection is closed 4409 `launcher_key_in_use` and nothing is
+  replaced or updated. With it, a newer connection replaces the old one (4409
+  `replaced by a newer connection`). A launcher is registered (discoverable, launchable)
+  only after its key is claimed.
+- **Machines.** With a persistence DB, every v2 launcher's machine descriptor is kept in
+  the new `launcher_machines` table (migration 008, which also adds `agent_definitions`),
+  at most 20 per account and 100 in open mode (beyond: close 4429 `too many machines;
+  forget one in the Cockpit`). Open-mode machines offline for more than
+  `SW_OPEN_MACHINES_RETENTION_DAYS` (default 30) are forgotten. Deleting an account
+  deletes its machines and definitions. New error code `launcher_not_found` (404).
+- Launchers may re-publish their profiles (`{"type":"profiles"}`) and prerequisite
+  report (`{"type":"prereqs"}`); prereq states include `not_logged_in`. Profiles may carry
+  `source` (`local`/`remote`), `kind` (`observer`/`operator`) and `coordinator_capable`,
+  returned by discovery.
+
 ## 0.35.1
 
 - **Admin-token joins can become coordinator.** A participant that joins with the relay

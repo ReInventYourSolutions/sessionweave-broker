@@ -85,7 +85,8 @@ OPEN_OWNER = ""
 
 _MODES = {"config", "local", "root"}
 _KEY_RE = re.compile(r"^lk_[0-9a-f]{32}$")
-_SANDBOX_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+# Sandboxes a launcher may report ("none" or null: no sandbox).
+_SANDBOXES = {"bwrap"}
 _PREREQ_STATES = {"ok", "installed", "missing", "wrong_version", "not_logged_in"}
 _MAX_PREREQS = 32
 _MAX_PREREQ_NAME = 32
@@ -206,7 +207,7 @@ def _ceiling(mode: str, raw: Any) -> str | None:
     if (
         not isinstance(raw, str)
         or not 0 < len(raw) <= _MAX_CEILING
-        or "\x00" in raw
+        or not raw.isprintable()
         or not raw.startswith("/")
         or raw.startswith("//")
         or posixpath.normpath(raw) != raw
@@ -245,8 +246,10 @@ def parse_hello_v2(hello: dict[str, Any], *, deploy_allowed: bool) -> HelloV2:
     if mode == "config" or not deploy_allowed:
         caps = frozenset()
     sandbox = hello.get("sandbox")
-    if sandbox is not None and (not isinstance(sandbox, str) or not _SANDBOX_RE.match(sandbox)):
-        raise HelloError("sandbox must be null or a short name")
+    if sandbox == "none":
+        sandbox = None
+    if sandbox is not None and not (isinstance(sandbox, str) and sandbox in _SANDBOXES):
+        raise HelloError(f"sandbox must be null, 'none' or one of {sorted(_SANDBOXES)}")
     run_as = hello.get("run_as", False)
     if not isinstance(run_as, bool):
         raise HelloError("run_as must be a boolean")
@@ -440,36 +443,66 @@ class LauncherRegistry:
         expires_at_ms: int | None = None,
         v2: HelloV2 | None = None,
     ) -> tuple[str, list[dict[str, str]]]:
-        """Register a launcher from a validated-shape hello.
+        """``prepare`` + ``add`` in one step (no key claim): returns
+        ``(launcher_id, rejected)``. A connection holding the same key is
+        unregistered (the caller closes it)."""
+        lnc, rejected = self.prepare(
+            conn, owner_account_id, hello, token_id=token_id, ip=ip,
+            resume_hash=resume_hash, owner_name=owner_name, expires_at_ms=expires_at_ms,
+            v2=v2,
+        )
+        self.add(lnc)
+        return lnc.launcher_id, rejected
 
-        ``v2`` is the parsed v2 part of the hello; when omitted it is parsed
-        here, with capabilities kept only for an account-mode launcher.
-
-        Returns ``(launcher_id, rejected)`` where ``rejected`` lists the
-        invalid or duplicate profiles as ``{"id", "reason"}``. Raises
-        ``LauncherLimitError`` when the owner (or, in open mode, the broker)
-        already has the maximum number of launchers. A connection holding
-        the same launcher key is not counted: the caller replaces it.
-        """
-        if v2 is None:
-            v2 = parse_hello_v2(hello, deploy_allowed=owner_account_id is not None)
-        owner = owner_account_id or OPEN_OWNER
+    def _check_limit(self, lnc: _Launcher) -> None:
+        """Raise ``LauncherLimitError`` when ``lnc``'s owner (or, in open
+        mode, the broker) already has the maximum number of launchers; a
+        connection holding the same launcher key is not counted (it is the
+        one ``add`` replaces)."""
+        key, owner = lnc.v2.launcher_key, owner_key(lnc)
         others = [
-            lnc for lnc in self._launchers.values()
-            if v2.launcher_key is None
-            or lnc.v2.launcher_key != v2.launcher_key
-            or owner_key(lnc) != owner
+            o for o in self._launchers.values()
+            if o.launcher_id != lnc.launcher_id
+            and (key is None or o.v2.launcher_key != key or owner_key(o) != owner)
         ]
-        if owner_account_id is not None:
-            owned = sum(1 for lnc in others if lnc.owner_account_id == owner_account_id)
+        if lnc.owner_account_id is not None:
+            owned = sum(1 for o in others if o.owner_account_id == lnc.owner_account_id)
             if owned >= MAX_LAUNCHERS_PER_ACCOUNT:
                 raise LauncherLimitError(
                     f"at most {MAX_LAUNCHERS_PER_ACCOUNT} launchers per account"
                 )
         elif len(others) >= MAX_LAUNCHERS_OPEN:
             raise LauncherLimitError(f"at most {MAX_LAUNCHERS_OPEN} launchers on this broker")
+
+    def prepare(
+        self,
+        conn: LauncherConn,
+        owner_account_id: str | None,
+        hello: dict[str, Any],
+        *,
+        token_id: str | None = None,
+        ip: str = "",
+        resume_hash: bytes = b"",
+        owner_name: str | None = None,
+        expires_at_ms: int | None = None,
+        v2: HelloV2 | None = None,
+    ) -> tuple[_Launcher, list[dict[str, str]]]:
+        """Validate a hello and build its launcher WITHOUT registering it:
+        it is not discoverable, launchable or indexed until ``add``.
+
+        ``v2`` is the parsed v2 part of the hello; when omitted it is parsed
+        here, with capabilities kept only for an account-mode launcher.
+        Returns ``(launcher, rejected)`` where ``rejected`` lists the invalid
+        or duplicate profiles as ``{"id", "reason"}``. Raises ``HelloError``
+        or ``LauncherLimitError``.
+        """
+        if v2 is None:
+            v2 = parse_hello_v2(hello, deploy_allowed=owner_account_id is not None)
         machine = hello.get("machine")
-        if not isinstance(machine, str) or not machine.strip() or len(machine) > 100:
+        if (
+            not isinstance(machine, str) or not machine.strip() or len(machine) > 100
+            or not machine.isprintable()
+        ):
             raise HelloError("machine must be a non-empty string of at most 100 chars")
         visibility = hello.get("visibility", "personal")
         if visibility not in _VISIBILITIES:
@@ -497,9 +530,24 @@ class LauncherRegistry:
             resume_hash=resume_hash, owner_name=owner_name, expires_at_ms=expires_at_ms,
             v2=v2,
         )
+        self._check_limit(lnc)
         lnc.profiles, rejected = _load_profiles(raw_profiles)
-        self._launchers[launcher_id] = lnc
-        return launcher_id, rejected
+        return lnc, rejected
+
+    def add(self, lnc: _Launcher) -> list[_Launcher]:
+        """Register a prepared launcher (synchronously): re-check the limit,
+        unregister the connections holding the same owner + launcher key and
+        return them (the caller closes them with 4409)."""
+        self._check_limit(lnc)
+        key, owner = lnc.v2.launcher_key, owner_key(lnc)
+        replaced = [] if key is None else [
+            o for o in self._launchers.values()
+            if o.v2.launcher_key == key and owner_key(o) == owner
+        ]
+        for old in replaced:
+            self.unregister(old.launcher_id)
+        self._launchers[lnc.launcher_id] = lnc
+        return replaced
 
     def get(self, launcher_id: str) -> _Launcher | None:
         return self._launchers.get(launcher_id)
@@ -530,8 +578,8 @@ class LauncherRegistry:
         lnc.profiles, rejected = _load_profiles(raw)
         return rejected
 
-    def claim_key(self, launcher_id: str, presented: str | None) -> str | None:
-        """Claim the launcher key of ``launcher_id`` without a persistence DB.
+    def claim_key(self, lnc: _Launcher, presented: str | None) -> str | None:
+        """Claim the launcher key of a prepared ``lnc`` without a persistence DB.
 
         While another connection of the same owner holds the key, the hello
         must present that connection's ``key_secret`` (else
@@ -539,11 +587,10 @@ class LauncherRegistry:
         None returned. A key nobody holds gets a new secret, returned so it
         is sent in ``welcome`` (only its hash is kept).
         """
-        lnc = self._launchers[launcher_id]
         key, owner = lnc.v2.launcher_key, owner_key(lnc)
         holders = [
             o for o in self._launchers.values()
-            if o.launcher_id != launcher_id and o.v2.launcher_key == key
+            if o.launcher_id != lnc.launcher_id and o.v2.launcher_key == key
             and owner_key(o) == owner
         ]
         if holders:
@@ -866,7 +913,9 @@ async def launcher_ws(websocket: WebSocket) -> None:
         # Lets this launcher reclaim its running agents after a reconnect;
         # only its hash is kept, and it is never logged.
         resume_secret = secrets.token_urlsafe(32)
-        launcher_id, rejected = registry.register(
+        # Validated, not yet registered: invisible (discovery, launches,
+        # by_key) until its launcher key is claimed below.
+        lnc, rejected = registry.prepare(
             websocket, owner_account_id, hello, token_id=token_id, ip=source_ip,
             resume_hash=hash_token(resume_secret), owner_name=auth.owner_name,
             expires_at_ms=auth.expires_at_ms, v2=v2,
@@ -880,12 +929,10 @@ async def launcher_ws(websocket: WebSocket) -> None:
     except LauncherLimitError as exc:
         await websocket.close(code=_CLOSE_LIMITED, reason=str(exc)[:100])
         return
-    lnc = registry.get(launcher_id)
-    assert lnc is not None
-    owner = owner_key(lnc)
+    launcher_id, owner = lnc.launcher_id, owner_key(lnc)
     # Proof of possession of the launcher key: its first registration gets a
     # secret (sent once in welcome); a later hello with the key must present
-    # it, else nothing is replaced or updated. Never logged.
+    # it, else nothing is registered, replaced or updated. Never logged.
     issued_secret: str | None = None
     if v2.launcher_key is not None:
         from sessionweave.machines import MachineLimitError
@@ -897,39 +944,38 @@ async def launcher_ws(websocket: WebSocket) -> None:
                     key_secret=presented_secret, token_id=token_id,
                 )
             else:
-                issued_secret = registry.claim_key(launcher_id, presented_secret)
+                issued_secret = registry.claim_key(lnc, presented_secret)
         except LauncherKeyInUseError:
-            registry.unregister(launcher_id)
             log.info("launcher key in use: refused a connection without its secret")
             await websocket.close(code=_CLOSE_REPLACED, reason=KEY_IN_USE_REASON)
             return
         except MachineLimitError:
-            registry.unregister(launcher_id)
             await websocket.close(
                 code=_CLOSE_LIMITED, reason="too many machines; forget one in the Cockpit"
             )
             return
         except Exception:
-            registry.unregister(launcher_id)
             log.exception("could not record the launcher's machine")
             await websocket.close(code=_CLOSE_INTERNAL, reason="internal error")
             return
+    # From here to the welcome send there is no await: register, replace the
+    # connections holding the same key and re-attach running agents in one
+    # step, so nothing reaches this socket before its welcome.
+    try:
+        replaced = registry.add(lnc)
+    except LauncherLimitError as exc:
+        if issued_secret is not None and machines is not None and v2.launcher_key:
+            # Undo the fresh registration: its secret is never delivered.
+            with contextlib.suppress(Exception):
+                await machines.forget_machine(owner, v2.launcher_key)
+        await websocket.close(code=_CLOSE_LIMITED, reason=str(exc)[:100])
+        return
     stops: list[dict[str, Any]] = []
     if deps.launches is not None and hello.get("running"):
         stops = deps.launches.reattach(
-            launcher_id, owner_account_id, token_id, hello["machine"].strip(),
+            launcher_id, owner_account_id, token_id, lnc.machine,
             list(hello["running"]), hello.get("resume_secret"),
         )
-    if v2.launcher_key is not None:
-        # The same launcher reconnected (its old socket may be half-open):
-        # its running agents moved over above; drop the old connection.
-        for old in registry.for_account(owner):
-            if old.launcher_id != launcher_id and old.v2.launcher_key == v2.launcher_key:
-                registry.unregister(old.launcher_id)
-                close = getattr(old.conn, "close", None)
-                if close is not None:
-                    with contextlib.suppress(Exception):
-                        await close(code=_CLOSE_REPLACED, reason="replaced by a newer connection")
 
     pinger: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
@@ -941,6 +987,13 @@ async def launcher_ws(websocket: WebSocket) -> None:
              "resume_secret": resume_secret, "account": auth.owner_name,
              "protocol": PROTOCOL_VERSION, "key_secret": issued_secret}
         )
+        # The same launcher reconnected (its old socket may be half-open):
+        # its running agents moved over above; drop the old connection.
+        for old in replaced:
+            close = getattr(old.conn, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close(code=_CLOSE_REPLACED, reason="replaced by a newer connection")
         for stop in stops:
             await websocket.send_json(stop)
         pinger = asyncio.create_task(_ping_loop(websocket, auth.expires_at_ms))
@@ -961,6 +1014,10 @@ async def launcher_ws(websocket: WebSocket) -> None:
                 # dead socket is noticed) so it is never reported unretrieved.
                 await task
         registry.unregister(launcher_id)
+        if machines is not None and v2.launcher_key is not None:
+            # last_seen = when it went offline (open-mode retention counts from it)
+            with contextlib.suppress(Exception):
+                await machines.touch(owner, v2.launcher_key, int(time.time() * 1000))
         with contextlib.suppress(Exception):
             await websocket.close()
 

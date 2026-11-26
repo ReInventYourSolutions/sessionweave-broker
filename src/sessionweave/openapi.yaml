@@ -1205,14 +1205,17 @@ paths:
         `local`, `/` in `root`, null in `config`), `"capabilities"`
         (`definitions`, `browse`, `processes`; unknown names dropped; ignored
         in `config` mode and on an open-mode broker without a persistence DB),
-        `"sandbox"`, `"run_as"` (root mode only), `"platform"` and `"prereqs"`
+        `"sandbox"` (`bwrap`, or `none`/null), `"run_as"` (root mode only), `"platform"` and `"prereqs"`
         (at most 32 `{name, state: ok|installed|missing|wrong_version|not_logged_in,
         version, required, needed_by, command}`) and `"key_secret"`. The first
         registration of a launcher key (per owner) gets a secret in
         `welcome.key_secret` (sent once, only its hash is kept; null on every
         later welcome); a later hello with that key must present it as
         `key_secret`, else it is closed 4409 `launcher_key_in_use` and nothing
-        is replaced or updated (reset a lost secret by deleting the machine).
+        is replaced or updated (reset a lost secret by deleting the machine); a
+        launcher is registered (discoverable, launchable) only once its key is
+        claimed. Open-mode machines offline longer than
+        `SW_OPEN_MACHINES_RETENTION_DAYS` (default 30) are forgotten.
         With the secret, a newer connection with the
         same owner and launcher key replaces the old one (closed 4409); a new
         key over the machine limit (20 per account; 100 in open mode) closes

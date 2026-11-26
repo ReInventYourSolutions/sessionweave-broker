@@ -51,6 +51,12 @@ def account_events_retention_days() -> int:
     return _env_int("SW_ACCOUNT_EVENTS_RETENTION_DAYS", 30)
 
 
+def open_machines_retention_days() -> int:
+    """``SW_OPEN_MACHINES_RETENTION_DAYS``: open-mode machines offline for longer
+    are forgotten with their definitions (default 30)."""
+    return _env_int("SW_OPEN_MACHINES_RETENTION_DAYS", 30)
+
+
 class _BodyTooLargeError(Exception):
     pass
 

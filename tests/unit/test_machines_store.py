@@ -203,3 +203,27 @@ async def test_key_secret_issued_once_and_required(store: PersistenceStore) -> N
     await ms.forget_machine("acc_1", KEY)
     _m, fresh = await ms.claim_machine("acc_1", "box", hello, 4)
     assert fresh is not None and fresh != secret
+
+
+async def test_prune_open_machines(store: PersistenceStore) -> None:
+    ms = MachineStore(store)
+    day = 86_400_000
+    now = 100 * day
+    for i, seen in enumerate((now - 40 * day, now - 40 * day, now - 5 * day)):
+        await ms.claim_machine(
+            OPEN_OWNER, "m",
+            parse_hello_v2({**V2, "launcher_key": _key(i)}, deploy_allowed=True), seen)
+        await _add_definition(store, OPEN_OWNER, _key(i))
+    await ms.claim_machine("acc_1", "m", parse_hello_v2(V2, deploy_allowed=True), 0)
+    # key 1 is online: kept whatever its last_seen
+    assert await ms.prune_open(now, 30, online_keys={_key(1)}) == 1
+    assert [m.launcher_key for m in await ms.list_machines(OPEN_OWNER)] == [_key(1), _key(2)]
+    assert await _definition_rows(store, OPEN_OWNER) == 2
+    assert len(await ms.list_machines("acc_1")) == 1  # account rows never pruned
+
+
+async def test_touch_updates_last_seen(store: PersistenceStore) -> None:
+    ms = MachineStore(store)
+    await ms.claim_machine("acc_1", "m", parse_hello_v2(V2, deploy_allowed=True), 1)
+    await ms.touch("acc_1", KEY, 50)
+    assert (await ms.get_machine("acc_1", KEY)).last_seen == 50

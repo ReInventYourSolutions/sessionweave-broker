@@ -86,6 +86,7 @@ def test_invalid_and_duplicate_profiles_reported() -> None:
     {"machine": "", "profiles": []}, {"machine": "m", "visibility": "x", "profiles": []},
     {"machine": "m", "allowed_accounts": "bob", "profiles": []},
     {"machine": "m", "profiles": "no"},
+    {"machine": "m\nfake", "profiles": []},
 ])
 def test_bad_hello(hello: dict[str, Any]) -> None:
     with pytest.raises(HelloError):
@@ -284,6 +285,8 @@ def test_root_mode_ceiling_is_slash() -> None:
     {"prereqs": [{"name": "x", "state": "ok", "command": "y" * 301}]},
     {"prereqs": [{"name": "x", "state": "ok", "required": "yes"}]},
     {"prereqs": [{"name": "x", "state": "ok", "needed_by": "cline"}]},
+    {"sandbox": "firejail"}, {"sandbox": "BWRAP"},
+    {"mode": "local", "ceiling": "/srv/a\nb"}, {"mode": "local", "ceiling": "/srv/\x7f"},
 ])
 def test_hello_v2_rejects(bad: dict[str, Any]) -> None:
     with pytest.raises(HelloError):
@@ -354,19 +357,36 @@ def test_claim_key_without_db() -> None:
     from sessionweave.launchers import LauncherKeyInUseError
 
     reg = LauncherRegistry()
-    a, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    a, _ = reg.prepare(_Conn(), None, _hello([_prof()], **V2))
     secret = reg.claim_key(a, None)
     assert secret is not None
-    b, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    reg.add(a)
+    b, _ = reg.prepare(_Conn(), None, _hello([_prof()], **V2))
     for bad in (None, "lks_wrong"):
         with pytest.raises(LauncherKeyInUseError):
             reg.claim_key(b, bad)
     assert reg.claim_key(b, secret) is None  # holder's secret: claim ok, no new secret
+    assert reg.by_key(OPEN_OWNER, KEY) is a  # b is not registered by prepare/claim
     # nobody holds the key any more: a new secret
-    reg.unregister(a)
-    reg.unregister(b)
-    c, _ = reg.register(_Conn(), None, _hello([_prof()], **V2))
+    reg.unregister(a.launcher_id)
+    c, _ = reg.prepare(_Conn(), None, _hello([_prof()], **V2))
     assert reg.claim_key(c, None) not in (None, secret)
+
+
+def test_add_replaces_same_key_and_rechecks_limit() -> None:
+    reg = LauncherRegistry()
+    a, _ = reg.prepare(_Conn(), "acc_1", _hello([_prof()], **V2))
+    assert reg.add(a) == []
+    b, _ = reg.prepare(_Conn(), "acc_1", _hello([_prof()], **V2))
+    assert [x.launcher_id for x in reg.add(b)] == [a.launcher_id]
+    assert reg.by_key("acc_1", KEY) is b and reg.get(a.launcher_id) is None
+    # the limit is checked again when adding
+    pending = [reg.prepare(_Conn(), "acc_1", _hello([_prof()], **{
+        **V2, "launcher_key": f"lk_{i:032x}"}))[0] for i in range(5)]
+    for p in pending[:4]:
+        reg.add(p)
+    with pytest.raises(Exception, match="5 launchers"):
+        reg.add(pending[4])
 
 
 @pytest.mark.parametrize("bad", ["", 3, "x" * 201])
@@ -376,3 +396,8 @@ def test_hello_key_secret_validated(bad: Any) -> None:
     with pytest.raises(HelloError):
         hello_key_secret({"key_secret": bad})
     assert hello_key_secret({}) is None
+
+
+def test_sandbox_none_means_no_sandbox() -> None:
+    assert parse_hello_v2({**V2, "sandbox": "none"}, deploy_allowed=True).sandbox is None
+    assert parse_hello_v2({**V2, "sandbox": None}, deploy_allowed=True).sandbox is None

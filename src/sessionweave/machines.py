@@ -160,6 +160,46 @@ class MachineStore:
                 (json.dumps(prereqs), account_id, launcher_key),
             )
 
+    async def touch(self, account_id: str, launcher_key: str, now_ms: int) -> None:
+        """Set ``last_seen`` (the launcher went offline); no-op for an unknown one."""
+        async with self._store._write_tx_lock:
+            await self._write().execute(
+                "UPDATE launcher_machines SET last_seen = ?"
+                " WHERE account_id = ? AND launcher_key = ?",
+                (now_ms, account_id, launcher_key),
+            )
+
+    async def prune_open(
+        self, now_ms: int, retention_days: int, *, online_keys: set[str]
+    ) -> int:
+        """Forget open-mode machines (and their definitions) offline for more
+        than ``retention_days`` (``last_seen`` older; ``online_keys`` are
+        always kept). Account machines are never pruned. Returns the count."""
+        cutoff = now_ms - retention_days * 86_400_000
+        conn = self._write()
+        async with self._store._write_tx_lock:
+            async with conn.execute(
+                "SELECT launcher_key FROM launcher_machines"
+                " WHERE account_id = ? AND last_seen < ?",
+                (OPEN_OWNER, cutoff),
+            ) as cur:
+                stale = [r[0] async for r in cur if r[0] not in online_keys]
+            if not stale:
+                return 0
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                for key in stale:
+                    for table in ("agent_definitions", "launcher_machines"):
+                        await conn.execute(
+                            f"DELETE FROM {table} WHERE account_id = ? AND launcher_key = ?",
+                            (OPEN_OWNER, key),
+                        )
+                await conn.execute("COMMIT")
+            except BaseException:
+                await conn.execute("ROLLBACK")
+                raise
+        return len(stale)
+
     async def list_machines(self, account_id: str) -> list[Machine]:
         async with self._read().execute(
             f"SELECT {_COLUMNS} FROM launcher_machines WHERE account_id = ?"

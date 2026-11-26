@@ -41,7 +41,7 @@ from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.events_ws import routes as events_ws_routes
 from sessionweave.firehose import FirehoseRegistry
 from sessionweave.http_api import routes as http_api_routes
-from sessionweave.launchers import launcher_token_from_env
+from sessionweave.launchers import OPEN_OWNER, launcher_token_from_env
 from sessionweave.launchers import routes as launcher_routes
 from sessionweave.limits import (
     McpNewSessionLimitMiddleware,
@@ -49,6 +49,7 @@ from sessionweave.limits import (
     account_events_retention_days,
     account_max_sessions,
     account_max_tokens,
+    open_machines_retention_days,
 )
 from sessionweave.machines import MachineStore
 from sessionweave.mcp_adapter import (
@@ -1466,12 +1467,22 @@ def build_app() -> Starlette:
             events = EventLog(store)
             tool_deps.accounts = AccountStore(store, events=events)
             tool_deps.events = events
-            tool_deps.machines = MachineStore(store)
+            machines = MachineStore(store)
+            tool_deps.machines = machines
             registry.events = events
             retention_days = account_events_retention_days()
+            machines_retention_days = open_machines_retention_days()
 
             async def _prune_events(now_ms: int) -> None:
                 await events.prune(now_ms, retention_days)
+                online = {
+                    lnc.v2.launcher_key
+                    for lnc in tool_deps.launchers.for_account(OPEN_OWNER)
+                    if lnc.v2.launcher_key is not None
+                }
+                await machines.prune_open(
+                    now_ms, machines_retention_days, online_keys=online
+                )
 
             # Sweep loop
             sweep_task = asyncio.create_task(

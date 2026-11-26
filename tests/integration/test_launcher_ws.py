@@ -601,3 +601,30 @@ async def test_key_secret_required_open_mode_with_db(tmp_path: Path) -> None:
         ws, w = await _connect(base, None, _hello([_prof()], **V2, key_secret=secret))
         async with ws:
             assert w["type"] == "welcome" and w["key_secret"] is None
+
+
+async def test_simultaneous_hellos_with_the_secret_leave_one_connection(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        ws0, w0 = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        secret = w0["key_secret"]
+        await ws0.close()
+        hello = _hello([_prof()], **V2, key_secret=secret)
+        (wa, a), (wb, b) = await asyncio.gather(
+            _connect(s.base, s.token, hello), _connect(s.base, s.token, hello))
+        assert a["type"] == b["type"] == "welcome"
+        # exactly one is replaced by the other; the survivor is the one discovered
+        done, _pending = await asyncio.wait(
+            {asyncio.ensure_future(_closed_by_broker(wa)),
+             asyncio.ensure_future(_closed_by_broker(wb))},
+            timeout=3, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == 1
+        code, reason = next(iter(done)).result()
+        assert (code, reason) == (4409, "replaced by a newer connection")
+        survivor = (wb, b) if wa.close_code is not None else (wa, a)
+        assert survivor[0].close_code is None
+        sess = await _session(c, s.token)
+        r = await c.get("/v1/agents", params={"session_id": sess["session_id"],
+                                              "domain": "backend"}, headers=bearer(s.token))
+        assert [x["launcher_id"] for x in r.json()["agents"]] == [survivor[1]["launcher_id"]]
+        await survivor[0].close()
