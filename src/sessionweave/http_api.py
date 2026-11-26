@@ -128,6 +128,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.NO_FREE_SLOT: 409,
     ErrorCode.LAUNCH_LIMIT: 409,
     ErrorCode.LAUNCH_NOT_FOUND: 404,
+    ErrorCode.LAUNCHER_NOT_FOUND: 404,
 }
 
 

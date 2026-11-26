@@ -66,6 +66,7 @@ from sessionweave.supervisor import (
 
 if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
+    from sessionweave.machines import MachineStore
     from sessionweave.metrics import Metrics
     from sessionweave.persistence import PersistenceStore
     from sessionweave.schemas import PersistenceStatePublic
@@ -88,6 +89,7 @@ class ToolDeps:
         "events",
         "launchers",
         "launches",
+        "machines",
         "metrics",
         "registry",
         "relay_epoch",
@@ -122,6 +124,9 @@ class ToolDeps:
         # Set in the server lifespan once the persistence store exists.
         self.accounts: AccountStore | None = None
         self.events: EventLog | None = None
+        # Machines of v2 launchers (and their deployed definitions); set
+        # whenever the persistence DB exists, in both modes.
+        self.machines: MachineStore | None = None
         from sessionweave.launchers import LauncherRegistry
         from sessionweave.launches import LaunchManager
         self.launchers = LauncherRegistry()

@@ -437,6 +437,9 @@ components:
         limits: { type: object, additionalProperties: { type: number, nullable: true } }
         online: { type: boolean }
         free_slots: { type: integer }
+        source: { type: string, enum: [local, remote], description: "local: the launcher's own configuration; remote: a definition deployed from the Cockpit" }
+        kind: { type: string, enum: [observer, operator], nullable: true }
+        coordinator_capable: { type: boolean }
     LaunchRequest:
       type: object
       required: [task]
@@ -509,6 +512,7 @@ components:
                 - no_free_slot
                 - launch_limit
                 - launch_not_found
+                - launcher_not_found
             message:
               type: string
     Account:
@@ -1193,14 +1197,29 @@ paths:
         Frames (JSON text). Launcher → broker: first
         `{"type":"hello","machine","visibility":"personal"|"general","allowed_accounts":[names],"profiles":[...]}`
         (a profile may carry its own `visibility` and `allowed_accounts`,
-        overriding the launcher's for that profile);
+        overriding the launcher's for that profile, and `source`
+        (`local`|`remote`), `kind` (`observer`|`operator`|null) and
+        `coordinator_capable`). Protocol v2 adds to the hello `"protocol": 2`,
+        `"launcher_key": "lk_" + 32 hex` (stable), `"mode"`
+        (`config`|`local`|`root`), `"ceiling"` (normalized absolute path in
+        `local`, `/` in `root`, null in `config`), `"capabilities"`
+        (`definitions`, `browse`, `processes`; unknown names dropped; ignored
+        in `config` mode and on an open-mode broker without a persistence DB),
+        `"sandbox"`, `"run_as"` (root mode only), `"platform"` and `"prereqs"`
+        (at most 32 `{name, state: ok|installed|missing|wrong_version|not_logged_in,
+        version, required, needed_by, command}`). A newer connection with the
+        same owner and launcher key replaces the old one (closed 4409); a new
+        key over the machine limit (20 per account; 100 in open mode) closes
+        4429. Later frames `{"type":"profiles","profiles":[...]}` replace the
+        published profiles and `{"type":"prereqs","prereqs":[...]}` the
+        prerequisite report;
         then `{"type":"launch_result","launch_id","status":"started"|"failed","error"?,"message"?}`
         (`message`: at most 300 printable characters, kept with the launch
         and sent in `agent.launch_failed`)
         and `{"type":"stopped","launch_id","reason"}` (its own stop, e.g. a
         limit: the broker removes the participant — halt first — and sends the
         session event `agent.stopped {participant_id, launch_id, reason}`).
-        Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}],"resume_secret","account"}`
+        Broker → launcher: `{"type":"welcome","launcher_id","rejected":[{id,reason}],"resume_secret","account","protocol":2}`
         (`account`: the owner account's name, null in open mode),
         `{"type":"ping"}` every 20 s,
         `{"type":"launch","launch_id","session_id","profile_id","task","join_credential","coordinator_id","session_owner","broker_url"?}`

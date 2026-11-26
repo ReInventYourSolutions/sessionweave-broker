@@ -21,7 +21,7 @@ def _app(mode: str = "open", accounts: Any = None) -> Starlette:
     app = Starlette(routes=launchers.routes())
     app.state.tool_deps = SimpleNamespace(
         session_creation=mode, accounts=accounts, launchers=LauncherRegistry(),
-        launches=None, auth_limiter=AuthFailureLimiter(),
+        launches=None, auth_limiter=AuthFailureLimiter(), machines=None,
     )
     app.state.launcher_token = None
     return app

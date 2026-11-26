@@ -304,10 +304,20 @@ class AccountStore:
         return before, await self.get(account_id)
 
     async def delete(self, account_id: str) -> None:
-        """Delete an account; its tokens go with it (ON DELETE CASCADE)."""
+        """Delete an account; its tokens go with it (ON DELETE CASCADE), and
+        its machines and deployed agent definitions are deleted too."""
         conn = self._write_conn()
         async with self._store._write_tx_lock:
-            await conn.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table in ("agent_definitions", "launcher_machines", "accounts"):
+                    await conn.execute(
+                        f"DELETE FROM {table} WHERE account_id = ?", (account_id,)
+                    )
+                await conn.execute("COMMIT")
+            except BaseException:
+                await conn.execute("ROLLBACK")
+                raise
 
     # ----- tokens -----
 

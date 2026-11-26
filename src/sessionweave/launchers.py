@@ -7,6 +7,13 @@ offline the moment the socket closes. The registry is in memory only and is
 rebuilt from live launchers.
 
 Workdir and start prompt never reach the broker: the launcher keeps them.
+
+Protocol v2 (``"protocol": 2`` in ``hello``) adds a stable ``launcher_key``,
+the launcher's start ``mode`` and ``ceiling``, the remote ``capabilities`` it
+offers, its ``sandbox``, ``platform`` and ``prereqs``. A v2 launcher is
+indexed by ``(owner key, launcher_key)``: a newer connection with the same key
+replaces the old one (closed 4409), and its machine descriptor is kept in the
+persistence DB (``machines.MachineStore``) when there is one.
 """
 from __future__ import annotations
 
@@ -15,11 +22,12 @@ import contextlib
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from starlette.routing import WebSocketRoute
@@ -31,6 +39,7 @@ from sessionweave.errors import ErrorCode, ToolError
 
 if TYPE_CHECKING:
     from sessionweave.launches import LaunchManager
+    from sessionweave.machines import MachineStore
     from sessionweave.session import Session
 
 log = logging.getLogger(__name__)
@@ -40,6 +49,7 @@ HELLO_TIMEOUT_S = 10.0
 _CLOSE_BAD_HELLO = 4400
 _CLOSE_UNAUTHORIZED = 4401
 _CLOSE_FORBIDDEN = 4403
+_CLOSE_REPLACED = 4409
 _CLOSE_LIMITED = 4429
 _CLOSE_TOO_BIG = 1009
 _CLOSE_INTERNAL = 1011
@@ -58,6 +68,30 @@ _PRESETS = {"reader", "operator"}
 _VISIBILITIES = {"personal", "general"}
 _MAX_PROFILES = 200
 _MAX_ACCOUNTS = 100
+_SOURCES = {"local", "remote"}
+_KINDS = {"observer", "operator"}
+
+# Launcher protocol v2: what the broker speaks (sent in ``welcome``).
+PROTOCOL_VERSION = 2
+# Persisted machines (v2 launchers with a key) per owner account, and in all
+# for the open-mode owner key.
+MAX_MACHINES_PER_ACCOUNT = 20
+MAX_MACHINES_OPEN = 100
+# Remote capabilities a launcher may advertise; unknown names are dropped.
+KNOWN_CAPABILITIES = frozenset({"definitions", "browse", "processes"})
+# Owner key of open-mode (ownerless) launchers, machines and definitions.
+OPEN_OWNER = ""
+
+_MODES = {"config", "local", "root"}
+_KEY_RE = re.compile(r"^lk_[0-9a-f]{32}$")
+_SANDBOX_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_PREREQ_STATES = {"ok", "installed", "missing", "wrong_version", "not_logged_in"}
+_MAX_PREREQS = 32
+_MAX_PREREQ_NAME = 32
+_MAX_PREREQ_TEXT = 300
+_MAX_CEILING = 4096
+_MAX_PLATFORM = 32
+_MAX_CAPABILITY_NAMES = 32
 
 
 class LauncherConn(Protocol):
@@ -70,6 +104,131 @@ class HelloError(ValueError):
 
 class LauncherLimitError(Exception):
     """Too many launchers connected for this owner (or in all)."""
+
+
+@dataclass(frozen=True)
+class HelloV2:
+    """The protocol-v2 part of a launcher's ``hello`` (defaults for v1)."""
+
+    protocol: int
+    launcher_key: str | None
+    mode: str
+    ceiling: str | None
+    capabilities: frozenset[str]
+    sandbox: str | None
+    run_as: bool
+    platform: str
+    prereqs: tuple[dict[str, Any], ...]
+
+
+LEGACY_HELLO = HelloV2(1, None, "config", None, frozenset(), None, False, "", ())
+
+
+def _short_text(v: Any, limit: int = _MAX_PREREQ_TEXT) -> bool:
+    return isinstance(v, str) and len(v) <= limit and v.isprintable()
+
+
+def parse_prereqs(raw: Any) -> tuple[dict[str, Any], ...]:
+    """Validate a launcher's prerequisite list; raise ValueError with the reason."""
+    if not isinstance(raw, list) or len(raw) > _MAX_PREREQS:
+        raise ValueError(f"prereqs must be a list of at most {_MAX_PREREQS} entries")
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each prereq must be an object")
+        name = item.get("name")
+        if not isinstance(name, str) or not name or not _short_text(name, _MAX_PREREQ_NAME):
+            raise ValueError(f"prereq name must be 1-{_MAX_PREREQ_NAME} printable chars")
+        state = item.get("state")
+        if state not in _PREREQ_STATES:
+            raise ValueError(f"prereq state must be one of {sorted(_PREREQ_STATES)}")
+        version, command = item.get("version"), item.get("command")
+        for label, v in (("version", version), ("command", command)):
+            if v is not None and not _short_text(v):
+                raise ValueError(
+                    f"prereq {label} must be null or at most {_MAX_PREREQ_TEXT} printable chars"
+                )
+        required = item.get("required", False)
+        if not isinstance(required, bool):
+            raise ValueError("prereq required must be a boolean")
+        needed_by = item.get("needed_by", [])
+        if (
+            not isinstance(needed_by, list)
+            or len(needed_by) > _MAX_PREREQS
+            or not all(_short_text(n) for n in needed_by)
+        ):
+            raise ValueError("prereq needed_by must be a list of short strings")
+        out.append({"name": name, "state": state, "version": version, "required": required,
+                    "needed_by": list(needed_by), "command": command})
+    return tuple(out)
+
+
+def _ceiling(mode: str, raw: Any) -> str | None:
+    if mode == "config":
+        if raw is not None:
+            raise HelloError("ceiling must be null in config mode")
+        return None
+    if mode == "root":
+        if raw is not None and raw != "/":
+            raise HelloError("ceiling must be '/' in root mode")
+        return "/"
+    if (
+        not isinstance(raw, str)
+        or not 0 < len(raw) <= _MAX_CEILING
+        or "\x00" in raw
+        or not raw.startswith("/")
+        or raw.startswith("//")
+        or posixpath.normpath(raw) != raw
+    ):
+        raise HelloError("ceiling must be a normalized absolute path in local mode")
+    return raw
+
+
+def parse_hello_v2(hello: dict[str, Any], *, deploy_allowed: bool) -> HelloV2:
+    """Parse the v2 fields of ``hello`` (a hello without ``protocol`` >= 2 is
+    a v1 launcher: config mode, no key, no capability).
+
+    ``deploy_allowed=False`` strips the capabilities (open mode without a
+    persistence DB). Raises ``HelloError``.
+    """
+    protocol = hello.get("protocol", 1)
+    if not _is_int(protocol) or protocol < 1:
+        raise HelloError("protocol must be a positive integer")
+    if protocol < 2:
+        return LEGACY_HELLO
+    key = hello.get("launcher_key")
+    if not isinstance(key, str) or not _KEY_RE.match(key):
+        raise HelloError("launcher_key must be 'lk_' and 32 lowercase hex chars")
+    mode = hello.get("mode", "config")
+    if mode not in _MODES:
+        raise HelloError(f"mode must be one of {sorted(_MODES)}")
+    ceiling = _ceiling(mode, hello.get("ceiling"))
+    caps_raw = hello.get("capabilities", [])
+    if (
+        not isinstance(caps_raw, list)
+        or len(caps_raw) > _MAX_CAPABILITY_NAMES
+        or not all(isinstance(c, str) and len(c) <= 64 for c in caps_raw)
+    ):
+        raise HelloError("capabilities must be a list of names")
+    caps = frozenset(caps_raw) & KNOWN_CAPABILITIES
+    if mode == "config" or not deploy_allowed:
+        caps = frozenset()
+    sandbox = hello.get("sandbox")
+    if sandbox is not None and (not isinstance(sandbox, str) or not _SANDBOX_RE.match(sandbox)):
+        raise HelloError("sandbox must be null or a short name")
+    run_as = hello.get("run_as", False)
+    if not isinstance(run_as, bool):
+        raise HelloError("run_as must be a boolean")
+    if run_as and mode != "root":
+        raise HelloError("run_as is only valid in root mode")
+    platform = hello.get("platform", "")
+    if not _short_text(platform, _MAX_PLATFORM):
+        raise HelloError(f"platform must be at most {_MAX_PLATFORM} printable chars")
+    try:
+        prereqs = parse_prereqs(hello.get("prereqs", []))
+    except ValueError as exc:
+        raise HelloError(str(exc)) from exc
+    return HelloV2(protocol, key, mode, ceiling, caps, sandbox, run_as, platform, prereqs)
 
 
 def _is_int(v: Any) -> bool:
@@ -145,6 +304,20 @@ def validate_profile(raw: Any) -> dict[str, Any]:
     out["allowed_accounts"] = (
         None if allowed is None else frozenset(a.casefold() for a in allowed)
     )
+    # v2: where the profile comes from (the launcher's TOML or a remote
+    # definition), its kind and whether it can coordinate a session.
+    source = raw.get("source", "local")
+    if source not in _SOURCES:
+        raise ValueError("source must be 'local' or 'remote'")
+    out["source"] = source
+    kind = raw.get("kind")
+    if kind is not None and kind not in _KINDS:
+        raise ValueError("kind must be 'observer', 'operator' or null")
+    out["kind"] = kind
+    coord = raw.get("coordinator_capable", False)
+    if not isinstance(coord, bool):
+        raise ValueError("coordinator_capable must be a boolean")
+    out["coordinator_capable"] = coord
     return out
 
 
@@ -186,6 +359,33 @@ class _Launcher:
     owner_name: str | None = None
     # When the account token it connected with expires (ms), if it does.
     expires_at_ms: int | None = None
+    # Protocol v2 fields of its hello (LEGACY_HELLO for a v1 launcher).
+    v2: HelloV2 = LEGACY_HELLO
+
+
+def owner_key(lnc: _Launcher) -> str:
+    """The key machines and definitions are stored under: the owner account,
+    or ``OPEN_OWNER`` for an open-mode launcher."""
+    return lnc.owner_account_id or OPEN_OWNER
+
+
+def _load_profiles(
+    raw_profiles: list[Any],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    profiles: dict[str, dict[str, Any]] = {}
+    rejected: list[dict[str, str]] = []
+    for raw in raw_profiles:
+        pid = raw.get("id") if isinstance(raw, dict) else None
+        label = pid if isinstance(pid, str) else ""
+        try:
+            prof = validate_profile(raw)
+            if prof["id"] in profiles:
+                raise ValueError("duplicate profile id")
+        except ValueError as exc:
+            rejected.append({"id": label[:64], "reason": str(exc)})
+            continue
+        profiles[prof["id"]] = prof
+    return profiles, rejected
 
 
 class LauncherRegistry:
@@ -205,23 +405,35 @@ class LauncherRegistry:
         resume_hash: bytes = b"",
         owner_name: str | None = None,
         expires_at_ms: int | None = None,
+        v2: HelloV2 | None = None,
     ) -> tuple[str, list[dict[str, str]]]:
         """Register a launcher from a validated-shape hello.
+
+        ``v2`` is the parsed v2 part of the hello; when omitted it is parsed
+        here, with capabilities kept only for an account-mode launcher.
 
         Returns ``(launcher_id, rejected)`` where ``rejected`` lists the
         invalid or duplicate profiles as ``{"id", "reason"}``. Raises
         ``LauncherLimitError`` when the owner (or, in open mode, the broker)
-        already has the maximum number of launchers.
+        already has the maximum number of launchers. A connection holding
+        the same launcher key is not counted: the caller replaces it.
         """
+        if v2 is None:
+            v2 = parse_hello_v2(hello, deploy_allowed=owner_account_id is not None)
+        owner = owner_account_id or OPEN_OWNER
+        others = [
+            lnc for lnc in self._launchers.values()
+            if v2.launcher_key is None
+            or lnc.v2.launcher_key != v2.launcher_key
+            or owner_key(lnc) != owner
+        ]
         if owner_account_id is not None:
-            owned = sum(
-                1 for lnc in self._launchers.values() if lnc.owner_account_id == owner_account_id
-            )
+            owned = sum(1 for lnc in others if lnc.owner_account_id == owner_account_id)
             if owned >= MAX_LAUNCHERS_PER_ACCOUNT:
                 raise LauncherLimitError(
                     f"at most {MAX_LAUNCHERS_PER_ACCOUNT} launchers per account"
                 )
-        elif len(self._launchers) >= MAX_LAUNCHERS_OPEN:
+        elif len(others) >= MAX_LAUNCHERS_OPEN:
             raise LauncherLimitError(f"at most {MAX_LAUNCHERS_OPEN} launchers on this broker")
         machine = hello.get("machine")
         if not isinstance(machine, str) or not machine.strip() or len(machine) > 100:
@@ -250,21 +462,45 @@ class LauncherRegistry:
             launcher_id, conn, owner_account_id, machine.strip(), visibility,
             frozenset(a.casefold() for a in allowed), token_id=token_id, ip=ip,
             resume_hash=resume_hash, owner_name=owner_name, expires_at_ms=expires_at_ms,
+            v2=v2,
         )
-        rejected: list[dict[str, str]] = []
-        for raw in raw_profiles:
-            pid = raw.get("id") if isinstance(raw, dict) else None
-            label = pid if isinstance(pid, str) else ""
-            try:
-                prof = validate_profile(raw)
-                if prof["id"] in lnc.profiles:
-                    raise ValueError("duplicate profile id")
-            except ValueError as exc:
-                rejected.append({"id": label[:64], "reason": str(exc)})
-                continue
-            lnc.profiles[prof["id"]] = prof
+        lnc.profiles, rejected = _load_profiles(raw_profiles)
         self._launchers[launcher_id] = lnc
         return launcher_id, rejected
+
+    def get(self, launcher_id: str) -> _Launcher | None:
+        return self._launchers.get(launcher_id)
+
+    def by_key(self, owner: str, launcher_key: str) -> _Launcher | None:
+        """The connected launcher of ``owner`` (an account id or
+        ``OPEN_OWNER``) with this launcher key, if any (the newest one)."""
+        found: _Launcher | None = None
+        for lnc in self._launchers.values():
+            if lnc.v2.launcher_key == launcher_key and owner_key(lnc) == owner:
+                found = lnc
+        return found
+
+    def for_account(self, owner: str) -> list[_Launcher]:
+        """Connected launchers of ``owner``; ``OPEN_OWNER`` = every ownerless one."""
+        return [lnc for lnc in self._launchers.values() if owner_key(lnc) == owner]
+
+    def replace_profiles(self, launcher_id: str, raw: Any) -> list[dict[str, str]]:
+        """Replace the published profiles of a launcher (a ``profiles``
+        frame); returns the rejected ones. A list that is not a list of at
+        most ``_MAX_PROFILES`` entries changes nothing."""
+        lnc = self._launchers.get(launcher_id)
+        if lnc is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > _MAX_PROFILES:
+            return [{"id": "", "reason":
+                     f"profiles must be a list of at most {_MAX_PROFILES} entries"}]
+        lnc.profiles, rejected = _load_profiles(raw)
+        return rejected
+
+    def set_prereqs(self, launcher_id: str, prereqs: tuple[dict[str, Any], ...]) -> None:
+        lnc = self._launchers.get(launcher_id)
+        if lnc is not None:
+            lnc.v2 = replace(lnc.v2, prereqs=prereqs)
 
     def unregister(self, launcher_id: str) -> None:
         """Forget a launcher; its launches not yet joined fail (idempotent)."""
@@ -443,6 +679,9 @@ class LauncherRegistry:
                     "model": p["model"],
                     "access_preset": p["access_preset"],
                     "limits": dict(p["limits"]),
+                    "source": p["source"],
+                    "kind": p["kind"],
+                    "coordinator_capable": p["coordinator_capable"],
                     "online": True,
                     "free_slots": max(0, p["max_instances"] - lnc.running.get(p["id"], 0)),
                 })
@@ -557,15 +796,21 @@ async def launcher_ws(websocket: WebSocket) -> None:
     owner_account_id, token_id = auth.owner_account_id, auth.token_id
     source_ip = (websocket.client.host if websocket.client is not None else "") or ""
 
+    machines: MachineStore | None = deps.machines
     try:
         hello = await _read_hello(websocket)
+        # Remote capabilities need the DB that keeps the deployed definitions:
+        # always there in account mode, optional in open mode.
+        v2 = parse_hello_v2(
+            hello, deploy_allowed=owner_account_id is not None or machines is not None
+        )
         # Lets this launcher reclaim its running agents after a reconnect;
         # only its hash is kept, and it is never logged.
         resume_secret = secrets.token_urlsafe(32)
         launcher_id, rejected = registry.register(
             websocket, owner_account_id, hello, token_id=token_id, ip=source_ip,
             resume_hash=hash_token(resume_secret), owner_name=auth.owner_name,
-            expires_at_ms=auth.expires_at_ms,
+            expires_at_ms=auth.expires_at_ms, v2=v2,
         )
     except FrameTooLargeError:
         await websocket.close(code=_CLOSE_TOO_BIG, reason="frame too large")
@@ -576,12 +821,41 @@ async def launcher_ws(websocket: WebSocket) -> None:
     except LauncherLimitError as exc:
         await websocket.close(code=_CLOSE_LIMITED, reason=str(exc)[:100])
         return
+    lnc = registry.get(launcher_id)
+    assert lnc is not None
+    owner = owner_key(lnc)
+    if machines is not None and v2.launcher_key is not None:
+        from sessionweave.machines import MachineLimitError
+
+        try:
+            await machines.upsert_machine(owner, lnc.machine, v2, int(time.time() * 1000))
+        except MachineLimitError:
+            registry.unregister(launcher_id)
+            await websocket.close(
+                code=_CLOSE_LIMITED, reason="too many machines; forget one in the Cockpit"
+            )
+            return
+        except Exception:
+            registry.unregister(launcher_id)
+            log.exception("could not record the launcher's machine")
+            await websocket.close(code=_CLOSE_INTERNAL, reason="internal error")
+            return
     stops: list[dict[str, Any]] = []
     if deps.launches is not None and hello.get("running"):
         stops = deps.launches.reattach(
             launcher_id, owner_account_id, token_id, hello["machine"].strip(),
             list(hello["running"]), hello.get("resume_secret"),
         )
+    if v2.launcher_key is not None:
+        # The same launcher reconnected (its old socket may be half-open):
+        # its running agents moved over above; drop the old connection.
+        for old in registry.for_account(owner):
+            if old.launcher_id != launcher_id and old.v2.launcher_key == v2.launcher_key:
+                registry.unregister(old.launcher_id)
+                close = getattr(old.conn, "close", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        await close(code=_CLOSE_REPLACED, reason="replaced by a newer connection")
 
     pinger: asyncio.Task[None] | None = None
     receiver: asyncio.Task[None] | None = None
@@ -590,12 +864,13 @@ async def launcher_ws(websocket: WebSocket) -> None:
         # launcher can double-check the visibility of each order.
         await websocket.send_json(
             {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
-             "resume_secret": resume_secret, "account": auth.owner_name}
+             "resume_secret": resume_secret, "account": auth.owner_name,
+             "protocol": PROTOCOL_VERSION}
         )
         for stop in stops:
             await websocket.send_json(stop)
         pinger = asyncio.create_task(_ping_loop(websocket, auth.expires_at_ms))
-        receiver = asyncio.create_task(_receive(websocket, launcher_id, deps.launches))
+        receiver = asyncio.create_task(_receive(websocket, launcher_id, deps))
         await asyncio.wait({pinger, receiver}, return_when=asyncio.FIRST_COMPLETED)
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -616,8 +891,11 @@ async def launcher_ws(websocket: WebSocket) -> None:
             await websocket.close()
 
 
-async def _receive(websocket: WebSocket, launcher_id: str, launches: LaunchManager | None) -> None:
-    """Handle launcher frames (launch results, stops) until the socket closes."""
+async def _receive(websocket: WebSocket, launcher_id: str, deps: Any) -> None:
+    """Handle launcher frames (launch results, stops, profiles, prereqs)
+    until the socket closes."""
+    launches: LaunchManager | None = deps.launches
+    registry: LauncherRegistry = deps.launchers
     with contextlib.suppress(WebSocketDisconnect, RuntimeError):
         while True:
             msg = await websocket.receive()
@@ -631,13 +909,41 @@ async def _receive(websocket: WebSocket, launcher_id: str, launches: LaunchManag
                 body = json.loads(raw)
             except ValueError:
                 continue
-            if not isinstance(body, dict) or launches is None:
+            if not isinstance(body, dict):
                 continue
             kind = body.get("type")
-            if kind == "launch_result":
+            if kind == "profiles":
+                rejected = registry.replace_profiles(launcher_id, body.get("profiles"))
+                if rejected:
+                    log.info("launcher %s: profiles rejected: %s", launcher_id, rejected)
+            elif kind == "prereqs":
+                await _on_prereqs(registry, deps.machines, launcher_id, body.get("prereqs"))
+            elif launches is None:
+                continue
+            elif kind == "launch_result":
                 launches.on_result(launcher_id, body)
             elif kind == "stopped":
                 launches.on_stopped(launcher_id, body)
+
+
+async def _on_prereqs(
+    registry: LauncherRegistry, machines: MachineStore | None, launcher_id: str, raw: Any
+) -> None:
+    """A later prerequisite report (e.g. after an install): an invalid list
+    is ignored; a valid one updates the registry and the machine row."""
+    try:
+        prereqs = parse_prereqs(raw)
+    except ValueError as exc:
+        log.info("launcher %s: prereqs ignored: %s", launcher_id, exc)
+        return
+    registry.set_prereqs(launcher_id, prereqs)
+    lnc = registry.get(launcher_id)
+    if machines is None or lnc is None or lnc.v2.launcher_key is None:
+        return
+    try:
+        await machines.set_prereqs(owner_key(lnc), lnc.v2.launcher_key, list(prereqs))
+    except Exception:
+        log.exception("could not record the launcher's prereqs")
 
 
 def launcher_token_from_env() -> str | None:

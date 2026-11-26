@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -364,3 +365,152 @@ async def test_launcher_closed_when_account_token_expires(tmp_path: Path) -> Non
                                               "domain": "backend"},
                         headers=bearer(coord["participant_token"]))
         assert r.json()["agents"] == []
+
+
+# --- protocol v2: stable launcher key, modes, machines ---
+
+KEY = "lk_" + "ab" * 16
+V2: dict[str, Any] = {
+    "protocol": 2, "launcher_key": KEY, "mode": "local", "ceiling": "/srv/app",
+    "capabilities": ["definitions", "browse", "processes", "teleport"],
+    "sandbox": "bwrap", "run_as": False, "platform": "linux",
+}
+
+
+def _machine_rows(db: str, account_id: str) -> list[dict[str, Any]]:
+    import sqlite3
+
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM launcher_machines WHERE account_id = ? ORDER BY launcher_key",
+            (account_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def test_v2_welcome_and_same_key_replaces_old_connection(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s:
+        ws1, w1 = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        assert w1["type"] == "welcome" and w1["protocol"] == 2
+        ws2, w2 = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        async with ws2:
+            code, reason = await _closed_by_broker(ws1)
+            assert code == 4409 and reason == "replaced by a newer connection"
+            assert w2["launcher_id"] != w1["launcher_id"]
+            rows = _machine_rows(str(tmp_path / "acc-account.db"), s.acc.account_id)
+            assert [(r["launcher_key"], r["mode"], r["ceiling"]) for r in rows] == [
+                (KEY, "local", "/srv/app")]
+            assert json.loads(rows[0]["capabilities_json"]) == [
+                "browse", "definitions", "processes"]
+        # a legacy hello still works and gets the protocol in welcome
+        ws3, w3 = await _connect(s.base, s.token, _hello([_prof()]))
+        async with ws3:
+            assert w3["type"] == "welcome" and w3["protocol"] == 2
+
+
+async def test_v2_bad_hello_closes_4400() -> None:
+    async with relay_subprocess() as base:
+        ws = await websockets.connect(_ws(base))
+        await ws.send(_hello([], **{**V2, "mode": "god"}))
+        code, _reason = await _closed_by_broker(ws)
+        assert code == 4400
+
+
+def _open_mode_in_process(monkeypatch: pytest.MonkeyPatch, db: str | None) -> frozenset[str]:
+    """Connect a v2 launcher to an in-process open-mode broker; return the
+    capabilities the registry kept for it."""
+    from starlette.testclient import TestClient
+
+    from sessionweave.launchers import OPEN_OWNER
+    from sessionweave.server import build_app
+
+    if db is None:
+        monkeypatch.delenv("SW_PERSISTENCE_DB_PATH", raising=False)
+    else:
+        monkeypatch.setenv("SW_PERSISTENCE_DB_PATH", db)
+    with TestClient(build_app()) as c, c.websocket_connect("/v1/launchers/connect") as ws:
+        ws.send_text(_hello([_prof()], **V2))
+        welcome = ws.receive_json()
+        assert welcome["type"] == "welcome" and welcome["protocol"] == 2
+        lnc = c.app.state.tool_deps.launchers.by_key(OPEN_OWNER, KEY)  # type: ignore[attr-defined]
+        assert lnc is not None
+        caps: frozenset[str] = lnc.v2.capabilities
+        return caps
+
+
+async def test_open_mode_v2_launcher_recorded_under_open_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = str(tmp_path / "open.db")
+    caps = await asyncio.to_thread(_open_mode_in_process, monkeypatch, db)
+    assert caps == frozenset({"definitions", "browse", "processes"})
+    rows = _machine_rows(db, "")
+    assert [(r["launcher_key"], r["machine"], r["mode"]) for r in rows] == [
+        (KEY, "box", "local")]
+    # the same broker without a DB: welcome ok, capabilities stripped
+    caps = await asyncio.to_thread(_open_mode_in_process, monkeypatch, None)
+    assert caps == frozenset()
+
+
+async def test_too_many_machines_closes_4429(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s:
+        for i in range(20):
+            ws, w = await _connect(s.base, s.token, _hello(
+                [_prof()], **{**V2, "launcher_key": f"lk_{i:032x}"}))
+            assert w["type"] == "welcome", w
+            await ws.close()
+        ws = await websockets.connect(
+            _ws(s.base), additional_headers={"Authorization": f"Bearer {s.token}"})
+        await ws.send(_hello([_prof()], **V2))
+        code, reason = await _closed_by_broker(ws)
+        assert code == 4429 and reason == "too many machines; forget one in the Cockpit"
+        # a known key still connects; another account is not affected
+        ws, w = await _connect(s.base, s.token, _hello(
+            [_prof()], **{**V2, "launcher_key": f"lk_{0:032x}"}))
+        async with ws:
+            assert w["type"] == "welcome"
+        ws, w = await _connect(s.base, s.other_token, _hello([_prof()], **V2))
+        async with ws:
+            assert w["type"] == "welcome"
+
+
+async def test_prereqs_frame_updates_machine_row(tmp_path: Path) -> None:
+    async with seeded_relay(tmp_path, mode="account") as s:
+        db = str(tmp_path / "acc-account.db")
+        ws, _ = await _connect(s.base, s.token, _hello([_prof()], **V2))
+        async with ws:
+            p = {"name": "cline", "state": "installed", "version": "3.0.75",
+                 "required": False, "needed_by": ["cline"], "command": None}
+            await ws.send(json.dumps({"type": "prereqs", "prereqs": [p]}))
+            for _ in range(100):
+                rows = _machine_rows(db, s.acc.account_id)
+                if json.loads(rows[0]["prereqs_json"]) == [p]:
+                    break
+                await asyncio.sleep(0.05)
+            assert json.loads(rows[0]["prereqs_json"]) == [p]
+            # an invalid list is ignored (the row keeps the last valid one)
+            await ws.send(json.dumps({"type": "prereqs", "prereqs": [{"name": "x"}]}))
+            await ws.send(json.dumps({"type": "pong"}))
+            await asyncio.sleep(0.3)
+            assert json.loads(_machine_rows(db, s.acc.account_id)[0]["prereqs_json"]) == [p]
+
+
+async def test_profiles_frame_updates_discovery() -> None:
+    async with relay_subprocess() as base, httpx.AsyncClient(base_url=base) as c:
+        made = await _session(c)
+        sid, creator = made["session_id"], made["creator_token"]
+        ws, _ = await _connect(base, None, _hello([_prof()], **V2))
+        async with ws:
+            await ws.send(json.dumps({"type": "profiles", "profiles": [
+                _prof("p2", source="remote", kind="observer")]}))
+            for _ in range(100):
+                r = await c.get("/v1/agents", params={"session_id": sid, "domain": "backend"},
+                                headers=bearer(creator))
+                ids = [a["profile_id"] for a in r.json()["agents"]]
+                if ids == ["p2"]:
+                    break
+                await asyncio.sleep(0.05)
+            assert ids == ["p2"]
+            item = r.json()["agents"][0]
+            assert (item["source"], item["kind"], item["coordinator_capable"]) == (
+                "remote", "observer", False)

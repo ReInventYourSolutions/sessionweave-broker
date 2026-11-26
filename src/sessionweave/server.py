@@ -50,6 +50,7 @@ from sessionweave.limits import (
     account_max_sessions,
     account_max_tokens,
 )
+from sessionweave.machines import MachineStore
 from sessionweave.mcp_adapter import (
     HandleRegistry,
     connection_of,
@@ -1465,6 +1466,7 @@ def build_app() -> Starlette:
             events = EventLog(store)
             tool_deps.accounts = AccountStore(store, events=events)
             tool_deps.events = events
+            tool_deps.machines = MachineStore(store)
             registry.events = events
             retention_days = account_events_retention_days()
 

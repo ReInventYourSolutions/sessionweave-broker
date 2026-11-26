@@ -45,6 +45,7 @@ class ErrorCode(StrEnum):
     NO_FREE_SLOT = "no_free_slot"
     LAUNCH_LIMIT = "launch_limit"
     LAUNCH_NOT_FOUND = "launch_not_found"
+    LAUNCHER_NOT_FOUND = "launcher_not_found"
 
 
 @dataclass(slots=True)
