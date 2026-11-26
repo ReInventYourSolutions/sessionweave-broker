@@ -93,3 +93,25 @@ def test_open_mode_without_launcher_token_warns(
     with caplog.at_level(logging.WARNING):
         build_app()
     assert "launchers can register without a token" not in caplog.text
+
+
+def test_failed_definitions_sync_closes_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A launcher whose definitions could not be sent is closed (it reconnects
+    and converges) rather than left connected and never ready."""
+    app = _app()
+
+    async def broken(lnc: Any) -> None:
+        raise OSError("db gone")
+
+    app.state.tool_deps.deploys.on_connected = broken
+    with caplog.at_level(logging.ERROR), TestClient(app) as client:
+        with client.websocket_connect("/v1/launchers/connect") as ws:
+            ws.send_json(_HELLO)
+            assert ws.receive_json()["type"] == "welcome"
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 1011
+    assert "could not send the launcher its definitions" in caplog.text
+    assert app.state.tool_deps.launchers._launchers == {}

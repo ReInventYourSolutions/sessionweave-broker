@@ -1010,12 +1010,19 @@ async def launcher_ws(websocket: WebSocket) -> None:
             await websocket.send_json(stop)
         # Converge its deployed definitions (index, removals, puts) before
         # reading its frames.
+        # On failure close it: it reconnects and converges then, instead of
+        # staying connected without ever getting its definitions.
         try:
             await deps.deploys.on_connected(lnc)
         except (WebSocketDisconnect, RuntimeError):
             raise
         except Exception:
-            log.exception("could not send the launcher its definitions")
+            log.exception("could not send the launcher its definitions; closing it")
+            with contextlib.suppress(Exception):
+                await websocket.close(
+                    code=_CLOSE_INTERNAL, reason="definitions sync failed; reconnect"
+                )
+            return
         pinger = asyncio.create_task(_ping_loop(websocket, auth.expires_at_ms))
         receiver = asyncio.create_task(_receive(websocket, launcher_id, deps))
         await asyncio.wait({pinger, receiver}, return_when=asyncio.FIRST_COMPLETED)

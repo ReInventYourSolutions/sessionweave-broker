@@ -25,8 +25,10 @@ address instead. Nothing a launcher produces is stored here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from sessionweave.definitions import (
@@ -73,7 +75,10 @@ class DeployManager:
         # listed (live only) and nothing can be deployed.
         self.store = store
         self._deps = deps
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # One lock per machine while anyone uses or waits for it: (lock,
+        # users); the entry goes when the last user leaves, so the dict stays
+        # bounded (forgotten or pruned machines leave nothing behind).
+        self._locks: dict[tuple[str, str], tuple[asyncio.Lock, int]] = {}
         # Launchers that got their index: only these get puts/deletes directly
         # (a launcher between ``welcome`` and its index gets them with it).
         self._ready: set[str] = set()
@@ -88,8 +93,22 @@ class DeployManager:
             )
         return self.store
 
-    def _lock(self, owner: str, key: str) -> asyncio.Lock:
-        return self._locks.setdefault((owner, key), asyncio.Lock())
+    @contextlib.asynccontextmanager
+    async def _machine_lock(self, owner: str, key: str) -> AsyncIterator[None]:
+        """Hold the machine's lock. Every caller of one machine shares the
+        same Lock object, also across a forget (never two locks at once)."""
+        k = (owner, key)
+        lock, users = self._locks.get(k, (asyncio.Lock(), 0))
+        self._locks[k] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = self._locks[k]
+            if users <= 1:
+                del self._locks[k]
+            else:
+                self._locks[k] = (lock, users - 1)
 
     def _ready_launcher(self, owner: str, key: str) -> _Launcher | None:
         lnc = self._launchers.by_key(owner, key)
@@ -138,7 +157,7 @@ class DeployManager:
         if self.store is None or key is None or _CAPABILITY not in lnc.v2.capabilities:
             return
         owner = owner_key(lnc)
-        async with self._lock(owner, key):
+        async with self._machine_lock(owner, key):
             rows = await self.store.list_definitions(owner, key, include_deleted=True)
             live = [r for r in rows if not r.deleted]
             await lnc.conn.send_json({
@@ -179,7 +198,7 @@ class DeployManager:
         assert isinstance(revision, int)
         owner = owner_key(lnc)
         problems, warnings = _texts(body.get("problems")), _texts(body.get("warnings"))
-        async with self._lock(owner, key):
+        async with self._machine_lock(owner, key):
             try:
                 row = await self.store.get_definition(owner, key, def_id)
             except ToolError:
@@ -216,6 +235,17 @@ class DeployManager:
         """Validate and store ``raw`` as definition ``def_id`` of the machine,
         then send it (online) or queue it (offline)."""
         store = self.require_store()
+        await self._machine(owner, launcher_key)  # 404 before taking a lock
+        async with self._machine_lock(owner, launcher_key):
+            return await self._deploy_locked(
+                store, owner, launcher_key, def_id, raw, client=client)
+
+    async def _deploy_locked(
+        self, store: MachineStore, owner: str, launcher_key: str, def_id: str, raw: Any,
+        *, client: str,
+    ) -> dict[str, Any]:
+        # Re-read under the lock: a forget that ran meanwhile must not leave
+        # an orphan definition behind.
         machine = await self._machine(owner, launcher_key)
         if _CAPABILITY not in machine.capabilities:
             raise ToolError(
@@ -231,30 +261,29 @@ class DeployManager:
             definition = validate_definition(raw, machine)
         except DefinitionError as exc:
             raise ToolError(exc.code, str(exc)) from exc
-        async with self._lock(owner, launcher_key):
-            lnc = self._launchers.by_key(owner, launcher_key)
-            prof = None if lnc is None else lnc.profiles.get(def_id)
-            if prof is not None and prof["source"] == "local":
-                raise ToolError(
-                    ErrorCode.DEFINITION_ID_CONFLICT,
-                    f"the launcher has a local profile {def_id!r}; choose another id",
-                )
-            rows = await store.list_definitions(owner, launcher_key)
-            if def_id not in {r.def_id for r in rows} and (
-                len(rows) >= MAX_DEFINITIONS_PER_LAUNCHER
-            ):
-                raise ToolError(
-                    ErrorCode.DEFINITION_LIMIT,
-                    f"at most {MAX_DEFINITIONS_PER_LAUNCHER} definitions per machine",
-                )
-            online = lnc is not None
-            row = await store.put_definition(
-                owner, launcher_key, definition, "sent" if online else "queued", _now_ms())
-            ready = self._ready_launcher(owner, launcher_key)
-            if ready is not None:
-                await self._send(ready, self._put_frame(row))
-            await self._event(owner, "definition.deployed", machine.machine, launcher_key,
-                              def_id, row.revision, client=client, queued=not online)
+        lnc = self._launchers.by_key(owner, launcher_key)
+        prof = None if lnc is None else lnc.profiles.get(def_id)
+        if prof is not None and prof["source"] == "local":
+            raise ToolError(
+                ErrorCode.DEFINITION_ID_CONFLICT,
+                f"the launcher has a local profile {def_id!r}; choose another id",
+            )
+        rows = await store.list_definitions(owner, launcher_key)
+        if def_id not in {r.def_id for r in rows} and (
+            len(rows) >= MAX_DEFINITIONS_PER_LAUNCHER
+        ):
+            raise ToolError(
+                ErrorCode.DEFINITION_LIMIT,
+                f"at most {MAX_DEFINITIONS_PER_LAUNCHER} definitions per machine",
+            )
+        online = lnc is not None
+        row = await store.put_definition(
+            owner, launcher_key, definition, "sent" if online else "queued", _now_ms())
+        ready = self._ready_launcher(owner, launcher_key)
+        if ready is not None:
+            await self._send(ready, self._put_frame(row))
+        await self._event(owner, "definition.deployed", machine.machine, launcher_key,
+                          def_id, row.revision, client=client, queued=not online)
         return {"definition_id": def_id, "revision": row.revision, "state": row.state}
 
     async def remove(
@@ -262,8 +291,9 @@ class DeployManager:
     ) -> dict[str, Any]:
         """Ask the launcher to remove a definition (refused while in use)."""
         store = self.require_store()
-        machine = await self._machine(owner, launcher_key)
-        async with self._lock(owner, launcher_key):
+        await self._machine(owner, launcher_key)
+        async with self._machine_lock(owner, launcher_key):
+            machine = await self._machine(owner, launcher_key)  # forgotten meanwhile?
             row = await store.get_definition(owner, launcher_key, def_id)
             if row.deleted:
                 raise ToolError(ErrorCode.DEFINITION_NOT_FOUND, "no such definition")
@@ -294,14 +324,14 @@ class DeployManager:
         definitions (the reset for a lost ``key_secret``)."""
         store = self.require_store()
         await self._machine(owner, launcher_key)
-        async with self._lock(owner, launcher_key):
+        async with self._machine_lock(owner, launcher_key):
+            await self._machine(owner, launcher_key)  # forgotten meanwhile: 404
             if self._launchers.by_key(owner, launcher_key) is not None:
                 raise ToolError(
                     ErrorCode.LAUNCHER_ONLINE,
                     "the machine's launcher is connected; stop it before forgetting it",
                 )
             await store.forget_machine(owner, launcher_key)
-        self._locks.pop((owner, launcher_key), None)
         log.info("machine %s forgotten%s", launcher_key,
                  f" from {client}" if owner == OPEN_OWNER and client else "")
 
