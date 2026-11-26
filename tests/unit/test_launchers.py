@@ -296,14 +296,15 @@ def test_hello_v2_rejects(bad: dict[str, Any]) -> None:
 def test_prereqs_parsed() -> None:
     p = {"name": "bwrap", "state": "missing", "version": None, "required": True,
          "needed_by": ["--local"], "command": "sudo apt-get install bubblewrap"}
-    assert parse_hello_v2({**V2, "prereqs": [p]}, deploy_allowed=True).prereqs == (p,)
+    assert parse_hello_v2({**V2, "prereqs": [p]}, deploy_allowed=True).prereqs == (
+        {**p, "path": None},)
 
 
 def test_prereqs_defaults_and_unknown_keys_dropped() -> None:
     v2 = parse_hello_v2({**V2, "prereqs": [{"name": "git", "state": "ok", "extra": 1}]},
                         deploy_allowed=True)
     assert v2.prereqs == ({"name": "git", "state": "ok", "version": None, "required": False,
-                           "needed_by": [], "command": None},)
+                           "needed_by": [], "command": None, "path": None},)
 
 
 def test_capabilities_stripped_when_deploy_not_allowed() -> None:
@@ -350,7 +351,7 @@ def test_prereqs_accept_not_logged_in_and_optional_runtimes() -> None:
     opencode = {"name": "opencode", "state": "ok", "version": "2.0.1",
                 "required": False, "needed_by": [], "command": None}
     v2 = parse_hello_v2({**V2, "prereqs": [claude, opencode]}, deploy_allowed=True)
-    assert v2.prereqs == (claude, opencode)
+    assert v2.prereqs == ({**claude, "path": None}, {**opencode, "path": None})
 
 
 def test_claim_key_without_db() -> None:
@@ -508,3 +509,39 @@ def test_relay_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for raw, want in (("0.2", 0.2), ("0", 0.1), ("999", 60.0), ("junk", 10.0)):
         monkeypatch.setenv("SW_LAUNCHER_RELAY_TIMEOUT_S", raw)
         assert relay_timeout_from_env() == want
+
+
+# --- final wave -------------------------------------------------------------------------
+
+def test_profile_warnings_kept_bounded_and_printable() -> None:
+    assert validate_profile(_prof())["warnings"] == []
+    p = validate_profile(_prof(warnings=["shared state: claude", "bad\x1b[31mcolour", 3, "",
+                                         "x" * 400] + [f"w{i}" for i in range(30)]))
+    w = p["warnings"]
+    assert len(w) <= 20
+    assert w[0] == "shared state: claude"
+    assert w[1] == "bad?[31mcolour"
+    assert "x" * 300 in w and "x" * 301 not in w
+    assert all(isinstance(x, str) and x and x.isprintable() and len(x) <= 300 for x in w)
+    # not a list: no warnings (the profile itself stays valid)
+    assert validate_profile(_prof(warnings="oops"))["warnings"] == []
+
+
+def test_profiles_frame_keeps_warnings() -> None:
+    reg = LauncherRegistry()
+    lid, _ = reg.register(_Conn(), None, _hello([_prof(id="a", warnings=["w1"])]))
+    reg.replace_profiles(lid, [_prof(id="b", source="remote", warnings=["w2"])])
+    assert reg.get(lid).profiles["b"]["warnings"] == ["w2"]  # type: ignore[union-attr]
+
+
+def test_prereq_path_kept_and_validated() -> None:
+    p = {"name": "claude", "state": "ok", "version": "2.1.0", "required": False,
+         "needed_by": ["claude"], "command": None, "path": "/opt/sessionweave/tools/bin/claude"}
+    (got,) = parse_hello_v2({**V2, "prereqs": [p]}, deploy_allowed=True).prereqs
+    assert got["path"] == "/opt/sessionweave/tools/bin/claude"
+    (got,) = parse_hello_v2({**V2, "prereqs": [{"name": "git", "state": "ok"}]},
+                            deploy_allowed=True).prereqs
+    assert got["path"] is None
+    for bad in ("/x\x00y", "/x\ny", "/" + "x" * 300, 3):
+        with pytest.raises(HelloError, match="path"):
+            parse_hello_v2({**V2, "prereqs": [{**p, "path": bad}]}, deploy_allowed=True)

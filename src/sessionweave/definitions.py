@@ -33,6 +33,20 @@ KINDS = ("observer", "operator")
 APPROVAL_POLICIES = ("auto", "listed", "always")
 COMMAND_MODES = ("none", "list", "shell")
 METRIC_KINDS = ("cpu", "memory", "disk", "load")
+# Upper bounds of ``limits`` (the launcher's TOML profiles use the same values).
+LIMIT_MAX: dict[str, int] = {
+    "max_duration_s": 30 * 86400,
+    "max_idle_s": 30 * 86400,
+    "max_cost_usd": 10000,
+}
+# The commands an observer may list: each allow entry must start with the words of
+# one of them (literal words: ``/bin/ls`` and ``lsblk`` are not ``ls``). A copy of
+# the launcher's ``permissions.READ_COMMANDS``: keep both in step.
+READ_COMMANDS = (
+    "ls", "cat", "head", "tail", "grep", "zcat", "zgrep", "wc", "stat", "file", "du", "df",
+    "free", "uptime", "uname", "hostname", "id", "whoami", "date", "ps", "pgrep", "top -b",
+    "vmstat", "iostat", "journalctl", "dmesg", "ss", "lsof", "systemctl status",
+)
 
 _TOP_KEYS = frozenset({
     "id", "domain", "role", "capabilities", "description", "runtime", "model", "kind",
@@ -149,7 +163,17 @@ def _commands(v: list[str], where: str) -> list[str]:
                 f"{where}: {c!r} is not a command prefix (words of [A-Za-z0-9._/+-], at most"
                 f" 8 words and {_COMMAND_MAX} chars, no shell syntax)"
             )
+        if c.startswith("-"):
+            raise DefinitionError(f"{where}: {c!r} must start with a command, not an option")
     return v
+
+
+def _is_read_command(entry: str) -> bool:
+    words = entry.split()
+    return any(
+        (rw := r.split()) and len(rw) <= len(words) and words[: len(rw)] == rw
+        for r in READ_COMMANDS
+    )
 
 
 def _observe(raw: Any, machine: Machine) -> dict[str, Any]:
@@ -216,6 +240,13 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
     )
     if allow and mode != "list":
         raise DefinitionError("access.commands.allow applies only to mode 'list'")
+    if kind == "observer":
+        bad = [c for c in allow if not _is_read_command(c)]
+        if bad:
+            raise DefinitionError(
+                f"access.commands.allow: an observer may only run read commands; {bad[0]!r}"
+                f" is not one (each entry must start with one of {list(READ_COMMANDS)})"
+            )
     privileged = _commands(
         _str_list(cmds.get("privileged"), "access.commands.privileged", _MAX_PRIVILEGED),
         "access.commands.privileged",
@@ -225,9 +256,10 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
             "an observer gets no privileged (root-delegated) commands:"
             " access.commands.privileged must be empty"
         )
-    if privileged and machine.mode != "root":
+    if privileged and not (machine.mode == "root" and machine.run_as):
         raise DefinitionError(
-            "access.commands.privileged needs a machine whose launcher runs with --root",
+            "access.commands.privileged needs a machine whose launcher runs with --root"
+            " as root (it may run commands as root)",
             ErrorCode.OUTSIDE_CEILING,
         )
     return {
@@ -247,6 +279,9 @@ def _limits(raw: Any) -> dict[str, Any]:
         ok = False
     if not ok:
         raise DefinitionError("limits must be positive finite numbers (or null)")
+    for key, v in limits.items():
+        if v is not None and v > LIMIT_MAX[key]:
+            raise DefinitionError(f"limits.{key} must be at most {LIMIT_MAX[key]}")
     return dict(limits)
 
 
@@ -271,9 +306,14 @@ def _text(raw: dict[str, Any], key: str, limit: int) -> str:
 def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     """Return the normalised definition (defaults filled) for ``machine``, or
     raise ``DefinitionError`` with the reason. Paths must be absolute,
-    normalised and inside the machine's ceiling; ``run_as`` needs a root
-    launcher that may run agents as other users; an observer never writes
-    files nor gets a shell."""
+    normalised and inside the machine's ceiling; root execution (``run_as``,
+    ``privileged``, ``observer_as_root``) needs a root launcher that may run
+    agents as other users, and ``observer_as_root`` excludes ``run_as``; an
+    observer never writes files nor gets a shell and lists only read commands;
+    command entries start with a command, not an option; limits are capped
+    (``LIMIT_MAX``). Same rules as the launcher's ``normalise_definition``.
+    A ``privileged`` entry is kept as written: the launcher's root helper runs
+    only the options it spells."""
     if not isinstance(raw, dict):
         raise DefinitionError("definition must be an object")
     try:
@@ -327,6 +367,11 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
         raise DefinitionError(
             "observer_as_root needs a launcher started with --root"
         )
+    if as_root and not machine.run_as:
+        raise DefinitionError(
+            "observer_as_root needs a launcher started with --root running as root",
+            ErrorCode.OUTSIDE_CEILING,
+        )
     out["observer_as_root"] = as_root
     out["workdir"] = _path(raw.get("workdir"), "workdir", machine)
     run_as = raw.get("run_as")
@@ -337,6 +382,12 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
             raise DefinitionError(
                 "run_as needs a launcher started with --root that may run agents as other users",
                 ErrorCode.OUTSIDE_CEILING,
+            )
+        if as_root:
+            # Two identities for one agent: refused rather than guessed.
+            raise DefinitionError(
+                "observer_as_root and run_as exclude each other: choose one identity"
+                " for the observer"
             )
     out["run_as"] = run_as
     out["observe"] = _observe(raw.get("observe"), machine)

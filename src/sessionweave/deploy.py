@@ -429,6 +429,12 @@ class DeployManager:
                 "max_instances": src.get("max_instances"),
                 "running": running, "status": status,
                 "approval_policy": (body.get("approval") or {}).get("policy"),
+                # Who the agent runs as (a TOML profile has no stored definition:
+                # the launcher's own user).
+                "observer_as_root": body.get("observer_as_root") is True,
+                "run_as": body.get("run_as") if isinstance(body.get("run_as"), str) else None,
+                # What the launcher published with the profile (e.g. shared state).
+                "warnings": [] if prof is None else list(prof.get("warnings", [])),
                 "deploy": None if row is None else row.deploy(),
             })
         desc["agents"] = agents

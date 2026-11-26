@@ -14,8 +14,10 @@ from sessionweave.definitions import (
     DEFINITION_MAX_BYTES,
     INSTRUCTIONS_MAX_BYTES,
     KINDS,
+    LIMIT_MAX,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
+    READ_COMMANDS,
     DefinitionError,
     inside,
     validate_definition,
@@ -273,3 +275,110 @@ def test_observer_as_root_only_for_observers_on_root_machines() -> None:
     for bad in ("yes", 1, None):
         with pytest.raises(DefinitionError, match="boolean"):
             validate_definition(_def(observer_as_root=bad), ROOT)
+
+
+# --- final wave: parity with the launcher (Runner) --------------------------------------
+
+@pytest.mark.parametrize("field,raw", [
+    ("allow", _def(kind="operator", access={"commands": {"mode": "list", "allow": ["-rf"]}})),
+    ("allow", _def(kind="operator", access={"commands": {"mode": "list",
+                                                         "allow": ["--help x"]}})),
+    ("privileged", _def(kind="operator", workdir="/opt",
+                        access={"commands": {"mode": "list", "privileged": ["-x"]}})),
+    ("patterns", _def(kind="operator", access={"commands": {"mode": "list", "allow": ["ls"]}},
+                      approval={"policy": "listed", "patterns": ["-f"]})),
+])
+def test_command_entry_starting_with_an_option_refused(field: str, raw: dict[str, Any]) -> None:
+    with pytest.raises(DefinitionError, match="start with a command") as exc:
+        validate_definition(raw, ROOT)
+    assert field in str(exc.value)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+
+
+def test_read_commands_match_the_launcher() -> None:
+    # A copy of the Runner's permissions.READ_COMMANDS (parity: keep both in step).
+    assert READ_COMMANDS == (
+        "ls", "cat", "head", "tail", "grep", "zcat", "zgrep", "wc", "stat", "file", "du",
+        "df", "free", "uptime", "uname", "hostname", "id", "whoami", "date", "ps", "pgrep",
+        "top -b", "vmstat", "iostat", "journalctl", "dmesg", "ss", "lsof",
+        "systemctl status",
+    )
+
+
+@pytest.mark.parametrize("entry", ["rm", "systemctl restart", "top", "git status", "lsblk",
+                                   "/bin/ls", "sh"])
+def test_observer_allow_entries_must_be_read_commands(entry: str) -> None:
+    with pytest.raises(DefinitionError, match="read command"):
+        validate_definition(_def(access={"commands": {"mode": "list", "allow": ["ls", entry]}}),
+                            LOCAL)
+    # An operator may list it.
+    d = validate_definition(
+        _def(kind="operator", access={"commands": {"mode": "list", "allow": [entry]}}), LOCAL)
+    assert d["access"]["commands"]["allow"] == [entry]
+
+
+def test_observer_read_command_entries_with_arguments_accepted() -> None:
+    allow = ["journalctl -u", "top -b -n1", "systemctl status nginx", "tail -n", "ps aux"]
+    d = validate_definition(_def(access={"commands": {"mode": "list", "allow": allow}}), LOCAL)
+    assert d["access"]["commands"]["allow"] == allow
+    # mode none and the empty default list stay valid
+    assert validate_definition(
+        _def(access={"commands": {"mode": "none"}}), LOCAL)["access"]["commands"]["mode"] == "none"
+    assert validate_definition(_def(), LOCAL)["access"]["commands"]["allow"] == []
+
+
+def test_privileged_entries_keep_their_options_exactly() -> None:
+    # The launcher's root helper runs only the options a privileged entry spells:
+    # the broker stores them as written (no reordering, no merging).
+    privileged = ["journalctl -u", "journalctl -n", "systemctl restart nginx",
+                  "journalctl --vacuum-size"]
+    d = validate_definition(
+        _def(kind="operator", workdir="/opt",
+             access={"commands": {"mode": "list", "privileged": privileged}}), ROOT)
+    assert d["access"]["commands"]["privileged"] == privileged
+
+
+def test_observer_as_root_excludes_run_as() -> None:
+    with pytest.raises(DefinitionError, match="exclude each other") as exc:
+        validate_definition(_def(observer_as_root=True, run_as="deploy"), ROOT)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+    assert validate_definition(_def(run_as="deploy"), ROOT)["run_as"] == "deploy"
+
+
+def test_root_execution_needs_a_run_as_capable_root_launcher() -> None:
+    no_run_as = dataclasses.replace(ROOT, run_as=False)
+    with pytest.raises(DefinitionError, match="--root") as exc:
+        validate_definition(
+            _def(kind="operator", workdir="/opt",
+                 access={"commands": {"mode": "list", "privileged": ["journalctl -u"]}}),
+            no_run_as)
+    assert exc.value.code is ErrorCode.OUTSIDE_CEILING
+    with pytest.raises(DefinitionError, match="--root") as exc:
+        validate_definition(_def(observer_as_root=True), no_run_as)
+    assert exc.value.code is ErrorCode.OUTSIDE_CEILING
+    with pytest.raises(DefinitionError, match="run_as") as exc:
+        validate_definition(_def(run_as="deploy"), no_run_as)
+    assert exc.value.code is ErrorCode.OUTSIDE_CEILING
+    # the same definitions are accepted by a root launcher that runs as root
+    validate_definition(_def(observer_as_root=True), ROOT)
+    validate_definition(
+        _def(kind="operator", workdir="/opt",
+             access={"commands": {"mode": "list", "privileged": ["journalctl -u"]}}), ROOT)
+
+
+# --- final wave: upper bounds of the limits ---------------------------------------------
+
+def test_limit_caps() -> None:
+    assert LIMIT_MAX == {"max_duration_s": 30 * 86400, "max_idle_s": 30 * 86400,
+                         "max_cost_usd": 10000}
+
+
+@pytest.mark.parametrize("key", ["max_duration_s", "max_idle_s", "max_cost_usd"])
+def test_limits_capped(key: str) -> None:
+    cap = LIMIT_MAX[key]
+    assert validate_definition(_def(limits={key: cap}), LOCAL)["limits"] == {key: cap}
+    assert validate_definition(_def(limits={key: None}), LOCAL)["limits"] == {key: None}
+    for over in (cap + 1, float(cap) + 0.5, 10**30):
+        with pytest.raises(DefinitionError, match="at most") as exc:
+            validate_definition(_def(limits={key: over}), LOCAL)
+        assert key in str(exc.value)

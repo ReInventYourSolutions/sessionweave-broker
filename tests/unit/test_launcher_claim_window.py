@@ -123,3 +123,71 @@ def test_machine_limit_refusal_leaves_no_trace() -> None:
             ws.receive_json()
         assert exc.value.code == 4429
     assert reg._launchers == {}
+
+
+class _RevokingAccounts:
+    """An account whose token is revoked while the launcher's claim runs."""
+
+    def __init__(self) -> None:
+        self.revoked = False
+        self.checks: list[tuple[str, str, str | None]] = []
+
+    async def authenticate(self, token: str, now_ms: int, origin: Any) -> Any:
+        from sessionweave.accounts import Account, AuthResult
+
+        acc = Account("acc_1", "alice", "active", None, "admin", 0)
+        return AuthResult(acc, "tok_1", account_id="acc_1")
+
+    async def token_usable(self, account_id: str, token_id: str, now_ms: int,
+                           ip: str | None = None) -> bool:
+        self.checks.append((account_id, token_id, ip))
+        return not self.revoked
+
+
+class _RevokeDuringClaim(_GatedMachines):
+    def __init__(self, accounts: _RevokingAccounts) -> None:
+        super().__init__()
+        self.accounts = accounts
+        self.forgotten: list[tuple[str, str]] = []
+
+    async def claim_machine(self, *args: Any, **kw: Any) -> tuple[Any, str | None]:
+        self.accounts.revoked = True  # revoked after authentication, before add
+        return None, "lks_fresh"
+
+    async def forget_machine(self, owner: str, key: str) -> None:
+        self.forgotten.append((owner, key))
+
+
+def test_token_revoked_during_claim_is_refused_before_registration() -> None:
+    accounts = _RevokingAccounts()
+    gm = _RevokeDuringClaim(accounts)
+    app = _app(gm)
+    deps = app.state.tool_deps
+    deps.session_creation, deps.accounts = "account", accounts
+    reg: LauncherRegistry = deps.launchers
+    with TestClient(app) as client, client.websocket_connect(
+            "/v1/launchers/connect", headers={"Authorization": "Bearer swa_x"}) as ws:
+        ws.send_json(HELLO)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_json()  # no welcome: the key secret is never delivered
+        assert exc.value.code == 4401
+    assert reg._launchers == {}
+    assert accounts.checks and accounts.checks[0][:2] == ("acc_1", "tok_1")
+    # the fresh registration is undone (its secret was never delivered)
+    assert gm.forgotten == [("acc_1", KEY)]
+
+
+def test_token_still_valid_after_claim_registers() -> None:
+    accounts = _RevokingAccounts()
+    gm = _GatedMachines()
+    gm.release.set()
+    gm.outcome = "lks_ok"
+    app = _app(gm)
+    deps = app.state.tool_deps
+    deps.session_creation, deps.accounts = "account", accounts
+    with TestClient(app) as client, client.websocket_connect(
+            "/v1/launchers/connect", headers={"Authorization": "Bearer swa_x"}) as ws:
+        ws.send_json(HELLO)
+        w = ws.receive_json()
+        assert w["type"] == "welcome" and w["key_secret"] == "lks_ok"
+    assert accounts.checks

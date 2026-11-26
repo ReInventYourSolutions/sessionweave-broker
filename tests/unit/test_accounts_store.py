@@ -142,3 +142,31 @@ async def test_revoke_token_changed_reports_first_revoke_only(accounts: AccountS
     second, changed2 = await accounts.revoke_token_changed(acc.account_id, meta.token_id)
     assert (changed1, changed2) == (True, False)
     assert first.revoked_at == second.revoked_at is not None
+
+
+async def test_token_usable_rechecks_without_side_effects(accounts: AccountStore) -> None:
+    acc = await accounts.create("Alice")
+    _plain, tok = await accounts.create_token(acc.account_id, "launcher")
+    now = _now()
+    assert await accounts.token_usable(acc.account_id, tok.token_id, now) is True
+    assert await accounts.token_usable(acc.account_id, tok.token_id, now, "10.0.0.1") is True
+    # bound to a network: other addresses are refused
+    await accounts.set_token_networks(acc.account_id, tok.token_id,
+                                      network_policy="approved_only",
+                                      approved_networks=["10.0.0.0/24"])
+    assert await accounts.token_usable(acc.account_id, tok.token_id, now, "10.0.0.7") is True
+    assert await accounts.token_usable(acc.account_id, tok.token_id, now, "10.9.0.7") is False
+    # expired
+    _p2, short = await accounts.create_token(acc.account_id, "short", expires_at_ms=now + 1000)
+    assert await accounts.token_usable(acc.account_id, short.token_id, now) is True
+    assert await accounts.token_usable(acc.account_id, short.token_id, now + 1000) is False
+    # revoked
+    await accounts.revoke_token(acc.account_id, tok.token_id)
+    assert await accounts.token_usable(acc.account_id, tok.token_id, now) is False
+    # account not active; unknown token or account
+    await accounts.update(acc.account_id, status="disabled")
+    assert await accounts.token_usable(acc.account_id, short.token_id, now) is False
+    assert await accounts.token_usable(acc.account_id, "tok_missing", now) is False
+    assert await accounts.token_usable("acc_missing", short.token_id, now) is False
+    # read-only: no last-use recorded
+    assert (await accounts.get_token(acc.account_id, short.token_id)).last_used_at is None

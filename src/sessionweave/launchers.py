@@ -37,6 +37,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from sessionweave.access import admin_matches, hash_token
 from sessionweave.account_events import Origin, request_client
 from sessionweave.errors import ErrorCode, ToolError
+from sessionweave.launches import _short_text as _clean_text
 
 if TYPE_CHECKING:
     from sessionweave.launches import LaunchManager
@@ -100,6 +101,9 @@ _PREREQ_STATES = {"ok", "installed", "missing", "wrong_version", "not_logged_in"
 _MAX_PREREQS = 32
 _MAX_PREREQ_NAME = 32
 _MAX_PREREQ_TEXT = 300
+# Warnings a launcher publishes with a profile (shown in the Cockpit).
+MAX_PROFILE_WARNINGS = 20
+MAX_PROFILE_WARNING = 300
 _MAX_CEILING = 4096
 _MAX_PLATFORM = 32
 _MAX_CAPABILITY_NAMES = 32
@@ -189,6 +193,11 @@ def parse_prereqs(raw: Any) -> tuple[dict[str, Any], ...]:
                 raise ValueError(
                     f"prereq {label} must be null or at most {_MAX_PREREQ_TEXT} printable chars"
                 )
+        path = item.get("path")  # where the launcher found it (inventory)
+        if path is not None and not (isinstance(path, str) and _short_text(path)):
+            raise ValueError(
+                f"prereq path must be null or at most {_MAX_PREREQ_TEXT} printable chars"
+            )
         required = item.get("required", False)
         if not isinstance(required, bool):
             raise ValueError("prereq required must be a boolean")
@@ -200,7 +209,7 @@ def parse_prereqs(raw: Any) -> tuple[dict[str, Any], ...]:
         ):
             raise ValueError("prereq needed_by must be a list of short strings")
         out.append({"name": name, "state": state, "version": version, "required": required,
-                    "needed_by": list(needed_by), "command": command})
+                    "needed_by": list(needed_by), "command": command, "path": path})
     return tuple(out)
 
 
@@ -370,7 +379,19 @@ def validate_profile(raw: Any) -> dict[str, Any]:
     if not isinstance(coord, bool):
         raise ValueError("coordinator_capable must be a boolean")
     out["coordinator_capable"] = coord
+    out["warnings"] = profile_warnings(raw.get("warnings"))
     return out
+
+
+def profile_warnings(raw: Any) -> list[str]:
+    """The warnings a launcher publishes with a profile: at most
+    ``MAX_PROFILE_WARNINGS`` printable strings of at most ``MAX_PROFILE_WARNING``
+    chars (anything else is cleaned or dropped, never a reason to refuse the
+    profile)."""
+    if not isinstance(raw, list):
+        return []
+    out = [_clean_text(v, "", MAX_PROFILE_WARNING) for v in raw[:MAX_PROFILE_WARNINGS]]
+    return [w for w in out if w]
 
 
 def _account_names(v: Any) -> bool:
@@ -1058,6 +1079,20 @@ async def launcher_ws(websocket: WebSocket) -> None:
             log.exception("could not record the launcher's machine")
             await websocket.close(code=_CLOSE_INTERNAL, reason="internal error")
             return
+    # A token revoked (or its account disabled, or its network withdrawn)
+    # while the claim ran: close_for_account could not see this launcher, not
+    # registered yet. Re-check it last; from then on it is registered with no
+    # await in between, so a later revocation closes it like any other.
+    if owner_account_id is not None and token_id is not None and not (
+        await deps.accounts.token_usable(
+            owner_account_id, token_id, int(time.time() * 1000), source_ip)
+    ):
+        if issued_secret is not None and machines is not None and v2.launcher_key:
+            # Undo the fresh registration: its secret is never delivered.
+            with contextlib.suppress(Exception):
+                await machines.forget_machine(owner, v2.launcher_key)
+        await websocket.close(code=_CLOSE_UNAUTHORIZED, reason="invalid token")
+        return
     # From here to the welcome send there is no await: register, replace the
     # connections holding the same key and re-attach running agents in one
     # step, so nothing reaches this socket before its welcome.

@@ -62,7 +62,8 @@ async def test_upsert_list_forget(store: PersistenceStore) -> None:
 async def test_get_machine_round_trips_every_field(store: PersistenceStore) -> None:
     ms = MachineStore(store)
     p = {"name": "bwrap", "state": "missing", "version": None, "required": True,
-         "needed_by": ["--local"], "command": "sudo apt-get install bubblewrap"}
+         "needed_by": ["--local"], "command": "sudo apt-get install bubblewrap",
+         "path": None}
     hello = parse_hello_v2({**V2, "prereqs": [p]}, deploy_allowed=True)
     await ms.upsert_machine("acc_1", "box", hello, 5)
     got = await ms.get_machine("acc_1", KEY)

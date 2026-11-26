@@ -12,6 +12,30 @@ the broker to launchers started with `--local <folder>` or `--root` (Runner 0.9.
 broker stores agent definitions and machine descriptors only; remote browse and process
 lists are relayed, never stored.
 
+- **Definition checks match the launcher's.** A deploy is now refused up front (400
+  `invalid_request`) when a command entry or approval pattern starts with an option
+  (`-`), when an observer's `allow` entry is not a read command (it must start with one
+  of `ls`, `cat`, `head`, `tail`, `grep`, `journalctl`, `ps`, `top -b`,
+  `systemctl status`, ...), or when `observer_as_root` is combined with a `run_as` user.
+  Root execution (`run_as`, `privileged` commands, `observer_as_root`) needs a `--root`
+  launcher that offers `run_as` (runs as root); otherwise 400 `outside_ceiling`.
+  `privileged` entries are stored as written: the launcher runs only the options an
+  entry spells, so list each option used (`journalctl -u`, `journalctl -n`).
+- **Upper bounds on definition limits** (the launcher's TOML profiles use the same):
+  `max_duration_s` and `max_idle_s` at most 2592000 (30 days), `max_cost_usd` at most
+  10000.
+- **Machines show more per agent:** `observer_as_root` (bool) and `run_as` (user or
+  null) of the deployed definition, and the `warnings` the launcher published with the
+  profile (at most 20 printable strings of at most 300 characters; the `profiles` frame
+  and hello profiles may carry them). Prerequisites keep the launcher's `path` (where it
+  found the tool; printable, at most 300 characters, or null).
+- **A launcher whose account token is revoked while its machine is being claimed is
+  refused** (4401) instead of registering on the revoked token; the token is checked
+  again (revoked, expired, account not active, network no longer allowed) right before
+  the launcher is registered.
+- **SDK range widened** to `sessionweave-sdk>=0.13.0,<0.15` (0.14 adds the launcher
+  methods; nothing the broker uses changed).
+
 - **`observer_as_root` in agent definitions** (bool, default `false`). Accepted as `true`
   only for an observer deployed to a `--root` launcher (else 400 `invalid_request`): the
   observer runs as root. Warning: runs as root: can read every file on the machine,

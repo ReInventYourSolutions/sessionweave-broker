@@ -241,8 +241,10 @@ async def test_deploy_to_offline_launcher_is_queued_and_sent_on_reconnect(
                 "type": "definitions_index", "definitions": [{"id": "obs", "revision": 1}]}
             put = await _recv(ws)
             assert put["type"] == "definition_put" and put["definition"]["revision"] == 1
-            agent = await _agent(c, s.token, KEY, "obs")
-            assert agent is not None and agent["deploy"]["state"] == "sent"
+            # the state is recorded right after the frame is sent
+            await _eventually(
+                lambda: _agent(c, s.token, KEY, "obs"),
+                lambda a: a is not None and a["deploy"]["state"] == "sent")
 
 
 async def test_reconnect_reconverges_after_offline_remove_and_redeploy(tmp_path: Path) -> None:

@@ -487,7 +487,8 @@ async def test_prereqs_frame_updates_machine_row(tmp_path: Path) -> None:
         ws, _ = await _connect(s.base, s.token, _hello([_prof()], **V2))
         async with ws:
             p = {"name": "cline", "state": "installed", "version": "3.0.75",
-                 "required": False, "needed_by": ["cline"], "command": None}
+                 "required": False, "needed_by": ["cline"], "command": None,
+                 "path": "/home/u/.sessionweave/tools/bin/cline"}
             await ws.send(json.dumps({"type": "prereqs", "prereqs": [p]}))
             for _ in range(100):
                 rows = _machine_rows(db, s.acc.account_id)

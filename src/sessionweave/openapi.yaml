@@ -544,6 +544,7 @@ components:
         required: { type: boolean }
         needed_by: { type: array, items: { type: string } }
         command: { type: string, nullable: true, description: "What to run by hand when it is missing" }
+        path: { type: string, nullable: true, maxLength: 300, description: "Where the launcher found it (inventory); null when not found or not reported" }
     DeployState:
       type: object
       properties:
@@ -566,6 +567,9 @@ components:
         running: { type: integer }
         status: { type: string, enum: [idle, in_session, offline, not_deployed] }
         approval_policy: { type: string, enum: [auto, listed, always], nullable: true }
+        observer_as_root: { type: boolean, description: "The deployed definition runs this observer as root (false for a TOML profile)" }
+        run_as: { type: string, nullable: true, description: "The machine user the deployed definition runs as; null: the launcher's own user" }
+        warnings: { type: array, items: { type: string, maxLength: 300 }, maxItems: 20, description: "What the launcher published with the profile (e.g. shared runtime state)" }
         deploy: { allOf: [{ $ref: '#/components/schemas/DeployState' }], nullable: true, description: "Null for a profile that was not deployed remotely" }
     Machine:
       type: object
@@ -589,9 +593,14 @@ components:
       description: |
         An agent definition (at most 64 KiB of JSON; unknown keys refused at every
         level). Validated against the target machine: paths absolute, normalised and
-        inside its ceiling; `run_as` only on a `--root` launcher offering it; an
-        observer never writes files nor gets a shell; `privileged` commands only on a
-        root machine. Never carries secrets.
+        inside its ceiling; root execution (`run_as`, `privileged`, `observer_as_root`)
+        only on a `--root` launcher offering `run_as` (running as root), and
+        `observer_as_root` excludes `run_as`; an observer never writes files nor gets a
+        shell, and its `allow` entries must start with a read command (`ls`, `cat`,
+        `tail`, `journalctl`, `ps`, `top -b`, `systemctl status`, ...). Command entries and
+        approval patterns start with a command, never an option (`-`). A `privileged`
+        entry allows exactly the options it spells: list each option used
+        (`journalctl -u`, `journalctl -n`). Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
       properties:
         id: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it" }
@@ -617,9 +626,9 @@ components:
         limits:
           type: object
           properties:
-            max_duration_s: { type: number }
-            max_idle_s: { type: number }
-            max_cost_usd: { type: number }
+            max_duration_s: { type: number, exclusiveMinimum: 0, maximum: 2592000, nullable: true }
+            max_idle_s: { type: number, exclusiveMinimum: 0, maximum: 2592000, nullable: true }
+            max_cost_usd: { type: number, exclusiveMinimum: 0, maximum: 10000, nullable: true }
         approval:
           type: object
           properties:

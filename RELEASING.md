@@ -10,7 +10,7 @@ which the release workflow sends when the `E2E_DISPATCH_TOKEN` secret is set).
 
 ## Python SDK dependency
 
-The broker depends on `sessionweave-sdk` (`pyproject.toml`, range `>=0.13.0,<0.14`); `/sdk`
+The broker depends on `sessionweave-sdk` (`pyproject.toml`, range `>=0.13.0,<0.15`); `/sdk`
 renders the installed SDK's README. It comes from PyPI. A new SDK minor needs the range
 bumped here.
 
