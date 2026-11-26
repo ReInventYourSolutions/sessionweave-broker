@@ -11,6 +11,7 @@ import pytest
 from sessionweave.definitions import (
     APPROVAL_POLICIES,
     COMMAND_MODES,
+    COMMAND_WRAPPERS,
     DEFINITION_MAX_BYTES,
     INSTRUCTIONS_MAX_BYTES,
     KINDS,
@@ -464,3 +465,78 @@ def test_listed_table_matches_the_launcher() -> None:
         except ValueError:
             runner_ok = False
         assert runner_ok is accepted, (kind, allow, privileged, pattern)
+
+
+# --- final wave: listed approvals refuse shells and command wrappers --------------------
+
+# (kind, mode, allow, privileged, pattern, accepted)
+_LISTED_WRAPPER_TABLE: list[tuple[str, str, list[str], list[str], str, bool]] = [
+    ("operator", "shell", [], [], "git push", False),               # a shell with patterns
+    ("operator", "shell", [], ["journalctl -u"], "rm", False),
+    ("operator", "list", ["sh"], [], "git push", False),
+    ("operator", "list", ["bash -c"], [], "git push", False),
+    ("operator", "list", ["/usr/bin/env"], [], "git push", False),  # by basename
+    ("operator", "list", ["xargs"], [], "rm", False),
+    ("operator", "list", ["python3.12"], [], "git push", False),    # python*
+    ("operator", "list", ["python"], [], "git push", False),
+    ("operator", "list", ["find /srv"], [], "rm", False),
+    ("operator", "list", ["ls", "sudo"], [], "rm", False),
+    ("operator", "list", ["ls"], ["systemd-run"], "rm", False),     # privileged too
+    ("operator", "list", ["ls"], ["/usr/bin/nsenter"], "rm", False),
+    ("operator", "list", ["git status", "pythonic"], [], "git push", False),  # prefix match
+    ("operator", "list", ["ls", "git status", "shred"], [], "rm", True),     # not wrappers
+    ("operator", "list", ["shx", "bashful", "envoy"], [], "rm", True),
+    ("operator", "list", ["ls"], ["systemctl status"], "rm", True),
+]
+
+
+@pytest.mark.parametrize("kind,mode,allow,privileged,pattern,accepted", _LISTED_WRAPPER_TABLE)
+def test_listed_refuses_shell_and_wrappers(
+    kind: str, mode: str, allow: list[str], privileged: list[str], pattern: str,
+    accepted: bool,
+) -> None:
+    raw = _def(kind=kind, access={"commands": {"mode": mode, "allow": allow,
+                                               "privileged": privileged}},
+               approval={"policy": "listed", "patterns": [pattern]})
+    if accepted:
+        assert validate_definition(raw, ROOT)["approval"]["patterns"] == [pattern]
+        return
+    with pytest.raises(DefinitionError, match=r"'list' until approvals|runs other commands"
+                       ) as exc:
+        validate_definition(raw, ROOT)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+
+
+def test_shell_and_wrappers_fine_without_listed_patterns() -> None:
+    for approval in ({"policy": "auto", "patterns": ["git push"]},
+                     {"policy": "listed", "patterns": []}):
+        validate_definition(_def(kind="operator", approval=approval), LOCAL)  # shell
+        validate_definition(_def(kind="operator", access={"commands": {
+            "mode": "list", "allow": ["sh", "python3"]}}, approval=approval), LOCAL)
+
+
+def test_command_wrappers_match_the_launcher() -> None:
+    # A copy of the Runner's permissions.COMMAND_WRAPPERS (parity: keep both in step).
+    assert len(COMMAND_WRAPPERS) == len(set(COMMAND_WRAPPERS)) == 65
+    assert {"sh", "env", "xargs", "python*", "find", "ssh", "man"} <= set(COMMAND_WRAPPERS)
+    perms = pytest.importorskip(
+        "sessionweave_runner.permissions",
+        reason="sessionweave-runner is not installed in this environment (not a broker"
+               " dependency)")
+    assert perms.COMMAND_WRAPPERS == COMMAND_WRAPPERS
+
+
+def test_listed_wrapper_table_matches_the_launcher() -> None:
+    perms = pytest.importorskip(
+        "sessionweave_runner.permissions",
+        reason="sessionweave-runner is not installed in this environment (not a broker"
+               " dependency); the launcher runs its own tests")
+    for kind, mode, allow, privileged, pattern, accepted in _LISTED_WRAPPER_TABLE:
+        try:
+            cmds = perms._resolve_commands(
+                kind, perms.Commands(mode, tuple(allow), (), tuple(privileged)))
+            perms._listed_denies(cmds, (pattern,))
+            runner_ok = True
+        except ValueError:
+            runner_ok = False
+        assert runner_ok is accepted, (kind, mode, allow, privileged, pattern)

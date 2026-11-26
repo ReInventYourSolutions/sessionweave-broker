@@ -605,7 +605,10 @@ components:
         subcommand word with no option word before (allow `git status`, `git log` with
         `git push` is accepted; allow `git` or `git push origin` with `git push`, or
         `git -C x log` with `git -C x push`, is refused); an observer's empty `allow`
-        stands for the default read commands. Never carries secrets.
+        stands for the default read commands. Listed patterns also need commands mode
+        `list` (not `shell`), and no `allow`/`privileged` entry may start with a command
+        that runs other commands (shells, `env`, `xargs`, `sudo`, interpreters such as
+        `python*`, `find`, `awk`, `sed`, `ssh`, ...). Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
       properties:
         id: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it" }

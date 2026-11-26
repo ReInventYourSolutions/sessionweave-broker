@@ -28,6 +28,10 @@ lists are relayed, never stored.
   with the pattern `git push` is accepted; allow `git` (it would run `git push` unasked),
   `git push origin` (it would always ask) or `git -C x log` with `git -C x push` are
   refused. An observer's empty allow list counts as the default read commands.
+  Listed patterns are also refused with commands mode `shell`, and with any `allow` or
+  `privileged` entry that runs other commands (shells, `env`, `xargs`, `sudo`,
+  interpreters such as `python*`, `find`, `awk`, `sed`, `ssh`, ...; compared by
+  basename), which could run a listed command unchecked.
 - **Upper bounds on definition limits** (the launcher's TOML profiles use the same):
   `max_duration_s` and `max_idle_s` at most 2592000 (30 days), `max_cost_usd` at most
   10000.

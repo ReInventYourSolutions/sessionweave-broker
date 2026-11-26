@@ -47,6 +47,21 @@ READ_COMMANDS = (
     "free", "uptime", "uname", "hostname", "id", "whoami", "date", "ps", "pgrep", "top -b",
     "vmstat", "iostat", "journalctl", "dmesg", "ss", "lsof", "systemctl status",
 )
+# Commands that run other commands (shells, wrappers, interpreters, ``find -exec``,
+# ``awk system()``, ...), compared by the basename of the command word (``python*``
+# covers every ``python3.x``). With approval ``listed`` patterns an allow or
+# privileged entry starting with one is refused: it would run a listed command
+# unchecked. A copy of the launcher's ``permissions.COMMAND_WRAPPERS``: keep both
+# in step.
+COMMAND_WRAPPERS = (
+    "sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "busybox", "env", "command",
+    "exec", "xargs", "parallel", "nice", "ionice", "nohup", "timeout", "stdbuf", "setsid",
+    "flock", "watch", "script", "taskset", "chrt", "strace", "gdb", "sudo", "su", "doas",
+    "pkexec", "runuser", "setpriv", "nsenter", "unshare", "chroot", "systemd-run",
+    "python*", "perl", "ruby", "node", "npx", "npm", "bun", "deno", "php", "lua", "tclsh",
+    "expect", "find", "awk", "gawk", "mawk", "sed", "make", "ssh", "tar", "rsync",
+    "vi", "vim", "nvim", "ex", "less", "more", "man",
+)
 
 _TOP_KEYS = frozenset({
     "id", "domain", "role", "capabilities", "description", "runtime", "model", "kind",
@@ -197,19 +212,41 @@ def _distinct_subcommands(entry: list[str], pattern: list[str]) -> bool:
     return False
 
 
+def is_command_wrapper(word: str) -> bool:
+    """Whether the command word (by basename) is in ``COMMAND_WRAPPERS``."""
+    name = posixpath.basename(word) or word
+    return any(name.startswith(w[:-1]) if w.endswith("*") else name == w
+               for w in COMMAND_WRAPPERS)
+
+
 def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any]) -> None:
     """Approval ``listed`` fails closed (its patterns become denies): an allow or
     privileged entry sharing a pattern's command word must differ from it at a
     subcommand word (allow ``git status``, ``git log`` with ``git push``); else the
     entry would run the pattern unasked, always ask, or reach it in another
-    spelling. An observer's empty list stands for the default read commands."""
+    spelling. An observer's empty list stands for the default read commands. A
+    shell, and any entry that runs other commands (``COMMAND_WRAPPERS``), are
+    refused: they could run a listed command under another spelling."""
     patterns = approval["patterns"]
     if approval["policy"] != "listed" or not patterns or commands["mode"] == "none":
         return
+    if commands["mode"] == "shell":
+        raise DefinitionError(
+            "approval.patterns: approval 'listed' with patterns needs access.commands.mode"
+            " 'list' until approvals are implemented (a shell can run a listed command"
+            " under another spelling)"
+        )
     allow = commands["allow"]
     if kind == "observer" and commands["mode"] == "list" and not allow:
         allow = list(READ_COMMANDS)
     for what, entries in (("allow", allow), ("privileged", commands["privileged"])):
+        for entry in entries:
+            if is_command_wrapper(entry.split()[0]):
+                raise DefinitionError(
+                    f"access.commands.{what}: {entry!r} runs other commands (shell, wrapper"
+                    " or interpreter): with approval for listed commands it could run a"
+                    " listed command unchecked; remove it"
+                )
         for entry in entries:
             ew = _norm_words(entry)
             for p in patterns:
