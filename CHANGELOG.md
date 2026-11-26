@@ -12,6 +12,10 @@ the broker to launchers started with `--local <folder>` or `--root` (Runner 0.9.
 broker stores agent definitions and machine descriptors only; remote browse and process
 lists are relayed, never stored.
 
+- **`observer_as_root` in agent definitions** (bool, default `false`). Accepted as `true`
+  only for an observer deployed to a `--root` launcher (else 400 `invalid_request`): the
+  observer runs as root. Warning: runs as root: can read every file on the machine,
+  including passwords and keys (it stays read-only).
 - **Remote browse and process list.** `GET /v1/me/launchers/{key}/browse?path=&cursor=&limit=&hidden=`
   and `GET /v1/me/launchers/{key}/processes?q=&cursor=&limit=` (owner's account token only;
   open mode with a persistence DB: `/v1/launchers/{key}/…` without a credential) relay a

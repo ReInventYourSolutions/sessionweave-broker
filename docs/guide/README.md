@@ -905,6 +905,11 @@ to it remotely:
 | `local` | `--local <folder>` | that folder and below, enforced with an OS sandbox (bubblewrap on Linux); the agents run as the user who started the launcher | yes |
 | `root` | `--root` | the whole machine; a definition may pick another machine user (`run_as`) | yes |
 
+An **observer** deployed to a `--root` launcher may set `observer_as_root: true` (default
+`false`; refused for operators and on other machines) to run as root. The Cockpit shows
+the warning: **runs as root: can read every file on the machine, including passwords and
+keys.** It stays read-only like every observer.
+
 The `hello` also reports the `capabilities` it offers (`definitions`, `browse`,
 `processes`), its `sandbox` (`bwrap` or null), `run_as` (root mode), `platform` and
 `prereqs`: what the launcher needs (bubblewrap, git, node, the agent runtimes) with a

@@ -36,7 +36,8 @@ METRIC_KINDS = ("cpu", "memory", "disk", "load")
 
 _TOP_KEYS = frozenset({
     "id", "domain", "role", "capabilities", "description", "runtime", "model", "kind",
-    "coordinator_capable", "workdir", "run_as", "observe", "access", "limits", "approval",
+    "coordinator_capable", "observer_as_root", "workdir", "run_as", "observe", "access",
+    "limits", "approval",
     "instructions", "max_instances", "visibility", "allowed_accounts",
 })
 _OBSERVE_KEYS = frozenset({"sources", "logs", "processes", "metrics"})
@@ -315,6 +316,18 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     if not isinstance(coord, bool):
         raise DefinitionError("coordinator_capable must be a boolean")
     out["coordinator_capable"] = coord
+    # An observer that runs as root: it can read every file on the machine,
+    # including passwords and keys (still read-only). Root launchers only.
+    as_root = raw.get("observer_as_root", False)
+    if not isinstance(as_root, bool):
+        raise DefinitionError("observer_as_root must be a boolean")
+    if as_root and kind != "observer":
+        raise DefinitionError("observer_as_root is only valid for an observer")
+    if as_root and machine.mode != "root":
+        raise DefinitionError(
+            "observer_as_root needs a launcher started with --root"
+        )
+    out["observer_as_root"] = as_root
     out["workdir"] = _path(raw.get("workdir"), "workdir", machine)
     run_as = raw.get("run_as")
     if run_as is not None:

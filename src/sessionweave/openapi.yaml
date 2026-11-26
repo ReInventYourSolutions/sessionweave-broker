@@ -603,6 +603,7 @@ components:
         model: { type: string, maxLength: 200 }
         kind: { type: string, enum: [observer, operator] }
         coordinator_capable: { type: boolean, default: false }
+        observer_as_root: { type: boolean, default: false, description: "Observers on a --root launcher only: the observer runs as root. Warning: runs as root: can read every file on the machine, including passwords and keys. Still read-only. Refused (invalid_request) for an operator or on a non-root machine" }
         workdir: { type: string, description: Absolute path inside the ceiling }
         run_as: { type: string, nullable: true, pattern: '^[a-z_][a-z0-9_-]{0,31}$' }
         observe:

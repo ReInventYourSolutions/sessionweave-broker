@@ -252,3 +252,24 @@ def test_normalised_output_size_limit() -> None:
     assert len(json.dumps(raw).encode()) <= DEFINITION_MAX_BYTES
     with pytest.raises(DefinitionError, match="64 KiB"):
         validate_definition(raw, LOCAL)
+
+
+def test_observer_as_root_defaults_false() -> None:
+    assert validate_definition(_def(), LOCAL)["observer_as_root"] is False
+    assert validate_definition(_def(), ROOT)["observer_as_root"] is False
+
+
+def test_observer_as_root_only_for_observers_on_root_machines() -> None:
+    d = validate_definition(_def(observer_as_root=True), ROOT)
+    assert d["observer_as_root"] is True
+    assert validate_definition(d, ROOT) == d  # round trip
+    assert validate_definition(_def(observer_as_root=False), LOCAL)["observer_as_root"] is False
+    with pytest.raises(DefinitionError, match="--root") as exc:
+        validate_definition(_def(observer_as_root=True), LOCAL)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+    with pytest.raises(DefinitionError, match="observer") as exc:
+        validate_definition(_def(kind="operator", observer_as_root=True), ROOT)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+    for bad in ("yes", 1, None):
+        with pytest.raises(DefinitionError, match="boolean"):
+            validate_definition(_def(observer_as_root=bad), ROOT)
