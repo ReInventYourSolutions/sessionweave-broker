@@ -129,6 +129,8 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.LAUNCH_LIMIT: 409,
     ErrorCode.LAUNCH_NOT_FOUND: 404,
     ErrorCode.LAUNCHER_NOT_FOUND: 404,
+    ErrorCode.DEFINITION_NOT_FOUND: 404,
+    ErrorCode.OUTSIDE_CEILING: 400,
 }
 
 

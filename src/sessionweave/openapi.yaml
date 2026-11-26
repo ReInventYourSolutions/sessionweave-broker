@@ -513,6 +513,8 @@ components:
                 - launch_limit
                 - launch_not_found
                 - launcher_not_found
+                - definition_not_found
+                - outside_ceiling
             message:
               type: string
     Account:

@@ -27,6 +27,13 @@ All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions
   report (`{"type":"prereqs"}`); prereq states include `not_logged_in`. Profiles may carry
   `source` (`local`/`remote`), `kind` (`observer`/`operator`) and `coordinator_capable`,
   returned by discovery.
+- **Agent definitions (schema and store).** `sessionweave.definitions.validate_definition`
+  checks an agent definition (unknown keys refused, at most 64 KiB, instructions at most
+  16 KiB) against the target machine: paths absolute, normalised and inside its ceiling,
+  `run_as` only on a `--root` launcher that allows it, observers never write files nor get
+  a shell, command entries are plain command prefixes (no shell syntax). Deployed
+  definitions are stored revisioned per machine with the launcher's last status. New
+  error codes `definition_not_found` (404) and `outside_ceiling` (400).
 
 ## 0.35.1
 

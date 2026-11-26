@@ -17,7 +17,7 @@ from sessionweave.launchers import (
     LauncherKeyInUseError,
     parse_hello_v2,
 )
-from sessionweave.machines import Machine, MachineLimitError, MachineStore
+from sessionweave.machines import Machine, MachineLimitError, MachineStore, StoredDefinition
 from sessionweave.persistence import PersistenceStore
 
 KEY = "lk_" + "ab" * 16
@@ -227,3 +227,69 @@ async def test_touch_updates_last_seen(store: PersistenceStore) -> None:
     await ms.claim_machine("acc_1", "m", parse_hello_v2(V2, deploy_allowed=True), 1)
     await ms.touch("acc_1", KEY, 50)
     assert (await ms.get_machine("acc_1", KEY)).last_seen == 50
+
+
+async def _with_machine(store: PersistenceStore) -> MachineStore:
+    ms = MachineStore(store)
+    await ms.claim_machine("acc_1", "box", parse_hello_v2(V2, deploy_allowed=True), 0)
+    return ms
+
+
+async def test_definition_revisions_and_status(store: PersistenceStore) -> None:
+    ms = await _with_machine(store)
+    a = await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 1)
+    b = await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 2)
+    assert (a.revision, b.revision) == (1, 2)
+    assert await ms.set_status("acc_1", KEY, "obs", 1, "applied", [], [], 3) is None   # stale
+    s = await ms.set_status("acc_1", KEY, "obs", 2, "applied", [], ["w"], 3)
+    assert s is not None and (s.state, s.applied_revision, s.warnings) == ("applied", 2, ["w"])
+    d = await ms.mark_deleted("acc_1", KEY, "obs", 4)
+    assert (d.revision, d.state, d.deleted) == (3, "removing", True)
+    assert await ms.list_definitions("acc_1", KEY) == []
+    await ms.purge_definition("acc_1", KEY, "obs")
+    assert await ms.list_definitions("acc_1", KEY, include_deleted=True) == []
+
+
+async def test_definition_rows_fields_and_redeploy_after_delete(store: PersistenceStore) -> None:
+    ms = await _with_machine(store)
+    a = await ms.put_definition("acc_1", KEY, {"id": "obs", "kind": "observer"}, "queued", 10)
+    assert a == StoredDefinition("obs", 1, {"id": "obs", "kind": "observer"}, "queued", None,
+                                 [], [], False, 10)
+    assert a.deploy() == {"revision": 1, "applied_revision": None, "state": "queued",
+                          "problems": [], "warnings": []}
+    r = await ms.set_status("acc_1", KEY, "obs", 1, "rejected", ["bad"], [], 11)
+    assert r is not None
+    assert (r.state, r.problems, r.applied_revision) == ("rejected", ["bad"], None)
+    # A later revision keeps the last applied revision and clears problems.
+    await ms.set_status("acc_1", KEY, "obs", 1, "applied", [], [], 12)
+    b = await ms.put_definition("acc_1", KEY, {"id": "obs", "v": 2}, "sent", 13)
+    assert (b.revision, b.applied_revision, b.problems, b.state) == (2, 1, [], "sent")
+    assert await ms.get_definition("acc_1", KEY, "obs") == b
+    await ms.mark_deleted("acc_1", KEY, "obs", 14)
+    assert [x.def_id for x in await ms.list_definitions("acc_1", KEY, include_deleted=True)] \
+        == ["obs"]
+    # Redeploying a definition being removed continues its revisions and clears ``deleted``.
+    c = await ms.put_definition("acc_1", KEY, {"id": "obs"}, "sent", 15)
+    assert (c.revision, c.deleted) == (4, False)
+    assert [x.def_id for x in await ms.list_definitions("acc_1", KEY)] == ["obs"]
+
+
+async def test_definitions_scoped_by_owner_and_key(store: PersistenceStore) -> None:
+    ms = await _with_machine(store)
+    await ms.put_definition("acc_1", KEY, {"id": "b"}, "sent", 1)
+    await ms.put_definition("acc_1", KEY, {"id": "a"}, "sent", 2)
+    assert [x.def_id for x in await ms.list_definitions("acc_1", KEY)] == ["a", "b"]
+    assert await ms.list_definitions("acc_2", KEY) == []
+    assert await ms.list_definitions("acc_1", _key(9)) == []
+    for fn in (
+        ms.get_definition("acc_2", KEY, "a"),
+        ms.mark_deleted("acc_1", KEY, "nope", 3),
+    ):
+        with pytest.raises(ToolError) as e:
+            await fn
+        assert e.value.code is ErrorCode.DEFINITION_NOT_FOUND
+    assert await ms.set_status("acc_1", KEY, "nope", 1, "applied", [], [], 3) is None
+    await ms.purge_definition("acc_1", KEY, "nope")  # idempotent
+    # Forgetting the machine drops its definitions.
+    await ms.forget_machine("acc_1", KEY)
+    assert await ms.list_definitions("acc_1", KEY, include_deleted=True) == []

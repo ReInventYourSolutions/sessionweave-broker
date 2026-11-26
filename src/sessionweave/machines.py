@@ -9,8 +9,9 @@ can list offline machines and the broker can queue definitions for them
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from sessionweave.access import hash_token
 from sessionweave.errors import ErrorCode, ToolError
@@ -31,6 +32,13 @@ _COLUMNS = (
 )
 
 
+_DEF_COLUMNS = (
+    "def_id, revision, definition_json, state, applied_revision, problems_json,"
+    " warnings_json, deleted, updated_at"
+)
+_T = TypeVar("_T")
+
+
 class MachineLimitError(Exception):
     """The owner already has the maximum number of machines."""
 
@@ -49,6 +57,42 @@ class Machine:
     prereqs: list[dict[str, Any]]
     first_seen: int
     last_seen: int
+
+
+@dataclass
+class StoredDefinition:
+    """A deployed definition (desired state) and the launcher's last status.
+
+    ``revision`` grows with every put and delete; ``state`` is one of
+    queued, sent, pending_in_use, applied, rejected, removing;
+    ``applied_revision`` is the last revision the launcher applied;
+    ``deleted`` marks a removal waiting for the launcher's ``removed``."""
+
+    def_id: str
+    revision: int
+    definition: dict[str, Any]
+    state: str
+    applied_revision: int | None
+    problems: list[str]
+    warnings: list[str]
+    deleted: bool
+    updated_at: int
+
+    def deploy(self) -> dict[str, Any]:
+        """The ``deploy`` object of the API's Machine agents."""
+        return {
+            "revision": self.revision, "applied_revision": self.applied_revision,
+            "state": self.state, "problems": list(self.problems),
+            "warnings": list(self.warnings),
+        }
+
+
+def _def_row(r: Any) -> StoredDefinition:
+    return StoredDefinition(
+        def_id=r[0], revision=r[1], definition=json.loads(r[2]), state=r[3],
+        applied_revision=r[4], problems=list(json.loads(r[5])),
+        warnings=list(json.loads(r[6])), deleted=bool(r[7]), updated_at=r[8],
+    )
 
 
 def _row(r: Any) -> Machine:
@@ -238,3 +282,140 @@ class MachineStore:
     async def forget_account(self, account_id: str) -> None:
         """Delete every machine and definition of an owner (idempotent)."""
         await self._delete("account_id = ?", (account_id,))
+
+    # --- deployed definitions (agent_definitions) ---------------------------
+
+    async def _in_tx(self, fn: Callable[[Any], Awaitable[_T]]) -> _T:
+        conn = self._write()
+        async with self._store._write_tx_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = await fn(conn)
+                await conn.execute("COMMIT")
+            except BaseException:
+                await conn.execute("ROLLBACK")
+                raise
+        return result
+
+    @staticmethod
+    async def _fetch_def(
+        conn: Any, account_id: str, launcher_key: str, def_id: str
+    ) -> StoredDefinition | None:
+        async with conn.execute(
+            f"SELECT {_DEF_COLUMNS} FROM agent_definitions"
+            " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+            (account_id, launcher_key, def_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else _def_row(row)
+
+    async def put_definition(
+        self, account_id: str, launcher_key: str, definition: dict[str, Any],
+        state: str, now_ms: int,
+    ) -> StoredDefinition:
+        """Store a (validated) definition as the desired state under its ``id``:
+        revision = previous + 1 (1 for a new one), ``deleted`` cleared,
+        problems/warnings reset; ``applied_revision`` is kept."""
+        def_id = str(definition["id"])
+
+        async def put(conn: Any) -> StoredDefinition:
+            prev = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            await conn.execute(
+                f"INSERT INTO agent_definitions ({_DEF_COLUMNS}, account_id, launcher_key)"
+                " VALUES (?, ?, ?, ?, ?, '[]', '[]', 0, ?, ?, ?)"
+                " ON CONFLICT(account_id, launcher_key, def_id) DO UPDATE SET"
+                " revision = excluded.revision, definition_json = excluded.definition_json,"
+                " state = excluded.state, problems_json = '[]', warnings_json = '[]',"
+                " deleted = 0, updated_at = excluded.updated_at",
+                (
+                    def_id, 1 if prev is None else prev.revision + 1, json.dumps(definition),
+                    state, None, now_ms, account_id, launcher_key,
+                ),
+            )
+            out = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            assert out is not None
+            return out
+
+        return await self._in_tx(put)
+
+    async def list_definitions(
+        self, account_id: str, launcher_key: str, *, include_deleted: bool = False
+    ) -> list[StoredDefinition]:
+        """The machine's definitions by id (rows being removed only when asked)."""
+        async with self._read().execute(
+            f"SELECT {_DEF_COLUMNS} FROM agent_definitions"
+            " WHERE account_id = ? AND launcher_key = ?"
+            + ("" if include_deleted else " AND deleted = 0")
+            + " ORDER BY def_id",
+            (account_id, launcher_key),
+        ) as cur:
+            return [_def_row(r) async for r in cur]
+
+    async def get_definition(
+        self, account_id: str, launcher_key: str, def_id: str
+    ) -> StoredDefinition:
+        """One definition, also while being removed (see ``deleted``); raises
+        ``ToolError(DEFINITION_NOT_FOUND)``."""
+        found = await self._fetch_def(self._read(), account_id, launcher_key, def_id)
+        if found is None:
+            raise ToolError(ErrorCode.DEFINITION_NOT_FOUND, "no such definition")
+        return found
+
+    async def set_status(
+        self, account_id: str, launcher_key: str, def_id: str, revision: int,
+        state: str, problems: list[str], warnings: list[str], now_ms: int,
+    ) -> StoredDefinition | None:
+        """Record the launcher's status for ``revision``; ignored (``None``)
+        when that is not the stored revision (stale) or the row is unknown.
+        ``applied`` also sets ``applied_revision``."""
+
+        async def update(conn: Any) -> StoredDefinition | None:
+            prev = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            if prev is None or prev.revision != revision:
+                return None
+            await conn.execute(
+                "UPDATE agent_definitions SET state = ?, problems_json = ?,"
+                " warnings_json = ?, updated_at = ?,"
+                " applied_revision = CASE WHEN ? THEN revision ELSE applied_revision END"
+                " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+                (
+                    state, json.dumps(problems), json.dumps(warnings), now_ms,
+                    int(state == "applied"), account_id, launcher_key, def_id,
+                ),
+            )
+            return await self._fetch_def(conn, account_id, launcher_key, def_id)
+
+        return await self._in_tx(update)
+
+    async def mark_deleted(
+        self, account_id: str, launcher_key: str, def_id: str, now_ms: int
+    ) -> StoredDefinition:
+        """Ask for the definition's removal: revision + 1, ``deleted``, state
+        ``removing`` (the row goes on ``purge_definition``). Raises
+        ``ToolError(DEFINITION_NOT_FOUND)``."""
+
+        async def delete(conn: Any) -> StoredDefinition:
+            prev = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            if prev is None:
+                raise ToolError(ErrorCode.DEFINITION_NOT_FOUND, "no such definition")
+            await conn.execute(
+                "UPDATE agent_definitions SET revision = revision + 1, deleted = 1,"
+                " state = 'removing', problems_json = '[]', warnings_json = '[]',"
+                " updated_at = ?"
+                " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+                (now_ms, account_id, launcher_key, def_id),
+            )
+            out = await self._fetch_def(conn, account_id, launcher_key, def_id)
+            assert out is not None
+            return out
+
+        return await self._in_tx(delete)
+
+    async def purge_definition(self, account_id: str, launcher_key: str, def_id: str) -> None:
+        """Delete the definition's row (idempotent)."""
+        async with self._store._write_tx_lock:
+            await self._write().execute(
+                "DELETE FROM agent_definitions"
+                " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+                (account_id, launcher_key, def_id),
+            )

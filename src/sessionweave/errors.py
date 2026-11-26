@@ -46,6 +46,8 @@ class ErrorCode(StrEnum):
     LAUNCH_LIMIT = "launch_limit"
     LAUNCH_NOT_FOUND = "launch_not_found"
     LAUNCHER_NOT_FOUND = "launcher_not_found"
+    DEFINITION_NOT_FOUND = "definition_not_found"
+    OUTSIDE_CEILING = "outside_ceiling"
 
 
 @dataclass(slots=True)

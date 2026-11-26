@@ -269,6 +269,27 @@ def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _valid_network(v: Any) -> bool:
+    """``access.network``: 'none', 'any' or at most 100 host names."""
+    return v in ("none", "any") or (
+        isinstance(v, list) and len(v) <= 100
+        and all(isinstance(h, str) and 0 < len(h) <= 253 for h in v)
+    )
+
+
+def _valid_limits(v: Any) -> bool:
+    """``limits``: an object of at most 10 numeric (or null) values."""
+    return (
+        isinstance(v, dict)
+        and len(v) <= 10
+        and all(
+            isinstance(k, str) and len(k) <= 64
+            and (x is None or _is_int(x) or isinstance(x, float))
+            for k, x in v.items()
+        )
+    )
+
+
 def validate_profile(raw: Any) -> dict[str, Any]:
     """Return the normalized profile or raise ValueError with the reason."""
     if not isinstance(raw, dict):
@@ -304,23 +325,11 @@ def validate_profile(raw: Any) -> dict[str, Any]:
     files, network = access.get("files"), access.get("network")
     if files is not None and not isinstance(files, dict):
         raise ValueError("access.files must be an object")
-    if network is not None and not (
-        network in ("none", "any")
-        or (isinstance(network, list) and len(network) <= 100
-            and all(isinstance(h, str) and 0 < len(h) <= 253 for h in network))
-    ):
+    if network is not None and not _valid_network(network):
         raise ValueError("access.network must be 'none', 'any' or a list of hosts")
     out["access_preset"] = access["preset"]
     limits = raw.get("limits", {})
-    if (
-        not isinstance(limits, dict)
-        or len(limits) > 10
-        or not all(
-            isinstance(k, str) and len(k) <= 64
-            and (v is None or _is_int(v) or isinstance(v, float))
-            for k, v in limits.items()
-        )
-    ):
+    if not _valid_limits(limits):
         raise ValueError("limits must be an object of at most 10 numeric values")
     out["limits"] = dict(limits)
     mi = raw.get("max_instances")
