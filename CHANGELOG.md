@@ -21,6 +21,13 @@ lists are relayed, never stored.
   launcher that offers `run_as` (runs as root); otherwise 400 `outside_ceiling`.
   `privileged` entries are stored as written: the launcher runs only the options an
   entry spells, so list each option used (`journalctl -u`, `journalctl -n`).
+- **Listed approvals are checked against the allowed commands** (the launcher's rule,
+  refused up front with 400 `invalid_request`): with approval `listed`, an `allow` or
+  `privileged` entry that shares a pattern's command word must differ from it at a
+  subcommand word, with no option word before that point. Allow `git status`, `git log`
+  with the pattern `git push` is accepted; allow `git` (it would run `git push` unasked),
+  `git push origin` (it would always ask) or `git -C x log` with `git -C x push` are
+  refused. An observer's empty allow list counts as the default read commands.
 - **Upper bounds on definition limits** (the launcher's TOML profiles use the same):
   `max_duration_s` and `max_idle_s` at most 2592000 (30 days), `max_cost_usd` at most
   10000.

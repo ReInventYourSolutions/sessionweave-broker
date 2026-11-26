@@ -382,3 +382,85 @@ def test_limits_capped(key: str) -> None:
         with pytest.raises(DefinitionError, match="at most") as exc:
             validate_definition(_def(limits={key: over}), LOCAL)
         assert key in str(exc.value)
+
+
+# --- final wave: listed approval vs allowed entries (the launcher's rule) ---------------
+
+# (kind, allow, privileged, pattern, accepted)
+_LISTED_TABLE: list[tuple[str, list[str], list[str], str, bool]] = [
+    ("operator", ["git status", "git log"], [], "git push", True),
+    ("operator", ["git status", "git log", "ls -la", "cat"], [], "git push", True),
+    ("operator", ["git status -s"], [], "git push", True),
+    ("operator", ["git status"], [], "git push --force", True),
+    ("operator", ["/usr/bin/git status"], [], "git push", True),
+    ("operator", ["docker compose ps", "docker compose logs"], [], "docker compose up", True),
+    ("operator", ["ls"], ["systemctl status"], "systemctl restart", True),
+    ("observer", ["journalctl -u"], [], "rm", True),
+    ("operator", ["git"], [], "git push", False),                  # entry runs the pattern
+    ("operator", ["git push origin"], [], "git push", False),      # pattern covers the entry
+    ("operator", ["git push --dry-run"], [], "git push", False),
+    ("operator", ["git status"], [], "git", False),
+    ("operator", ["git --no-pager log"], [], "git --no-pager push", False),  # option first
+    ("operator", ["git -C x log"], [], "git -C x push", False),
+    ("operator", ["git -C"], [], "git push", False),
+    ("operator", ["tail /var/log/syslog"], [], "tail -f", False),  # differ at an option
+    ("operator", ["tail -n"], [], "tail -f", False),
+    ("operator", ["/usr/bin/git"], [], "git push", False),         # basename
+    ("operator", ["ls"], ["systemctl"], "systemctl restart", False),
+    ("operator", ["ls"], ["systemctl restart nginx"], "systemctl restart", False),
+    ("operator", ["ls"], ["/bin/systemctl"], "systemctl restart", False),
+    ("operator", ["ls"], ["systemctl --no-block"], "systemctl restart", False),
+    ("observer", [], [], "journalctl --vacuum-size", False),       # the default read list
+    ("observer", ["systemctl status"], [], "systemctl status nginx", False),
+]
+
+
+def _listed_def(kind: str, allow: list[str], privileged: list[str], pattern: str,
+                ) -> dict[str, Any]:
+    return _def(kind=kind, access={"commands": {"mode": "list", "allow": allow,
+                                                "privileged": privileged}},
+                approval={"policy": "listed", "patterns": [pattern]})
+
+
+@pytest.mark.parametrize("kind,allow,privileged,pattern,accepted", _LISTED_TABLE)
+def test_listed_pattern_vs_allowed_entries(
+    kind: str, allow: list[str], privileged: list[str], pattern: str, accepted: bool,
+) -> None:
+    raw = _listed_def(kind, allow, privileged, pattern)
+    if accepted:
+        d = validate_definition(raw, ROOT)
+        assert d["approval"]["patterns"] == [pattern]
+        return
+    with pytest.raises(DefinitionError, match="overlaps") as exc:
+        validate_definition(raw, ROOT)
+    assert exc.value.code is ErrorCode.INVALID_REQUEST
+    assert repr(pattern) in str(exc.value)
+
+
+def test_listed_check_only_with_listed_patterns() -> None:
+    for approval in ({"policy": "auto", "patterns": ["git push"]},
+                     {"policy": "always", "patterns": ["git push"]},
+                     {"policy": "listed", "patterns": []}):
+        validate_definition(_def(kind="operator", access={"commands": {
+            "mode": "list", "allow": ["git"]}}, approval=approval), LOCAL)
+    # mode none: no command runs, the patterns change nothing
+    validate_definition(_def(access={"commands": {"mode": "none"}},
+                             approval={"policy": "listed", "patterns": ["journalctl -f"]}), LOCAL)
+
+
+def test_listed_table_matches_the_launcher() -> None:
+    """The same table through the Runner's own rule (not a dependency of the broker:
+    runs only where the Runner is installed next to it)."""
+    perms = pytest.importorskip(
+        "sessionweave_runner.permissions",
+        reason="sessionweave-runner is not installed in this environment (not a broker"
+               " dependency); the launcher runs the same table in its own tests")
+    for kind, allow, privileged, pattern, accepted in _LISTED_TABLE:
+        cmds = perms._resolve_commands(
+            kind, perms.Commands("list", tuple(allow), (), tuple(privileged)))
+        try:
+            perms._listed_denies(cmds, (pattern,))
+            runner_ok = True
+        except ValueError:
+            runner_ok = False
+        assert runner_ok is accepted, (kind, allow, privileged, pattern)

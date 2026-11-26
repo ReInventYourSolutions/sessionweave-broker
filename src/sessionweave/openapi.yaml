@@ -600,7 +600,12 @@ components:
         `tail`, `journalctl`, `ps`, `top -b`, `systemctl status`, ...). Command entries and
         approval patterns start with a command, never an option (`-`). A `privileged`
         entry allows exactly the options it spells: list each option used
-        (`journalctl -u`, `journalctl -n`). Never carries secrets.
+        (`journalctl -u`, `journalctl -n`). With approval `listed`, an `allow` or
+        `privileged` entry sharing a pattern's command word must differ from it at a
+        subcommand word with no option word before (allow `git status`, `git log` with
+        `git push` is accepted; allow `git` or `git push origin` with `git push`, or
+        `git -C x log` with `git -C x push`, is refused); an observer's empty `allow`
+        stands for the default read commands. Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
       properties:
         id: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it" }

@@ -176,6 +176,55 @@ def _is_read_command(entry: str) -> bool:
     )
 
 
+def _norm_words(entry: str) -> list[str]:
+    """The entry's words, the command word compared by basename (``/usr/bin/git``
+    is ``git``)."""
+    words = entry.split()
+    return [posixpath.basename(words[0]) or words[0], *words[1:]]
+
+
+def _distinct_subcommands(entry: list[str], pattern: list[str]) -> bool:
+    """Whether an entry and a pattern with the same command word differ at a later
+    word that is not an option in either, with no option word before it (``git
+    status`` vs ``git push``). False when one is a word prefix of the other (``git``
+    vs ``git push``, ``git push origin`` vs ``git push``) or an option comes first
+    (``git -C x log`` vs ``git -C x push``). The launcher's rule, word for word."""
+    for e, p in zip(entry[1:], pattern[1:], strict=False):
+        if e.startswith("-") or p.startswith("-"):
+            return False
+        if e != p:
+            return True
+    return False
+
+
+def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any]) -> None:
+    """Approval ``listed`` fails closed (its patterns become denies): an allow or
+    privileged entry sharing a pattern's command word must differ from it at a
+    subcommand word (allow ``git status``, ``git log`` with ``git push``); else the
+    entry would run the pattern unasked, always ask, or reach it in another
+    spelling. An observer's empty list stands for the default read commands."""
+    patterns = approval["patterns"]
+    if approval["policy"] != "listed" or not patterns or commands["mode"] == "none":
+        return
+    allow = commands["allow"]
+    if kind == "observer" and commands["mode"] == "list" and not allow:
+        allow = list(READ_COMMANDS)
+    for what, entries in (("allow", allow), ("privileged", commands["privileged"])):
+        for entry in entries:
+            ew = _norm_words(entry)
+            for p in patterns:
+                pw = _norm_words(p)
+                if ew[0] != pw[0] or _distinct_subcommands(ew, pw):
+                    continue
+                raise DefinitionError(
+                    f"approval.patterns: {p!r} shares the command {pw[0]!r} with the"
+                    f" access.commands.{what} entry {entry!r} and overlaps it: one is a word"
+                    " prefix of the other, or an option comes before they differ; list only"
+                    " commands that differ from it at a subcommand word (e.g. 'git status'"
+                    " with 'git push'), without options before it"
+                )
+
+
 def _observe(raw: Any, machine: Machine) -> dict[str, Any]:
     obs = _obj(raw, "observe", _OBSERVE_KEYS)
     out: dict[str, Any] = {}
@@ -394,6 +443,7 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     out["access"] = _access(raw.get("access"), kind, machine)
     out["limits"] = _limits(raw.get("limits"))
     out["approval"] = _approval(raw.get("approval"))
+    _listed_overlap(kind, out["access"]["commands"], out["approval"])
     instructions = raw.get("instructions", "")
     try:
         ok = isinstance(instructions, str) and (
