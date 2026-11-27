@@ -335,11 +335,12 @@ class MachineStore:
 
     async def put_definition(
         self, account_id: str, launcher_key: str, definition: dict[str, Any],
-        state: str, now_ms: int,
+        state: str, now_ms: int, *, warnings: list[str] | None = None,
     ) -> StoredDefinition:
         """Store a (validated) definition as the desired state under its ``id``:
-        revision = previous + 1 (1 for a new one), ``deleted`` cleared,
-        problems/warnings reset; ``applied_revision`` is kept."""
+        revision = previous + 1 (1 for a new one), ``deleted`` cleared, problems
+        reset, warnings set to ``warnings`` (what the broker can already tell; the
+        launcher's status replaces them); ``applied_revision`` is kept."""
         def_id = str(definition["id"])
         key = (account_id, launcher_key, def_id)
 
@@ -356,14 +357,16 @@ class MachineStore:
                 last = hwm[0] if hwm is not None else 0
             await conn.execute(
                 f"INSERT INTO agent_definitions ({_DEF_COLUMNS}, account_id, launcher_key)"
-                " VALUES (?, ?, ?, ?, ?, '[]', '[]', 0, ?, ?, ?)"
+                " VALUES (?, ?, ?, ?, ?, '[]', ?, 0, ?, ?, ?)"
                 " ON CONFLICT(account_id, launcher_key, def_id) DO UPDATE SET"
                 " revision = excluded.revision, definition_json = excluded.definition_json,"
-                " state = excluded.state, problems_json = '[]', warnings_json = '[]',"
+                " state = excluded.state, problems_json = '[]',"
+                " warnings_json = excluded.warnings_json,"
                 " deleted = 0, updated_at = excluded.updated_at",
                 (
                     def_id, last + 1, json.dumps(definition),
-                    state, None, now_ms, account_id, launcher_key,
+                    state, None, json.dumps(list(warnings or [])), now_ms, account_id,
+                    launcher_key,
                 ),
             )
             out = await self._fetch_def(conn, account_id, launcher_key, def_id)

@@ -35,6 +35,7 @@ from sessionweave.definitions import (
     MAX_DEFINITIONS_PER_LAUNCHER,
     DefinitionError,
     budget_problem,
+    definition_warnings,
     json_size,
     profiles_frame_size,
     published_profile,
@@ -307,21 +308,28 @@ class DeployManager:
                 ErrorCode.DEFINITION_LIMIT,
                 f"at most {MAX_DEFINITIONS_PER_LAUNCHER} definitions per machine",
             )
-        if (why := self._budget_problem(lnc, rows, definition)) is not None:
+        # What the launcher will warn about that the broker can tell now (git in a
+        # writer's list): stored with the row, so the Cockpit shows it before the
+        # launcher answers; the launcher's status then replaces it.
+        warnings = definition_warnings(definition, machine)
+        if (why := self._budget_problem(lnc, rows, definition, warnings)) is not None:
             raise ToolError(ErrorCode.DEFINITIONS_BUDGET, why)
         online = lnc is not None
         row = await store.put_definition(
-            owner, launcher_key, definition, "sent" if online else "queued", _now_ms())
+            owner, launcher_key, definition, "sent" if online else "queued", _now_ms(),
+            warnings=warnings)
         ready = self._ready_launcher(owner, launcher_key)
         if ready is not None:
             await self._send(ready, self._put_frame(row))
         await self._event(owner, "definition.deployed", machine.machine, launcher_key,
                           def_id, row.revision, client=client, queued=not online)
-        return {"definition_id": def_id, "revision": row.revision, "state": row.state}
+        return {"definition_id": def_id, "revision": row.revision, "state": row.state,
+                "warnings": list(row.warnings)}
 
     @staticmethod
     def _budget_problem(
         lnc: _Launcher | None, rows: list[StoredDefinition], definition: dict[str, Any],
+        warnings: list[str] | None = None,
     ) -> str | None:
         """Why storing ``definition`` would make the machine publish more than the
         launcher's ``PUBLISHED_PROFILES_BUDGET`` (the launcher would reject it), else
@@ -349,8 +357,9 @@ class DeployManager:
             else:
                 sizes[r.def_id] = json_size(published_profile(r.definition, r.warnings))
         prev = next((r for r in rows if r.def_id == def_id), None)
-        warnings = prev.warnings if prev is not None and prev.state == "applied" else []
-        sizes[def_id] = json_size(published_profile(definition, warnings))
+        known = prev.warnings if prev is not None and prev.state == "applied" else []
+        sizes[def_id] = json_size(published_profile(
+            definition, list(dict.fromkeys([*known, *(warnings or [])]))))
         return budget_problem(profiles_frame_size(list(sizes.values())))
 
     async def remove(

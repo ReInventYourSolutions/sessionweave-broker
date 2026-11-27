@@ -14,6 +14,8 @@ from sessionweave.definitions import (
     COMMAND_MODES,
     COMMAND_WRAPPERS,
     DEFINITION_MAX_BYTES,
+    GIT_LIST_WARNING,
+    GIT_LIST_WARNING_UNSANDBOXED,
     INSTRUCTIONS_MAX_BYTES,
     KINDS,
     LIMIT_MAX,
@@ -28,9 +30,11 @@ from sessionweave.definitions import (
     DefinitionError,
     _listed_overlap,
     budget_problem,
+    definition_warnings,
     inside,
     is_command_wrapper,
     json_size,
+    list_git_warning,
     profiles_frame_size,
     protected_write_problem,
     published_profile,
@@ -327,8 +331,8 @@ def test_observer_allow_entries_must_be_read_commands(entry: str) -> None:
         validate_definition(_def(access={"commands": {"mode": "list", "allow": ["ls", entry]}}),
                             LOCAL)
     raw = _def(kind="operator", access={"commands": {"mode": "list", "allow": [entry]}})
-    if entry in ("git status", "sh"):
-        # An operator (it writes) may not list a command runner.
+    if entry == "sh":
+        # An operator (it writes) may not list a command runner (git excepted).
         with pytest.raises(DefinitionError, match="can run other commands"):
             validate_definition(raw, LOCAL)
         return
@@ -625,10 +629,15 @@ def test_is_command_wrapper(word: str, expected: bool) -> None:
 
 # (kind, write, policy, allow, privileged, accepted): list mode, no listed patterns.
 _LIST_RUNNER_TABLE: list[tuple[str, list[str], str, list[str], list[str], bool]] = [
-    ("operator", [], "auto", ["git status"], [], False),          # [] = default ".": writes
-    ("operator", ["out"], "auto", ["git log"], [], False),
-    ("operator", [], "auto", ["/usr/bin/git diff"], [], False),
-    ("operator", [], "auto", ["ls"], ["git pull"], False),         # privileged too
+    ("operator", [], "auto", ["git status"], [], True),           # git: accepted, warned
+    ("operator", ["out"], "auto", ["git log"], [], True),
+    ("operator", [], "auto", ["/usr/bin/git diff"], [], True),
+    ("operator", [], "auto", ["git2.43 diff"], [], True),
+    ("operator", [], "auto", ["git status", "env git"], [], False),  # [] = default ".": writes
+    ("operator", [], "auto", ["nice git"], [], False),
+    ("operator", [], "auto", ["xargs git"], [], False),
+    ("operator", [], "auto", ["ls"], ["git pull"], False),         # privileged git refused
+    ("operator", [], "auto", ["git status"], ["git pull"], False),
     ("operator", [], "auto", ["env"], [], False),
     ("operator", [], "auto", ["nice make"], [], False),
     ("operator", [], "auto", ["python3.12"], [], False),
@@ -649,7 +658,8 @@ def test_list_mode_refuses_command_runners_for_writers(
     if accepted:
         validate_definition(raw, ROOT)
         return
-    entry = next(e for e in [*allow, *privileged] if is_command_wrapper(e.split()[0]))
+    entry = next(e for e in [*allow, *privileged] if is_command_wrapper(e.split()[0])
+                 and (e in privileged or wrapper_name(e.split()[0]) != "git"))
     with pytest.raises(DefinitionError) as exc:
         validate_definition(raw, ROOT)
     assert str(exc.value) == LIST_RUNNER_WITH_WRITES.format(entry=entry)
@@ -1035,3 +1045,53 @@ def test_shell_builtins_that_run_commands_are_wrappers(word: str) -> None:
     with pytest.raises(DefinitionError, match="can run other commands"):
         validate_definition(_def(kind="operator", access={"commands": {
             "mode": "list", "allow": ["ls", word]}}), LOCAL)
+
+
+# --- owner decision (Runner b3745b1): a writer may list git, accepted with a warning -----
+
+_GIT_WARNING_CASES: list[tuple[dict[str, Any], dict[str, str | None]]] = [
+    # (definition overrides, expected warning per machine: None, "sandbox" or "machine")
+    ({"kind": "operator", "access": {"commands": {"mode": "list", "allow": ["git status"]}}},
+     {"local": "sandbox", "root": "machine", "root-nobw": "machine", "root-user": "machine"}),
+    ({"kind": "operator", "access": {"commands": {"mode": "list",
+                                                  "allow": ["ls", "/usr/bin/git"]}}},
+     {"local": "sandbox", "root": "machine", "root-nobw": "machine", "root-user": "machine"}),
+    ({"kind": "operator", "approval": {"policy": "always"},
+      "access": {"commands": {"mode": "list", "allow": ["git status"]}}},
+     dict.fromkeys(MACHINES)),                                    # read-only: no warning
+    ({"kind": "operator", "access": {"commands": {"mode": "list", "allow": ["ls"]}}},
+     dict.fromkeys(MACHINES)),
+    ({"kind": "operator"}, dict.fromkeys(MACHINES)),               # shell: no list
+]
+
+
+@pytest.mark.parametrize("over,expected", _GIT_WARNING_CASES)
+def test_git_list_warning_for_writers(over: dict[str, Any],
+                                      expected: dict[str, str | None]) -> None:
+    texts = {"sandbox": [GIT_LIST_WARNING], "machine": [GIT_LIST_WARNING_UNSANDBOXED],
+             None: []}
+    for mname, machine in MACHINES.items():
+        d = validate_definition({**_def(), **over}, machine)
+        assert definition_warnings(d, machine) == texts[expected[mname]], mname
+
+
+def test_git_list_warning_matches_the_launcher() -> None:
+    """The warning texts and ``list_git_warning`` against the Runner's, over every
+    combination of commands mode, writes, sandbox and allow lists."""
+    perms = pytest.importorskip("sessionweave_runner.permissions",
+                                reason="sessionweave-runner is not installed")
+    assert perms.GIT_LIST_WARNING == GIT_LIST_WARNING
+    assert perms.GIT_LIST_WARNING_UNSANDBOXED == GIT_LIST_WARNING_UNSANDBOXED
+    lists = [[], ["ls"], ["git"], ["git status", "ls"], ["/usr/bin/git log"], ["git2.43"],
+             ["gitk"], ["ls", "git-2.43 diff"]]
+    for mode in ("none", "list", "shell"):
+        for allow in lists:
+            for writes in (True, False):
+                for sandboxed in (True, False):
+                    ours = list_git_warning({"mode": mode, "allow": allow},
+                                            writes=writes, sandboxed=sandboxed)
+                    theirs = perms.list_git_warning(
+                        perms.Commands(mode, tuple(allow)), writes=writes,
+                        sandboxed=sandboxed)
+                    assert ours == theirs, (mode, allow, writes, sandboxed)
+    assert list_git_warning(None, writes=True, sandboxed=True) is None

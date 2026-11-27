@@ -560,6 +560,51 @@ def budget_problem(size: int) -> str | None:
     )
 
 
+# The launcher's ``GIT_LIST_WARNING`` / ``GIT_LIST_WARNING_UNSANDBOXED``, word for word.
+GIT_LIST_WARNING = (
+    "git is in the command list of an agent that can write: git can run other commands "
+    "(hooks, config, aliases), so the agent can effectively run any command inside the "
+    "sandbox"
+)
+GIT_LIST_WARNING_UNSANDBOXED = (
+    "git is in the command list of an agent that can write and runs without a sandbox: "
+    "git can run other commands (hooks, config, aliases), so the agent can effectively "
+    "run any command on the machine as its user (its run_as user, else root)"
+)
+
+
+def _is_git(word: str) -> bool:
+    """The command word is git (``wrapper_name``: ``/usr/bin/git``, ``git2.43``)."""
+    return wrapper_name(word) == "git"
+
+
+def list_git_warning(commands: dict[str, Any] | None, *, writes: bool,
+                     sandboxed: bool) -> str | None:
+    """The launcher's ``list_git_warning``: for an agent that can write with ``git``
+    among its list-mode allow entries, ``GIT_LIST_WARNING`` in the sandbox,
+    ``GIT_LIST_WARNING_UNSANDBOXED`` without one; else None. ``commands`` are the
+    effective commands (``{"mode", "allow", ...}``)."""
+    if commands is None or not writes or commands["mode"] != "list":
+        return None
+    if not any((words := e.split()) and _is_git(words[0]) for e in commands["allow"]):
+        return None
+    return GIT_LIST_WARNING if sandboxed else GIT_LIST_WARNING_UNSANDBOXED
+
+
+def definition_warnings(d: dict[str, Any], machine: Machine) -> list[str]:
+    """Warnings the launcher will report for the (normalised) definition ``d`` that
+    the broker can already tell (shown at deploy, before the launcher answers; the
+    launcher's own warnings replace them with its status): the git-in-a-writer's-list
+    warning. An agent that can write is sandboxed only on a ``--local`` launcher (the
+    launcher's ``_sandboxed``: a ``--root`` launcher sandboxes observers only)."""
+    observer = d["kind"] == "observer"
+    always = d["approval"]["policy"] == "always"
+    writes = not observer and not always  # an empty write list is the default "."
+    commands = None if always else d["access"]["commands"]
+    why = list_git_warning(commands, writes=writes, sandboxed=machine.mode == "local")
+    return [] if why is None else [why]
+
+
 # The runtimes' configuration and instruction files and git's metadata: inside the
 # sandbox they stay read-only, and a write glob naming them would bind them read-write.
 # The launcher's ``permissions.PROTECTED_WRITE_NAMES`` (``sandbox.PROTECTED_NAMES`` plus
@@ -681,10 +726,16 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
             )
     if mode == "list" and write:
         # The launcher's ``list_runner_problem``: an agent that can write may not list
-        # a command that runs other commands (shells, wrappers, interpreters, git,
-        # which runs commands from repository config a writer can plant). Read-only
-        # agents (observers, approval "always") are unaffected.
-        for entry in (*cmds["allow"], *cmds["privileged"]):
+        # a command that runs other commands (shells, wrappers, interpreters, shell
+        # builtins). ``git`` is the one allow-entry exception (owner decision: an
+        # explicit opt-in, accepted with ``list_git_warning``); a privileged ``git``
+        # stays refused (the root helper runs it as root outside the sandbox).
+        # Read-only agents (observers, approval "always") are unaffected.
+        for entry in cmds["allow"]:
+            words = entry.split()
+            if words and is_command_wrapper(words[0]) and not _is_git(words[0]):
+                raise DefinitionError(LIST_RUNNER_WITH_WRITES.format(entry=entry))
+        for entry in cmds["privileged"]:
             words = entry.split()
             if words and is_command_wrapper(words[0]):
                 raise DefinitionError(LIST_RUNNER_WITH_WRITES.format(entry=entry))

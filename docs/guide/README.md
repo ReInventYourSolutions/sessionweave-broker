@@ -964,7 +964,8 @@ that session ends.
 **What the broker checks at deploy.** Every rule of the launcher that does not need the
 machine itself: the schema, the ceiling, the root-execution rules, the command rules
 (listed approvals, which are refused for an agent that can write; command runners such as
-shells, interpreters, `eval`/`source` and `git` in the list of an agent that can write;
+shells, interpreters and `eval`/`source` in the list of an agent that can write, where
+`git` is accepted with a warning shown at deploy and `git` in `privileged` is refused;
 write globs that would name `.git` or a runtime's configuration or instruction file, such
 as `.git`, `**/AGENTS.md` or `*.md`), host and glob syntax, the model name and what the
 runtime can enforce (see the OpenAPI `AgentDefinition`). An operator's empty write list

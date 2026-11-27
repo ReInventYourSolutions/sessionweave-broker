@@ -333,3 +333,38 @@ async def test_repeated_status_is_recorded_and_announced_once(tmp_path: Path) ->
                           ("definition.deployed", "obs", 2), ("definition.rejected", "obs", 2)]
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_git_list_warning_shown_at_deploy(tmp_path: Path) -> None:
+    """Owner decision: a writer may list git. The deploy answer and the stored deploy
+    state carry the launcher's warning (sandboxed on a --local machine) before the
+    launcher answers; its own status then replaces it."""
+    from sessionweave.definitions import GIT_LIST_WARNING
+
+    store, machines, dm = await _setup(tmp_path)
+    try:
+        raw = {**_DEF, "kind": "operator", "runtime": "opencode",
+               "access": {"commands": {"mode": "list", "allow": ["git status", "ls"]}}}
+        out = await dm.deploy(OPEN_OWNER, KEY, "obs", raw)
+        assert out["warnings"] == [GIT_LIST_WARNING]
+        row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
+        assert row.deploy()["warnings"] == [GIT_LIST_WARNING]
+        assert "warnings" not in row.definition  # the definition itself is unchanged
+        # without git: no warning; a redeploy resets what was stored
+        out = await dm.deploy(OPEN_OWNER, KEY, "obs", {**raw, "access": {
+            "commands": {"mode": "list", "allow": ["ls"]}}})
+        assert out["warnings"] == []
+        assert (await machines.get_definition(OPEN_OWNER, KEY, "obs")).warnings == []
+        await dm.deploy(OPEN_OWNER, KEY, "obs", raw)
+        v2 = parse_hello_v2({"protocol": 2, "launcher_key": KEY, "mode": "local",
+                             "ceiling": "/srv/app", "capabilities": ["definitions"]},
+                            deploy_allowed=True)
+        lid, _ = dm._launchers.register(_SinkConn(), None, {"machine": "box", "profiles": []},
+                                        v2=v2)
+        await dm.on_status(lid, {"id": "obs", "revision": 3, "state": "applied",
+                                 "warnings": [GIT_LIST_WARNING, "launcher's own"]})
+        row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
+        assert row.warnings == [GIT_LIST_WARNING, "launcher's own"]
+    finally:
+        await store.close()

@@ -48,7 +48,14 @@ lists are relayed, never stored.
   `python3.12`, `node18`, `lua-5.4` count as `perl`, `python`, `node`, `lua`). They are
   refused in `allow`/`privileged` with listed patterns, and in commands mode `list` for
   every agent that can write (an operator unless approval is `always`): such an agent
-  could run any command through them. Read-only agents keep them. `docker`, `kubectl`
+  could run any command through them. Read-only agents keep them. **Exception (owner
+  decision): a writer may list `git` in `allow`**, accepted with a warning that git
+  can run other commands (hooks, config, aliases), so the agent can effectively run any
+  command inside the sandbox, or on the machine as its user when it runs without one (a
+  `--root` operator). The deploy answer carries it in `warnings` and the stored
+  definition's deploy warnings show it until the launcher reports its own. `env git`,
+  `nice git`, `xargs git` and other runners stay refused, and so does `git` in
+  `privileged` (the root helper runs it as root outside the sandbox). `docker`, `kubectl`
   and `systemctl` are not runners: the subcommand rule governs them. Even so, **for an
   agent that can write, a command list limits convenience, not capability**: test
   runners, build tools, package managers, linters and the folder's own scripts run code

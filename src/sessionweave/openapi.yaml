@@ -621,7 +621,11 @@ components:
         string or a file: `eval`, `source`, `.`, `builtin`, `trap`, `alias`, ...; the
         launcher's `COMMAND_WRAPPERS`). In commands mode `list`, an agent that can write
         (an operator unless approval is `always`; an empty write list means `.`) may not
-        list one in `allow` or `privileged`. For such an agent a command list limits
+        list one in `allow` or `privileged`, except `git` in `allow` (owner decision: an
+        explicit opt-in, accepted with a warning that git can run other commands, so the
+        agent can effectively run any command inside the sandbox, or on the machine
+        when it runs without one: a `--root` operator); a `privileged` git stays
+        refused. For such an agent a command list limits
         convenience, not capability (test runners, builds and scripts run code it can
         write): the sandbox (`--local`) and `run_as` are the boundary.
 
@@ -718,6 +722,10 @@ components:
         definition_id: { type: string }
         revision: { type: integer }
         state: { type: string, enum: [queued, sent, removing, removed] }
+        warnings:
+          type: array
+          items: { type: string }
+          description: "Deploy only: what the launcher will warn about that the broker can already tell (git in the command list of an agent that can write: the agent can effectively run any command inside the sandbox, or on the machine without one). Also stored as the definition's deploy warnings until the launcher reports its own"
     BrowseEntry:
       type: object
       required: [name, kind]
