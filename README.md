@@ -537,6 +537,7 @@ default 30). Event data never contains token values or join links.
 | `token.rejected` | a known token was refused (revoked, expired, account not active): token_id, label, reason, ip, client; at most one per token and reason per 10 min |
 | `account.status_changed` | from, to, by |
 | `agent.launched`, `agent.stopped` | session_id, launch_id, profile_id, launcher_id, machine; `agent.stopped` adds reason (`removed`, `session_ended`, a launcher limit, or the failure: `launcher_offline`, `join_timeout`, the launcher's error). Recorded on the launcher owner's and the session owner's account |
+| `definition.deployed`, `definition.applied`, `definition.rejected`, `definition.removed` | launcher_key, machine, definition_id, revision; `deployed` adds `queued` (the machine was offline), `rejected` adds `problems` (see [Machines and remote deploy](#machines-and-remote-deploy)) |
 
 Read them with `GET /v1/me/events` (own account) or, as admin,
 `GET /v1/accounts/events?account_id=...` (all accounts, or one). Parameters:
@@ -716,6 +717,36 @@ agents (`unknown_launch`), and it makes each one leave the session with the
 agent's own participant token, so (persisted sessions) the roster holds no stale
 entry. An agent whose launcher never comes back stays in the roster, offline,
 until `offline_grace_seconds` evicts it.
+
+## Machines and remote deploy
+
+Since 0.36.0 a launcher may speak **launcher protocol v2** (Runner 0.9.0+): a stable
+`launcher_key`, its start mode (`config` = TOML profiles only, `local` = one folder in an
+OS sandbox, `root` = the whole machine) and ceiling, the capabilities it offers
+(`definitions`, `browse`, `processes`), its sandbox, platform and prerequisites. With a
+persistence DB the broker keeps each machine's descriptor and its **deployed agent
+definitions** (revisioned desired state), sends them over the launcher socket (queued while
+the machine is offline, re-converged on every reconnect) and relays **remote browse** and
+**process list** requests to the connected launcher. It stores definitions and machine
+descriptors only: browse listings and process lists are relayed, never stored.
+
+| route | |
+|---|---|
+| `GET /v1/me/launchers`, `GET /v1/me/launchers/{key}` | the caller's machines with their agents and deploy states; one machine with its definitions |
+| `PUT` / `DELETE /v1/me/launchers/{key}/definitions/{id}` | deploy (body `{"definition": {...}}`) / remove a definition |
+| `DELETE /v1/me/launchers/{key}` | forget an offline machine (also the reset for a launcher that lost its `key_secret`) |
+| `GET /v1/me/launchers/{key}/browse?path=&cursor=&limit=&hidden=` | list a folder on the machine, inside its ceiling (limit ≤ 300) |
+| `GET /v1/me/launchers/{key}/processes?q=&cursor=&limit=` | list its processes, command lines redacted on the machine (limit ≤ 200) |
+
+**Account mode:** only the launcher owner's account token (the relay admin token cannot;
+another account gets 404). **Open mode with a persistence DB:** the same routes under
+`/v1/launchers…`, with **no credential** — any client that reaches the broker may deploy
+to `--local`/`--root` launchers, browse, list processes and forget offline machines
+(LAN-only trust; `SW_LAUNCHER_TOKEN` only gates launcher connections). Without a DB the
+write, browse and process routes answer 503 `definitions_unavailable`. Relayed requests
+wait `SW_LAUNCHER_RELAY_TIMEOUT_S` (default 10 s; 504 `launcher_timeout`), need a connected
+launcher (409 `launcher_offline`) with the capability (409 `launcher_capability_missing`).
+The operator's view, with every code, is in the [guide §10](docs/guide/README.md#10-launchers-from-the-operators-side).
 
 ## Architecture (sub-project #1)
 

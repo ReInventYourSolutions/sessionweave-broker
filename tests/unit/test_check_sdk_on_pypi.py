@@ -119,3 +119,14 @@ def test_check_requires_provenance_for_every_file(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(guard, "_get_json", lambda url: fake(url, _prov("attacker/x")))
     with pytest.raises(guard.GuardError, match="no PEP 740 provenance"):
         guard.check("sessionweave-sdk", req, REPO, "release.yml")
+
+
+def test_pyproject_sdk_range_accepts_0_13_and_0_14(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(Path(__file__).resolve().parents[2])
+    req = guard.requirement_from_pyproject("sessionweave-sdk")
+    assert str(req.specifier) == "<0.15,>=0.13.0"
+    assert req.specifier.contains("0.13.0") and req.specifier.contains("0.14.0")
+    assert not req.specifier.contains("0.15.0") and not req.specifier.contains("0.12.9")
+    releases = {"0.13.0": [{"yanked": False}], "0.14.0": [{"yanked": False}],
+                "0.15.0": [{"yanked": False}]}
+    assert guard.newest_satisfying(releases, req.specifier) == "0.14.0"

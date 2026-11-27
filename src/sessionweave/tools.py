@@ -66,6 +66,7 @@ from sessionweave.supervisor import (
 
 if TYPE_CHECKING:
     from sessionweave.config import ConfigBounds
+    from sessionweave.machines import MachineStore
     from sessionweave.metrics import Metrics
     from sessionweave.persistence import PersistenceStore
     from sessionweave.schemas import PersistenceStatePublic
@@ -85,9 +86,11 @@ class ToolDeps:
         "admin_token",
         "auth_limiter",
         "bounds",
+        "deploys",
         "events",
         "launchers",
         "launches",
+        "machines",
         "metrics",
         "registry",
         "relay_epoch",
@@ -122,11 +125,17 @@ class ToolDeps:
         # Set in the server lifespan once the persistence store exists.
         self.accounts: AccountStore | None = None
         self.events: EventLog | None = None
+        # Machines of v2 launchers (and their deployed definitions); set
+        # whenever the persistence DB exists, in both modes.
+        self.machines: MachineStore | None = None
         from sessionweave.launchers import LauncherRegistry
         from sessionweave.launches import LaunchManager
         self.launchers = LauncherRegistry()
         self.launches = LaunchManager(self.launchers, self)
         self.launchers.launches = self.launches
+        from sessionweave.deploy import DeployManager
+        # Deployed agent definitions; its store is set with ``machines``.
+        self.deploys = DeployManager(self.launchers, None, self)
         registry.launch_hooks = self.launches
         self.session_creation: Literal["open", "account"] = "open"
         # Per-account caps (SW_ACCOUNT_MAX_SESSIONS / SW_ACCOUNT_MAX_TOKENS).

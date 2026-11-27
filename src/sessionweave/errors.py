@@ -45,6 +45,20 @@ class ErrorCode(StrEnum):
     NO_FREE_SLOT = "no_free_slot"
     LAUNCH_LIMIT = "launch_limit"
     LAUNCH_NOT_FOUND = "launch_not_found"
+    LAUNCHER_NOT_FOUND = "launcher_not_found"
+    DEFINITION_NOT_FOUND = "definition_not_found"
+    OUTSIDE_CEILING = "outside_ceiling"
+    DEFINITIONS_UNAVAILABLE = "definitions_unavailable"
+    LAUNCHER_CAPABILITY_MISSING = "launcher_capability_missing"
+    DEFINITION_IN_USE = "definition_in_use"
+    DEFINITION_ID_CONFLICT = "definition_id_conflict"
+    DEFINITION_LIMIT = "definition_limit"
+    DEFINITIONS_BUDGET = "definitions_budget"
+    LAUNCHER_ONLINE = "launcher_online"
+    LAUNCHER_OFFLINE = "launcher_offline"
+    LAUNCHER_TIMEOUT = "launcher_timeout"
+    LAUNCHER_BAD_REPLY = "launcher_bad_reply"
+    PATH_NOT_FOUND = "path_not_found"
 
 
 @dataclass(slots=True)

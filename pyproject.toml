@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sessionweave-broker"
-version = "0.35.1"
+version = "0.36.0"
 description = "MCP-native session broker for multi-agent collaboration"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -39,7 +39,7 @@ dependencies = [
     "httpx2>=2.16,<3",
     "aiosqlite>=0.20.0",
     # Python SDK: /sdk and /sdk.md render its README, /sdk shows its version.
-    "sessionweave-sdk>=0.13.0,<0.14",
+    "sessionweave-sdk>=0.13.0,<0.15",
 ]
 
 [project.optional-dependencies]

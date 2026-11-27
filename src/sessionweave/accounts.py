@@ -304,10 +304,23 @@ class AccountStore:
         return before, await self.get(account_id)
 
     async def delete(self, account_id: str) -> None:
-        """Delete an account; its tokens go with it (ON DELETE CASCADE)."""
+        """Delete an account; its tokens go with it (ON DELETE CASCADE), and
+        its machines and deployed agent definitions are deleted too."""
         conn = self._write_conn()
         async with self._store._write_tx_lock:
-            await conn.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table in (
+                    "agent_definitions", "agent_definition_revisions",
+                    "launcher_machines", "accounts",
+                ):
+                    await conn.execute(
+                        f"DELETE FROM {table} WHERE account_id = ?", (account_id,)
+                    )
+                await conn.execute("COMMIT")
+            except BaseException:
+                await conn.execute("ROLLBACK")
+                raise
 
     # ----- tokens -----
 
@@ -416,6 +429,25 @@ class AccountStore:
 
     async def get_token(self, account_id: str, token_id: str) -> AccountToken:
         return await self._get_token(account_id, token_id)
+
+    async def token_usable(
+        self, account_id: str, token_id: str, now_ms: int, ip: str | None = None
+    ) -> bool:
+        """Re-check a token that already authenticated: not revoked, not
+        expired, its account active and, with ``ip``, its network policy still
+        allows ``ip``. Read-only (no events, no approvals, no last use): for a
+        connection that registers only after a slow step, so a revocation in
+        between is not missed."""
+        try:
+            token = await self._get_token(account_id, token_id)
+            account = await self.get(account_id)
+        except ToolError:
+            return False
+        if token.revoked_at is not None or account.status != "active":
+            return False
+        if token.expires_at is not None and token.expires_at <= now_ms:
+            return False
+        return ip is None or self.network_allows(token, ip)
 
     @staticmethod
     def network_allows(token: AccountToken, ip: str) -> bool:
