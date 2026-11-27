@@ -172,3 +172,164 @@ async def test_fast_status_is_never_overwritten_by_sent(tmp_path: Path, state: s
         assert (out["revision"], row.revision, row.state) == (2, 2, state)
     finally:
         await store.close()
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+class _SinkConn:
+    def __init__(self) -> None:
+        self.frames: list[dict[str, object]] = []
+
+    async def send_json(self, frame: dict[str, object]) -> None:
+        self.frames.append(frame)
+
+
+def _big(def_id: str) -> dict[str, object]:
+    """A definition whose published profile is about 30 KB (all fields at their caps)."""
+    return {**_DEF, "id": def_id, "description": "é" * 1000,
+            "capabilities": [f"{i:02d}" + "c" * 62 for i in range(32)],
+            "allowed_accounts": [f"{i:03d}" + "a" * 197 for i in range(100)]}
+
+
+def _local_profile(pid: str, size: int) -> dict[str, object]:
+    return {"id": pid, "domain": "ops", "role": "w", "runtime": "claude", "model": "",
+            "access": {"preset": "reader"}, "limits": {}, "max_instances": 1,
+            "source": "local", "description": "", "capabilities": [],
+            "warnings": [f"w{i:03d}" + "x" * 296 for i in range(min(size // 300, 20))]}
+
+
+@pytest.mark.asyncio
+async def test_deploy_refused_over_the_published_profiles_budget(tmp_path: Path) -> None:
+    """I1: a deploy that would make the machine publish more than the launcher's
+    192 KiB budget is refused (409 definitions_budget) and nothing is stored; an
+    update of a stored definition replaces its own share."""
+    from sessionweave.definitions import (
+        PUBLISHED_PROFILES_BUDGET,
+        json_size,
+        profiles_frame_size,
+        published_profile,
+        validate_definition,
+    )
+    from sessionweave.machines import Machine
+
+    store, machines, dm = await _setup(tmp_path)
+    try:
+        machine = Machine(OPEN_OWNER, KEY, "box", "local", "/srv/app", ["definitions"],
+                          "bwrap", False, "linux", [], 0, 0)
+        one = json_size(published_profile(validate_definition(_big("d0"), machine), []))
+        fit = 0
+        while profiles_frame_size([one] * (fit + 1)) <= PUBLISHED_PROFILES_BUDGET:
+            fit += 1
+        assert 5 <= fit < 9
+        for i in range(fit):
+            await dm.deploy(OPEN_OWNER, KEY, f"d{i}", _big(f"d{i}"))
+        with pytest.raises(ToolError) as exc:
+            await dm.deploy(OPEN_OWNER, KEY, "extra", _big("extra"))
+        assert exc.value.code is ErrorCode.DEFINITIONS_BUDGET
+        assert "budget exceeded" in exc.value.message and "of the 192 KiB" in exc.value.message
+        assert len(await machines.list_definitions(OPEN_OWNER, KEY)) == fit
+        # an update of a stored one counts once; a small new one still fits
+        out = await dm.deploy(OPEN_OWNER, KEY, "d0", {**_big("d0"), "description": "x"})
+        assert out["revision"] == 2
+        await dm.deploy(OPEN_OWNER, KEY, "small", {**_DEF, "id": "small"})
+        # removing one makes room again
+        await dm.remove(OPEN_OWNER, KEY, "d1")
+        await dm.deploy(OPEN_OWNER, KEY, "extra", _big("extra"))
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_the_launchers_published_profiles(tmp_path: Path) -> None:
+    """Online, the launcher's TOML profiles count at the size it sent them."""
+    store, _machines, dm = await _setup(tmp_path)
+    try:
+        v2 = parse_hello_v2({"protocol": 2, "launcher_key": KEY, "mode": "local",
+                             "ceiling": "/srv/app", "capabilities": ["definitions"]},
+                            deploy_allowed=True)
+        locals_ = [_local_profile(f"t{i}", 6000) for i in range(30)]  # ~180 KB
+        lid, rejected = dm._launchers.register(
+            _SinkConn(), None, {"machine": "box", "profiles": locals_}, v2=v2)
+        assert rejected == []
+        lnc = dm._launchers.get(lid)
+        assert lnc is not None and sum(lnc.profile_sizes.values()) > 170_000
+        with pytest.raises(ToolError) as exc:
+            await dm.deploy(OPEN_OWNER, KEY, "d0", _big("d0"))
+        assert exc.value.code is ErrorCode.DEFINITIONS_BUDGET
+        # offline, the TOML profiles are unknown: the launcher's own check decides
+        dm._launchers.unregister(lid)
+        assert (await dm.deploy(OPEN_OWNER, KEY, "d0", _big("d0")))["state"] == "queued"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_removals_done_when_the_launcher_comes_back_without_definitions(
+    tmp_path: Path,
+) -> None:
+    """M5: a launcher online without the definitions capability (config mode)
+    holds no definitions: pending removals are purged when it connects, and a
+    removal asked while it is connected is done at once."""
+    store, machines, dm = await _setup(tmp_path)
+    try:
+        for d in ("a", "b"):
+            await dm.deploy(OPEN_OWNER, KEY, d, {**_DEF, "id": d})
+            await machines.set_status(OPEN_OWNER, KEY, d, 1, "applied", [], [], 1)
+        assert (await dm.remove(OPEN_OWNER, KEY, "a"))["state"] == "removing"
+        v2 = parse_hello_v2({"protocol": 2, "launcher_key": KEY, "mode": "config"},
+                            deploy_allowed=True)
+        conn = _SinkConn()
+        lid, _ = dm._launchers.register(conn, None, {"machine": "box", "profiles": []}, v2=v2)
+        lnc = dm._launchers.get(lid)
+        assert lnc is not None
+        await dm.on_connected(lnc)
+        assert conn.frames == []  # nothing is sent to a config-mode launcher
+        rows = await machines.list_definitions(OPEN_OWNER, KEY, include_deleted=True)
+        assert [r.def_id for r in rows] == ["b"]
+        out = await dm.remove(OPEN_OWNER, KEY, "b")
+        assert out["state"] == "removed"
+        assert await machines.list_definitions(OPEN_OWNER, KEY, include_deleted=True) == []
+        assert conn.frames == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_status_is_recorded_and_announced_once(tmp_path: Path) -> None:
+    """M7: a launcher repeating the same status writes nothing and emits no
+    second definition.applied (or rejected) event."""
+    store, machines, dm = await _setup(tmp_path)
+    events: list[tuple[str, str, int]] = []
+
+    async def record(owner: str, kind: str, machine: str, key: str, def_id: str,
+                     revision: int, **kw: object) -> None:
+        events.append((kind, def_id, revision))
+
+    dm._event = record  # type: ignore[method-assign]
+    try:
+        v2 = parse_hello_v2({"protocol": 2, "launcher_key": KEY, "mode": "local",
+                             "ceiling": "/srv/app", "capabilities": ["definitions"]},
+                            deploy_allowed=True)
+        lid, _ = dm._launchers.register(_SinkConn(), None, {"machine": "box", "profiles": []},
+                                        v2=v2)
+        await dm.deploy(OPEN_OWNER, KEY, "obs", dict(_DEF))
+        for _ in range(3):
+            await dm.on_status(lid, {"id": "obs", "revision": 1, "state": "applied",
+                                     "warnings": ["w"]})
+        row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
+        updated = row.updated_at
+        await dm.on_status(lid, {"id": "obs", "revision": 1, "state": "applied",
+                                 "warnings": ["w"]})
+        assert (await machines.get_definition(OPEN_OWNER, KEY, "obs")).updated_at == updated
+        # changed warnings are recorded (no new event: still applied at rev 1)...
+        await dm.on_status(lid, {"id": "obs", "revision": 1, "state": "applied",
+                                 "warnings": ["w2"]})
+        assert (await machines.get_definition(OPEN_OWNER, KEY, "obs")).warnings == ["w2"]
+        await dm.deploy(OPEN_OWNER, KEY, "obs", {**_DEF, "description": "v2"})
+        for _ in range(2):
+            await dm.on_status(lid, {"id": "obs", "revision": 2, "state": "rejected",
+                                     "problems": ["p"]})
+        assert events == [("definition.deployed", "obs", 1), ("definition.applied", "obs", 1),
+                          ("definition.deployed", "obs", 2), ("definition.rejected", "obs", 2)]
+    finally:
+        await store.close()

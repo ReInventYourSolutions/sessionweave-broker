@@ -3,8 +3,13 @@
 ``validate_definition`` checks a definition against the schema (unknown keys
 are refused at every level) and against the target machine's start-mode
 ceiling, and returns it normalised with every default filled, as the broker
-stores and sends it. The launcher validates again on its side (realpaths,
-sandbox, runtime support); this is the broker's first, purely syntactic line.
+stores and sends it. It applies every rule of the launcher (Runner) that does not
+need the machine itself (``_launcher_rules``: host and glob syntax, models, command
+runners, what each runtime can enforce, the run-as rules), so a definition the
+launcher would always reject is refused before it is stored. The launcher validates
+again on its side (realpaths, sandbox, runtime installs and logins).
+``published_profile``/``profiles_frame_size`` estimate what a machine publishes,
+for the launcher's published-profiles budget (``PUBLISHED_PROFILES_BUDGET``).
 """
 from __future__ import annotations
 
@@ -47,21 +52,49 @@ READ_COMMANDS = (
     "free", "uptime", "uname", "hostname", "id", "whoami", "date", "ps", "pgrep", "top -b",
     "vmstat", "iostat", "journalctl", "dmesg", "ss", "lsof", "systemctl status",
 )
-# Commands that run other commands (shells, wrappers, interpreters, ``find -exec``,
-# ``awk system()``, ...), compared by the basename of the command word (``python*``
-# covers every ``python3.x``). With approval ``listed`` patterns an allow or
-# privileged entry starting with one is refused: it would run a listed command
-# unchecked. A copy of the launcher's ``permissions.COMMAND_WRAPPERS``: keep both
-# in step.
+# Commands that run other commands (shells, wrappers, interpreters, debuggers,
+# ``find -exec``, ``awk system()``, ``sed e``, ``make`` recipes, ``ssh``, and ``git``,
+# which runs ``core.fsmonitor``, ``diff.external``, hooks, filters and aliases from
+# repository config that its own ``--output``/``--format`` options can write), compared
+# by ``wrapper_name`` (the basename of the command word with a trailing version suffix
+# stripped: ``perl5.36``, ``python3.12``, ``node18`` compare as ``perl``, ``python``,
+# ``node``); an entry ending in ``*`` matches by prefix (``python*``, ``ld-linux*``).
+# With approval ``listed`` patterns an allow or privileged entry starting with one is
+# refused: it would run a listed command unchecked. An exact copy of the launcher's
+# ``permissions.COMMAND_WRAPPERS`` (95 entries, same order): keep both in step.
 COMMAND_WRAPPERS = (
-    "sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "busybox", "env", "command",
-    "exec", "xargs", "parallel", "nice", "ionice", "nohup", "timeout", "stdbuf", "setsid",
-    "flock", "watch", "script", "taskset", "chrt", "strace", "gdb", "sudo", "su", "doas",
-    "pkexec", "runuser", "setpriv", "nsenter", "unshare", "chroot", "systemd-run",
-    "python*", "perl", "ruby", "node", "npx", "npm", "bun", "deno", "php", "lua", "tclsh",
-    "expect", "find", "awk", "gawk", "mawk", "sed", "make", "ssh", "tar", "rsync",
+    # shells
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "rbash",
+    "yash", "busybox", "toybox",
+    # wrappers that run their arguments as a command
+    "env", "command", "exec", "xargs", "parallel", "nice", "ionice", "nohup", "timeout",
+    "time", "stdbuf", "setsid", "flock", "watch", "script", "taskset", "chrt", "socat",
+    "sudo", "su", "doas", "pkexec", "runuser", "setpriv", "nsenter", "unshare", "chroot",
+    "systemd-run", "ld-linux*", "ld.so", "bwrap", "firejail", "tmux", "screen", "at",
+    "batch", "crontab",
+    # debuggers and tracers
+    "strace", "ltrace", "gdb", "valgrind",
+    # interpreters
+    "python*", "pypy", "perl", "ruby", "irb", "node", "nodejs", "npx", "npm", "bun", "deno",
+    "php", "lua", "luajit", "tclsh", "wish", "expect", "Rscript", "R", "awk", "gawk",
+    "mawk", "nawk",
+    # tools with an exec feature
+    "find", "sed", "make", "ssh", "scp", "sftp", "tar", "zip", "rsync", "git",
     "vi", "vim", "nvim", "ex", "less", "more", "man",
 )
+# A trailing version suffix on a command name (the launcher's ``_VERSION_SUFFIX_RE``).
+_VERSION_SUFFIX_RE = re.compile(r"-?[0-9][0-9.]*\Z")
+# The most a launcher publishes about its agents: the serialized ``profiles`` frame (its
+# TOML profiles and applied definitions with their warnings), the same list its hello
+# carries. A copy of the launcher's ``definitions.PUBLISHED_PROFILES_BUDGET``: it leaves
+# room for the rest of the hello under the broker's 256 KiB frame cap.
+PUBLISHED_PROFILES_BUDGET = 192 * 1024
+# The launcher's ``launcher_config.DEFAULT_MAX_IDLE_S`` (published for a definition
+# without ``limits.max_idle_s``).
+DEFAULT_MAX_IDLE_S = 86400.0
+# The machine user the launcher reserves for runtime installs (``prereqs``), never an
+# agent's ``run_as``.
+RESERVED_RUN_AS = ("root", "sessionweave")
 
 _TOP_KEYS = frozenset({
     "id", "domain", "role", "capabilities", "description", "runtime", "model", "kind",
@@ -93,6 +126,15 @@ _DEFAULT_INTERVAL_S = 60
 # Brace expansion ({..,x}) and escapes (\.\.) could rebuild a '..' that the
 # component check does not see, in matchers that support them.
 _GLOB_FORBIDDEN = ("{", "}", "\\")
+# Wildcards: observe paths are read literally by some runtimes and as patterns by others.
+_GLOB_CHARS = "*?[]{}"
+# The launcher's ``permissions`` syntax rules for models and hosts (same expressions).
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}\Z")
+_CLINE_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
+_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_HOST_RE = re.compile(rf"^(\*\.)?{_LABEL}(\.{_LABEL})*(:(?P<port>\d{{1,5}}))?$")
+# Claude's tool-rule parser splits on whitespace and commas (``RUNTIME_CAPS``).
+_UNSAFE_PATH_RE = re.compile(r"[\s,()]")
 
 
 class DefinitionError(ValueError):
@@ -160,15 +202,51 @@ def _path(v: Any, where: str, machine: Machine) -> str:
 
 def _glob(v: str, where: str) -> str:
     if (
-        not v or len(v) > _MAX_GLOB or not v.isprintable()
-        or v.startswith(("/", "~")) or ".." in v.split("/")
+        not v or len(v) > _MAX_GLOB or not v.isprintable() or v != v.strip()
+        or v.startswith("/") or "~" in v or ".." in v.split("/")
         or any(c in v for c in _GLOB_FORBIDDEN)
     ):
         raise DefinitionError(
-            f"{where}: {v!r} must be a glob relative to the workdir (no leading '/' or '~',"
-            " no '..', no braces or backslashes)"
+            f"{where}: {v!r} must be a glob relative to the workdir (no leading '/',"
+            " no '~', no '..', no braces or backslashes, no leading or trailing spaces)"
         )
     return v
+
+
+def _model(model: str, runtime: str) -> str:
+    """The launcher's ``model_problem``/``cline_model_problem``: '' is the runtime's
+    default; else it starts with a letter or digit (never read as a flag); Cline's
+    ``provider:model`` has a lowercase provider id."""
+    if model and not _MODEL_RE.match(model):
+        raise DefinitionError(
+            f"model {model!r} must start with a letter or digit and use only letters,"
+            " digits and . _ : / @ + -"
+        )
+    if runtime == "cline" and model:
+        provider, sep, name = model.partition(":")
+        if sep and (not _CLINE_PROVIDER_RE.match(provider) or not _MODEL_RE.match(name)):
+            raise DefinitionError(
+                f"cline model {model!r} must be 'provider:model' with a lowercase provider"
+                " id (letters, digits, _ -) and a model name"
+            )
+    return model
+
+
+def _host(host: str) -> str:
+    """The launcher's ``check_host``: a lowercase host name, ``*.name`` (not on a
+    bare TLD) or ``name:port``; no IPv6 literals."""
+    if host != host.lower() or "[" in host or host.count(":") > 1:
+        raise DefinitionError(
+            f"access.network: malformed host {host!r} (lowercase host name, optional"
+            " '*.' prefix and ':port'; no IPv6 literals)"
+        )
+    m = _HOST_RE.match(host)
+    if not m or (m.group("port") is not None and not 1 <= int(m.group("port")) <= 65535):
+        raise DefinitionError(f"access.network: malformed host {host!r}")
+    name = host.split(":")[0]
+    if name.startswith("*.") and "." not in name[2:]:
+        raise DefinitionError(f"access.network: wildcard on a bare TLD is not allowed: {host!r}")
+    return host
 
 
 def _commands(v: list[str], where: str) -> list[str]:
@@ -212,9 +290,19 @@ def _distinct_subcommands(entry: list[str], pattern: list[str]) -> bool:
     return False
 
 
-def is_command_wrapper(word: str) -> bool:
-    """Whether the command word (by basename) is in ``COMMAND_WRAPPERS``."""
+def wrapper_name(word: str) -> str:
+    """The name ``is_command_wrapper`` compares: the basename of the command word
+    with a trailing version suffix (``-``? digits and dots) stripped, so
+    ``/usr/bin/perl5.36`` is ``perl`` and ``node18`` is ``node``. A name that is only
+    digits stays as it is. The launcher's ``wrapper_name``."""
     name = posixpath.basename(word) or word
+    return _VERSION_SUFFIX_RE.sub("", name) or name
+
+
+def is_command_wrapper(word: str) -> bool:
+    """Whether the command word is in ``COMMAND_WRAPPERS``: its ``wrapper_name``
+    equals an entry, or starts with an entry ending in ``*``."""
+    name = wrapper_name(word)
     return any(name.startswith(w[:-1]) if w.endswith("*") else name == w
                for w in COMMAND_WRAPPERS)
 
@@ -222,7 +310,7 @@ def is_command_wrapper(word: str) -> bool:
 def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any]) -> None:
     """Approval ``listed`` fails closed (its patterns become denies): an allow or
     privileged entry sharing a pattern's command word must differ from it at a
-    subcommand word (allow ``git status``, ``git log`` with ``git push``); else the
+    subcommand word (allow ``systemctl status`` with ``systemctl restart``); else the
     entry would run the pattern unasked, always ask, or reach it in another
     spelling. An observer's empty list stands for the default read commands. A
     shell, and any entry that runs other commands (``COMMAND_WRAPPERS``), are
@@ -243,9 +331,11 @@ def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any
         for entry in entries:
             if is_command_wrapper(entry.split()[0]):
                 raise DefinitionError(
-                    f"access.commands.{what}: {entry!r} runs other commands (shell, wrapper"
-                    " or interpreter): with approval for listed commands it could run a"
-                    " listed command unchecked; remove it"
+                    f"access.commands.{what}: {entry!r} runs other commands (shell, wrapper,"
+                    " interpreter or git, which runs commands from repository config): with"
+                    " approval for listed commands it could run a listed command unchecked;"
+                    " remove it (git cannot be combined with listed approvals until"
+                    " approvals are implemented)"
                 )
         for entry in entries:
             ew = _norm_words(entry)
@@ -257,8 +347,8 @@ def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any
                     f"approval.patterns: {p!r} shares the command {pw[0]!r} with the"
                     f" access.commands.{what} entry {entry!r} and overlaps it: one is a word"
                     " prefix of the other, or an option comes before they differ; list only"
-                    " commands that differ from it at a subcommand word (e.g. 'git status'"
-                    " with 'git push'), without options before it"
+                    " commands that differ from it at a subcommand word (e.g. 'systemctl"
+                    " status' with 'systemctl restart'), without options before it"
                 )
 
 
@@ -270,6 +360,13 @@ def _observe(raw: Any, machine: Machine) -> dict[str, Any]:
             _path(p, f"observe.{key}", machine)
             for p in _str_list(obs.get(key), f"observe.{key}", _MAX_LIST)
         ]
+        for p in out[key]:
+            if any(c in p for c in _GLOB_CHARS):
+                # Claude and opencode would read them as wildcards, Cline and the
+                # sandbox literally.
+                raise DefinitionError(
+                    f"observe.{key}: {p!r} must not contain glob characters (* ? [ ] {{ }})"
+                )
     procs = obs.get("processes", [])
     if not isinstance(procs, list) or len(procs) > _MAX_LIST:
         raise DefinitionError(f"observe.processes must be a list of at most {_MAX_LIST} entries")
@@ -315,6 +412,9 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
         and (not isinstance(network, list) or all(h.isprintable() for h in network))
     ):
         raise DefinitionError("access.network must be 'none', 'any' or a list of hosts")
+    if isinstance(network, list):
+        for h in network:
+            _host(h)
     cmds = _obj(acc.get("commands"), "access.commands", _COMMANDS_KEYS)
     mode = cmds.get("mode", "list" if kind == "observer" else "shell")
     if mode not in COMMAND_MODES:
@@ -342,7 +442,7 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
             "an observer gets no privileged (root-delegated) commands:"
             " access.commands.privileged must be empty"
         )
-    if privileged and not (machine.mode == "root" and machine.run_as):
+    if privileged and machine.mode != "root":
         raise DefinitionError(
             "access.commands.privileged needs a machine whose launcher runs with --root"
             " as root (it may run commands as root)",
@@ -382,6 +482,195 @@ def _approval(raw: Any) -> dict[str, Any]:
     return {"policy": policy, "patterns": patterns}
 
 
+# --- the published-profiles budget -------------------------------------------------
+
+_LIMIT_KEYS = ("max_duration_s", "max_idle_s", "max_cost_usd")
+
+
+def published_profile(definition: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    """What the launcher publishes for an applied (normalised) definition: its
+    ``public_profile`` (no workdir, instructions or globs; limits as floats, with the
+    default idle limit) plus the warnings it reports with it."""
+    files = definition["access"]["files"]
+    access: dict[str, Any] = {
+        "preset": "reader" if definition["kind"] == "observer" else "operator"}
+    network = definition["access"]["network"]
+    if network is not None:
+        access["network"] = network if isinstance(network, str) else list(network)
+    if any(files[k] for k in _FILES_KEYS):
+        access["custom_files"] = True
+    limits: dict[str, float] = {}
+    for key in _LIMIT_KEYS:
+        if key in definition["limits"]:
+            v = definition["limits"][key]
+            value = None if v is None else float(v)
+        else:
+            value = DEFAULT_MAX_IDLE_S if key == "max_idle_s" else None
+        if value is not None:
+            limits[key] = value
+    out: dict[str, Any] = {
+        "id": definition["id"], "domain": definition["domain"], "role": definition["role"],
+        "capabilities": list(definition["capabilities"]),
+        "description": definition["description"], "runtime": definition["runtime"],
+        "model": definition["model"], "access": access, "limits": limits,
+        "max_instances": definition["max_instances"], "source": "remote",
+        "kind": definition["kind"], "coordinator_capable": definition["coordinator_capable"],
+    }
+    if definition["visibility"] is not None:
+        out["visibility"] = definition["visibility"]
+    if definition["allowed_accounts"] is not None:
+        out["allowed_accounts"] = list(definition["allowed_accounts"])
+    out["warnings"] = list(warnings)
+    return out
+
+
+def json_size(value: Any) -> int:
+    """Bytes of ``value`` as the launcher serializes it (``json.dumps`` defaults)."""
+    return len(json.dumps(value).encode("utf-8"))
+
+
+def profiles_frame_size(sizes: list[int]) -> int:
+    """Bytes of the ``{"type": "profiles", "profiles": [...]}`` frame whose profiles
+    serialize to ``sizes`` bytes each (``json.dumps`` separators)."""
+    empty = json_size({"type": "profiles", "profiles": []})
+    return empty + sum(sizes) + 2 * max(len(sizes) - 1, 0)
+
+
+def budget_problem(size: int) -> str | None:
+    """The launcher's ``BUDGET_PROBLEM`` when a frame of ``size`` bytes exceeds
+    ``PUBLISHED_PROFILES_BUDGET``, else None."""
+    if size <= PUBLISHED_PROFILES_BUDGET:
+        return None
+    return (
+        "machine definitions budget exceeded: this machine's published agents would take"
+        f" {-(-size // 1024)} KiB of the {PUBLISHED_PROFILES_BUDGET // 1024} KiB a machine"
+        " may publish; remove or shorten other definitions (descriptions, capabilities,"
+        " allowed_accounts)"
+    )
+
+
+# The launcher's ``LIST_RUNNER_WITH_WRITES`` (``list_runner_problem``), word for word.
+LIST_RUNNER_WITH_WRITES = (
+    "'{entry}' can run other commands, so it can't be in the list of an agent that can "
+    "write; use shell mode (sandboxed) or remove it"
+)
+NETWORK_NEEDS_NO_COMMANDS = (
+    "access.network: host lists need access.commands.mode 'none' (a shell or a command"
+    " list on the shared host network can reach any host; use network 'any' or 'none',"
+    " or drop the commands)"
+)
+
+
+def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
+    """The launcher's checks that depend only on the definition, its runtime and the
+    machine's start mode (``validate_profile``/``check_runtime`` and the run-as rules of
+    ``_check_definition``): a definition failing one is rejected on every machine of
+    that mode, so it is refused here before it is stored. Checks that need the machine
+    itself (runtime installed, logins, sandbox probes, real paths) stay launcher-side."""
+    runtime, observer = d["runtime"], d["kind"] == "observer"
+    acc, approval = d["access"], d["approval"]
+    files, cmds, network = acc["files"], acc["commands"], acc["network"]
+    # What the launcher resolves (``resolve_definition_permissions``): approval
+    # "always" leaves no commands and no writes; an observer's empty list is the
+    # default read commands; empty file lists are the defaults.
+    always = approval["policy"] == "always"
+    mode = "none" if always else cmds["mode"]
+    allow = cmds["allow"] or (list(READ_COMMANDS) if observer and mode == "list" else [])
+    listed = approval["policy"] == "listed" and mode != "none" and bool(approval["patterns"])
+    read = files["read"] or ["."]
+    write = [] if observer or always else (files["write"] or ["."])
+    hosts = network if isinstance(network, list) else None
+    root_launcher = machine.mode == "root" and machine.run_as
+    # A --local launcher runs every agent in bubblewrap; a --root one only observers,
+    # when it has bubblewrap.
+    sandboxed = machine.mode == "local" or (
+        machine.mode == "root" and observer and machine.sandbox is not None
+    )
+
+    if d["run_as"] in RESERVED_RUN_AS:
+        raise DefinitionError(
+            f"run_as {d['run_as']!r} is reserved (root, or the launcher's install user);"
+            " choose a non-root machine user"
+        )
+    if observer and root_launcher and d["run_as"] is None and not d["observer_as_root"]:
+        raise DefinitionError(
+            "an observer on a --root launcher needs run_as (a non-root machine user) or"
+            " observer_as_root"
+        )
+    if d["observer_as_root"]:
+        if machine.sandbox is None:
+            raise DefinitionError(
+                "observer_as_root needs the bubblewrap sandbox on the launcher's machine"
+                " (install bubblewrap and restart the launcher)",
+                ErrorCode.OUTSIDE_CEILING,
+            )
+        if runtime == "cline":
+            raise DefinitionError(
+                "observer_as_root does not support the cline runtime (Cline keeps its"
+                " settings in a host directory)"
+            )
+    if mode == "list" and write:
+        # The launcher's ``list_runner_problem``: an agent that can write may not list
+        # a command that runs other commands (shells, wrappers, interpreters, git,
+        # which runs commands from repository config a writer can plant). Read-only
+        # agents (observers, approval "always") are unaffected.
+        for entry in (*cmds["allow"], *cmds["privileged"]):
+            words = entry.split()
+            if words and is_command_wrapper(words[0]):
+                raise DefinitionError(LIST_RUNNER_WITH_WRITES.format(entry=entry))
+    if cmds["privileged"] and not always and not root_launcher:
+        # (approval "always" leaves no commands: its privileged entries never run)
+        raise DefinitionError(
+            "access.commands.privileged needs a machine whose launcher runs with --root"
+            " as root (it may run commands as root)",
+            ErrorCode.OUTSIDE_CEILING,
+        )
+    if hosts is not None and mode != "none":
+        raise DefinitionError(NETWORK_NEEDS_NO_COMMANDS)
+    # The runtime's enforcement limits (the launcher's RUNTIME_CAPS).
+    if runtime == "claude":
+        if read != ["."]:
+            raise DefinitionError(
+                "claude cannot restrict reads to part of the workdir: leave"
+                " access.files.read empty (or '.') and use deny paths"
+            )
+        if hosts is not None and any(":" in h for h in hosts):
+            raise DefinitionError("claude cannot restrict a host to one port; drop ':port'")
+        bad = [v for v in [d["workdir"], *read, *write, *files["deny"]]
+               if _UNSAFE_PATH_RE.search(v)]
+        if bad:
+            raise DefinitionError(
+                "claude cannot enforce paths with whitespace, ',' or parentheses:"
+                f" {bad[0]!r}"
+            )
+        if mode == "list" and allow and not sandboxed:
+            raise DefinitionError(
+                "claude cannot keep a command list from writing files outside the OS"
+                " sandbox (its built-in read-only commands run with redirections); use"
+                " commands 'none' or 'shell', or run it on a --local launcher"
+            )
+        if mode == "list" and listed:
+            raise DefinitionError(
+                "claude cannot hold a command list next to approval for listed commands:"
+                " its built-in read-only commands (git status, git log, ...) run without a"
+                " rule and git runs commands from repository config, so a listed command"
+                " could run unasked; use opencode or cline, or approval 'always' or 'auto'"
+            )
+    elif runtime == "opencode":
+        if any("*" in g.replace("**", "") for g in [*read, *write]):
+            raise DefinitionError(
+                "opencode widens a single '*' in read/write globs to any depth; use 'dir'"
+                " or 'dir/**'"
+            )
+        if hosts is not None and any(h.startswith("*.") for h in hosts):
+            raise DefinitionError("opencode cannot enforce wildcard hosts; list each host")
+    elif runtime == "cline" and hosts is not None:
+        raise DefinitionError(
+            "cline cannot restrict network hosts (its web fetch follows redirects); use"
+            " network 'none' or 'any'"
+        )
+
+
 def _text(raw: dict[str, Any], key: str, limit: int) -> str:
     v = raw.get(key, "")
     if not isinstance(v, str) or len(v) > limit:
@@ -397,7 +686,8 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     agents as other users, and ``observer_as_root`` excludes ``run_as``; an
     observer never writes files nor gets a shell and lists only read commands;
     command entries start with a command, not an option; limits are capped
-    (``LIMIT_MAX``). Same rules as the launcher's ``normalise_definition``.
+    (``LIMIT_MAX``). The launcher's ``normalise_definition`` plus the checks of its
+    ``_check_definition`` that do not need the machine (``_launcher_rules``).
     A ``privileged`` entry is kept as written: the launcher's root helper runs
     only the options it spells."""
     if not isinstance(raw, dict):
@@ -418,7 +708,7 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     for key in ("id", "domain", "role"):
         v = raw.get(key)
         if not isinstance(v, str) or not _ID_RE.fullmatch(v):
-            raise DefinitionError(f"{key} must be 1-64 chars of [A-Za-z0-9._-]")
+            raise DefinitionError(f"{key} must be 1-64 chars of [A-Za-z0-9._-], not only dots")
         out[key] = v
     caps = raw.get("capabilities", [])
     if (
@@ -433,7 +723,7 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     if raw.get("runtime") not in _RUNTIMES:
         raise DefinitionError(f"runtime must be one of {sorted(_RUNTIMES)}")
     out["runtime"] = raw["runtime"]
-    out["model"] = _text(raw, "model", 200)
+    out["model"] = _model(_text(raw, "model", 200), out["runtime"])
     kind = raw.get("kind")
     if kind not in KINDS:
         raise DefinitionError(f"kind must be one of {list(KINDS)}")
@@ -481,6 +771,7 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     out["limits"] = _limits(raw.get("limits"))
     out["approval"] = _approval(raw.get("approval"))
     _listed_overlap(kind, out["access"]["commands"], out["approval"])
+    _launcher_rules(out, machine)
     instructions = raw.get("instructions", "")
     try:
         ok = isinstance(instructions, str) and (

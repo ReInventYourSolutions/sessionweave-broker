@@ -191,3 +191,58 @@ def test_token_still_valid_after_claim_registers() -> None:
         w = ws.receive_json()
         assert w["type"] == "welcome" and w["key_secret"] == "lks_ok"
     assert accounts.checks
+
+
+class _ReleasingMachines(_GatedMachines):
+    """Claims at once; records ``release_key_secret`` and ``touch`` calls."""
+
+    def __init__(self, issued: str | None) -> None:
+        super().__init__()
+        self.release.set()
+        self.outcome = issued
+        self.released: list[tuple[str, str, bytes]] = []
+
+    async def claim_machine(self, *args: Any, **kw: Any) -> tuple[Any, str | None]:
+        return None, self.outcome
+
+    async def release_key_secret(self, owner: str, key: str, secret_hash: bytes) -> bool:
+        self.released.append((owner, key, secret_hash))
+        return True
+
+    async def touch(self, *a: Any) -> None:
+        return None
+
+
+@pytest.mark.parametrize("issued", ["lks_fresh", None])
+def test_undelivered_welcome_releases_a_fresh_secret(
+    monkeypatch: pytest.MonkeyPatch, issued: str | None,
+) -> None:
+    """M2: a welcome that cannot be sent never delivers the fresh key secret: the
+    broker releases it (the machine row stays), so the launcher's next hello claims
+    the key again instead of being refused as launcher_key_in_use. A claim that
+    issued no secret is left alone."""
+    from starlette.websockets import WebSocket
+
+    from sessionweave.access import hash_token
+
+    real_send = WebSocket.send_json
+
+    async def failing_send(self: WebSocket, data: Any, mode: str = "text") -> None:
+        if isinstance(data, dict) and data.get("type") == "welcome":
+            raise RuntimeError("socket gone")
+        await real_send(self, data, mode)
+
+    monkeypatch.setattr(WebSocket, "send_json", failing_send)
+    gm = _ReleasingMachines(issued)
+    app = _app(gm)
+    reg: LauncherRegistry = app.state.tool_deps.launchers
+    with TestClient(app) as client, client.websocket_connect(
+            "/v1/launchers/connect") as ws:
+        ws.send_json(HELLO)
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+    assert reg._launchers == {}
+    if issued is None:
+        assert gm.released == []
+    else:
+        assert gm.released == [(OPEN_OWNER, KEY, hash_token(issued))]

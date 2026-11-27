@@ -53,6 +53,7 @@ class ErrorCode(StrEnum):
     DEFINITION_IN_USE = "definition_in_use"
     DEFINITION_ID_CONFLICT = "definition_id_conflict"
     DEFINITION_LIMIT = "definition_limit"
+    DEFINITIONS_BUDGET = "definitions_budget"
     LAUNCHER_ONLINE = "launcher_online"
     LAUNCHER_OFFLINE = "launcher_offline"
     LAUNCHER_TIMEOUT = "launcher_timeout"

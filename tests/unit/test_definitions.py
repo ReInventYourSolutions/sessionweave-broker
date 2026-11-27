@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,12 +17,20 @@ from sessionweave.definitions import (
     INSTRUCTIONS_MAX_BYTES,
     KINDS,
     LIMIT_MAX,
+    LIST_RUNNER_WITH_WRITES,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
+    PUBLISHED_PROFILES_BUDGET,
     READ_COMMANDS,
     DefinitionError,
+    budget_problem,
     inside,
+    is_command_wrapper,
+    json_size,
+    profiles_frame_size,
+    published_profile,
     validate_definition,
+    wrapper_name,
 )
 from sessionweave.errors import ErrorCode
 from sessionweave.machines import Machine
@@ -34,8 +43,8 @@ CONFIG = dataclasses.replace(LOCAL, mode="config", ceiling=None, capabilities=[]
 
 
 def _def(**kw: Any) -> dict[str, Any]:
-    return {"id": "obs", "domain": "shop", "role": "logs", "runtime": "claude", "kind": "observer",
-            "workdir": "/srv/app", "max_instances": 1, **kw}
+    return {"id": "obs", "domain": "shop", "role": "logs", "runtime": "opencode",
+            "kind": "observer", "workdir": "/srv/app", "max_instances": 1, **kw}
 
 
 def test_constants() -> None:
@@ -76,11 +85,11 @@ def test_full_definition_round_trips_and_input_untouched() -> None:
         observe={"sources": ["/srv/app/src"], "logs": ["/srv/app/log/x.log"],
                  "processes": [{"name": "nginx", "pid": 12}, {"name": "app"}],
                  "metrics": {"enabled": True, "interval_s": 30, "kinds": ["cpu", "load"]}},
-        access={"files": {"read": ["**/*.py"], "write": ["out/"], "deny": [".env"]},
-                "network": ["example.com"],
-                "commands": {"mode": "list", "allow": ["git status", "ls"]}},
+        access={"files": {"read": ["src/**"], "write": ["out/"], "deny": [".env"]},
+                "network": "any",
+                "commands": {"mode": "list", "allow": ["systemctl status", "ls"]}},
         limits={"max_duration_s": 600, "max_idle_s": 60, "max_cost_usd": 1.5},
-        approval={"policy": "listed", "patterns": ["git push"]},
+        approval={"policy": "listed", "patterns": ["systemctl restart"]},
         instructions="Watch.", visibility="personal", allowed_accounts=["bob"],
     )
     before = copy.deepcopy(raw)
@@ -88,11 +97,11 @@ def test_full_definition_round_trips_and_input_untouched() -> None:
     assert raw == before
     assert d["observe"]["processes"] == [{"name": "nginx", "pid": 12}, {"name": "app", "pid": None}]
     assert d["observe"]["metrics"] == {"enabled": True, "interval_s": 30, "kinds": ["cpu", "load"]}
-    assert d["access"]["commands"] == {"mode": "list", "allow": ["git status", "ls"],
+    assert d["access"]["commands"] == {"mode": "list", "allow": ["systemctl status", "ls"],
                                        "privileged": []}
-    assert d["access"]["network"] == ["example.com"]
+    assert d["access"]["network"] == "any"
     assert d["limits"] == {"max_duration_s": 600, "max_idle_s": 60, "max_cost_usd": 1.5}
-    assert d["approval"] == {"policy": "listed", "patterns": ["git push"]}
+    assert d["approval"] == {"policy": "listed", "patterns": ["systemctl restart"]}
     assert d["allowed_accounts"] == ["bob"] and d["coordinator_capable"] is True
     assert validate_definition(d, LOCAL) == d  # normalised output is valid input
 
@@ -259,7 +268,7 @@ def test_normalised_output_size_limit() -> None:
 
 def test_observer_as_root_defaults_false() -> None:
     assert validate_definition(_def(), LOCAL)["observer_as_root"] is False
-    assert validate_definition(_def(), ROOT)["observer_as_root"] is False
+    assert validate_definition(_def(run_as="deploy"), ROOT)["observer_as_root"] is False
 
 
 def test_observer_as_root_only_for_observers_on_root_machines() -> None:
@@ -312,9 +321,14 @@ def test_observer_allow_entries_must_be_read_commands(entry: str) -> None:
     with pytest.raises(DefinitionError, match="read command"):
         validate_definition(_def(access={"commands": {"mode": "list", "allow": ["ls", entry]}}),
                             LOCAL)
+    raw = _def(kind="operator", access={"commands": {"mode": "list", "allow": [entry]}})
+    if entry in ("git status", "sh"):
+        # An operator (it writes) may not list a command runner.
+        with pytest.raises(DefinitionError, match="can run other commands"):
+            validate_definition(raw, LOCAL)
+        return
     # An operator may list it.
-    d = validate_definition(
-        _def(kind="operator", access={"commands": {"mode": "list", "allow": [entry]}}), LOCAL)
+    d = validate_definition(raw, LOCAL)
     assert d["access"]["commands"]["allow"] == [entry]
 
 
@@ -389,24 +403,26 @@ def test_limits_capped(key: str) -> None:
 
 # (kind, allow, privileged, pattern, accepted)
 _LISTED_TABLE: list[tuple[str, list[str], list[str], str, bool]] = [
-    ("operator", ["git status", "git log"], [], "git push", True),
-    ("operator", ["git status", "git log", "ls -la", "cat"], [], "git push", True),
-    ("operator", ["git status -s"], [], "git push", True),
-    ("operator", ["git status"], [], "git push --force", True),
-    ("operator", ["/usr/bin/git status"], [], "git push", True),
+    ("operator", ["systemctl status", "systemctl show"], [], "systemctl restart", True),
+    ("operator", ["systemctl status", "systemctl show", "ls -la", "cat"], [],
+     "systemctl restart", True),
+    ("operator", ["systemctl status -l"], [], "systemctl restart", True),
+    ("operator", ["systemctl status"], [], "systemctl restart --now", True),
+    ("operator", ["/usr/bin/systemctl status"], [], "systemctl restart", True),
     ("operator", ["docker compose ps", "docker compose logs"], [], "docker compose up", True),
     ("operator", ["ls"], ["systemctl status"], "systemctl restart", True),
     ("observer", ["journalctl -u"], [], "rm", True),
-    ("operator", ["git"], [], "git push", False),                  # entry runs the pattern
-    ("operator", ["git push origin"], [], "git push", False),      # pattern covers the entry
-    ("operator", ["git push --dry-run"], [], "git push", False),
-    ("operator", ["git status"], [], "git", False),
-    ("operator", ["git --no-pager log"], [], "git --no-pager push", False),  # option first
-    ("operator", ["git -C x log"], [], "git -C x push", False),
-    ("operator", ["git -C"], [], "git push", False),
+    ("operator", ["systemctl"], [], "systemctl restart", False),    # entry runs the pattern
+    ("operator", ["systemctl restart nginx"], [], "systemctl restart", False),  # covered
+    ("operator", ["systemctl restart --dry-run"], [], "systemctl restart", False),
+    ("operator", ["systemctl status"], [], "systemctl", False),
+    ("operator", ["systemctl --no-pager status"], [], "systemctl --no-pager restart",
+     False),                                                         # option first
+    ("operator", ["systemctl -H x status"], [], "systemctl -H x restart", False),
+    ("operator", ["systemctl -H"], [], "systemctl restart", False),
     ("operator", ["tail /var/log/syslog"], [], "tail -f", False),  # differ at an option
     ("operator", ["tail -n"], [], "tail -f", False),
-    ("operator", ["/usr/bin/git"], [], "git push", False),         # basename
+    ("operator", ["/usr/bin/systemctl"], [], "systemctl restart", False),  # basename
     ("operator", ["ls"], ["systemctl"], "systemctl restart", False),
     ("operator", ["ls"], ["systemctl restart nginx"], "systemctl restart", False),
     ("operator", ["ls"], ["/bin/systemctl"], "systemctl restart", False),
@@ -420,7 +436,9 @@ def _listed_def(kind: str, allow: list[str], privileged: list[str], pattern: str
                 ) -> dict[str, Any]:
     return _def(kind=kind, access={"commands": {"mode": "list", "allow": allow,
                                                 "privileged": privileged}},
-                approval={"policy": "listed", "patterns": [pattern]})
+                approval={"policy": "listed", "patterns": [pattern]},
+                # an observer on a --root launcher runs as a non-root machine user
+                run_as="deploy" if kind == "observer" else None)
 
 
 @pytest.mark.parametrize("kind,allow,privileged,pattern,accepted", _LISTED_TABLE)
@@ -443,7 +461,7 @@ def test_listed_check_only_with_listed_patterns() -> None:
                      {"policy": "always", "patterns": ["git push"]},
                      {"policy": "listed", "patterns": []}):
         validate_definition(_def(kind="operator", access={"commands": {
-            "mode": "list", "allow": ["git"]}}, approval=approval), LOCAL)
+            "mode": "list", "allow": ["systemctl"]}}, approval=approval), LOCAL)
     # mode none: no command runs, the patterns change nothing
     validate_definition(_def(access={"commands": {"mode": "none"}},
                              approval={"policy": "listed", "patterns": ["journalctl -f"]}), LOCAL)
@@ -484,7 +502,12 @@ _LISTED_WRAPPER_TABLE: list[tuple[str, str, list[str], list[str], str, bool]] = 
     ("operator", "list", ["ls"], ["systemd-run"], "rm", False),     # privileged too
     ("operator", "list", ["ls"], ["/usr/bin/nsenter"], "rm", False),
     ("operator", "list", ["git status", "pythonic"], [], "git push", False),  # prefix match
-    ("operator", "list", ["ls", "git status", "shred"], [], "rm", True),     # not wrappers
+    ("operator", "list", ["git status"], [], "rm", False),         # git runs repo config
+    ("operator", "list", ["ls"], ["/usr/bin/git log"], "rm", False),
+    ("operator", "list", ["perl5.36"], [], "rm", False),           # version suffixes
+    ("operator", "list", ["node18"], [], "rm", False),
+    ("operator", "list", ["ld-linux-x86-64.so.2"], [], "rm", False),
+    ("operator", "list", ["ls", "systemctl status", "shred"], [], "rm", True),  # not wrappers
     ("operator", "list", ["shx", "bashful", "envoy"], [], "rm", True),
     ("operator", "list", ["ls"], ["systemctl status"], "rm", True),
 ]
@@ -511,14 +534,17 @@ def test_shell_and_wrappers_fine_without_listed_patterns() -> None:
     for approval in ({"policy": "auto", "patterns": ["git push"]},
                      {"policy": "listed", "patterns": []}):
         validate_definition(_def(kind="operator", approval=approval), LOCAL)  # shell
-        validate_definition(_def(kind="operator", access={"commands": {
-            "mode": "list", "allow": ["sh", "python3"]}}, approval=approval), LOCAL)
+    # A read-only agent may list them (approval "always" leaves no commands at all).
+    validate_definition(_def(kind="operator", access={"commands": {
+        "mode": "list", "allow": ["sh", "python3"]}}, approval={"policy": "always"}), LOCAL)
 
 
 def test_command_wrappers_match_the_launcher() -> None:
     # A copy of the Runner's permissions.COMMAND_WRAPPERS (parity: keep both in step).
-    assert len(COMMAND_WRAPPERS) == len(set(COMMAND_WRAPPERS)) == 65
-    assert {"sh", "env", "xargs", "python*", "find", "ssh", "man"} <= set(COMMAND_WRAPPERS)
+    assert len(COMMAND_WRAPPERS) == len(set(COMMAND_WRAPPERS)) == 95
+    assert {"sh", "env", "xargs", "python*", "find", "ssh", "man", "git", "ld-linux*",
+            "time", "mksh", "socat"} <= set(COMMAND_WRAPPERS)
+    assert not {"docker", "kubectl", "systemctl"} & set(COMMAND_WRAPPERS)
     perms = pytest.importorskip(
         "sessionweave_runner.permissions",
         reason="sessionweave-runner is not installed in this environment (not a broker"
@@ -540,3 +566,370 @@ def test_listed_wrapper_table_matches_the_launcher() -> None:
         except ValueError:
             runner_ok = False
         assert runner_ok is accepted, (kind, mode, allow, privileged, pattern)
+
+
+# --- final review: dot-only ids, wrapper names, command runners in writers' lists -------
+
+@pytest.mark.parametrize("value", [".", "..", "...", "." * 64])
+@pytest.mark.parametrize("key", ["id", "domain", "role"])
+def test_dot_only_ids_refused(key: str, value: str) -> None:
+    with pytest.raises(DefinitionError, match="not only dots"):
+        validate_definition({**_def(), key: value}, LOCAL)
+
+
+@pytest.mark.parametrize("value", ["a.", ".a", "a..b", "-", "_", "v1.2"])
+def test_ids_with_dots_and_more_accepted(value: str) -> None:
+    assert validate_definition({**_def(), "id": value}, LOCAL)["id"] == value
+
+
+@pytest.mark.parametrize("word,name", [
+    ("perl5.36", "perl"), ("python3.12", "python"), ("node18", "node"), ("lua-5.4", "lua"),
+    ("/usr/bin/ruby3.2", "ruby"), ("ld-linux-x86-64.so.2", "ld-linux-x86-64.so."),
+    ("123", "123"), ("git", "git"), ("/usr/bin/git", "git"),
+])
+def test_wrapper_name_strips_version_suffix(word: str, name: str) -> None:
+    assert wrapper_name(word) == name
+
+
+@pytest.mark.parametrize("word,expected", [
+    ("perl5.36", True), ("ruby3.2", True), ("php8.1", True), ("node18", True),
+    ("tclsh8.6", True), ("lua5.4", True), ("python3.12", True), ("/usr/bin/git", True),
+    ("ld-linux-x86-64.so.2", True), ("ld.so", True), ("time", True), ("mksh", True),
+    ("Rscript", True), ("docker", False), ("kubectl", False), ("systemctl", False),
+    ("pythonic", True), ("gitk", False), ("shred", False),
+])
+def test_is_command_wrapper(word: str, expected: bool) -> None:
+    assert is_command_wrapper(word) is expected
+
+
+# (kind, write, policy, allow, privileged, accepted): list mode, no listed patterns.
+_LIST_RUNNER_TABLE: list[tuple[str, list[str], str, list[str], list[str], bool]] = [
+    ("operator", [], "auto", ["git status"], [], False),          # [] = default ".": writes
+    ("operator", ["out"], "auto", ["git log"], [], False),
+    ("operator", [], "auto", ["/usr/bin/git diff"], [], False),
+    ("operator", [], "auto", ["ls"], ["git pull"], False),         # privileged too
+    ("operator", [], "auto", ["env"], [], False),
+    ("operator", [], "auto", ["nice make"], [], False),
+    ("operator", [], "auto", ["python3.12"], [], False),
+    ("operator", [], "auto", ["ls", "cat", "systemctl status"], ["systemctl restart"], True),
+    ("operator", [], "always", ["git status", "sh"], [], True),    # read-only: no commands
+    ("observer", [], "auto", ["ls"], [], True),
+]
+
+
+@pytest.mark.parametrize("kind,write,policy,allow,privileged,accepted", _LIST_RUNNER_TABLE)
+def test_list_mode_refuses_command_runners_for_writers(
+    kind: str, write: list[str], policy: str, allow: list[str], privileged: list[str],
+    accepted: bool,
+) -> None:
+    raw = _def(kind=kind, access={"files": {"write": write}, "commands": {
+        "mode": "list", "allow": allow, "privileged": privileged}},
+        approval={"policy": policy}, run_as="deploy" if kind == "observer" else None)
+    if accepted:
+        validate_definition(raw, ROOT)
+        return
+    entry = next(e for e in [*allow, *privileged] if is_command_wrapper(e.split()[0]))
+    with pytest.raises(DefinitionError) as exc:
+        validate_definition(raw, ROOT)
+    assert str(exc.value) == LIST_RUNNER_WITH_WRITES.format(entry=entry)
+
+
+def test_list_runner_rule_matches_the_launcher() -> None:
+    perms = pytest.importorskip(
+        "sessionweave_runner.permissions",
+        reason="sessionweave-runner is not installed in this environment (not a broker"
+               " dependency)")
+    assert perms.LIST_RUNNER_WITH_WRITES == LIST_RUNNER_WITH_WRITES
+    for word in ["perl5.36", "node18", "ld-linux-x86-64.so.2", "123", "/usr/bin/git",
+                 "python3.12", "docker", "gitk"]:
+        assert perms.wrapper_name(word) == wrapper_name(word)
+        assert perms.is_command_wrapper(word) is is_command_wrapper(word)
+    for kind, write, policy, allow, privileged, accepted in _LIST_RUNNER_TABLE:
+        try:
+            perms.resolve_definition_permissions(
+                Path("/srv/app"), kind, read=None, write=write or None, deny=None,
+                network=None, commands=perms.Commands("list", tuple(allow), (),
+                                                      tuple(privileged)),
+                extra_read=(), approval=perms.Approval(policy, ()))
+            runner_ok = True
+        except ValueError:
+            runner_ok = False
+        assert runner_ok is accepted, (kind, write, policy, allow, privileged)
+
+
+# --- final review I2: the launcher's rules that depend only on the definition, its
+# runtime and the machine's start mode ---------------------------------------------------
+
+NO_BWRAP_ROOT = dataclasses.replace(ROOT, sandbox=None)
+USER_ROOT = dataclasses.replace(ROOT, run_as=False)
+MACHINES = {"local": LOCAL, "root": ROOT, "root-nobw": NO_BWRAP_ROOT, "root-user": USER_ROOT}
+_OP = {"kind": "operator"}
+_NONE = {"commands": {"mode": "none"}}
+
+# (name, definition overrides, machines that accept it)
+_LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
+    ("host list + default shell", {**_OP, "access": {"network": ["example.com"]}}, set()),
+    ("empty host list + shell", {**_OP, "access": {"network": []}}, set()),
+    ("host list + list", {**_OP, "access": {"network": ["a.com"], "commands": {
+        "mode": "list", "allow": ["ls"]}}}, set()),
+    ("host list observer default list", {"run_as": "deploy",
+                                         "access": {"network": ["a.com"]}}, set()),
+    ("host list + none", {**_OP, "access": {"network": ["a.com"], **_NONE}}, set(MACHINES)),
+    ("host list + always", {**_OP, "access": {"network": ["a.com"]},
+                            "approval": {"policy": "always"}}, set(MACHINES)),
+    ("uppercase host", {**_OP, "access": {"network": ["Example.com"], **_NONE}}, set()),
+    ("ipv6 host", {**_OP, "access": {"network": ["[::1]"], **_NONE}}, set()),
+    ("bare ipv6", {**_OP, "access": {"network": ["::1"], **_NONE}}, set()),
+    ("wildcard tld", {**_OP, "access": {"network": ["*.com"], **_NONE}}, set()),
+    ("port 0", {**_OP, "access": {"network": ["a.com:0"], **_NONE}}, set()),
+    ("port", {**_OP, "access": {"network": ["a.com:8443"], **_NONE}}, set(MACHINES)),
+    ("wildcard host", {**_OP, "runtime": "claude",
+                       "access": {"network": ["*.example.com"], **_NONE}}, set(MACHINES)),
+    ("tilde inside glob", {**_OP, "access": {"files": {"read": ["a/~b"]}}}, set()),
+    ("padded glob", {**_OP, "access": {"files": {"deny": [" a"]}}}, set()),
+    ("trailing space glob", {**_OP, "access": {"files": {"write": ["a "]}}}, set()),
+    ("model leading dash", {**_OP, "model": "-x"}, set()),
+    ("model with space", {**_OP, "model": "big pickle"}, set()),
+    ("model ok", {**_OP, "model": "opencode/big-pickle"}, set(MACHINES)),
+    ("observe glob *", {"run_as": "deploy", "observe": {"logs": ["/srv/app/*.log"]}}, set()),
+    ("observe glob [", {"run_as": "deploy", "observe": {"sources": ["/srv/app/a[1]"]}},
+     set()),
+    ("run_as root", {**_OP, "run_as": "root"}, set()),
+    ("run_as install user", {**_OP, "run_as": "sessionweave"}, set()),
+    ("root observer without run_as", {}, {"local", "root-user"}),
+    ("observer_as_root without bwrap", {"observer_as_root": True}, {"root"}),
+    ("opencode single star", {**_OP, "access": {"files": {"read": ["src/*.py"]}}},
+     set()),
+    ("opencode double star", {**_OP, "access": {"files": {"read": ["src/**"]}}},
+     set(MACHINES)),
+    ("opencode wildcard host", {**_OP, "access": {"network": ["*.a.com"], **_NONE}}, set()),
+    ("cline host list", {**_OP, "runtime": "cline", "access": {"network": ["a.com"],
+                                                               **_NONE}}, set()),
+    ("cline bad provider", {**_OP, "runtime": "cline", "model": "Open:x"}, set()),
+    ("cline provider", {**_OP, "runtime": "cline", "model": "ollama:qwen3:8b"},
+     set(MACHINES)),
+    ("cline observer_as_root", {"runtime": "cline", "observer_as_root": True}, set()),
+    ("claude read subset", {**_OP, "runtime": "claude",
+                            "access": {"files": {"read": ["src"]}}}, set()),
+    ("claude read dot", {**_OP, "runtime": "claude", "access": {"files": {"read": ["."]}}},
+     set(MACHINES)),
+    ("claude port", {**_OP, "runtime": "claude",
+                     "access": {"network": ["a.com:443"], **_NONE}}, set()),
+    ("claude comma glob", {**_OP, "runtime": "claude",
+                           "access": {"files": {"deny": ["a,b"]}}}, set()),
+    ("claude workdir space", {**_OP, "runtime": "claude", "workdir": "/srv/app/a b"},
+     set()),
+    ("claude list unsandboxed", {**_OP, "runtime": "claude", "access": {"commands": {
+        "mode": "list", "allow": ["ls"]}}}, {"local"}),
+    ("claude observer list", {"runtime": "claude", "run_as": "deploy"},
+     {"root"}),
+    ("claude list + listed", {**_OP, "runtime": "claude", "access": {"commands": {
+        "mode": "list", "allow": ["systemctl status"]}},
+        "approval": {"policy": "listed", "patterns": ["systemctl restart"]}}, set()),
+    ("opencode list + listed", {**_OP, "access": {"commands": {
+        "mode": "list", "allow": ["systemctl status"]}},
+        "approval": {"policy": "listed", "patterns": ["systemctl restart"]}}, set(MACHINES)),
+    ("privileged + always", {**_OP, "access": {"commands": {"privileged": ["journalctl"]}},
+                             "approval": {"policy": "always"}}, {"root", "root-nobw",
+                                                                 "root-user"}),
+]
+
+
+@pytest.mark.parametrize("name,over,accepted", _LAUNCHER_RULES,
+                         ids=[c[0] for c in _LAUNCHER_RULES])
+def test_launcher_rules(name: str, over: dict[str, Any], accepted: set[str]) -> None:
+    raw = {**_def(), **over}
+    for mname, machine in MACHINES.items():
+        try:
+            validate_definition(copy.deepcopy(raw), machine)
+            ok = True
+        except DefinitionError:
+            ok = False
+        assert ok is (mname in accepted), (name, mname)
+
+
+def _runner_check(raw: dict[str, Any], machine: Machine) -> Any:
+    """The launcher's verdict on ``raw`` for a launcher like ``machine``: its own
+    validator (``parse_definition``) plus every check of ``_check_definition`` that does
+    not need the machine itself (validate_profile's globs, model and hosts, the runtime
+    caps with its sandbox rule, the run-as rules). None: accepted."""
+    rdefs = pytest.importorskip("sessionweave_runner.definitions")
+    rmode = pytest.importorskip("sessionweave_runner.launcher_mode")
+    perms = pytest.importorskip("sessionweave_runner.permissions")
+    prereqs = pytest.importorskip("sessionweave_runner.prereqs")
+    rsandbox = pytest.importorskip("sessionweave_runner.sandbox")
+
+    sandbox = (rsandbox.SandboxSupport("bwrap", "t", "/usr/bin/bwrap") if machine.sandbox
+               else rsandbox.SandboxSupport(None, "t"))
+    assert machine.ceiling is not None
+    mode = rmode.LauncherMode(machine.mode, Path(machine.ceiling), sandbox, machine.run_as,
+                              "linux")
+    try:
+        p = rdefs.parse_definition(copy.deepcopy(raw), mode)
+    except rdefs.DefinitionError as e:
+        return str(e)
+    if (why := prereqs.run_as_problem(p.run_as)) is not None:
+        return why
+    if p.run_as == "root":  # resolve_run_as refuses uid 0
+        return "run_as root"
+    as_root = mode.kind == "root" and mode.can_run_as
+    sandboxed = mode.kind == "local" or (
+        mode.kind == "root" and p.kind == "observer" and sandbox.kind is not None)
+    if p.observer_as_root and not as_root:
+        return "observer_as_root needs a launcher running as root"
+    if p.kind == "observer" and as_root:
+        if p.observer_as_root and not sandboxed:
+            return "observer_as_root needs the sandbox"
+        if p.observer_as_root and p.runtime == "cline":
+            return "observer_as_root: no cline"
+        if not p.observer_as_root and p.run_as is None:
+            return "an Observer on a --root launcher needs run_as"
+    resolved = p.permissions
+    if (resolved.commands is not None and resolved.commands.privileged
+            and not mode.can_run_as):
+        return "privileged needs root"
+    for g in [*(p.files_read or []), *(p.files_write or []), *(p.files_deny or [])]:
+        if (why := perms.check_glob(g)) is not None:
+            return why
+    check_model = perms.cline_model_problem if p.runtime == "cline" else perms.model_problem
+    if (why := check_model(p.model)) is not None:
+        return why
+    for h in p.network if isinstance(p.network, list) else []:
+        if (why := perms.check_host(h)) is not None:
+            return why
+    problems: list[str] = perms.check_runtime(p.runtime, resolved, sandboxed=sandboxed)
+    return problems[0] if problems else None
+
+
+def _broker_check(raw: dict[str, Any], machine: Machine) -> str | None:
+    try:
+        validate_definition(copy.deepcopy(raw), machine)
+    except DefinitionError as e:
+        return str(e)
+    return None
+
+
+def test_launcher_rules_match_the_launcher() -> None:
+    """The table through the Runner's own validator and runtime checks."""
+    pytest.importorskip("sessionweave_runner.definitions",
+                        reason="sessionweave-runner is not installed (not a broker"
+                               " dependency)")
+    for name, over, _accepted in _LAUNCHER_RULES:
+        raw = {**_def(), **over}
+        for mname, machine in MACHINES.items():
+            b, r = _broker_check(raw, machine), _runner_check(raw, machine)
+            assert (b is None) is (r is None), (name, mname, b, r)
+
+
+_WORDS = ["git", "/usr/bin/git", "status", "push", "-C", "x", "log", "ls", "-la", "rm",
+          "journalctl", "-u", "systemctl", "restart", "env", "sh", "python3.11", "perl5.36",
+          "cat", "top", "-b", "node18", "tail", "-f", "docker", "compose", "ps"]
+_GLOBS = [".", "**", "src", "src/**", "*.py", "a/*", " a", "a ", "a/~b", "~/x", "a,b",
+          "a b", "(x)", "./**", "x?", "[ab]", "../x", "/etc", "a{b}"]
+_HOSTS = ["example.com", "Example.com", "*.example.com", "*.com", "a.com:443", "a.com:0",
+          "[::1]", "::1", "localhost", "127.0.0.1", "-a.com", "a_b.com", "a.com."]
+_MODELS = ["", "sonnet", "-x", "big pickle", "openai:gpt-4", "Open:x", "ollama:qwen3:8b",
+           "a:", ":x", "a/b@c+d", "é", "p_x:m", "p-x:-m"]
+_PATHS = ["/srv/app", "/srv/app/log", "/srv/app/a*.log", "/srv/app/a[1]", "/srv/app/a b",
+          "/srv/app/x?", "/srv/app/(x)"]
+_IDS = ["x", ".", "..", "a.", ".a", "a..b", "-"]
+
+
+def _random_definition(rnd: Any) -> dict[str, Any]:
+    def entry() -> str:
+        w = [rnd.choice(_WORDS) for _ in range(rnd.randint(1, 3))]
+        return " ".join(["ls" if w[0].startswith("-") else w[0], *w[1:]])
+
+    kind = rnd.choice(["operator", "observer"])
+    mode = rnd.choice(["list", "shell", "none", None])
+    cmds: dict[str, Any] = {} if mode is None else {"mode": mode}
+    if mode == "list":
+        cmds["allow"] = [entry() for _ in range(rnd.randint(0, 2))]
+    if kind == "operator" and rnd.random() < 0.3:
+        cmds["privileged"] = [entry()]
+    files = {k: [rnd.choice(_GLOBS) for _ in range(rnd.randint(0, 2))]
+             for k in ("read", "write", "deny") if rnd.random() < 0.4}
+    if kind == "observer" and rnd.random() < 0.9:
+        files.pop("write", None)
+    access: dict[str, Any] = {"commands": cmds, "files": files}
+    r = rnd.random()
+    if r < 0.3:
+        access["network"] = [rnd.choice(_HOSTS) for _ in range(rnd.randint(0, 2))]
+    elif r < 0.6:
+        access["network"] = rnd.choice(["none", "any"])
+    d: dict[str, Any] = {
+        **_def(), "kind": kind, "runtime": rnd.choice(["claude", "opencode", "cline"]),
+        "id": rnd.choice(_IDS) if rnd.random() < 0.1 else "x", "model": rnd.choice(_MODELS),
+        "workdir": rnd.choice(["/srv/app", "/srv/app/a b", "/srv/app/x,y", "/srv/app/sub"]),
+        "access": access,
+        "approval": {"policy": rnd.choice(["auto", "listed", "always"]),
+                     "patterns": [entry() for _ in range(rnd.randint(0, 2))]},
+    }
+    if rnd.random() < 0.3:
+        d["observe"] = {"sources": [rnd.choice(_PATHS)], "logs": [rnd.choice(_PATHS)]}
+    if rnd.random() < 0.25:
+        d["run_as"] = rnd.choice(["deploy", "root", "sessionweave"])
+    if kind == "observer" and rnd.random() < 0.3:
+        d["observer_as_root"] = True
+    return d
+
+
+def test_random_definitions_match_the_launcher() -> None:
+    """A seeded random comparison: broker and launcher agree on every definition."""
+    import random
+
+    pytest.importorskip("sessionweave_runner.definitions",
+                        reason="sessionweave-runner is not installed (not a broker"
+                               " dependency)")
+    rnd = random.Random(20261127)
+    diffs = []
+    for _ in range(3000):
+        raw = _random_definition(rnd)
+        for mname, machine in MACHINES.items():
+            b, r = _broker_check(raw, machine), _runner_check(raw, machine)
+            if (b is None) is not (r is None):
+                diffs.append((mname, raw, b, r))
+    assert diffs == []
+
+
+# --- final review I1: the published-profiles budget -------------------------------------
+
+def test_budget_constants() -> None:
+    assert PUBLISHED_PROFILES_BUDGET == 192 * 1024
+    assert budget_problem(PUBLISHED_PROFILES_BUDGET) is None
+    why = budget_problem(PUBLISHED_PROFILES_BUDGET + 1)
+    assert why is not None and why.startswith("machine definitions budget exceeded")
+    assert "193 KiB of the 192 KiB" in why
+
+
+def test_profiles_frame_size_is_the_serialized_frame() -> None:
+    profiles = [{"id": "a", "x": "é"}, {"id": "b"}, {"id": "c", "w": ["1", "2"]}]
+    for n in range(4):
+        frame = {"type": "profiles", "profiles": profiles[:n]}
+        assert profiles_frame_size([json_size(p) for p in profiles[:n]]) == json_size(frame)
+
+
+def test_published_profile_matches_the_launcher() -> None:
+    rdefs = pytest.importorskip("sessionweave_runner.definitions",
+                                reason="sessionweave-runner is not installed")
+    public_profile = pytest.importorskip("sessionweave_runner.launcher_config").public_profile
+    rmode = pytest.importorskip("sessionweave_runner.launcher_mode")
+    rsandbox = pytest.importorskip("sessionweave_runner.sandbox")
+
+    assert rdefs.PUBLISHED_PROFILES_BUDGET == PUBLISHED_PROFILES_BUDGET
+    assert rdefs.BUDGET_PROBLEM.format(size=193, budget=192) == budget_problem(
+        PUBLISHED_PROFILES_BUDGET + 1)
+    mode = rmode.LauncherMode("local", Path("/srv/app"),
+                              rsandbox.SandboxSupport("bwrap", "t", "/x"), False, "linux")
+    for raw in (
+        _def(),
+        _def(kind="operator", description="é" * 1000, capabilities=["c" * 64] * 32,
+             limits={"max_duration_s": 600, "max_cost_usd": 1.5},
+             access={"network": "any", "files": {"deny": ["x"]}},
+             visibility="general", allowed_accounts=["bob", "ann"]),
+        _def(limits={"max_idle_s": None}, access={"network": "none"}),
+    ):
+        d = validate_definition(raw, LOCAL)
+        expected = {**public_profile(rdefs.parse_definition(d, mode)), "warnings": ["w"]}
+        assert published_profile(d, ["w"]) == expected
+        assert json_size(published_profile(d, ["w"])) == json_size(expected)

@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Any
 from sessionweave.definitions import (
     MAX_DEFINITIONS_PER_LAUNCHER,
     DefinitionError,
+    budget_problem,
+    json_size,
+    profiles_frame_size,
+    published_profile,
     validate_definition,
 )
 from sessionweave.errors import ErrorCode, ToolError
@@ -154,9 +158,12 @@ class DeployManager:
     async def on_connected(self, lnc: _Launcher) -> None:
         """Converge a (re)connected launcher to the stored desired state."""
         key = lnc.v2.launcher_key
-        if self.store is None or key is None or _CAPABILITY not in lnc.v2.capabilities:
+        if self.store is None or key is None:
             return
         owner = owner_key(lnc)
+        if _CAPABILITY not in lnc.v2.capabilities:
+            await self._purge_removals(lnc, owner, key)
+            return
         async with self._machine_lock(owner, key):
             rows = await self.store.list_definitions(owner, key, include_deleted=True)
             live = [r for r in rows if not r.deleted]
@@ -178,6 +185,21 @@ class DeployManager:
                     await self.store.set_status(
                         owner, key, r.def_id, r.revision, "sent", [], [], now)
             self._ready.add(lnc.launcher_id)
+
+    async def _purge_removals(self, lnc: _Launcher, owner: str, key: str) -> None:
+        """A launcher connected without the ``definitions`` capability (config
+        mode) holds no definitions: its pending removals are done (they would
+        otherwise wait for a ``removed`` that never comes, and block forget while
+        it is online). Should it restart with the capability, the index it gets
+        then no longer names them, so it drops any it kept on disk."""
+        assert self.store is not None
+        async with self._machine_lock(owner, key):
+            rows = await self.store.list_definitions(owner, key, include_deleted=True)
+            for r in rows:
+                if r.deleted:
+                    await self.store.purge_definition(owner, key, r.def_id)
+                    await self._event(owner, "definition.removed", lnc.machine, key,
+                                      r.def_id, r.revision)
 
     def on_disconnected(self, launcher_id: str) -> None:
         self._ready.discard(launcher_id)
@@ -213,9 +235,18 @@ class DeployManager:
                 return
             if state == "removed":
                 return  # a live definition is not removed by a launcher report
+            if (
+                row.revision == revision and row.state == state
+                and row.problems == problems and row.warnings == warnings
+                and (state != "applied" or row.applied_revision == revision)
+            ):
+                return  # a repeat of the recorded status: no write, no event
+            # Announce a change of state (or of a rejection's problems), not every
+            # repeat: a launcher re-reporting its status does not flood the events.
+            announce = row.state != state or (state == "rejected" and row.problems != problems)
             updated = await self.store.set_status(
                 owner, key, def_id, revision, state, problems, warnings, _now_ms())
-            if updated is None:
+            if updated is None or not announce:
                 return
             if state == "applied":
                 await self._event(owner, "definition.applied", lnc.machine, key,
@@ -276,6 +307,8 @@ class DeployManager:
                 ErrorCode.DEFINITION_LIMIT,
                 f"at most {MAX_DEFINITIONS_PER_LAUNCHER} definitions per machine",
             )
+        if (why := self._budget_problem(lnc, rows, definition)) is not None:
+            raise ToolError(ErrorCode.DEFINITIONS_BUDGET, why)
         online = lnc is not None
         row = await store.put_definition(
             owner, launcher_key, definition, "sent" if online else "queued", _now_ms())
@@ -285,6 +318,40 @@ class DeployManager:
         await self._event(owner, "definition.deployed", machine.machine, launcher_key,
                           def_id, row.revision, client=client, queued=not online)
         return {"definition_id": def_id, "revision": row.revision, "state": row.state}
+
+    @staticmethod
+    def _budget_problem(
+        lnc: _Launcher | None, rows: list[StoredDefinition], definition: dict[str, Any],
+    ) -> str | None:
+        """Why storing ``definition`` would make the machine publish more than the
+        launcher's ``PUBLISHED_PROFILES_BUDGET`` (the launcher would reject it), else
+        None. Counted like the launcher's ``profiles`` frame: every profile the
+        launcher publishes now at the size it sent (TOML profiles, and definitions
+        applied at their stored revision, warnings included), every other stored
+        definition and the new one as the launcher would publish it, with the warnings
+        it last reported for them. Offline, the launcher's TOML profiles are unknown:
+        the launcher's own check (at the put) stays the authority."""
+        def_id = definition["id"]
+        published = {} if lnc is None else lnc.profiles
+        sizes: dict[str, int] = {}
+        for pid, prof in published.items():
+            if prof.get("source") == "local" and pid != def_id:
+                sizes[pid] = lnc.profile_sizes.get(pid, 0) if lnc is not None else 0
+        for r in rows:  # live rows: the desired state
+            if r.def_id == def_id or r.def_id in sizes:
+                continue
+            pub = published.get(r.def_id)
+            if (
+                lnc is not None and pub is not None and pub.get("source") == "remote"
+                and r.applied_revision == r.revision and r.def_id in lnc.profile_sizes
+            ):
+                sizes[r.def_id] = lnc.profile_sizes[r.def_id]
+            else:
+                sizes[r.def_id] = json_size(published_profile(r.definition, r.warnings))
+        prev = next((r for r in rows if r.def_id == def_id), None)
+        warnings = prev.warnings if prev is not None and prev.state == "applied" else []
+        sizes[def_id] = json_size(published_profile(definition, warnings))
+        return budget_problem(profiles_frame_size(list(sizes.values())))
 
     async def remove(
         self, owner: str, launcher_key: str, def_id: str, *, client: str = "",
@@ -303,7 +370,13 @@ class DeployManager:
                     ErrorCode.DEFINITION_IN_USE,
                     "the agent is running in a session; remove it after the session ends",
                 )
-            never_held = row.applied_revision is None and row.state in ("queued", "rejected")
+            # The launcher never held it, or it is connected without the
+            # ``definitions`` capability (restarted in config mode): it holds no
+            # definitions now and its next index (with the capability) drops any
+            # it kept on disk, so nothing is waited for.
+            never_held = (
+                row.applied_revision is None and row.state in ("queued", "rejected")
+            ) or (lnc is not None and _CAPABILITY not in lnc.v2.capabilities)
             gone = await store.mark_deleted(owner, launcher_key, def_id, _now_ms())
             if never_held:
                 # The launcher never held it: nothing to wait for.

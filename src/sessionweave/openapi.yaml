@@ -527,6 +527,7 @@ components:
                 - definition_in_use
                 - definition_id_conflict
                 - definition_limit
+                - definitions_budget
                 - launcher_online
                 - launcher_offline
                 - launcher_timeout
@@ -582,7 +583,7 @@ components:
         ceiling: { type: string, nullable: true, description: "The folder of a --local launcher, / for --root, null in config mode" }
         sandbox: { type: string, nullable: true, enum: [bwrap] }
         run_as: { type: boolean }
-        platform: { type: string, nullable: true }
+        platform: { type: string, description: "The launcher's platform (empty when it reported none)" }
         capabilities: { type: array, items: { type: string, enum: [definitions, browse, processes] } }
         prereqs: { type: array, items: { $ref: '#/components/schemas/Prereq' } }
         last_seen: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
@@ -592,45 +593,79 @@ components:
       additionalProperties: false
       description: |
         An agent definition (at most 64 KiB of JSON; unknown keys refused at every
-        level). Validated against the target machine: paths absolute, normalised and
-        inside its ceiling; root execution (`run_as`, `privileged`, `observer_as_root`)
-        only on a `--root` launcher offering `run_as` (running as root), and
-        `observer_as_root` excludes `run_as`; an observer never writes files nor gets a
-        shell, and its `allow` entries must start with a read command (`ls`, `cat`,
-        `tail`, `journalctl`, `ps`, `top -b`, `systemctl status`, ...). Command entries and
-        approval patterns start with a command, never an option (`-`). A `privileged`
-        entry allows exactly the options it spells: list each option used
-        (`journalctl -u`, `journalctl -n`). With approval `listed`, an `allow` or
-        `privileged` entry sharing a pattern's command word must differ from it at a
-        subcommand word with no option word before (allow `git status`, `git log` with
-        `git push` is accepted; allow `git` or `git push origin` with `git push`, or
-        `git -C x log` with `git -C x push`, is refused); an observer's empty `allow`
-        stands for the default read commands. Listed patterns also need commands mode
-        `list` (not `shell`), and no `allow`/`privileged` entry may start with a command
-        that runs other commands (shells, `env`, `xargs`, `sudo`, interpreters such as
-        `python*`, `find`, `awk`, `sed`, `ssh`, ...). Never carries secrets.
+        level). The broker applies every rule of the launcher that does not need the
+        machine itself, so a definition it accepts is rejected later only for a
+        machine reason (runtime missing or not logged in, sandbox probe, a path that
+        does not exist or resolves elsewhere, a local profile with the same id, the
+        published-profiles budget once the launcher's own warnings are known).
+        Ids, domains and roles are 1-64 chars of `[A-Za-z0-9._-]`, never only dots.
+
+        Validated against the target machine: paths absolute, normalised and inside
+        its ceiling (`outside_ceiling`); root execution (`run_as`, `privileged`,
+        `observer_as_root`) only on a `--root` launcher offering `run_as` (running as
+        root; else `outside_ceiling`), and `observer_as_root` excludes `run_as`, needs
+        the machine's bubblewrap sandbox (`outside_ceiling`) and is refused for the
+        cline runtime; `run_as` is never `root` or the launcher's install user
+        `sessionweave`; an observer on a `--root` launcher running as root needs
+        `run_as` (a non-root machine user) or `observer_as_root`. An observer never
+        writes files nor gets a shell, and its `allow` entries must start with a read
+        command (`ls`, `cat`, `tail`, `journalctl`, `ps`, `top -b`, `systemctl status`,
+        ...). Command entries and approval patterns start with a command, never an
+        option (`-`). A `privileged` entry allows exactly the options it spells: list
+        each option used (`journalctl -u`, `journalctl -n`).
+
+        Command runners: commands that run other commands (shells, `env`, `xargs`,
+        `sudo`, `time`, interpreters such as `python*`, `perl`, `node`, also with a
+        version suffix like `perl5.36` or `node18`, `find`, `awk`, `sed`, `ssh`, and
+        `git`, which runs commands from repository config; the launcher's
+        `COMMAND_WRAPPERS`). In commands mode `list`, an agent that can write (an
+        operator unless approval is `always`) may not list one in `allow` or
+        `privileged`. With approval `listed` patterns: commands mode `list` (not
+        `shell`); no `allow`/`privileged` entry may be a command runner; an entry
+        sharing a pattern's command word must differ from it at a subcommand word with
+        no option word before (allow `systemctl status` with `systemctl restart` is
+        accepted; allow `systemctl` or `systemctl restart nginx` with `systemctl
+        restart`, or `systemctl -H x status` with `systemctl -H x restart`, is
+        refused); an observer's empty `allow` stands for the default read commands.
+
+        Network: a host list (also `[]`) needs commands mode `none` (or approval
+        `always`): a shell or a command list reaches any host. Hosts are lowercase
+        names, `*.name` (not on a bare TLD) or `name:port`; no IPv6 literals. File
+        globs are relative to the workdir: no leading `/`, no `~`, no `..`, no braces
+        or backslashes, no leading or trailing spaces. `observe.sources`/`logs` hold no
+        glob characters (`* ? [ ] { }`). `model` starts with a letter or digit and uses
+        only letters, digits and `. _ : / @ + -`; for cline a `provider:model` has a
+        lowercase provider id.
+
+        Per runtime (what it can enforce): claude refuses a `files.read` list other
+        than `.`, `host:port` entries, paths with whitespace, `,` or parentheses
+        (workdir and globs), a command list outside the sandbox (an operator on a
+        `--root` launcher, or an observer on one without bubblewrap) and a command list
+        with approval `listed` patterns; opencode refuses a single `*` in read/write
+        globs (use `dir` or `dir/**`) and `*.name` hosts; cline refuses host lists.
+        Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
       properties:
-        id: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it" }
-        domain: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' }
-        role: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' }
+        id: { type: string, pattern: '^(?!\.+$)[A-Za-z0-9._-]{1,64}$', description: "Defaults to the id in the URL; must match it. Never only dots" }
+        domain: { type: string, pattern: '^(?!\.+$)[A-Za-z0-9._-]{1,64}$' }
+        role: { type: string, pattern: '^(?!\.+$)[A-Za-z0-9._-]{1,64}$' }
         capabilities: { type: array, maxItems: 32, items: { type: string, maxLength: 64 } }
         description: { type: string, maxLength: 1000 }
         runtime: { type: string, enum: [claude, opencode, cline] }
         model: { type: string, maxLength: 200 }
         kind: { type: string, enum: [observer, operator] }
         coordinator_capable: { type: boolean, default: false }
-        observer_as_root: { type: boolean, default: false, description: "Observers on a --root launcher only: the observer runs as root. Warning: runs as root: can read every file on the machine, including passwords and keys. Still read-only. Refused (invalid_request) for an operator or on a non-root machine" }
+        observer_as_root: { type: boolean, default: false, description: "Observers on a --root launcher only: the observer runs as root. Warning: runs as root: can read every file on the machine, including passwords and keys. Still read-only. Refused (invalid_request) for an operator, on a non-root machine, with run_as or for the cline runtime; refused (outside_ceiling) on a --root launcher not running as root or without bubblewrap" }
         workdir: { type: string, description: Absolute path inside the ceiling }
         run_as: { type: string, nullable: true, pattern: '^[a-z_][a-z0-9_-]{0,31}$' }
         observe:
           type: object
-          description: "sources, logs (absolute paths), processes ({name, pid?}) and metrics ({enabled, interval_s 5..3600, kinds: cpu|memory|disk|load}); each list at most 50"
-          additionalProperties: true
+          description: "sources, logs (absolute paths without glob characters), processes ({name, pid?}) and metrics ({enabled, interval_s 5..3600, kinds: cpu|memory|disk|load}); each list at most 50. Unknown keys are refused at every level"
+          additionalProperties: false
         access:
           type: object
-          description: "files {read, write, deny: globs relative to workdir}; network none|any|[hosts]; commands {mode: none|list|shell, allow (<=100), privileged (<=50)}"
-          additionalProperties: true
+          description: "files {read, write, deny: globs relative to workdir}; network none|any|[hosts]; commands {mode: none|list|shell, allow (<=100), privileged (<=50)}. Unknown keys are refused at every level"
+          additionalProperties: false
         limits:
           type: object
           properties:
@@ -1399,13 +1434,14 @@ paths:
         in `config` mode and on an open-mode broker without a persistence DB),
         `"sandbox"` (`bwrap`, or `none`/null), `"run_as"` (root mode only), `"platform"` and `"prereqs"`
         (at most 32 `{name, state: ok|installed|missing|wrong_version|not_logged_in,
-        version, required, needed_by, command}`) and `"key_secret"`. The first
+        version, required, needed_by, command, path}`) and `"key_secret"`. The first
         registration of a launcher key (per owner) gets a secret in
         `welcome.key_secret` (sent once, only its hash is kept; null on every
         later welcome); a later hello with that key must present it as
         `key_secret`, else it is closed 4409 `launcher_key_in_use` and nothing
-        is replaced or updated (reset a lost secret by deleting the machine); a
-        launcher is registered (discoverable, launchable) only once its key is
+        is replaced or updated (reset a lost secret by deleting the machine; a
+        secret whose welcome could not be sent is released, so the next hello
+        claims the key again); a launcher is registered (discoverable, launchable) only once its key is
         claimed. Open-mode machines offline longer than
         `SW_OPEN_MACHINES_RETENTION_DAYS` (default 30) are forgotten.
         With the secret, a newer connection with the
@@ -1550,7 +1586,7 @@ paths:
         '401': { description: "invalid_account_token (missing, unknown, revoked, expired, account not active; also the relay admin token)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '403': { description: "network_not_approved", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine); definitions_budget (the machine's published agents would exceed the launcher's 192 KiB budget: remove or shorten other definitions)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '413': { description: "payload_too_large", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '503': { description: "accounts_unavailable; definitions_unavailable", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     delete:
@@ -1706,7 +1742,7 @@ paths:
         '400': { description: "invalid_request (unknown keys, id mismatch, invalid definition); outside_ceiling", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '403': { description: "permission_denied (the broker runs in account mode: use /v1/me/launchers)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '404': { description: launcher_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: "launcher_capability_missing (not a --local/--root launcher); definition_id_conflict (a local profile has that id); definition_limit (50 per machine); definitions_budget (the machine's published agents would exceed the launcher's 192 KiB budget: remove or shorten other definitions)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '413': { description: "payload_too_large", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '503': { description: "definitions_unavailable (no persistence DB)", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     delete:

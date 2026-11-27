@@ -333,3 +333,53 @@ async def test_concurrent_puts_get_distinct_revisions(store: PersistenceStore) -
     final = await ms.get_definition("acc_1", KEY, "obs")
     assert final.revision == 5
     assert final.definition == next(d.definition for d in got if d.revision == 5)
+
+
+async def test_release_key_secret_lets_the_key_be_claimed_again(
+    store: PersistenceStore,
+) -> None:
+    """M2: a secret issued in a welcome that never reached the launcher is
+    released; the row (and its definitions, first_seen) stays and the next hello
+    claims the key afresh. A secret that changed meanwhile is not touched."""
+    from sessionweave.access import hash_token
+
+    ms = MachineStore(store)
+    hello = parse_hello_v2(V2, deploy_allowed=True)
+    _m, secret = await ms.claim_machine("acc_1", "box", hello, 1)
+    assert secret is not None
+    await ms.put_definition("acc_1", KEY, {"id": "obs"}, "queued", 1)
+    assert await ms.release_key_secret("acc_1", KEY, hash_token("lks_other")) is False
+    assert await ms.release_key_secret("acc_1", KEY, hash_token(secret)) is True
+    assert (await _secret_row(store, "acc_1"))[0] is None
+    m, fresh = await ms.claim_machine("acc_1", "box", hello, 5)  # no secret presented
+    assert fresh is not None and fresh != secret and m.first_seen == 1
+    assert [d.def_id for d in await ms.list_definitions("acc_1", KEY)] == ["obs"]
+    with pytest.raises(LauncherKeyInUseError):  # the new secret is required again
+        await ms.claim_machine("acc_1", "box", hello, 6)
+
+
+async def test_revision_marks_capped_per_machine(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M7: a machine keeps the high-water marks of its most recently purged ids."""
+    from sessionweave import machines as machines_mod
+
+    monkeypatch.setattr(machines_mod, "MAX_REVISION_MARKS", 3)
+    ms = await _with_machine(store)
+    for i in range(5):
+        await ms.put_definition("acc_1", KEY, {"id": f"d{i}"}, "sent", i)
+        await ms.mark_deleted("acc_1", KEY, f"d{i}", i)
+        await ms.purge_definition("acc_1", KEY, f"d{i}")
+    # d1 (its mark already dropped: it starts again at 1) purged again: the newest mark
+    await ms.put_definition("acc_1", KEY, {"id": "d1"}, "sent", 9)
+    await ms.mark_deleted("acc_1", KEY, "d1", 9)
+    await ms.purge_definition("acc_1", KEY, "d1")
+    async with store._read_pool[0].execute(
+        "SELECT def_id, revision FROM agent_definition_revisions ORDER BY rowid"
+    ) as cur:
+        rows = [tuple(r) async for r in cur]
+    assert rows == [("d3", 2), ("d4", 2), ("d1", 2)]
+    # a kept mark still continues its revisions; a dropped one starts again
+    assert (await ms.put_definition("acc_1", KEY, {"id": "d4"}, "sent", 10)).revision == 3
+    assert (await ms.put_definition("acc_1", KEY, {"id": "d0"}, "sent", 10)).revision == 1
+    assert machines_mod.MAX_REVISION_MARKS == 3

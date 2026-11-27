@@ -64,7 +64,10 @@ MAX_FRAME_BYTES = 256 * 1024
 # under this pseudo session id, per source IP.
 AUTH_LIMIT_KEY = "launcher"
 
-_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# Profile and definition ids (matched with fullmatch). Never only dots: ``.``/``..``
+# would turn a definition's URL path into its parent's (a Remove of ``..`` resolving to
+# forget-machine in clients). The launcher's ``DEFINITION_ID_RE``.
+_ID_RE = re.compile(r"(?!\.+\Z)[A-Za-z0-9._-]{1,64}")
 _RUNTIMES = {"claude", "opencode", "cline"}
 _PRESETS = {"reader", "operator"}
 _VISIBILITIES = {"personal", "general"}
@@ -315,7 +318,7 @@ def validate_profile(raw: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in ("id", "domain", "role"):
         v = raw.get(key)
-        if not isinstance(v, str) or not _ID_RE.match(v):
+        if not isinstance(v, str) or not _ID_RE.fullmatch(v):
             raise ValueError(f"{key} must be 1-64 chars of [A-Za-z0-9._-]")
         out[key] = v
     caps = raw.get("capabilities", [])
@@ -421,6 +424,9 @@ class _Launcher:
     visibility: str
     allowed_accounts: frozenset[str]  # casefolded account names
     profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Bytes of each published profile as the launcher serialized it (the
+    # published-profiles budget counts them; ``profiles`` is normalised).
+    profile_sizes: dict[str, int] = field(default_factory=dict)
     running: dict[str, int] = field(default_factory=dict)
     # The account token it authenticated with and its address (account
     # mode), so it can be dropped when that token or account dies.
@@ -446,9 +452,12 @@ def owner_key(lnc: _Launcher) -> str:
 
 def _load_profiles(
     raw_profiles: list[Any],
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], dict[str, int]]:
+    """The valid profiles by id, the rejected ones, and the serialized size of each
+    valid one (``json.dumps`` of what the launcher sent)."""
     profiles: dict[str, dict[str, Any]] = {}
     rejected: list[dict[str, str]] = []
+    sizes: dict[str, int] = {}
     for raw in raw_profiles:
         pid = raw.get("id") if isinstance(raw, dict) else None
         label = pid if isinstance(pid, str) else ""
@@ -460,7 +469,11 @@ def _load_profiles(
             rejected.append({"id": label[:64], "reason": str(exc)})
             continue
         profiles[prof["id"]] = prof
-    return profiles, rejected
+        try:
+            sizes[prof["id"]] = len(json.dumps(raw).encode("utf-8"))
+        except (TypeError, ValueError):  # cannot happen for a parsed JSON frame
+            sizes[prof["id"]] = 0
+    return profiles, rejected, sizes
 
 
 def relay_timeout_from_env() -> float:
@@ -586,7 +599,7 @@ class LauncherRegistry:
             v2=v2,
         )
         self._check_limit(lnc)
-        lnc.profiles, rejected = _load_profiles(raw_profiles)
+        lnc.profiles, rejected, lnc.profile_sizes = _load_profiles(raw_profiles)
         return lnc, rejected
 
     def add(self, lnc: _Launcher) -> list[_Launcher]:
@@ -630,7 +643,7 @@ class LauncherRegistry:
         if not isinstance(raw, list) or len(raw) > _MAX_PROFILES:
             return [{"id": "", "reason":
                      f"profiles must be a list of at most {_MAX_PROFILES} entries"}]
-        lnc.profiles, rejected = _load_profiles(raw)
+        lnc.profiles, rejected, lnc.profile_sizes = _load_profiles(raw)
         return rejected
 
     def claim_key(self, lnc: _Launcher, presented: str | None) -> str | None:
@@ -1117,11 +1130,22 @@ async def launcher_ws(websocket: WebSocket) -> None:
     try:
         # ``account``: the owner account's name (None in open mode), so the
         # launcher can double-check the visibility of each order.
-        await websocket.send_json(
-            {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
-             "resume_secret": resume_secret, "account": auth.owner_name,
-             "protocol": PROTOCOL_VERSION, "key_secret": issued_secret}
-        )
+        try:
+            await websocket.send_json(
+                {"type": "welcome", "launcher_id": launcher_id, "rejected": rejected,
+                 "resume_secret": resume_secret, "account": auth.owner_name,
+                 "protocol": PROTOCOL_VERSION, "key_secret": issued_secret}
+            )
+        except BaseException:
+            if issued_secret is not None and machines is not None and v2.launcher_key:
+                # The fresh secret never reached the launcher: release it, so its
+                # next hello claims the key again (the machine row, its
+                # definitions and first_seen stay) instead of being refused as
+                # launcher_key_in_use until someone forgets the machine.
+                with contextlib.suppress(Exception):
+                    await machines.release_key_secret(
+                        owner, v2.launcher_key, hash_token(issued_secret))
+            raise
         # The same launcher reconnected (its old socket may be half-open):
         # its running agents moved over above; drop the old connection.
         for old in replaced:

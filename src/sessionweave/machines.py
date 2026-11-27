@@ -47,6 +47,11 @@ class MachineLimitError(Exception):
     """The owner already has the maximum number of machines."""
 
 
+# The revision high-water marks a machine keeps for purged definition ids (20 per
+# definition slot: 20 x MAX_DEFINITIONS_PER_LAUNCHER).
+MAX_REVISION_MARKS = 1000
+
+
 @dataclass
 class Machine:
     account_id: str
@@ -196,6 +201,21 @@ class MachineStore:
                 raise
         assert row is not None
         return _row(row), issued
+
+    async def release_key_secret(
+        self, account_id: str, launcher_key: str, secret_hash: bytes
+    ) -> bool:
+        """Clear the machine's key secret when it is still ``secret_hash`` (a secret
+        issued in a welcome that was never delivered): the next hello with the key
+        is a fresh claim and gets a new secret. Nothing else changes. Returns
+        whether it was cleared."""
+        async with self._store._write_tx_lock:
+            cur = await self._write().execute(
+                "UPDATE launcher_machines SET key_secret_hash = NULL"
+                " WHERE account_id = ? AND launcher_key = ? AND key_secret_hash = ?",
+                (account_id, launcher_key, secret_hash),
+            )
+            return bool(cur.rowcount)
 
     async def set_prereqs(
         self, account_id: str, launcher_key: str, prereqs: list[dict[str, Any]]
@@ -427,19 +447,33 @@ class MachineStore:
 
     async def purge_definition(self, account_id: str, launcher_key: str, def_id: str) -> None:
         """Delete the definition's row (idempotent). Its revision is kept as a
-        high-water mark: a later put of the same id continues from it."""
+        high-water mark: a later put of the same id continues from it. A machine
+        keeps the marks of its ``MAX_REVISION_MARKS`` most recently purged ids: an
+        older id deployed again starts at revision 1 (the launcher removed it long
+        ago, so no revision it holds is reused)."""
         key = (account_id, launcher_key, def_id)
 
         async def purge(conn: Any) -> None:
             prev = await self._fetch_def(conn, *key)
             if prev is None:
                 return
+            # Delete and insert (not upsert): the rowid orders the marks by purge.
+            await conn.execute(
+                "DELETE FROM agent_definition_revisions"
+                " WHERE account_id = ? AND launcher_key = ? AND def_id = ?",
+                key,
+            )
             await conn.execute(
                 "INSERT INTO agent_definition_revisions"
-                " (account_id, launcher_key, def_id, revision) VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(account_id, launcher_key, def_id)"
-                " DO UPDATE SET revision = excluded.revision",
+                " (account_id, launcher_key, def_id, revision) VALUES (?, ?, ?, ?)",
                 (*key, prev.revision),
+            )
+            await conn.execute(
+                "DELETE FROM agent_definition_revisions"
+                " WHERE account_id = ? AND launcher_key = ? AND rowid NOT IN ("
+                " SELECT rowid FROM agent_definition_revisions"
+                " WHERE account_id = ? AND launcher_key = ? ORDER BY rowid DESC LIMIT ?)",
+                (account_id, launcher_key, account_id, launcher_key, MAX_REVISION_MARKS),
             )
             await conn.execute(
                 "DELETE FROM agent_definitions"
