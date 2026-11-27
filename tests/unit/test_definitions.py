@@ -18,6 +18,7 @@ from sessionweave.definitions import (
     KINDS,
     LIMIT_MAX,
     LIST_IS_GUIDANCE,
+    LISTED_NOT_YET,
     LISTED_WITH_WRITES,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
@@ -29,6 +30,7 @@ from sessionweave.definitions import (
     READ_COMMANDS,
     READ_ONLY_NEEDS_SANDBOX,
     READ_ONLY_NETWORK_WARNING,
+    UNKNOWN_USER,
     UNSANDBOXED_WRITER_WARNING,
     DefinitionError,
     _listed_overlap,
@@ -460,8 +462,8 @@ def _listed_def(kind: str, allow: list[str], privileged: list[str], pattern: str
 def test_listed_pattern_vs_allowed_entries(
     kind: str, allow: list[str], privileged: list[str], pattern: str, accepted: bool,
 ) -> None:
-    # The rule itself (an operator can write, so through validate_definition its
-    # listed patterns are refused before this rule: LISTED_WITH_WRITES).
+    # The rule itself, kept for when approvals ship (Runner 51b8132: through
+    # validate_definition listed patterns are refused first, LISTED_NOT_YET).
     cmds = {"mode": "list", "allow": allow, "privileged": privileged}
     appr = {"policy": "listed", "patterns": [pattern]}
     raw = _listed_def(kind, allow, privileged, pattern)
@@ -472,15 +474,9 @@ def test_listed_pattern_vs_allowed_entries(
             _listed_overlap(kind, cmds, appr)
         assert exc.value.code is ErrorCode.INVALID_REQUEST
         assert repr(pattern) in str(exc.value)
-    if kind == "operator":
-        with pytest.raises(DefinitionError) as exc:
-            validate_definition(raw, ROOT)
-        assert str(exc.value) == LISTED_WITH_WRITES
-    elif accepted:
-        assert validate_definition(raw, ROOT)["approval"]["patterns"] == [pattern]
-    else:
-        with pytest.raises(DefinitionError, match="overlaps"):
-            validate_definition(raw, ROOT)
+    with pytest.raises(DefinitionError) as exc:
+        validate_definition(raw, ROOT)
+    assert str(exc.value) == LISTED_NOT_YET
 
 
 def test_listed_check_only_with_listed_patterns() -> None:
@@ -489,9 +485,11 @@ def test_listed_check_only_with_listed_patterns() -> None:
                      {"policy": "listed", "patterns": []}):
         validate_definition(_def(kind="operator", access={"commands": {
             "mode": "list", "allow": ["systemctl"]}}, approval=approval), LOCAL)
-    # mode none: no command runs, the patterns change nothing
-    validate_definition(_def(access={"commands": {"mode": "none"}},
-                             approval={"policy": "listed", "patterns": ["journalctl -f"]}), LOCAL)
+    # Runner 51b8132: listed patterns are refused whatever the commands (mode none too)
+    with pytest.raises(DefinitionError) as exc:
+        validate_definition(_def(access={"commands": {"mode": "none"}}, approval={
+            "policy": "listed", "patterns": ["journalctl -f"]}), LOCAL)
+    assert str(exc.value) == LISTED_NOT_YET
 
 
 def test_listed_table_matches_the_launcher() -> None:
@@ -554,11 +552,11 @@ def test_listed_refuses_shell_and_wrappers(
                            ) as exc:
             _listed_overlap(kind, cmds, appr)
         assert exc.value.code is ErrorCode.INVALID_REQUEST
-    # Through validate_definition an operator (it writes) gets LISTED_WITH_WRITES first.
+    # Through validate_definition listed patterns are refused first (Runner 51b8132).
     raw = _def(kind=kind, access={"commands": cmds}, approval=appr)
     with pytest.raises(DefinitionError) as exc:
         validate_definition(raw, ROOT)
-    assert str(exc.value) == LISTED_WITH_WRITES
+    assert str(exc.value) == LISTED_NOT_YET
 
 
 def test_shell_and_wrappers_fine_without_listed_patterns() -> None:
@@ -678,7 +676,10 @@ def test_list_runner_rule_matches_the_launcher() -> None:
                  "PRIVILEGED_RUNNER_PROBLEM", "READ_ONLY_NETWORK_WARNING",
                  "OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS", "DENY_SUMMARY_SANDBOXED",
                  "DENY_SUMMARY_UNSANDBOXED", "DENY_SUMMARY_ROOT_OBSERVER",
-                 "DENY_ROOT_OBSERVER_WARNING", "NETWORK_SUMMARY_NONE_WITH_COMMANDS"):
+                 "DENY_ROOT_OBSERVER_WARNING", "NETWORK_SUMMARY_NONE_WITH_COMMANDS",
+                 "LISTED_NOT_YET", "READ_SUMMARY_LOCAL", "READ_SUMMARY_ROOT_OBSERVER",
+                 "READ_SUMMARY_UNSANDBOXED", "WRITE_SUMMARY_UNSANDBOXED",
+                 "WRITE_SUMMARY_WHOLE_FOLDER"):
         assert getattr(perms, name) == getattr(ours, name), name
     for gone in ("LIST_RUNNER_WITH_WRITES", "GIT_LIST_WARNING", "GIT_LIST_WARNING_UNSANDBOXED",
                  "list_git_warning"):
@@ -781,7 +782,8 @@ _LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
     ("observer list + listed", {"run_as": "deploy", "access": {"commands": {
         "mode": "list", "allow": ["systemctl status"]}},
         "approval": {"policy": "listed", "patterns": ["systemctl restart"]}},
-     {"root"}),
+     set()),                                    # listed refused until approvals ship
+    ("listed without patterns", {**_OP, "approval": {"policy": "listed"}}, set(MACHINES)),
     ("operator listed + always", {**_OP, "approval": {"policy": "always", "patterns": [
         "systemctl restart"]}}, set(MACHINES)),
     ("protected write glob", {**_OP, "access": {"files": {"write": [".git"]}}}, set()),
@@ -1035,22 +1037,35 @@ def test_protected_write_rule_matches_the_launcher() -> None:
         assert perms.protected_write_problem([glob]) == protected_write_problem([glob])
 
 
-def test_listed_approvals_refused_for_writers() -> None:
-    assert "\u2014" in LISTED_WITH_WRITES
+def test_listed_approvals_refused_for_every_agent() -> None:
+    """Runner 51b8132 (v2 review I2, plan B): approval "listed" with patterns is
+    refused for every agent until approvals ship (a command list is guidance, so it
+    can't keep a listed operation from running); without patterns it asks nothing."""
+    assert LISTED_NOT_YET == ("listed approvals aren't available yet: use approval 'auto' "
+                              "or 'always'")
+    assert "\u2014" in LISTED_WITH_WRITES  # kept, unreachable until approvals ship
     listed = {"policy": "listed", "patterns": ["systemctl restart"]}
-    for cmds in ({"mode": "shell"}, {"mode": "list", "allow": ["systemctl status"]}):
-        with pytest.raises(DefinitionError) as exc:
-            validate_definition(_def(kind="operator", access={"commands": cmds},
-                                     approval=listed), LOCAL)
-        assert str(exc.value) == LISTED_WITH_WRITES
-    # not a writer, no command, or no pattern: fine
+    for kind, machine, extra in (("operator", LOCAL, {}), ("observer", LOCAL, {}),
+                                 ("operator", ROOT, {}),
+                                 ("observer", ROOT, {"run_as": "deploy"})):
+        for cmds in (None, {"mode": "shell"}, {"mode": "none"}, {"mode": "list"},
+                     {"mode": "list", "allow": ["java", "sqlite3"]},
+                     {"mode": "list", "allow": ["systemctl status"]}):
+            for runtime in ("claude", "opencode", "cline"):
+                raw = _def(kind=kind, runtime=runtime, approval=listed, **extra,
+                           **({"access": {"commands": cmds}} if cmds else {}))
+                with pytest.raises(DefinitionError) as exc:
+                    validate_definition(raw, machine)
+                assert str(exc.value) == LISTED_NOT_YET, (kind, cmds, runtime)
+    # auto/always with patterns, or listed without patterns: fine
     validate_definition(_def(kind="operator", approval={**listed, "policy": "always"}), LOCAL)
-    validate_definition(_def(kind="operator", access={"commands": {"mode": "none"}},
-                             approval=listed), LOCAL)
+    validate_definition(_def(kind="operator", approval={**listed, "policy": "auto"}), LOCAL)
     validate_definition(_def(kind="operator", approval={"policy": "listed", "patterns": []}),
                         LOCAL)
-    validate_definition(_def(access={"commands": {"mode": "list", "allow": [
-        "systemctl status"]}}, approval=listed), LOCAL)  # an observer
+    validate_definition(_def(approval={"policy": "listed"}), LOCAL)  # an observer
+    # the bad-pattern checks come first (as in the launcher's _entries)
+    with pytest.raises(DefinitionError, match="start with a command"):
+        validate_definition(_def(approval={"policy": "listed", "patterns": ["-f"]}), LOCAL)
 
 
 @pytest.mark.parametrize("word", [
@@ -1107,7 +1122,10 @@ def test_read_only_sandbox_problem_truth_table() -> None:
 
 
 # (definition overrides, expected warnings per machine)
-_G, _U, _N = [LIST_IS_GUIDANCE], [UNSANDBOXED_WRITER_WARNING], [READ_ONLY_NETWORK_WARNING]
+_G, _N = [LIST_IS_GUIDANCE], [READ_ONLY_NETWORK_WARNING]
+# Runner 51b8132: the warning names the OS user (run_as, else the launcher's own user,
+# which only the launcher knows)
+_U = [UNSANDBOXED_WRITER_WARNING.format(user=UNKNOWN_USER)]
 _NO_WARNINGS: dict[str, list[str]] = {m: [] for m in MACHINES}
 _ACCESS_WARNING_CASES: list[tuple[dict[str, Any], dict[str, list[str]]]] = [
     ({"kind": "operator", "access": {"commands": {"mode": "list", "allow": ["git status"]}}},
@@ -1126,6 +1144,8 @@ _ACCESS_WARNING_CASES: list[tuple[dict[str, Any], dict[str, list[str]]]] = [
      {"local": [], "root-user": []}),
     ({"kind": "operator", "approval": {"policy": "always"}},         # always: no commands
      _NO_WARNINGS),
+    ({"kind": "operator", "run_as": "deploy"},                       # names run_as
+     {m: [UNSANDBOXED_WRITER_WARNING.format(user="deploy")] for m in ("root", "root-nobw")}),
 ]
 
 
@@ -1143,10 +1163,13 @@ def test_access_warnings_match_the_launcher() -> None:
     for read_only in (True, False):
         for mode in ("none", "list", "shell"):
             for sandboxed in (True, False):
-                assert access_warnings(
-                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed
-                ) == perms.access_warnings(
-                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed)
+                for user in (None, "deploy"):
+                    assert access_warnings(
+                        read_only=read_only, commands_mode=mode, sandboxed=sandboxed,
+                        user=user,
+                    ) == perms.access_warnings(
+                        read_only=read_only, commands_mode=mode, sandboxed=sandboxed,
+                        user=user)
                 assert read_only_sandbox_problem(
                     read_only=read_only, commands_mode=mode, sandboxed=sandboxed
                 ) == perms.read_only_sandbox_problem(
@@ -1177,20 +1200,18 @@ def test_observer_as_root_needs_commands_none(access: dict[str, Any], refused: b
 
 def test_empty_list_is_no_commands() -> None:
     """Runner 7f06d1f/8f6ff56: a list with no allow and no privileged entry runs
-    nothing: no read-only-without-sandbox refusal, a host list is fine, listed
-    patterns are ignored (no LISTED_WITH_WRITES), no warnings."""
+    nothing: no read-only-without-sandbox refusal, a host list is fine, no warnings
+    (listed patterns are refused for every agent since Runner 51b8132)."""
     empty = {"commands": {"mode": "list"}}
     validate_definition(_def(workdir="/var", run_as="mon", access=empty), NO_BWRAP_ROOT)
     validate_definition(_def(kind="operator", access={**empty, "network": ["a.com"]}), LOCAL)
-    d = validate_definition(_def(kind="operator", access=empty, approval={
-        "policy": "listed", "patterns": ["systemctl restart"]}), LOCAL)
-    assert definition_warnings(d, LOCAL) == []
-    # privileged entries only: still commands (swv-root)
-    with pytest.raises(DefinitionError) as exc:
-        validate_definition(_def(kind="operator", workdir="/opt", access={"commands": {
-            "mode": "list", "privileged": ["journalctl -u"]}}, approval={
-            "policy": "listed", "patterns": ["systemctl restart"]}), ROOT)
-    assert str(exc.value) == LISTED_WITH_WRITES
+    d = validate_definition(_def(kind="operator", access=empty), ROOT)
+    assert definition_warnings(d, ROOT) == []
+    # privileged entries only: still commands (swv-root), unsandboxed on --root
+    d = validate_definition(_def(kind="operator", workdir="/opt", access={"commands": {
+        "mode": "list", "privileged": ["journalctl -u"]}}), ROOT)
+    assert definition_warnings(d, ROOT) == [
+        LIST_IS_GUIDANCE, UNSANDBOXED_WRITER_WARNING.format(user=UNKNOWN_USER)]
 
 
 def test_read_only_network_warning() -> None:

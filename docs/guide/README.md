@@ -963,7 +963,8 @@ that session ends.
 
 **What the broker checks at deploy.** Every rule of the launcher that does not need the
 machine itself: the schema, the ceiling, the root-execution rules, the command rules
-(listed approvals, which are refused for an agent that can write; `privileged` entries
+(approval `listed` with patterns, refused for every agent until approvals ship: "listed
+approvals aren't available yet: use approval 'auto' or 'always'"; `privileged` entries
 that would run other commands, such as shells, interpreters, `eval`/`source` or `git`;
 write globs that would name `.git` or a runtime's configuration or instruction file, such
 as `.git`, `**/AGENTS.md` or `*.md`), host and glob syntax, the model name and what the
@@ -986,7 +987,9 @@ everything). An empty command list (no allow and no privileged entry) means no c
 An operator's command list guides the agent but does not stop it:
 test runners, build tools and the folder's own scripts run code it can write. The deploy
 answer shows this as a warning, and a `--root` operator gets "this agent runs without the
-OS sandbox: it can do anything its user can ..."; choose the writable paths, the sandbox
+OS sandbox: it can do anything the OS user deploy can on this machine" (its `run_as`
+user; without one the broker says "the OS user of its launcher", and the launcher's own
+status names that user); choose the writable paths, the sandbox
 and `run_as` for what the agent must not reach.
 
 A deploy the broker accepts can still be `rejected` by the launcher for a machine reason:

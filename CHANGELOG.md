@@ -19,21 +19,13 @@ lists are relayed, never stored.
   launcher that offers `run_as` (runs as root); otherwise 400 `outside_ceiling`.
   `privileged` entries are stored as written: the launcher runs only the options an
   entry spells, so list each option used (`journalctl -u`, `journalctl -n`).
-- **Listed approvals are checked against the allowed commands** (the launcher's rule,
-  refused up front with 400 `invalid_request`): with approval `listed`, an `allow` or
-  `privileged` entry that shares a pattern's command word must differ from it at a
-  subcommand word, with no option word before that point. Allow `systemctl status` with
-  the pattern `systemctl restart` is accepted; allow `systemctl` (it would run
-  `systemctl restart` unasked), `systemctl restart nginx` (it would always ask) or
-  `systemctl -H x status` with `systemctl -H x restart` are refused. Listed patterns are
-  also refused with
-  commands mode `shell`, and with any `allow` or `privileged` entry that runs other
-  commands (see command runners below), which could run a listed command unchecked.
-  **Listed patterns are refused for an agent that can write** (an operator unless
-  approval is `always`; its empty write list means `.`), in every commands mode but
-  `none`: it can run project code (tests, builds, scripts), so a listed approval cannot
-  protect it. Use approval `always` or `auto` until approvals ship; listed patterns stay
-  available to observers.
+- **Listed approvals are refused until approvals ship** (the launcher's rule, refused up
+  front with 400 `invalid_request`): approval `listed` with patterns is refused for every
+  agent, whatever its kind, runtime and commands mode, with "listed approvals aren't
+  available yet: use approval 'auto' or 'always'" (`LISTED_NOT_YET`). The command list
+  is guidance, so it can't keep a listed operation from running. `listed` without
+  patterns asks nothing and is accepted, like `auto`. The bad-pattern checks (a pattern
+  starting with an option) come first.
 - **Access model v2** (owner decision; the Runner's rules, mirrored exactly): an agent's
   limits are its files (read-only or writable paths) and its network, enforced by the
   launcher's sandbox (`--local`, and observers on `--root` launchers with bubblewrap)
@@ -41,8 +33,8 @@ lists are relayed, never stored.
   security limit.**
   - Observers (read-only) default to commands `shell` and may use any mode and any
     command (the "read commands only" rule is gone). An empty `list` (no allow and no
-    privileged entry) means no commands everywhere: it needs no sandbox, allows a host
-    list, and its listed approval patterns are ignored.
+    privileged entry) means no commands everywhere: it needs no sandbox and allows a host
+    list.
     Without the sandbox a read-only agent with commands is refused (400, the Runner's
     `READ_ONLY_NEEDS_SANDBOX`: install bubblewrap, or set
     commands to `none`); on a `--root` launcher without bubblewrap only commands
@@ -56,7 +48,9 @@ lists are relayed, never stored.
   - Operators (writers) may list any command, command runners and `git` included. A
     deploy in list mode carries the note `LIST_IS_GUIDANCE`; an operator that runs
     commands without the sandbox (a `--root` operator) carries
-    `UNSANDBOXED_WRITER_WARNING` (it can do anything its run_as user, else root, can).
+    `UNSANDBOXED_WRITER_WARNING`: "this agent runs without the OS sandbox: it can do
+    anything the OS user {user} can on this machine", naming its `run_as` user, else
+    "of its launcher" (the launcher's own status names its actual user).
     The deploy answer has these in `warnings`, and the stored definition's deploy
     warnings show them until the launcher reports its own (which add, for a `--root`
     observer, that denied files are hidden only under its workdir and observed paths:
@@ -66,9 +60,15 @@ lists are relayed, never stored.
     entries: shells, `env`, `xargs`, `sudo`, interpreters, shell builtins such as
     `eval`/`source`, `find`, `awk`, `sed`, `ssh`, `git`, ...; compared by basename with a
     version suffix stripped, so `perl5.36` is `perl`), refused with
-    `PRIVILEGED_RUNNER_PROBLEM`; listed approvals (refused for writers, and with a shell
-    or a command runner); protected write globs; the network rules. The broker no longer
+    `PRIVILEGED_RUNNER_PROBLEM`; protected write globs; the network rules. The broker no longer
     refuses a claude command list outside the sandbox.
+- **The launcher's summary texts are exported** by `sessionweave.definitions`, word for
+  word, for the Cockpit's preview (the broker does not build the summary):
+  `DENY_SUMMARY_SANDBOXED`, `DENY_SUMMARY_ROOT_OBSERVER` and `DENY_ROOT_OBSERVER_WARNING`
+  (denied files are hidden by path only: copies under other names, hard links and git
+  history stay readable), `DENY_SUMMARY_UNSANDBOXED`, `READ_SUMMARY_LOCAL`,
+  `READ_SUMMARY_ROOT_OBSERVER`, `READ_SUMMARY_UNSANDBOXED`, `WRITE_SUMMARY_WHOLE_FOLDER`,
+  `WRITE_SUMMARY_UNSANDBOXED`, `NETWORK_SUMMARY_NONE_WITH_COMMANDS` and `LISTED_NOT_YET`.
 - **Write globs never name a protected file** (the launcher's
   `protected_write_problem`): every `/` part of a write glob is compared with the
   runtimes' configuration and instruction files and `.git` (`.claude`, `.mcp.json`,
@@ -91,8 +91,8 @@ lists are relayed, never stored.
   `run_as` or `observer_as_root`; `observer_as_root` needs the machine's bubblewrap
   sandbox (`outside_ceiling`) and is refused for cline. What each runtime can enforce
   (the launcher's `RUNTIME_CAPS`): claude refuses a `files.read` list other than `.`,
-  `host:port` entries, paths with whitespace, `,` or parentheses, and a command list
-  with listed patterns; opencode refuses a single `*`
+  `host:port` entries, and paths with whitespace, `,` or parentheses; opencode refuses
+  a single `*`
   in read/write globs and `*.name` hosts; cline refuses host lists. `privileged`
   entries under approval `always` (which leaves no commands) no longer need a launcher
   running as root. Randomized comparisons against the Runner's own validator and

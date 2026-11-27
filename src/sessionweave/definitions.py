@@ -552,7 +552,9 @@ PROTECTED_WRITE_NAMES = (
     ".cline", ".agents", ".cursorrules", ".windsurfrules", "CLAUDE.md", "CLAUDE.local.md",
     "AGENTS.md", ".git",
 )
-# The launcher's ``PROTECTED_WRITE_PROBLEM`` and ``LISTED_WITH_WRITES``, word for word.
+# The launcher's ``LISTED_NOT_YET``, ``PROTECTED_WRITE_PROBLEM`` and
+# ``LISTED_WITH_WRITES``, word for word.
+LISTED_NOT_YET = "listed approvals aren't available yet: use approval 'auto' or 'always'"
 PROTECTED_WRITE_PROBLEM = (
     "write path {glob!r} would make {name!r} writable: the runtime configuration, "
     "instruction and git files stay read-only for agents (name the directories to "
@@ -586,15 +588,23 @@ def protected_write_problem(globs: list[str]) -> str | None:
 
 
 def _write_rules(d: dict[str, Any]) -> None:
-    """The launcher's write checks, in its order (before the listed-approval rules):
-    the write globs (an operator's empty list is the default ``.``; approval "always"
-    does not excuse a bad glob) never name a protected file, and approval ``listed``
-    with patterns is refused for an agent that can write (it can run project code)."""
+    """The launcher's first permission checks, in its order (before the listed-approval
+    rules): approval ``listed`` with patterns is refused for every agent until
+    approvals ship (``LISTED_NOT_YET``); the write globs (an operator's empty list is
+    the default ``.``; approval "always" does not excuse a bad glob) never name a
+    protected file, and approval ``listed`` with patterns is refused for an agent that
+    can write (it can run project code; unreachable until approvals ship)."""
+    approval = d["approval"]
+    if approval["policy"] == "listed" and approval["patterns"]:
+        # Runner 51b8132 (v2 review I2, plan B): a command list is guidance, so it
+        # can't keep a listed operation from running. The listed rules below
+        # (``LISTED_WITH_WRITES``, ``_listed_overlap``, claude's list rule) are kept
+        # for when approvals ship, unreachable until then, as in the launcher.
+        raise DefinitionError(LISTED_NOT_YET)
     observer = d["kind"] == "observer"
     writes = [] if observer else (d["access"]["files"]["write"] or ["."])
     if (why := protected_write_problem(writes)) is not None:
         raise DefinitionError(why)
-    approval = d["approval"]
     if (
         approval["policy"] == "listed" and approval["patterns"]
         and _mode_of(d["access"]["commands"]) != "none" and writes
@@ -607,10 +617,14 @@ LIST_IS_GUIDANCE = (
     "the command list guides the agent; it is not a security limit - the sandbox and "
     "the writable paths are"
 )
+# ``{user}``: the OS user the agent runs as. The broker knows only a definition's
+# ``run_as``; else it names the launcher's own user as the launcher's fallback does
+# (``UNKNOWN_USER``).
 UNSANDBOXED_WRITER_WARNING = (
-    "this agent runs without the OS sandbox: it can do anything its user can on this "
-    "machine (its run_as user, else root), within that user's own permissions"
+    "this agent runs without the OS sandbox: it can do anything the OS user {user} can on "
+    "this machine"
 )
+UNKNOWN_USER = "of its launcher"
 READ_ONLY_NEEDS_SANDBOX = (
     "read-only can't be guaranteed without the OS sandbox: this agent can run commands "
     "and this machine has no usable bubblewrap. Install it and restart the "
@@ -638,20 +652,33 @@ NETWORK_SUMMARY_NONE_WITH_COMMANDS = (
     "- Network: web tools off (commands can still reach the network)"
 )
 DENY_SUMMARY_SANDBOXED = (
-    "- Hidden from you: {globs} (files present when you start; do not try to read or "
-    "copy them)"
+    "- Hidden from you by path: {globs} (files present when you start; copies under other "
+    "names, hard links and git history stay readable: do not try to read or copy them)"
 )
 DENY_SUMMARY_ROOT_OBSERVER = (
-    "- Hidden from you under {roots} only: {globs} (files present when you start; do not "
-    "try to read or copy them); elsewhere on the machine they stay readable"
+    "- Hidden from you by path under {roots} only: {globs} (files present when you start; "
+    "elsewhere on the machine, copies under other names, hard links and git history stay "
+    "readable: do not try to read or copy them)"
 )
 DENY_ROOT_OBSERVER_WARNING = (
-    "denied files ({globs}) are hidden under {roots} only; elsewhere on the machine they "
-    "stay readable"
+    "denied files ({globs}) are hidden by path under {roots} only; elsewhere on the "
+    "machine, under other names (copies, hard links) and in git history they stay readable"
 )
 DENY_SUMMARY_UNSANDBOXED = (
     "- Your file tools can't read: {globs} (commands run with your OS user's permissions)"
 )
+# The extra parts of the summary's Read and Write lines (what the sandbox shows besides
+# the workdir and the observed paths; when commands can write more than the globs).
+# ``{folder}`` in ``READ_SUMMARY_LOCAL``: "the folder <ceiling>, " when the --local
+# ceiling differs from the workdir, else empty.
+READ_SUMMARY_LOCAL = "visible too: {folder}system files (/usr, /bin, /lib, /etc)"
+READ_SUMMARY_ROOT_OBSERVER = (
+    "visible too: the whole machine as far as your OS user may read it, except /root, "
+    "/run, /tmp and hidden secret files"
+)
+READ_SUMMARY_UNSANDBOXED = "commands: whatever your OS user can read"
+WRITE_SUMMARY_WHOLE_FOLDER = "commands can write the whole folder {folder}"
+WRITE_SUMMARY_UNSANDBOXED = "commands: whatever your OS user can write"
 
 
 def runs_sandboxed(kind: str, machine: Machine) -> bool:
@@ -673,12 +700,14 @@ def read_only_sandbox_problem(*, read_only: bool, commands_mode: str,
     return None
 
 
-def access_warnings(*, read_only: bool, commands_mode: str, sandboxed: bool) -> list[str]:
+def access_warnings(*, read_only: bool, commands_mode: str, sandboxed: bool,
+                    user: str | None = None) -> list[str]:
     """The launcher's ``access_warnings`` (``read_only``: the agent cannot write):
     ``READ_ONLY_NETWORK_WARNING`` for an agent that cannot write but runs commands;
     for one that can write, ``LIST_IS_GUIDANCE`` in list mode and
     ``UNSANDBOXED_WRITER_WARNING`` when it runs commands without the sandbox (a
-    ``--root`` operator)."""
+    ``--root`` operator), naming ``user`` (the OS user it runs as; ``UNKNOWN_USER``
+    when unknown)."""
     out: list[str] = []
     if read_only:
         if commands_mode != "none":
@@ -687,7 +716,7 @@ def access_warnings(*, read_only: bool, commands_mode: str, sandboxed: bool) -> 
     if commands_mode == "list":
         out.append(LIST_IS_GUIDANCE)
     if commands_mode != "none" and not sandboxed:
-        out.append(UNSANDBOXED_WRITER_WARNING)
+        out.append(UNSANDBOXED_WRITER_WARNING.format(user=user or UNKNOWN_USER))
     return out
 
 
@@ -713,10 +742,12 @@ def _effective_access(d: dict[str, Any]) -> tuple[bool, str]:
 def definition_warnings(d: dict[str, Any], machine: Machine) -> list[str]:
     """Warnings the launcher will report for the (normalised) definition ``d`` that
     the broker can already tell (shown at deploy, before the launcher answers; the
-    launcher's own warnings replace them with its status): its ``access_warnings``."""
+    launcher's own warnings replace them with its status): its ``access_warnings``,
+    naming the ``run_as`` user (else the launcher's user, which only the launcher
+    knows: ``UNKNOWN_USER``)."""
     read_only, mode = _effective_access(d)
     return access_warnings(read_only=read_only, commands_mode=mode,
-                           sandboxed=runs_sandboxed(d["kind"], machine))
+                           sandboxed=runs_sandboxed(d["kind"], machine), user=d["run_as"])
 
 
 NETWORK_NEEDS_NO_COMMANDS = (

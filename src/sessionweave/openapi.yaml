@@ -616,8 +616,7 @@ components:
         network, enforced by the launcher's sandbox and the `run_as` user; the command
         list is guidance, not a security limit. Both kinds default to commands `shell`
         and may use any mode and command (an empty `list`, without allow and privileged
-        entries, means no commands: no sandbox needed, a host list allowed, listed
-        patterns ignored). An
+        entries, means no commands: no sandbox needed, a host list allowed). An
         observer (or approval `always`) is read-only: with commands (`shell` or `list`)
         it needs the sandbox (every agent of a `--local` launcher; on `--root` an
         observer on a machine with bubblewrap), else it is refused with "read-only
@@ -629,7 +628,9 @@ components:
         ...").
         An operator gets the deploy warnings "the command list guides
         the agent; it is not a security limit ..." (list mode) and "this agent runs
-        without the OS sandbox ..." (a `--root` operator with commands). `privileged`
+        without the OS sandbox: it can do anything the OS user <user> can on this
+        machine" (a `--root` operator with commands; <user> is its `run_as` user, else
+        "of its launcher", which the launcher's own status replaces with its user). `privileged`
         entries never start with a command that runs other commands (shells, `env`,
         `xargs`, `sudo`, interpreters such as `python*`, `perl5.36`, `node18`, shell
         builtins such as `eval`/`source`, `find`, `awk`, `sed`, `ssh`, `git`, ...; the
@@ -643,14 +644,11 @@ components:
         `AGENTS.md`); `.`, `**`, `src/**`, `*.py` are fine, `.git`, `**/AGENTS.md`,
         `*.md` are refused (also with approval `always`).
 
-        Approval `listed` with patterns is refused for an agent that can write (unless
-        commands mode is `none`). Otherwise: commands mode `list` (not
-        `shell`); no `allow`/`privileged` entry may be a command runner (see above); an entry
-        sharing a pattern's command word must differ from it at a subcommand word with
-        no option word before (allow `systemctl status` with `systemctl restart` is
-        accepted; allow `systemctl` or `systemctl restart nginx` with `systemctl
-        restart`, or `systemctl -H x status` with `systemctl -H x restart`, is
-        refused).
+        Approval `listed` with patterns is refused for every agent, whatever its kind,
+        runtime and commands, until approvals ship: "listed approvals aren't available
+        yet: use approval 'auto' or 'always'" (`invalid_request`; a command list is
+        guidance, so it can't keep a listed operation from running). `listed` without
+        patterns asks nothing and is accepted, like `auto`.
 
         Network: a host list (also `[]`) needs commands mode `none` (or approval
         `always`): a shell or a command list reaches any host. Hosts are lowercase
@@ -663,7 +661,7 @@ components:
 
         Per runtime (what it can enforce): claude refuses a `files.read` list other
         than `.`, `host:port` entries, paths with whitespace, `,` or parentheses
-        (workdir and globs) and a command list with approval `listed` patterns; opencode refuses a single `*` in read/write
+        (workdir and globs); opencode refuses a single `*` in read/write
         globs (use `dir` or `dir/**`) and `*.name` hosts; cline refuses host lists.
         Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
@@ -697,7 +695,7 @@ components:
         approval:
           type: object
           properties:
-            policy: { type: string, enum: [auto, listed, always], default: auto }
+            policy: { type: string, enum: [auto, listed, always], default: auto, description: "listed with patterns is refused until approvals ship (use auto or always)" }
             patterns: { type: array, maxItems: 100, items: { type: string, maxLength: 200 } }
         instructions: { type: string, description: Standing instructions (at most 16 KiB UTF-8) }
         max_instances: { type: integer, minimum: 1, maximum: 32 }
