@@ -615,7 +615,7 @@ READ_ONLY_NEEDS_SANDBOX = (
     "read-only can't be guaranteed without the OS sandbox: this agent can run commands "
     "and this machine has no usable bubblewrap. Install it and restart the "
     "launcher (Ubuntu 24.04: also enable its AppArmor profile, see the bwrap "
-    "prerequisite), use observer_as_root, or set commands to none"
+    "prerequisite), or set commands to none"
 )
 PRIVILEGED_RUNNER_PROBLEM = (
     "privileged entry '{entry}' can run other commands: swv-root would run them as root "
