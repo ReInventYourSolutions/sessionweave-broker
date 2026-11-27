@@ -336,24 +336,23 @@ async def test_repeated_status_is_recorded_and_announced_once(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_git_list_warning_shown_at_deploy(tmp_path: Path) -> None:
-    """Owner decision: a writer may list git. The deploy answer and the stored deploy
-    state carry the launcher's warning (sandboxed on a --local machine) before the
-    launcher answers; its own status then replaces it."""
-    from sessionweave.definitions import GIT_LIST_WARNING
+async def test_access_warnings_shown_at_deploy(tmp_path: Path) -> None:
+    """Access model v2: the deploy answer and the stored deploy state carry the
+    launcher's access warnings (a writer's list is guidance) before the launcher
+    answers; its own status then replaces them."""
+    from sessionweave.definitions import LIST_IS_GUIDANCE
 
     store, machines, dm = await _setup(tmp_path)
     try:
         raw = {**_DEF, "kind": "operator", "runtime": "opencode",
-               "access": {"commands": {"mode": "list", "allow": ["git status", "ls"]}}}
+               "access": {"commands": {"mode": "list", "allow": ["git status", "env git"]}}}
         out = await dm.deploy(OPEN_OWNER, KEY, "obs", raw)
-        assert out["warnings"] == [GIT_LIST_WARNING]
+        assert out["warnings"] == [LIST_IS_GUIDANCE]  # a --local machine: sandboxed
         row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
-        assert row.deploy()["warnings"] == [GIT_LIST_WARNING]
+        assert row.deploy()["warnings"] == [LIST_IS_GUIDANCE]
         assert "warnings" not in row.definition  # the definition itself is unchanged
-        # without git: no warning; a redeploy resets what was stored
-        out = await dm.deploy(OPEN_OWNER, KEY, "obs", {**raw, "access": {
-            "commands": {"mode": "list", "allow": ["ls"]}}})
+        # shell: no warning in the sandbox; a redeploy resets what was stored
+        out = await dm.deploy(OPEN_OWNER, KEY, "obs", {**raw, "access": {}})
         assert out["warnings"] == []
         assert (await machines.get_definition(OPEN_OWNER, KEY, "obs")).warnings == []
         await dm.deploy(OPEN_OWNER, KEY, "obs", raw)
@@ -363,8 +362,8 @@ async def test_git_list_warning_shown_at_deploy(tmp_path: Path) -> None:
         lid, _ = dm._launchers.register(_SinkConn(), None, {"machine": "box", "profiles": []},
                                         v2=v2)
         await dm.on_status(lid, {"id": "obs", "revision": 3, "state": "applied",
-                                 "warnings": [GIT_LIST_WARNING, "launcher's own"]})
+                                 "warnings": [LIST_IS_GUIDANCE, "launcher's own"]})
         row = await machines.get_definition(OPEN_OWNER, KEY, "obs")
-        assert row.warnings == [GIT_LIST_WARNING, "launcher's own"]
+        assert row.warnings == [LIST_IS_GUIDANCE, "launcher's own"]
     finally:
         await store.close()

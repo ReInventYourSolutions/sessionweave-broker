@@ -963,23 +963,34 @@ that session ends.
 
 **What the broker checks at deploy.** Every rule of the launcher that does not need the
 machine itself: the schema, the ceiling, the root-execution rules, the command rules
-(listed approvals, which are refused for an agent that can write; command runners such as
-shells, interpreters and `eval`/`source` in the list of an agent that can write, where
-`git` is accepted with a warning shown at deploy and `git` in `privileged` is refused;
+(listed approvals, which are refused for an agent that can write; `privileged` entries
+that would run other commands, such as shells, interpreters, `eval`/`source` or `git`;
 write globs that would name `.git` or a runtime's configuration or instruction file, such
 as `.git`, `**/AGENTS.md` or `*.md`), host and glob syntax, the model name and what the
 runtime can enforce (see the OpenAPI `AgentDefinition`). An operator's empty write list
 means `.`: it can write unless its approval is `always`.
 
-**For an agent that can write, a command list limits convenience, not capability.** Test
-runners, build tools, package managers, linters and the folder's own scripts run code the
-agent can write, so the list does not stop it from running anything. The boundary is the
-launcher's sandbox (`--local`) and `run_as` (a `--root` operator without `run_as` runs as
-root by design); choose them for what the agent must not reach. A deploy the broker accepts can still be
-`rejected` by the launcher for a machine reason: the runtime is missing or not logged in,
-a path does not exist or resolves elsewhere, the sandbox cannot run the agent, a local
-profile has the same id. **Such a rejection is not retried**: fix the machine, then deploy
-the definition again (a new revision; the Cockpit's Deploy on the same content does it).
+**Access model: files and network are the limits, the command list is guidance.** An
+agent's limits are the paths it may read and write and its network; the launcher's
+sandbox (every agent of a `--local` launcher, observers on a `--root` launcher with
+bubblewrap) and, on `--root` launchers, the `run_as` user's OS permissions enforce them.
+An observer may run any command (default `shell`) but never modify files: without the
+sandbox a read-only agent with commands is refused ("read-only can't be guaranteed
+without the OS sandbox ..."; install bubblewrap, use `observer_as_root`, or set its
+commands to `none`). Read-only covers files only: an agent that cannot write but runs
+commands can still reach the network and the services there (network `none` turns the
+web tools off; it does not isolate commands), which its deploy warning says;
+`observer_as_root` with commands needs network `none`. An operator's command list guides the agent but does not stop it:
+test runners, build tools and the folder's own scripts run code it can write. The deploy
+answer shows this as a warning, and a `--root` operator gets "this agent runs without the
+OS sandbox: it can do anything its user can ..."; choose the writable paths, the sandbox
+and `run_as` for what the agent must not reach.
+
+A deploy the broker accepts can still be `rejected` by the launcher for a machine reason:
+the runtime is missing or not logged in, a path does not exist or resolves elsewhere, the
+sandbox cannot run the agent, a local profile has the same id. **Such a rejection is not
+retried**: fix the machine, then deploy the definition again (a new revision; the
+Cockpit's Deploy on the same content does it).
 
 **Published-profiles budget.** A launcher publishes at most 192 KiB of profiles (its
 hello and `profiles` frames must stay under the broker's 256 KiB frame cap). The broker

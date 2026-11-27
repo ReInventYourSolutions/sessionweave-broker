@@ -14,9 +14,7 @@ lists are relayed, never stored.
 
 - **Definition checks match the launcher's.** A deploy is now refused up front (400
   `invalid_request`) when a command entry or approval pattern starts with an option
-  (`-`), when an observer's `allow` entry is not a read command (it must start with one
-  of `ls`, `cat`, `head`, `tail`, `grep`, `journalctl`, `ps`, `top -b`,
-  `systemctl status`, ...), or when `observer_as_root` is combined with a `run_as` user.
+  (`-`), or when `observer_as_root` is combined with a `run_as` user.
   Root execution (`run_as`, `privileged` commands, `observer_as_root`) needs a `--root`
   launcher that offers `run_as` (runs as root); otherwise 400 `outside_ceiling`.
   `privileged` entries are stored as written: the launcher runs only the options an
@@ -27,8 +25,8 @@ lists are relayed, never stored.
   subcommand word, with no option word before that point. Allow `systemctl status` with
   the pattern `systemctl restart` is accepted; allow `systemctl` (it would run
   `systemctl restart` unasked), `systemctl restart nginx` (it would always ask) or
-  `systemctl -H x status` with `systemctl -H x restart` are refused. An observer's empty
-  allow list counts as the default read commands. Listed patterns are also refused with
+  `systemctl -H x status` with `systemctl -H x restart` are refused. Listed patterns are
+  also refused with
   commands mode `shell`, and with any `allow` or `privileged` entry that runs other
   commands (see command runners below), which could run a listed command unchecked.
   **Listed patterns are refused for an agent that can write** (an operator unless
@@ -36,31 +34,38 @@ lists are relayed, never stored.
   `none`: it can run project code (tests, builds, scripts), so a listed approval cannot
   protect it. Use approval `always` or `auto` until approvals ship; listed patterns stay
   available to observers.
-- **Command runners** (the launcher's `COMMAND_WRAPPERS`, 114 entries, copied exactly):
-  shells, `env`, `xargs`, `sudo`, `time`, `socat`, `tmux`, interpreters (`python*`,
-  `perl`, `node`, `Rscript`, ...), shell builtins and keywords that run a string or a
-  file (`eval`, `source`, `.`, `builtin`, `trap`, `coproc`, `fc`, `alias`, `enable`,
-  `let`, `mapfile`, `readarray`, `hash`; zsh `autoload`, `zmodload`, `noglob`,
-  `nocorrect`, `sched`, `zpty`), dynamic loaders (`ld-linux*`, `ld.so`), `find`, `awk`,
-  `sed`, `ssh`, `zip`, and `git` (it runs `core.fsmonitor`, hooks and diff/filter
-  drivers from repository config that its own `--output` can write). Compared by the
-  command word's basename with a trailing version suffix stripped (`perl5.36`,
-  `python3.12`, `node18`, `lua-5.4` count as `perl`, `python`, `node`, `lua`). They are
-  refused in `allow`/`privileged` with listed patterns, and in commands mode `list` for
-  every agent that can write (an operator unless approval is `always`): such an agent
-  could run any command through them. Read-only agents keep them. **Exception (owner
-  decision): a writer may list `git` in `allow`**, accepted with a warning that git
-  can run other commands (hooks, config, aliases), so the agent can effectively run any
-  command inside the sandbox, or on the machine as its user when it runs without one (a
-  `--root` operator). The deploy answer carries it in `warnings` and the stored
-  definition's deploy warnings show it until the launcher reports its own. `env git`,
-  `nice git`, `xargs git` and other runners stay refused, and so does `git` in
-  `privileged` (the root helper runs it as root outside the sandbox). `docker`, `kubectl`
-  and `systemctl` are not runners: the subcommand rule governs them. Even so, **for an
-  agent that can write, a command list limits convenience, not capability**: test
-  runners, build tools, package managers, linters and the folder's own scripts run code
-  the agent can write. The boundary is the sandbox (`--local`) and `run_as` (a `--root`
-  operator without `run_as` runs as root by design).
+- **Access model v2** (owner decision; the Runner's rules, mirrored exactly): an agent's
+  limits are its files (read-only or writable paths) and its network, enforced by the
+  launcher's sandbox (`--local`, and observers on `--root` launchers with bubblewrap)
+  and the `run_as` user on `--root` launchers. **The command list is guidance, not a
+  security limit.**
+  - Observers (read-only) default to commands `shell` and may use any mode and any
+    command (the "read commands only" rule is gone; an empty `list` means no commands).
+    Without the sandbox a read-only agent with commands is refused (400, the Runner's
+    `READ_ONLY_NEEDS_SANDBOX`: install bubblewrap, use `observer_as_root`, or set
+    commands to `none`); on a `--root` launcher without bubblewrap only commands
+    `none` remains. An agent that cannot write but runs commands gets the deploy warning
+    "read-only covers files only: commands can reach the network and call the services
+    there (including on this machine)": network `none` turns the web tools off but does
+    not isolate commands. `observer_as_root` with commands needs network `none` (400,
+    the Runner's `OBSERVER_AS_ROOT_NEEDS_NO_NETWORK`; it records intent until egress
+    filtering ships).
+  - Operators (writers) may list any command, command runners and `git` included. A
+    deploy in list mode carries the note `LIST_IS_GUIDANCE`; an operator that runs
+    commands without the sandbox (a `--root` operator) carries
+    `UNSANDBOXED_WRITER_WARNING` (it can do anything its run_as user, else root, can).
+    The deploy answer has these in `warnings`, and the stored definition's deploy
+    warnings show them until the launcher reports its own (which add, for a `--root`
+    observer, that denied files are hidden only under its workdir and observed paths:
+    the launcher computes that from the real paths).
+  - Kept as real boundaries: `privileged` entries (run as root by `swv-root` outside the
+    sandbox) never start with a command runner (the launcher's `COMMAND_WRAPPERS`, 114
+    entries: shells, `env`, `xargs`, `sudo`, interpreters, shell builtins such as
+    `eval`/`source`, `find`, `awk`, `sed`, `ssh`, `git`, ...; compared by basename with a
+    version suffix stripped, so `perl5.36` is `perl`), refused with
+    `PRIVILEGED_RUNNER_PROBLEM`; listed approvals (refused for writers, and with a shell
+    or a command runner); protected write globs; the network rules. The broker no longer
+    refuses a claude command list outside the sandbox.
 - **Write globs never name a protected file** (the launcher's
   `protected_write_problem`): every `/` part of a write glob is compared with the
   runtimes' configuration and instruction files and `.git` (`.claude`, `.mcp.json`,
@@ -83,9 +88,8 @@ lists are relayed, never stored.
   `run_as` or `observer_as_root`; `observer_as_root` needs the machine's bubblewrap
   sandbox (`outside_ceiling`) and is refused for cline. What each runtime can enforce
   (the launcher's `RUNTIME_CAPS`): claude refuses a `files.read` list other than `.`,
-  `host:port` entries, paths with whitespace, `,` or parentheses, a command list
-  outside the sandbox (an operator on a `--root` launcher, an observer on one without
-  bubblewrap) and a command list with listed patterns; opencode refuses a single `*`
+  `host:port` entries, paths with whitespace, `,` or parentheses, and a command list
+  with listed patterns; opencode refuses a single `*`
   in read/write globs and `*.name` hosts; cline refuses host lists. `privileged`
   entries under approval `always` (which leaves no commands) no longer need a launcher
   running as root. Randomized comparisons against the Runner's own validator and

@@ -607,27 +607,31 @@ components:
         the machine's bubblewrap sandbox (`outside_ceiling`) and is refused for the
         cline runtime; `run_as` is never `root` or the launcher's install user
         `sessionweave`; an observer on a `--root` launcher running as root needs
-        `run_as` (a non-root machine user) or `observer_as_root`. An observer never
-        writes files nor gets a shell, and its `allow` entries must start with a read
-        command (`ls`, `cat`, `tail`, `journalctl`, `ps`, `top -b`, `systemctl status`,
-        ...). Command entries and approval patterns start with a command, never an
-        option (`-`). A `privileged` entry allows exactly the options it spells: list
-        each option used (`journalctl -u`, `journalctl -n`).
+        `run_as` (a non-root machine user) or `observer_as_root`. Command entries and
+        approval patterns start with a command, never an option (`-`). A `privileged`
+        entry allows exactly the options it spells: list each option used
+        (`journalctl -u`, `journalctl -n`).
 
-        Command runners: commands that run other commands (shells, `env`, `xargs`,
-        `sudo`, `time`, interpreters such as `python*`, `perl`, `node`, also with a
-        version suffix like `perl5.36` or `node18`, `find`, `awk`, `sed`, `ssh`, and
-        `git`, which runs commands from repository config, and shell builtins that run a
-        string or a file: `eval`, `source`, `.`, `builtin`, `trap`, `alias`, ...; the
-        launcher's `COMMAND_WRAPPERS`). In commands mode `list`, an agent that can write
-        (an operator unless approval is `always`; an empty write list means `.`) may not
-        list one in `allow` or `privileged`, except `git` in `allow` (owner decision: an
-        explicit opt-in, accepted with a warning that git can run other commands, so the
-        agent can effectively run any command inside the sandbox, or on the machine
-        when it runs without one: a `--root` operator); a `privileged` git stays
-        refused. For such an agent a command list limits
-        convenience, not capability (test runners, builds and scripts run code it can
-        write): the sandbox (`--local`) and `run_as` are the boundary.
+        Access model v2: the limits are files (read-only or writable paths) and the
+        network, enforced by the launcher's sandbox and the `run_as` user; the command
+        list is guidance, not a security limit. Both kinds default to commands `shell`
+        and may use any mode and command (an empty `list` means no commands). An
+        observer (or approval `always`) is read-only: with commands (`shell` or `list`)
+        it needs the sandbox (every agent of a `--local` launcher; on `--root` an
+        observer on a machine with bubblewrap), else it is refused with "read-only
+        can't be guaranteed without the OS sandbox ..." (use `observer_as_root` or
+        commands `none`); with commands it gets the deploy warning "read-only covers
+        files only: commands can reach the network ..." (network `none` turns the web
+        tools off, it does not isolate commands). `observer_as_root` with commands needs
+        network `none` ("observer_as_root with commands needs network \"none\" ...").
+        An operator gets the deploy warnings "the command list guides
+        the agent; it is not a security limit ..." (list mode) and "this agent runs
+        without the OS sandbox ..." (a `--root` operator with commands). `privileged`
+        entries never start with a command that runs other commands (shells, `env`,
+        `xargs`, `sudo`, interpreters such as `python*`, `perl5.36`, `node18`, shell
+        builtins such as `eval`/`source`, `find`, `awk`, `sed`, `ssh`, `git`, ...; the
+        launcher's `COMMAND_WRAPPERS`): `swv-root` would run them as root outside the
+        sandbox.
 
         Write globs never name a protected file: no `/` part may equal, or as a
         wildcard match, `.git` or a runtime configuration/instruction file (`.claude`,
@@ -638,12 +642,12 @@ components:
 
         Approval `listed` with patterns is refused for an agent that can write (unless
         commands mode is `none`). Otherwise: commands mode `list` (not
-        `shell`); no `allow`/`privileged` entry may be a command runner; an entry
+        `shell`); no `allow`/`privileged` entry may be a command runner (see above); an entry
         sharing a pattern's command word must differ from it at a subcommand word with
         no option word before (allow `systemctl status` with `systemctl restart` is
         accepted; allow `systemctl` or `systemctl restart nginx` with `systemctl
         restart`, or `systemctl -H x status` with `systemctl -H x restart`, is
-        refused); an observer's empty `allow` stands for the default read commands.
+        refused).
 
         Network: a host list (also `[]`) needs commands mode `none` (or approval
         `always`): a shell or a command list reaches any host. Hosts are lowercase
@@ -656,9 +660,7 @@ components:
 
         Per runtime (what it can enforce): claude refuses a `files.read` list other
         than `.`, `host:port` entries, paths with whitespace, `,` or parentheses
-        (workdir and globs), a command list outside the sandbox (an operator on a
-        `--root` launcher, or an observer on one without bubblewrap) and a command list
-        with approval `listed` patterns; opencode refuses a single `*` in read/write
+        (workdir and globs) and a command list with approval `listed` patterns; opencode refuses a single `*` in read/write
         globs (use `dir` or `dir/**`) and `*.name` hosts; cline refuses host lists.
         Never carries secrets.
       required: [domain, role, runtime, kind, workdir, max_instances]
@@ -725,7 +727,7 @@ components:
         warnings:
           type: array
           items: { type: string }
-          description: "Deploy only: what the launcher will warn about that the broker can already tell (git in the command list of an agent that can write: the agent can effectively run any command inside the sandbox, or on the machine without one). Also stored as the definition's deploy warnings until the launcher reports its own"
+          description: "Deploy only: the launcher's access warnings the broker can already tell (an agent that cannot write but runs commands: read-only covers files only; an operator in list mode: the command list is guidance, not a security limit; an operator running commands without the sandbox, on a --root launcher: it can do anything its user can). Also stored as the definition's deploy warnings until the launcher reports its own"
     BrowseEntry:
       type: object
       required: [name, kind]

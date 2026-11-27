@@ -14,30 +14,35 @@ from sessionweave.definitions import (
     COMMAND_MODES,
     COMMAND_WRAPPERS,
     DEFINITION_MAX_BYTES,
-    GIT_LIST_WARNING,
-    GIT_LIST_WARNING_UNSANDBOXED,
     INSTRUCTIONS_MAX_BYTES,
     KINDS,
     LIMIT_MAX,
-    LIST_RUNNER_WITH_WRITES,
+    LIST_IS_GUIDANCE,
     LISTED_WITH_WRITES,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
+    OBSERVER_AS_ROOT_NEEDS_NO_NETWORK,
+    PRIVILEGED_RUNNER_PROBLEM,
     PROTECTED_WRITE_NAMES,
     PROTECTED_WRITE_PROBLEM,
     PUBLISHED_PROFILES_BUDGET,
     READ_COMMANDS,
+    READ_ONLY_NEEDS_SANDBOX,
+    READ_ONLY_NETWORK_WARNING,
+    UNSANDBOXED_WRITER_WARNING,
     DefinitionError,
     _listed_overlap,
+    access_warnings,
     budget_problem,
     definition_warnings,
     inside,
     is_command_wrapper,
     json_size,
-    list_git_warning,
     profiles_frame_size,
     protected_write_problem,
     published_profile,
+    read_only_sandbox_problem,
+    runs_sandboxed,
     validate_definition,
     wrapper_name,
 )
@@ -70,7 +75,8 @@ def test_constants() -> None:
 
 def test_observer_defaults() -> None:
     d = validate_definition(_def(), LOCAL)
-    assert d["access"]["commands"] == {"mode": "list", "allow": [], "privileged": []}
+    # access model v2: an observer may run any command (its sandbox keeps it read-only)
+    assert d["access"]["commands"] == {"mode": "shell", "allow": [], "privileged": []}
     assert d["approval"] == {"policy": "auto", "patterns": []}
     assert d["coordinator_capable"] is False and d["run_as"] is None
     assert d["observe"]["sources"] == [] and d["observe"]["logs"] == []
@@ -128,7 +134,6 @@ def test_paths_are_normalised_when_checked() -> None:
     (_def(observe={"logs": ["/var/log/app"]}), "outside"),
     (_def(run_as="alice"), "run_as"),                                    # local launcher cannot
     (_def(access={"files": {"write": ["."]}}), "observer"),              # observers never write
-    (_def(access={"commands": {"mode": "shell"}}), "observer"),
     (_def(access={"commands": {"mode": "list", "allow": ["ls; rm"]}}), "command"),
     (_def(instructions="x" * (16 * 1024 + 1)), "instructions"),
     (_def(secret="x"), "unknown"),
@@ -325,30 +330,27 @@ def test_read_commands_match_the_launcher() -> None:
 
 
 @pytest.mark.parametrize("entry", ["rm", "systemctl restart", "top", "git status", "lsblk",
-                                   "/bin/ls", "sh"])
-def test_observer_allow_entries_must_be_read_commands(entry: str) -> None:
-    with pytest.raises(DefinitionError, match="read command"):
-        validate_definition(_def(access={"commands": {"mode": "list", "allow": ["ls", entry]}}),
-                            LOCAL)
-    raw = _def(kind="operator", access={"commands": {"mode": "list", "allow": [entry]}})
-    if entry == "sh":
-        # An operator (it writes) may not list a command runner (git excepted).
-        with pytest.raises(DefinitionError, match="can run other commands"):
-            validate_definition(raw, LOCAL)
-        return
-    # An operator may list it.
-    d = validate_definition(raw, LOCAL)
-    assert d["access"]["commands"]["allow"] == [entry]
+                                   "/bin/ls", "sh", "python3", "env git", "eval"])
+def test_any_list_entry_accepted_for_both_kinds(entry: str) -> None:
+    """Access model v2: a command list is guidance; an observer may list any command
+    (its sandbox keeps it read-only) and so may an operator (runners and git
+    included)."""
+    for kind in ("observer", "operator"):
+        d = validate_definition(
+            _def(kind=kind, access={"commands": {"mode": "list", "allow": ["ls", entry]}}),
+            LOCAL)
+        assert d["access"]["commands"]["allow"] == ["ls", entry]
 
 
 def test_observer_read_command_entries_with_arguments_accepted() -> None:
     allow = ["journalctl -u", "top -b -n1", "systemctl status nginx", "tail -n", "ps aux"]
     d = validate_definition(_def(access={"commands": {"mode": "list", "allow": allow}}), LOCAL)
     assert d["access"]["commands"]["allow"] == allow
-    # mode none and the empty default list stay valid
+    # mode none, shell and an empty list stay valid
     assert validate_definition(
         _def(access={"commands": {"mode": "none"}}), LOCAL)["access"]["commands"]["mode"] == "none"
-    assert validate_definition(_def(), LOCAL)["access"]["commands"]["allow"] == []
+    assert validate_definition(_def(access={"commands": {"mode": "shell"}}), LOCAL)
+    assert validate_definition(_def(access={"commands": {"mode": "list"}}), LOCAL)
 
 
 def test_privileged_entries_keep_their_options_exactly() -> None:
@@ -436,7 +438,7 @@ _LISTED_TABLE: list[tuple[str, list[str], list[str], str, bool]] = [
     ("operator", ["ls"], ["systemctl restart nginx"], "systemctl restart", False),
     ("operator", ["ls"], ["/bin/systemctl"], "systemctl restart", False),
     ("operator", ["ls"], ["systemctl --no-block"], "systemctl restart", False),
-    ("observer", [], [], "journalctl --vacuum-size", False),       # the default read list
+    ("observer", [], [], "journalctl --vacuum-size", True),        # empty list: no commands
     ("observer", ["systemctl status"], [], "systemctl status nginx", False),
 ]
 
@@ -628,27 +630,25 @@ def test_is_command_wrapper(word: str, expected: bool) -> None:
 
 
 # (kind, write, policy, allow, privileged, accepted): list mode, no listed patterns.
+# Access model v2: a writer's list is guidance (runners and git accepted, with
+# LIST_IS_GUIDANCE); a privileged runner stays refused (swv-root runs it as root).
 _LIST_RUNNER_TABLE: list[tuple[str, list[str], str, list[str], list[str], bool]] = [
-    ("operator", [], "auto", ["git status"], [], True),           # git: accepted, warned
-    ("operator", ["out"], "auto", ["git log"], [], True),
-    ("operator", [], "auto", ["/usr/bin/git diff"], [], True),
-    ("operator", [], "auto", ["git2.43 diff"], [], True),
-    ("operator", [], "auto", ["git status", "env git"], [], False),  # [] = default ".": writes
-    ("operator", [], "auto", ["nice git"], [], False),
-    ("operator", [], "auto", ["xargs git"], [], False),
-    ("operator", [], "auto", ["ls"], ["git pull"], False),         # privileged git refused
-    ("operator", [], "auto", ["git status"], ["git pull"], False),
-    ("operator", [], "auto", ["env"], [], False),
-    ("operator", [], "auto", ["nice make"], [], False),
-    ("operator", [], "auto", ["python3.12"], [], False),
-    ("operator", [], "auto", ["ls", "cat", "systemctl status"], ["systemctl restart"], True),
-    ("operator", [], "always", ["git status", "sh"], [], True),    # read-only: no commands
-    ("observer", [], "auto", ["ls"], [], True),
+    ("operator", [], "auto", ["git status", "git log"], [], True),
+    ("operator", ["out"], "auto", ["git log", "env git"], [], True),
+    ("operator", [], "auto", ["nice git", "xargs git", "bash", "python3", "eval", "make"], [],
+     True),
+    ("operator", [], "auto", ["ls"], ["git pull"], False),         # privileged runners
+    ("operator", [], "auto", ["git status"], ["/usr/bin/git status"], False),
+    ("operator", [], "auto", ["ls"], ["env ls"], False),
+    ("operator", [], "auto", ["ls"], ["bash"], False),
+    ("operator", [], "auto", ["ls"], ["systemctl restart"], True),
+    ("operator", [], "always", ["git status", "sh"], ["bash"], True),  # always: no commands
+    ("observer", [], "auto", ["ls", "python3", "git log"], [], True),
 ]
 
 
 @pytest.mark.parametrize("kind,write,policy,allow,privileged,accepted", _LIST_RUNNER_TABLE)
-def test_list_mode_refuses_command_runners_for_writers(
+def test_list_runners_guidance_privileged_runners_refused(
     kind: str, write: list[str], policy: str, allow: list[str], privileged: list[str],
     accepted: bool,
 ) -> None:
@@ -658,11 +658,10 @@ def test_list_mode_refuses_command_runners_for_writers(
     if accepted:
         validate_definition(raw, ROOT)
         return
-    entry = next(e for e in [*allow, *privileged] if is_command_wrapper(e.split()[0])
-                 and (e in privileged or wrapper_name(e.split()[0]) != "git"))
+    entry = next(e for e in privileged if is_command_wrapper(e.split()[0]))
     with pytest.raises(DefinitionError) as exc:
         validate_definition(raw, ROOT)
-    assert str(exc.value) == LIST_RUNNER_WITH_WRITES.format(entry=entry)
+    assert str(exc.value) == PRIVILEGED_RUNNER_PROBLEM.format(entry=entry)
 
 
 def test_list_runner_rule_matches_the_launcher() -> None:
@@ -670,7 +669,16 @@ def test_list_runner_rule_matches_the_launcher() -> None:
         "sessionweave_runner.permissions",
         reason="sessionweave-runner is not installed in this environment (not a broker"
                " dependency)")
-    assert perms.LIST_RUNNER_WITH_WRITES == LIST_RUNNER_WITH_WRITES
+    from sessionweave import definitions as ours
+    for name in ("LIST_IS_GUIDANCE", "UNSANDBOXED_WRITER_WARNING", "READ_ONLY_NEEDS_SANDBOX",
+                 "PRIVILEGED_RUNNER_PROBLEM", "READ_ONLY_NETWORK_WARNING",
+                 "OBSERVER_AS_ROOT_NEEDS_NO_NETWORK", "DENY_SUMMARY_SANDBOXED",
+                 "DENY_SUMMARY_UNSANDBOXED", "DENY_SUMMARY_ROOT_OBSERVER",
+                 "DENY_ROOT_OBSERVER_WARNING", "NETWORK_SUMMARY_NONE_WITH_COMMANDS"):
+        assert getattr(perms, name) == getattr(ours, name), name
+    for gone in ("LIST_RUNNER_WITH_WRITES", "GIT_LIST_WARNING", "GIT_LIST_WARNING_UNSANDBOXED",
+                 "list_git_warning"):
+        assert not hasattr(ours, gone), gone
     for word in ["perl5.36", "node18", "ld-linux-x86-64.so.2", "123", "/usr/bin/git",
                  "python3.12", "docker", "gitk"]:
         assert perms.wrapper_name(word) == wrapper_name(word)
@@ -751,7 +759,12 @@ _LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
     ("claude workdir space", {**_OP, "runtime": "claude", "workdir": "/srv/app/a b"},
      set()),
     ("claude list unsandboxed", {**_OP, "runtime": "claude", "access": {"commands": {
-        "mode": "list", "allow": ["ls"]}}}, {"local"}),
+        "mode": "list", "allow": ["ls"]}}}, set(MACHINES)),        # a list is guidance
+    ("observer shell without bwrap", {"run_as": "deploy"}, {"root"}),
+    ("observer none without bwrap", {"run_as": "deploy", "access": _NONE},
+     {"root", "root-nobw"}),
+    ("privileged runner", {**_OP, "access": {"commands": {"privileged": ["git pull"]}}},
+     set()),
     ("claude observer list", {"runtime": "claude", "run_as": "deploy"},
      {"root"}),
     ("claude list + listed", {**_OP, "runtime": "claude", "access": {"commands": {
@@ -763,14 +776,14 @@ _LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
     ("observer list + listed", {"run_as": "deploy", "access": {"commands": {
         "mode": "list", "allow": ["systemctl status"]}},
         "approval": {"policy": "listed", "patterns": ["systemctl restart"]}},
-     {"root", "root-nobw"}),
+     {"root"}),
     ("operator listed + always", {**_OP, "approval": {"policy": "always", "patterns": [
         "systemctl restart"]}}, set(MACHINES)),
     ("protected write glob", {**_OP, "access": {"files": {"write": [".git"]}}}, set()),
     ("protected write + always", {**_OP, "access": {"files": {"write": ["**/AGENTS.md"]}},
                                   "approval": {"policy": "always"}}, set()),
     ("eval in a writer's list", {**_OP, "access": {"commands": {
-        "mode": "list", "allow": ["eval"]}}}, set()),
+        "mode": "list", "allow": ["eval"]}}}, set(MACHINES)),
     ("privileged + always", {**_OP, "access": {"commands": {"privileged": ["journalctl"]}},
                              "approval": {"policy": "always"}}, {"root", "root-nobw",
                                                                  "root-user"}),
@@ -1042,56 +1055,122 @@ def test_listed_approvals_refused_for_writers() -> None:
 ])
 def test_shell_builtins_that_run_commands_are_wrappers(word: str) -> None:
     assert is_command_wrapper(word)
-    with pytest.raises(DefinitionError, match="can run other commands"):
-        validate_definition(_def(kind="operator", access={"commands": {
-            "mode": "list", "allow": ["ls", word]}}), LOCAL)
+    # refused as a privileged entry (swv-root runs it as root outside the sandbox)
+    with pytest.raises(DefinitionError, match="can run other commands: swv-root"):
+        validate_definition(_def(kind="operator", workdir="/opt", access={"commands": {
+            "mode": "list", "allow": ["ls"], "privileged": [word]}}), ROOT)
 
 
-# --- owner decision (Runner b3745b1): a writer may list git, accepted with a warning -----
+# --- access model v2 (Runner a085c62): read-only needs the sandbox, access warnings --------
 
-_GIT_WARNING_CASES: list[tuple[dict[str, Any], dict[str, str | None]]] = [
-    # (definition overrides, expected warning per machine: None, "sandbox" or "machine")
+def test_runs_sandboxed() -> None:
+    assert runs_sandboxed("observer", LOCAL) and runs_sandboxed("operator", LOCAL)
+    assert runs_sandboxed("observer", ROOT) and not runs_sandboxed("operator", ROOT)
+    assert not runs_sandboxed("observer", NO_BWRAP_ROOT)
+    assert runs_sandboxed("observer", USER_ROOT)
+
+
+@pytest.mark.parametrize("access,refused", [
+    (None, True), ({"commands": {"mode": "shell"}}, True),
+    ({"commands": {"mode": "list", "allow": ["ls"]}}, True),
+    ({"commands": {"mode": "list"}}, True),     # the launcher's runtime check counts it
+    ({"commands": {"mode": "none"}}, False),
+])
+def test_read_only_without_a_sandbox_refused(access: dict[str, Any] | None,
+                                             refused: bool) -> None:
+    raw = _def(workdir="/var", run_as="mon", **({"access": access} if access else {}))
+    if refused:
+        with pytest.raises(DefinitionError) as exc:
+            validate_definition(raw, NO_BWRAP_ROOT)
+        assert str(exc.value) == READ_ONLY_NEEDS_SANDBOX
+    else:
+        validate_definition(raw, NO_BWRAP_ROOT)
+    validate_definition(raw, ROOT)  # with bubblewrap: fine
+    # an operator with approval "always" is read-only but has no commands
+    validate_definition(_def(kind="operator", workdir="/var",
+                             approval={"policy": "always"}), NO_BWRAP_ROOT)
+
+
+def test_read_only_sandbox_problem_truth_table() -> None:
+    for read_only in (True, False):
+        for mode in ("none", "list", "shell"):
+            for sandboxed in (True, False):
+                want = (READ_ONLY_NEEDS_SANDBOX
+                        if read_only and mode != "none" and not sandboxed else None)
+                assert read_only_sandbox_problem(read_only=read_only, commands_mode=mode,
+                                                 sandboxed=sandboxed) == want
+
+
+# (definition overrides, expected warnings per machine)
+_G, _U, _N = [LIST_IS_GUIDANCE], [UNSANDBOXED_WRITER_WARNING], [READ_ONLY_NETWORK_WARNING]
+_NO_WARNINGS: dict[str, list[str]] = {m: [] for m in MACHINES}
+_ACCESS_WARNING_CASES: list[tuple[dict[str, Any], dict[str, list[str]]]] = [
     ({"kind": "operator", "access": {"commands": {"mode": "list", "allow": ["git status"]}}},
-     {"local": "sandbox", "root": "machine", "root-nobw": "machine", "root-user": "machine"}),
-    ({"kind": "operator", "access": {"commands": {"mode": "list",
-                                                  "allow": ["ls", "/usr/bin/git"]}}},
-     {"local": "sandbox", "root": "machine", "root-nobw": "machine", "root-user": "machine"}),
+     {"local": _G, "root": _G + _U, "root-nobw": _G + _U, "root-user": _G + _U}),
+    ({"kind": "operator"},                                          # shell
+     {"local": [], "root": _U, "root-nobw": _U, "root-user": _U}),
+    ({"kind": "operator", "access": {"commands": {"mode": "none"}}}, _NO_WARNINGS),
+    ({"kind": "operator", "access": {"commands": {"mode": "list"}}},  # empty list: none
+     _NO_WARNINGS),
     ({"kind": "operator", "approval": {"policy": "always"},
-      "access": {"commands": {"mode": "list", "allow": ["git status"]}}},
-     dict.fromkeys(MACHINES)),                                    # read-only: no warning
-    ({"kind": "operator", "access": {"commands": {"mode": "list", "allow": ["ls"]}}},
-     dict.fromkeys(MACHINES)),
-    ({"kind": "operator"}, dict.fromkeys(MACHINES)),               # shell: no list
+      "access": {"commands": {"mode": "list", "allow": ["ls"]}}}, _NO_WARNINGS),
+    ({"kind": "observer", "run_as": "deploy",                      # cannot write
+      "access": {"commands": {"mode": "list", "allow": ["ls"]}}}, {"root": _N}),
+    ({"kind": "observer"}, {"local": _N, "root-user": _N}),          # shell
+    ({"kind": "observer", "access": {"commands": {"mode": "none"}}},
+     {"local": [], "root-user": []}),
+    ({"kind": "operator", "approval": {"policy": "always"}},         # always: no commands
+     _NO_WARNINGS),
 ]
 
 
-@pytest.mark.parametrize("over,expected", _GIT_WARNING_CASES)
-def test_git_list_warning_for_writers(over: dict[str, Any],
-                                      expected: dict[str, str | None]) -> None:
-    texts = {"sandbox": [GIT_LIST_WARNING], "machine": [GIT_LIST_WARNING_UNSANDBOXED],
-             None: []}
-    for mname, machine in MACHINES.items():
+@pytest.mark.parametrize("over,expected", _ACCESS_WARNING_CASES)
+def test_access_warnings_at_deploy(over: dict[str, Any], expected: dict[str, list[str]]) -> None:
+    for mname, want in expected.items():
+        machine = MACHINES[mname]
         d = validate_definition({**_def(), **over}, machine)
-        assert definition_warnings(d, machine) == texts[expected[mname]], mname
+        assert definition_warnings(d, machine) == want, mname
 
 
-def test_git_list_warning_matches_the_launcher() -> None:
-    """The warning texts and ``list_git_warning`` against the Runner's, over every
-    combination of commands mode, writes, sandbox and allow lists."""
+def test_access_warnings_match_the_launcher() -> None:
     perms = pytest.importorskip("sessionweave_runner.permissions",
                                 reason="sessionweave-runner is not installed")
-    assert perms.GIT_LIST_WARNING == GIT_LIST_WARNING
-    assert perms.GIT_LIST_WARNING_UNSANDBOXED == GIT_LIST_WARNING_UNSANDBOXED
-    lists = [[], ["ls"], ["git"], ["git status", "ls"], ["/usr/bin/git log"], ["git2.43"],
-             ["gitk"], ["ls", "git-2.43 diff"]]
-    for mode in ("none", "list", "shell"):
-        for allow in lists:
-            for writes in (True, False):
-                for sandboxed in (True, False):
-                    ours = list_git_warning({"mode": mode, "allow": allow},
-                                            writes=writes, sandboxed=sandboxed)
-                    theirs = perms.list_git_warning(
-                        perms.Commands(mode, tuple(allow)), writes=writes,
-                        sandboxed=sandboxed)
-                    assert ours == theirs, (mode, allow, writes, sandboxed)
-    assert list_git_warning(None, writes=True, sandboxed=True) is None
+    for read_only in (True, False):
+        for mode in ("none", "list", "shell"):
+            for sandboxed in (True, False):
+                assert access_warnings(
+                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed
+                ) == perms.access_warnings(
+                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed)
+                assert read_only_sandbox_problem(
+                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed
+                ) == perms.read_only_sandbox_problem(
+                    read_only=read_only, commands_mode=mode, sandboxed=sandboxed)
+
+
+# --- Runner 1edce91: observer_as_root network, read-only covers files only ------------------
+
+@pytest.mark.parametrize("access,refused", [
+    ({"network": "any"}, True),                                    # default commands: shell
+    ({"network": "any", "commands": {"mode": "list", "allow": ["ls"]}}, True),
+    ({"network": "any", "commands": {"mode": "list"}}, True),     # an empty list counts
+    ({"network": "any", "commands": {"mode": "none"}}, False),
+    ({"network": "none"}, False),
+    ({}, False),                                                   # an observer's default: none
+])
+def test_observer_as_root_needs_network_none(access: dict[str, Any], refused: bool) -> None:
+    raw = _def(workdir="/var", observer_as_root=True, access=access)
+    if refused:
+        with pytest.raises(DefinitionError) as exc:
+            validate_definition(raw, ROOT)
+        assert str(exc.value) == OBSERVER_AS_ROOT_NEEDS_NO_NETWORK
+    else:
+        validate_definition(raw, ROOT)
+    # approval "always" leaves no commands
+    validate_definition({**raw, "approval": {"policy": "always"}}, ROOT)
+
+
+def test_read_only_network_warning() -> None:
+    assert access_warnings(read_only=True, commands_mode="shell", sandboxed=True) == [
+        READ_ONLY_NETWORK_WARNING]
+    assert access_warnings(read_only=True, commands_mode="none", sandboxed=False) == []

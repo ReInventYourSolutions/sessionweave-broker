@@ -45,9 +45,9 @@ LIMIT_MAX: dict[str, int] = {
     "max_idle_s": 30 * 86400,
     "max_cost_usd": 10000,
 }
-# The commands an observer may list: each allow entry must start with the words of
-# one of them (literal words: ``/bin/ls`` and ``lsblk`` are not ``ls``). A copy of
-# the launcher's ``permissions.READ_COMMANDS``: keep both in step.
+# Suggested read commands (documentation and the Cockpit editor only; access model v2:
+# an observer may run any command, its sandbox keeps it read-only). A copy of the
+# launcher's ``permissions.READ_COMMANDS``: keep both in step.
 READ_COMMANDS = (
     "ls", "cat", "head", "tail", "grep", "zcat", "zgrep", "wc", "stat", "file", "du", "df",
     "free", "uptime", "uname", "hostname", "id", "whoami", "date", "ps", "pgrep", "top -b",
@@ -60,8 +60,9 @@ READ_COMMANDS = (
 # by ``wrapper_name`` (the basename of the command word with a trailing version suffix
 # stripped: ``perl5.36``, ``python3.12``, ``node18`` compare as ``perl``, ``python``,
 # ``node``); an entry ending in ``*`` matches by prefix (``python*``, ``ld-linux*``).
-# With approval ``listed`` patterns an allow or privileged entry starting with one is
-# refused: it would run a listed command unchecked. An exact copy of the launcher's
+# A privileged entry starting with one is refused (swv-root runs it as root outside
+# the sandbox), and so is an allow or privileged entry with approval ``listed``
+# patterns (it would run a listed command unchecked). An exact copy of the launcher's
 # ``permissions.COMMAND_WRAPPERS`` (114 entries, same order): keep both in step.
 COMMAND_WRAPPERS = (
     # shells
@@ -271,14 +272,6 @@ def _commands(v: list[str], where: str) -> list[str]:
     return v
 
 
-def _is_read_command(entry: str) -> bool:
-    words = entry.split()
-    return any(
-        (rw := r.split()) and len(rw) <= len(words) and words[: len(rw)] == rw
-        for r in READ_COMMANDS
-    )
-
-
 def _norm_words(entry: str) -> list[str]:
     """The entry's words, the command word compared by basename (``/usr/bin/git``
     is ``git``)."""
@@ -323,9 +316,8 @@ def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any
     privileged entry sharing a pattern's command word must differ from it at a
     subcommand word (allow ``systemctl status`` with ``systemctl restart``); else the
     entry would run the pattern unasked, always ask, or reach it in another
-    spelling. An observer's empty list stands for the default read commands. A
-    shell, and any entry that runs other commands (``COMMAND_WRAPPERS``), are
-    refused: they could run a listed command under another spelling."""
+    spelling. A shell, and any entry that runs other commands (``COMMAND_WRAPPERS``),
+    are refused: they could run a listed command under another spelling."""
     patterns = approval["patterns"]
     if approval["policy"] != "listed" or not patterns or commands["mode"] == "none":
         return
@@ -336,8 +328,6 @@ def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any
             " under another spelling)"
         )
     allow = commands["allow"]
-    if kind == "observer" and commands["mode"] == "list" and not allow:
-        allow = list(READ_COMMANDS)
     for what, entries in (("allow", allow), ("privileged", commands["privileged"])):
         for entry in entries:
             if is_command_wrapper(entry.split()[0]):
@@ -427,23 +417,16 @@ def _access(raw: Any, kind: str, machine: Machine) -> dict[str, Any]:
         for h in network:
             _host(h)
     cmds = _obj(acc.get("commands"), "access.commands", _COMMANDS_KEYS)
-    mode = cmds.get("mode", "list" if kind == "observer" else "shell")
+    # Access model v2: both kinds default to (and may use) any mode; an observer's
+    # sandbox keeps it read-only.
+    mode = cmds.get("mode", "shell")
     if mode not in COMMAND_MODES:
         raise DefinitionError(f"access.commands.mode must be one of {list(COMMAND_MODES)}")
-    if kind == "observer" and mode == "shell":
-        raise DefinitionError("an observer runs only listed read commands: mode 'shell' refused")
     allow = _commands(
         _str_list(cmds.get("allow"), "access.commands.allow", _MAX_ALLOW), "access.commands.allow"
     )
     if allow and mode != "list":
         raise DefinitionError("access.commands.allow applies only to mode 'list'")
-    if kind == "observer":
-        bad = [c for c in allow if not _is_read_command(c)]
-        if bad:
-            raise DefinitionError(
-                f"access.commands.allow: an observer may only run read commands; {bad[0]!r}"
-                f" is not one (each entry must start with one of {list(READ_COMMANDS)})"
-            )
     privileged = _commands(
         _str_list(cmds.get("privileged"), "access.commands.privileged", _MAX_PRIVILEGED),
         "access.commands.privileged",
@@ -560,51 +543,6 @@ def budget_problem(size: int) -> str | None:
     )
 
 
-# The launcher's ``GIT_LIST_WARNING`` / ``GIT_LIST_WARNING_UNSANDBOXED``, word for word.
-GIT_LIST_WARNING = (
-    "git is in the command list of an agent that can write: git can run other commands "
-    "(hooks, config, aliases), so the agent can effectively run any command inside the "
-    "sandbox"
-)
-GIT_LIST_WARNING_UNSANDBOXED = (
-    "git is in the command list of an agent that can write and runs without a sandbox: "
-    "git can run other commands (hooks, config, aliases), so the agent can effectively "
-    "run any command on the machine as its user (its run_as user, else root)"
-)
-
-
-def _is_git(word: str) -> bool:
-    """The command word is git (``wrapper_name``: ``/usr/bin/git``, ``git2.43``)."""
-    return wrapper_name(word) == "git"
-
-
-def list_git_warning(commands: dict[str, Any] | None, *, writes: bool,
-                     sandboxed: bool) -> str | None:
-    """The launcher's ``list_git_warning``: for an agent that can write with ``git``
-    among its list-mode allow entries, ``GIT_LIST_WARNING`` in the sandbox,
-    ``GIT_LIST_WARNING_UNSANDBOXED`` without one; else None. ``commands`` are the
-    effective commands (``{"mode", "allow", ...}``)."""
-    if commands is None or not writes or commands["mode"] != "list":
-        return None
-    if not any((words := e.split()) and _is_git(words[0]) for e in commands["allow"]):
-        return None
-    return GIT_LIST_WARNING if sandboxed else GIT_LIST_WARNING_UNSANDBOXED
-
-
-def definition_warnings(d: dict[str, Any], machine: Machine) -> list[str]:
-    """Warnings the launcher will report for the (normalised) definition ``d`` that
-    the broker can already tell (shown at deploy, before the launcher answers; the
-    launcher's own warnings replace them with its status): the git-in-a-writer's-list
-    warning. An agent that can write is sandboxed only on a ``--local`` launcher (the
-    launcher's ``_sandboxed``: a ``--root`` launcher sandboxes observers only)."""
-    observer = d["kind"] == "observer"
-    always = d["approval"]["policy"] == "always"
-    writes = not observer and not always  # an empty write list is the default "."
-    commands = None if always else d["access"]["commands"]
-    why = list_git_warning(commands, writes=writes, sandboxed=machine.mode == "local")
-    return [] if why is None else [why]
-
-
 # The runtimes' configuration and instruction files and git's metadata: inside the
 # sandbox they stay read-only, and a write glob naming them would bind them read-write.
 # The launcher's ``permissions.PROTECTED_WRITE_NAMES`` (``sandbox.PROTECTED_NAMES`` plus
@@ -664,11 +602,118 @@ def _write_rules(d: dict[str, Any]) -> None:
         raise DefinitionError(LISTED_WITH_WRITES)
 
 
-# The launcher's ``LIST_RUNNER_WITH_WRITES`` (``list_runner_problem``), word for word.
-LIST_RUNNER_WITH_WRITES = (
-    "'{entry}' can run other commands, so it can't be in the list of an agent that can "
-    "write; use shell mode (sandboxed) or remove it"
+# Access model v2 (the launcher's ``permissions`` texts, word for word, ASCII only).
+LIST_IS_GUIDANCE = (
+    "the command list guides the agent; it is not a security limit - the sandbox and "
+    "the writable paths are"
 )
+UNSANDBOXED_WRITER_WARNING = (
+    "this agent runs without the OS sandbox: it can do anything its user can on this "
+    "machine (its run_as user, else root), within that user's own permissions"
+)
+READ_ONLY_NEEDS_SANDBOX = (
+    "read-only can't be guaranteed without the OS sandbox: this agent can run commands "
+    "and this machine has no usable bubblewrap. Install it and restart the "
+    "launcher (Ubuntu 24.04: also enable its AppArmor profile, see the bwrap "
+    "prerequisite), use observer_as_root, or set commands to none"
+)
+PRIVILEGED_RUNNER_PROBLEM = (
+    "privileged entry '{entry}' can run other commands: swv-root would run them as root "
+    "outside the sandbox; remove it"
+)
+READ_ONLY_NETWORK_WARNING = (
+    "read-only covers files only: commands can reach the network and call the services "
+    "there (including on this machine)"
+)
+OBSERVER_AS_ROOT_NEEDS_NO_NETWORK = (
+    "observer_as_root with commands needs network \"none\" (this records intent: until "
+    "egress filtering ships, commands can still reach the network and the services on "
+    "this machine); set network to none or commands to none"
+)
+# The launcher's limits-summary and deny texts (shown by the Cockpit's preview; the
+# broker does not build the summary). ``DENY_ROOT_OBSERVER_WARNING`` needs the real
+# paths of a root observer's workdir and observed paths, so only the launcher reports
+# it (in its definition status).
+NETWORK_SUMMARY_NONE_WITH_COMMANDS = (
+    "- Network: web tools off (commands can still reach the network)"
+)
+DENY_SUMMARY_SANDBOXED = (
+    "- Hidden from you: {globs} (files present when you start; do not try to read or "
+    "copy them)"
+)
+DENY_SUMMARY_ROOT_OBSERVER = (
+    "- Hidden from you under {roots} only: {globs} (files present when you start; do not "
+    "try to read or copy them); elsewhere on the machine they stay readable"
+)
+DENY_ROOT_OBSERVER_WARNING = (
+    "denied files ({globs}) are hidden under {roots} only; elsewhere on the machine they "
+    "stay readable"
+)
+DENY_SUMMARY_UNSANDBOXED = (
+    "- Your file tools can't read: {globs} (commands run with your OS user's permissions)"
+)
+
+
+def runs_sandboxed(kind: str, machine: Machine) -> bool:
+    """The launcher's ``runs_sandboxed``: every agent of a ``--local`` launcher runs
+    in bubblewrap; on a ``--root`` launcher only an observer, when the machine has a
+    usable bubblewrap (``machine.sandbox``)."""
+    if machine.mode == "local":
+        return True
+    return machine.mode == "root" and kind == "observer" and machine.sandbox is not None
+
+
+def read_only_sandbox_problem(*, read_only: bool, commands_mode: str,
+                              sandboxed: bool) -> str | None:
+    """The launcher's ``read_only_sandbox_problem``: a read-only agent that can run
+    commands needs the sandbox (only its read-only binds keep a command from changing
+    files); mode ``none`` is fine."""
+    if read_only and commands_mode != "none" and not sandboxed:
+        return READ_ONLY_NEEDS_SANDBOX
+    return None
+
+
+def access_warnings(*, read_only: bool, commands_mode: str, sandboxed: bool) -> list[str]:
+    """The launcher's ``access_warnings`` (``read_only``: the agent cannot write):
+    ``READ_ONLY_NETWORK_WARNING`` for an agent that cannot write but runs commands;
+    for one that can write, ``LIST_IS_GUIDANCE`` in list mode and
+    ``UNSANDBOXED_WRITER_WARNING`` when it runs commands without the sandbox (a
+    ``--root`` operator)."""
+    out: list[str] = []
+    if read_only:
+        if commands_mode != "none":
+            out.append(READ_ONLY_NETWORK_WARNING)
+        return out
+    if commands_mode == "list":
+        out.append(LIST_IS_GUIDANCE)
+    if commands_mode != "none" and not sandboxed:
+        out.append(UNSANDBOXED_WRITER_WARNING)
+    return out
+
+
+def _effective_access(d: dict[str, Any]) -> tuple[bool, str]:
+    """``(cannot_write, commands_mode)`` as the launcher resolves them
+    (``cannot_write(perms)`` and ``commands_of(perms).mode``): observers and approval
+    "always" cannot write (a definition's operator never has an empty write list: [] is
+    the default "."); "always" leaves no commands; a list with no allow and no
+    privileged entry runs nothing."""
+    always = d["approval"]["policy"] == "always"
+    cmds = d["access"]["commands"]
+    mode = "none" if always else cmds["mode"]
+    if mode == "list" and not cmds["allow"] and not cmds["privileged"]:
+        mode = "none"
+    return d["kind"] == "observer" or always, mode
+
+
+def definition_warnings(d: dict[str, Any], machine: Machine) -> list[str]:
+    """Warnings the launcher will report for the (normalised) definition ``d`` that
+    the broker can already tell (shown at deploy, before the launcher answers; the
+    launcher's own warnings replace them with its status): its ``access_warnings``."""
+    read_only, mode = _effective_access(d)
+    return access_warnings(read_only=read_only, commands_mode=mode,
+                           sandboxed=runs_sandboxed(d["kind"], machine))
+
+
 NETWORK_NEEDS_NO_COMMANDS = (
     "access.network: host lists need access.commands.mode 'none' (a shell or a command"
     " list on the shared host network can reach any host; use network 'any' or 'none',"
@@ -686,21 +731,20 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
     acc, approval = d["access"], d["approval"]
     files, cmds, network = acc["files"], acc["commands"], acc["network"]
     # What the launcher resolves (``resolve_definition_permissions``): approval
-    # "always" leaves no commands and no writes; an observer's empty list is the
-    # default read commands; empty file lists are the defaults.
+    # "always" leaves no commands and no writes; empty file lists are the defaults.
     always = approval["policy"] == "always"
     mode = "none" if always else cmds["mode"]
-    allow = cmds["allow"] or (list(READ_COMMANDS) if observer and mode == "list" else [])
     listed = approval["policy"] == "listed" and mode != "none" and bool(approval["patterns"])
     read = files["read"] or ["."]
     write = [] if observer or always else (files["write"] or ["."])
     hosts = network if isinstance(network, list) else None
     root_launcher = machine.mode == "root" and machine.run_as
-    # A --local launcher runs every agent in bubblewrap; a --root one only observers,
-    # when it has bubblewrap.
-    sandboxed = machine.mode == "local" or (
-        machine.mode == "root" and observer and machine.sandbox is not None
-    )
+    sandboxed = runs_sandboxed(d["kind"], machine)
+    # The launcher's observer_as_root network rule (checked first, when it resolves the
+    # permissions; recorded intent: the web tools are off, commands still reach the network).
+    net = network if network is not None else ("none" if observer else "any")
+    if d["observer_as_root"] and mode != "none" and net != "none":
+        raise DefinitionError(OBSERVER_AS_ROOT_NEEDS_NO_NETWORK)
 
     if d["run_as"] in RESERVED_RUN_AS:
         raise DefinitionError(
@@ -724,21 +768,24 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
                 "observer_as_root does not support the cline runtime (Cline keeps its"
                 " settings in a host directory)"
             )
-    if mode == "list" and write:
-        # The launcher's ``list_runner_problem``: an agent that can write may not list
-        # a command that runs other commands (shells, wrappers, interpreters, shell
-        # builtins). ``git`` is the one allow-entry exception (owner decision: an
-        # explicit opt-in, accepted with ``list_git_warning``); a privileged ``git``
-        # stays refused (the root helper runs it as root outside the sandbox).
-        # Read-only agents (observers, approval "always") are unaffected.
-        for entry in cmds["allow"]:
-            words = entry.split()
-            if words and is_command_wrapper(words[0]) and not _is_git(words[0]):
-                raise DefinitionError(LIST_RUNNER_WITH_WRITES.format(entry=entry))
+    if not always:
+        # The launcher's ``privileged_runner_problem``: swv-root runs a privileged
+        # entry as root outside the sandbox, so none may run other commands (git
+        # included). A writer's command list itself is guidance (access model v2).
         for entry in cmds["privileged"]:
             words = entry.split()
             if words and is_command_wrapper(words[0]):
-                raise DefinitionError(LIST_RUNNER_WITH_WRITES.format(entry=entry))
+                raise DefinitionError(PRIVILEGED_RUNNER_PROBLEM.format(entry=entry))
+    # Access model v2: read-only is the sandbox's read-only binds; a read-only agent
+    # with commands is refused without one (observer_as_root has its own check above).
+    # The launcher checks this twice: ``parse_definition`` with the effective mode
+    # (``commands_of``: an empty list is "none") and ``check_runtime`` with the
+    # resolved mode (an empty list is still "list"), so an empty list counts as
+    # commands here, as its runtime check refuses it.
+    read_only, _effective = _effective_access(d)
+    if not d["observer_as_root"] and (why := read_only_sandbox_problem(
+            read_only=read_only, commands_mode=mode, sandboxed=sandboxed)) is not None:
+        raise DefinitionError(why)
     if cmds["privileged"] and not always and not root_launcher:
         # (approval "always" leaves no commands: its privileged entries never run)
         raise DefinitionError(
@@ -763,12 +810,6 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
             raise DefinitionError(
                 "claude cannot enforce paths with whitespace, ',' or parentheses:"
                 f" {bad[0]!r}"
-            )
-        if mode == "list" and allow and not sandboxed:
-            raise DefinitionError(
-                "claude cannot keep a command list from writing files outside the OS"
-                " sandbox (its built-in read-only commands run with redirections); use"
-                " commands 'none' or 'shell', or run it on a --local launcher"
             )
         if mode == "list" and listed:
             raise DefinitionError(
@@ -805,7 +846,8 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     normalised and inside the machine's ceiling; root execution (``run_as``,
     ``privileged``, ``observer_as_root``) needs a root launcher that may run
     agents as other users, and ``observer_as_root`` excludes ``run_as``; an
-    observer never writes files nor gets a shell and lists only read commands;
+    observer never writes files (access model v2: it may run any command, its
+    sandbox keeps it read-only; without one it gets commands "none" only);
     command entries start with a command, not an option; limits are capped
     (``LIMIT_MAX``). The launcher's ``normalise_definition`` plus the checks of its
     ``_check_definition`` that do not need the machine (``_launcher_rules``).

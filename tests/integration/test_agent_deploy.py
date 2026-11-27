@@ -16,6 +16,7 @@ import pytest
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from sessionweave.definitions import READ_ONLY_NETWORK_WARNING
 from tests.integration.accounts_fixtures import ADMIN, seeded_relay
 from tests.integration.client import bearer
 from tests.integration.harness import relay_subprocess
@@ -180,7 +181,7 @@ async def test_deploy_to_online_launcher_sends_put_and_tracks_status(tmp_path: P
             r = await _put(c, s.token, KEY, "obs", _def())
             assert r.status_code == 200, r.text
             assert r.json() == {"definition_id": "obs", "revision": 1, "state": "sent",
-                                "warnings": []}
+                                "warnings": [READ_ONLY_NETWORK_WARNING]}
             put = await _recv(ws)
             assert put["type"] == "definition_put" and put["definition"]["revision"] == 1
             assert put["definition"]["id"] == "obs" and put["definition"]["kind"] == "observer"
@@ -210,7 +211,7 @@ async def test_deploy_to_online_launcher_sends_put_and_tracks_status(tmp_path: P
             await _status(ws, "obs", 0, "rejected", problems=["old"])
             r = await _put(c, s.token, KEY, "obs", _def(description="v2"))
             assert r.json() == {"definition_id": "obs", "revision": 2, "state": "sent",
-                                "warnings": []}
+                                "warnings": [READ_ONLY_NETWORK_WARNING]}
             assert (await _recv(ws))["definition"]["description"] == "v2"
             # invalid definitions are refused with the reason
             r = await _put(c, s.token, KEY, "bad", _def("bad", workdir="/etc"))
@@ -266,7 +267,7 @@ async def test_reconnect_reconverges_after_offline_remove_and_redeploy(tmp_path:
         assert r.json() == {"definition_id": "obs", "revision": 2, "state": "removing"}
         r = await _put(c, s.token, KEY, "web", _def("web"))
         assert r.json() == {"definition_id": "web", "revision": 1, "state": "queued",
-                            "warnings": []}
+                            "warnings": [READ_ONLY_NETWORK_WARNING]}
         # removing twice: it is already gone for the API
         assert (await _del(c, s.token, KEY, "obs")).status_code == 404
         ws, _ = await lnc.connect()
@@ -377,7 +378,7 @@ async def test_redeploy_in_use_reports_pending_then_applied(tmp_path: Path) -> N
             assert (await _recv(ws))["type"] == "launch"
             r = await _put(c, s.token, KEY, "obs", _def(description="v2"))
             assert r.json() == {"definition_id": "obs", "revision": 2, "state": "sent",
-                                "warnings": []}
+                                "warnings": [READ_ONLY_NETWORK_WARNING]}
             assert (await _recv(ws))["definition"]["revision"] == 2
             await _status(ws, "obs", 2, "pending_in_use")
             agent = await _eventually(lambda: _agent(c, s.token, KEY, "obs"),
