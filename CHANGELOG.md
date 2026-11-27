@@ -31,9 +31,17 @@ lists are relayed, never stored.
   allow list counts as the default read commands. Listed patterns are also refused with
   commands mode `shell`, and with any `allow` or `privileged` entry that runs other
   commands (see command runners below), which could run a listed command unchecked.
-- **Command runners** (the launcher's `COMMAND_WRAPPERS`, 95 entries, copied exactly):
+  **Listed patterns are refused for an agent that can write** (an operator unless
+  approval is `always`; its empty write list means `.`), in every commands mode but
+  `none`: it can run project code (tests, builds, scripts), so a listed approval cannot
+  protect it. Use approval `always` or `auto` until approvals ship; listed patterns stay
+  available to observers.
+- **Command runners** (the launcher's `COMMAND_WRAPPERS`, 114 entries, copied exactly):
   shells, `env`, `xargs`, `sudo`, `time`, `socat`, `tmux`, interpreters (`python*`,
-  `perl`, `node`, `Rscript`, ...), dynamic loaders (`ld-linux*`, `ld.so`), `find`, `awk`,
+  `perl`, `node`, `Rscript`, ...), shell builtins and keywords that run a string or a
+  file (`eval`, `source`, `.`, `builtin`, `trap`, `coproc`, `fc`, `alias`, `enable`,
+  `let`, `mapfile`, `readarray`, `hash`; zsh `autoload`, `zmodload`, `noglob`,
+  `nocorrect`, `sched`, `zpty`), dynamic loaders (`ld-linux*`, `ld.so`), `find`, `awk`,
   `sed`, `ssh`, `zip`, and `git` (it runs `core.fsmonitor`, hooks and diff/filter
   drivers from repository config that its own `--output` can write). Compared by the
   command word's basename with a trailing version suffix stripped (`perl5.36`,
@@ -41,7 +49,21 @@ lists are relayed, never stored.
   refused in `allow`/`privileged` with listed patterns, and in commands mode `list` for
   every agent that can write (an operator unless approval is `always`): such an agent
   could run any command through them. Read-only agents keep them. `docker`, `kubectl`
-  and `systemctl` are not runners: the subcommand rule governs them.
+  and `systemctl` are not runners: the subcommand rule governs them. Even so, **for an
+  agent that can write, a command list limits convenience, not capability**: test
+  runners, build tools, package managers, linters and the folder's own scripts run code
+  the agent can write. The boundary is the sandbox (`--local`) and `run_as` (a `--root`
+  operator without `run_as` runs as root by design).
+- **Write globs never name a protected file** (the launcher's
+  `protected_write_problem`): every `/` part of a write glob is compared with the
+  runtimes' configuration and instruction files and `.git` (`.claude`, `.mcp.json`,
+  `opencode.json`, `.opencode`, `.clinerules`, `.cline`, `.agents`, `.cursorrules`,
+  `.windsurfrules`, `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.git`): a literal part
+  equal to one (`.git`, `src/.git/hooks`, `**/AGENTS.md`) or a wildcard part matching
+  one (`.gi?`, `AGENTS.*`, `*.md`, `*.json`) is refused, also with approval `always`.
+  `.`, `**`, `src/**`, `*.py`, `.github/**`, `.gitignore` stay allowed: under them the
+  launcher's sandbox keeps those files read-only. Name directories instead (`src`,
+  `docs/**`) or keep the default `.`.
 - **Every launcher rule that does not need the machine is applied at deploy** (400, so
   a definition the launcher would always reject is never stored and never sits
   `queued` until a reconnect): a network host list (also `[]`) needs commands mode

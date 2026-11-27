@@ -18,16 +18,21 @@ from sessionweave.definitions import (
     KINDS,
     LIMIT_MAX,
     LIST_RUNNER_WITH_WRITES,
+    LISTED_WITH_WRITES,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
+    PROTECTED_WRITE_NAMES,
+    PROTECTED_WRITE_PROBLEM,
     PUBLISHED_PROFILES_BUDGET,
     READ_COMMANDS,
     DefinitionError,
+    _listed_overlap,
     budget_problem,
     inside,
     is_command_wrapper,
     json_size,
     profiles_frame_size,
+    protected_write_problem,
     published_profile,
     validate_definition,
     wrapper_name,
@@ -89,7 +94,7 @@ def test_full_definition_round_trips_and_input_untouched() -> None:
                 "network": "any",
                 "commands": {"mode": "list", "allow": ["systemctl status", "ls"]}},
         limits={"max_duration_s": 600, "max_idle_s": 60, "max_cost_usd": 1.5},
-        approval={"policy": "listed", "patterns": ["systemctl restart"]},
+        approval={"policy": "auto", "patterns": ["systemctl restart"]},
         instructions="Watch.", visibility="personal", allowed_accounts=["bob"],
     )
     before = copy.deepcopy(raw)
@@ -101,7 +106,7 @@ def test_full_definition_round_trips_and_input_untouched() -> None:
                                        "privileged": []}
     assert d["access"]["network"] == "any"
     assert d["limits"] == {"max_duration_s": 600, "max_idle_s": 60, "max_cost_usd": 1.5}
-    assert d["approval"] == {"policy": "listed", "patterns": ["systemctl restart"]}
+    assert d["approval"] == {"policy": "auto", "patterns": ["systemctl restart"]}
     assert d["allowed_accounts"] == ["bob"] and d["coordinator_capable"] is True
     assert validate_definition(d, LOCAL) == d  # normalised output is valid input
 
@@ -445,15 +450,27 @@ def _listed_def(kind: str, allow: list[str], privileged: list[str], pattern: str
 def test_listed_pattern_vs_allowed_entries(
     kind: str, allow: list[str], privileged: list[str], pattern: str, accepted: bool,
 ) -> None:
+    # The rule itself (an operator can write, so through validate_definition its
+    # listed patterns are refused before this rule: LISTED_WITH_WRITES).
+    cmds = {"mode": "list", "allow": allow, "privileged": privileged}
+    appr = {"policy": "listed", "patterns": [pattern]}
     raw = _listed_def(kind, allow, privileged, pattern)
     if accepted:
-        d = validate_definition(raw, ROOT)
-        assert d["approval"]["patterns"] == [pattern]
-        return
-    with pytest.raises(DefinitionError, match="overlaps") as exc:
-        validate_definition(raw, ROOT)
-    assert exc.value.code is ErrorCode.INVALID_REQUEST
-    assert repr(pattern) in str(exc.value)
+        _listed_overlap(kind, cmds, appr)
+    else:
+        with pytest.raises(DefinitionError, match="overlaps") as exc:
+            _listed_overlap(kind, cmds, appr)
+        assert exc.value.code is ErrorCode.INVALID_REQUEST
+        assert repr(pattern) in str(exc.value)
+    if kind == "operator":
+        with pytest.raises(DefinitionError) as exc:
+            validate_definition(raw, ROOT)
+        assert str(exc.value) == LISTED_WITH_WRITES
+    elif accepted:
+        assert validate_definition(raw, ROOT)["approval"]["patterns"] == [pattern]
+    else:
+        with pytest.raises(DefinitionError, match="overlaps"):
+            validate_definition(raw, ROOT)
 
 
 def test_listed_check_only_with_listed_patterns() -> None:
@@ -518,16 +535,20 @@ def test_listed_refuses_shell_and_wrappers(
     kind: str, mode: str, allow: list[str], privileged: list[str], pattern: str,
     accepted: bool,
 ) -> None:
-    raw = _def(kind=kind, access={"commands": {"mode": mode, "allow": allow,
-                                               "privileged": privileged}},
-               approval={"policy": "listed", "patterns": [pattern]})
+    cmds = {"mode": mode, "allow": allow, "privileged": privileged}
+    appr = {"policy": "listed", "patterns": [pattern]}
     if accepted:
-        assert validate_definition(raw, ROOT)["approval"]["patterns"] == [pattern]
-        return
-    with pytest.raises(DefinitionError, match=r"'list' until approvals|runs other commands"
-                       ) as exc:
+        _listed_overlap(kind, cmds, appr)
+    else:
+        with pytest.raises(DefinitionError, match=r"'list' until approvals|runs other commands"
+                           ) as exc:
+            _listed_overlap(kind, cmds, appr)
+        assert exc.value.code is ErrorCode.INVALID_REQUEST
+    # Through validate_definition an operator (it writes) gets LISTED_WITH_WRITES first.
+    raw = _def(kind=kind, access={"commands": cmds}, approval=appr)
+    with pytest.raises(DefinitionError) as exc:
         validate_definition(raw, ROOT)
-    assert exc.value.code is ErrorCode.INVALID_REQUEST
+    assert str(exc.value) == LISTED_WITH_WRITES
 
 
 def test_shell_and_wrappers_fine_without_listed_patterns() -> None:
@@ -541,7 +562,7 @@ def test_shell_and_wrappers_fine_without_listed_patterns() -> None:
 
 def test_command_wrappers_match_the_launcher() -> None:
     # A copy of the Runner's permissions.COMMAND_WRAPPERS (parity: keep both in step).
-    assert len(COMMAND_WRAPPERS) == len(set(COMMAND_WRAPPERS)) == 95
+    assert len(COMMAND_WRAPPERS) == len(set(COMMAND_WRAPPERS)) == 114
     assert {"sh", "env", "xargs", "python*", "find", "ssh", "man", "git", "ld-linux*",
             "time", "mksh", "socat"} <= set(COMMAND_WRAPPERS)
     assert not {"docker", "kubectl", "systemctl"} & set(COMMAND_WRAPPERS)
@@ -728,7 +749,18 @@ _LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
         "approval": {"policy": "listed", "patterns": ["systemctl restart"]}}, set()),
     ("opencode list + listed", {**_OP, "access": {"commands": {
         "mode": "list", "allow": ["systemctl status"]}},
-        "approval": {"policy": "listed", "patterns": ["systemctl restart"]}}, set(MACHINES)),
+        "approval": {"policy": "listed", "patterns": ["systemctl restart"]}}, set()),
+    ("observer list + listed", {"run_as": "deploy", "access": {"commands": {
+        "mode": "list", "allow": ["systemctl status"]}},
+        "approval": {"policy": "listed", "patterns": ["systemctl restart"]}},
+     {"root", "root-nobw"}),
+    ("operator listed + always", {**_OP, "approval": {"policy": "always", "patterns": [
+        "systemctl restart"]}}, set(MACHINES)),
+    ("protected write glob", {**_OP, "access": {"files": {"write": [".git"]}}}, set()),
+    ("protected write + always", {**_OP, "access": {"files": {"write": ["**/AGENTS.md"]}},
+                                  "approval": {"policy": "always"}}, set()),
+    ("eval in a writer's list", {**_OP, "access": {"commands": {
+        "mode": "list", "allow": ["eval"]}}}, set()),
     ("privileged + always", {**_OP, "access": {"commands": {"privileged": ["journalctl"]}},
                              "approval": {"policy": "always"}}, {"root", "root-nobw",
                                                                  "root-user"}),
@@ -933,3 +965,73 @@ def test_published_profile_matches_the_launcher() -> None:
         expected = {**public_profile(rdefs.parse_definition(d, mode)), "warnings": ["w"]}
         assert published_profile(d, ["w"]) == expected
         assert json_size(published_profile(d, ["w"])) == json_size(expected)
+
+
+# --- re-review (Runner fc237d3): protected write globs, listed approvals for writers,
+# shell builtins as command runners -----------------------------------------------------
+
+_PROTECTED_REFUSED = [
+    ".git", "src/.git/hooks", "**/AGENTS.md", ".claude/settings.json", ".gi?", ".git*",
+    "[.]git", "AGENTS.*", "CLAUDE*", "*.md", "docs/*.md", "*.json", ".opencode/plugin",
+    "a/.mcp.json", "CLAUDE.local.md", ".cursorrules",
+]
+_PROTECTED_ACCEPTED = [
+    ".", "**", "./**", "*", "src/**", "*.py", ".github/**", ".gitignore", "src", "docs/**",
+    "AGENTS", "claude.md", "out/*",
+]
+
+
+@pytest.mark.parametrize("glob", _PROTECTED_REFUSED)
+def test_write_globs_naming_protected_files_refused(glob: str) -> None:
+    why = protected_write_problem([glob])
+    assert why is not None and why.startswith(f"write path {glob!r} would make ")
+    for approval in ("auto", "always"):  # approval "always" does not excuse it
+        with pytest.raises(DefinitionError) as exc:
+            validate_definition(_def(kind="operator", access={"files": {"write": [glob]}},
+                                     approval={"policy": approval}), LOCAL)
+        assert str(exc.value) == why
+
+
+@pytest.mark.parametrize("glob", _PROTECTED_ACCEPTED)
+def test_ordinary_write_globs_accepted(glob: str) -> None:
+    assert protected_write_problem([glob]) is None
+
+
+def test_protected_write_rule_matches_the_launcher() -> None:
+    perms = pytest.importorskip("sessionweave_runner.permissions",
+                                reason="sessionweave-runner is not installed")
+    assert perms.PROTECTED_WRITE_NAMES == PROTECTED_WRITE_NAMES
+    assert perms.PROTECTED_WRITE_PROBLEM == PROTECTED_WRITE_PROBLEM
+    assert perms.LISTED_WITH_WRITES == LISTED_WITH_WRITES
+    for glob in [*_PROTECTED_REFUSED, *_PROTECTED_ACCEPTED]:
+        assert perms.protected_write_problem([glob]) == protected_write_problem([glob])
+
+
+def test_listed_approvals_refused_for_writers() -> None:
+    assert "\u2014" in LISTED_WITH_WRITES
+    listed = {"policy": "listed", "patterns": ["systemctl restart"]}
+    for cmds in ({"mode": "shell"}, {"mode": "list", "allow": ["systemctl status"]}):
+        with pytest.raises(DefinitionError) as exc:
+            validate_definition(_def(kind="operator", access={"commands": cmds},
+                                     approval=listed), LOCAL)
+        assert str(exc.value) == LISTED_WITH_WRITES
+    # not a writer, no command, or no pattern: fine
+    validate_definition(_def(kind="operator", approval={**listed, "policy": "always"}), LOCAL)
+    validate_definition(_def(kind="operator", access={"commands": {"mode": "none"}},
+                             approval=listed), LOCAL)
+    validate_definition(_def(kind="operator", approval={"policy": "listed", "patterns": []}),
+                        LOCAL)
+    validate_definition(_def(access={"commands": {"mode": "list", "allow": [
+        "systemctl status"]}}, approval=listed), LOCAL)  # an observer
+
+
+@pytest.mark.parametrize("word", [
+    "eval", "source", ".", "builtin", "trap", "coproc", "fc", "alias", "enable", "let",
+    "mapfile", "readarray", "hash", "autoload", "zmodload", "noglob", "nocorrect", "sched",
+    "zpty", "/usr/bin/eval",
+])
+def test_shell_builtins_that_run_commands_are_wrappers(word: str) -> None:
+    assert is_command_wrapper(word)
+    with pytest.raises(DefinitionError, match="can run other commands"):
+        validate_definition(_def(kind="operator", access={"commands": {
+            "mode": "list", "allow": ["ls", word]}}), LOCAL)

@@ -13,6 +13,7 @@ for the launcher's published-profiles budget (``PUBLISHED_PROFILES_BUDGET``).
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
 import posixpath
@@ -61,7 +62,7 @@ READ_COMMANDS = (
 # ``node``); an entry ending in ``*`` matches by prefix (``python*``, ``ld-linux*``).
 # With approval ``listed`` patterns an allow or privileged entry starting with one is
 # refused: it would run a listed command unchecked. An exact copy of the launcher's
-# ``permissions.COMMAND_WRAPPERS`` (95 entries, same order): keep both in step.
+# ``permissions.COMMAND_WRAPPERS`` (114 entries, same order): keep both in step.
 COMMAND_WRAPPERS = (
     # shells
     "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "rbash",
@@ -78,6 +79,15 @@ COMMAND_WRAPPERS = (
     "python*", "pypy", "perl", "ruby", "irb", "node", "nodejs", "npx", "npm", "bun", "deno",
     "php", "lua", "luajit", "tclsh", "wish", "expect", "Rscript", "R", "awk", "gawk",
     "mawk", "nawk",
+    # shell builtins and keywords that run (or later run) a string or a file as
+    # commands: eval, source/., builtin (runs any builtin, eval included), trap and
+    # coproc (run a command), fc (re-runs history), alias (redefines a command), enable
+    # (loads a builtin from a shared object), let (arithmetic expands command
+    # substitutions in array subscripts), mapfile/readarray (-C callback), hash (-p
+    # binds a name to any file); zsh: autoload, zmodload, noglob, nocorrect, sched, zpty
+    "eval", "source", ".", "builtin", "trap", "coproc", "fc", "alias", "enable", "let",
+    "mapfile", "readarray", "hash", "autoload", "zmodload", "noglob", "nocorrect", "sched",
+    "zpty",
     # tools with an exec feature
     "find", "sed", "make", "ssh", "scp", "sftp", "tar", "zip", "rsync", "git",
     "vi", "vim", "nvim", "ex", "less", "more", "man",
@@ -278,10 +288,11 @@ def _norm_words(entry: str) -> list[str]:
 
 def _distinct_subcommands(entry: list[str], pattern: list[str]) -> bool:
     """Whether an entry and a pattern with the same command word differ at a later
-    word that is not an option in either, with no option word before it (``git
-    status`` vs ``git push``). False when one is a word prefix of the other (``git``
-    vs ``git push``, ``git push origin`` vs ``git push``) or an option comes first
-    (``git -C x log`` vs ``git -C x push``). The launcher's rule, word for word."""
+    word that is not an option in either, with no option word before it
+    (``systemctl status`` vs ``systemctl restart``). False when one is a word prefix
+    of the other (``systemctl`` vs ``systemctl restart``, ``systemctl restart nginx``
+    vs ``systemctl restart``) or an option comes first (``systemctl -H x status`` vs
+    ``systemctl -H x restart``). The launcher's rule, word for word."""
     for e, p in zip(entry[1:], pattern[1:], strict=False):
         if e.startswith("-") or p.startswith("-"):
             return False
@@ -549,6 +560,65 @@ def budget_problem(size: int) -> str | None:
     )
 
 
+# The runtimes' configuration and instruction files and git's metadata: inside the
+# sandbox they stay read-only, and a write glob naming them would bind them read-write.
+# The launcher's ``permissions.PROTECTED_WRITE_NAMES`` (``sandbox.PROTECTED_NAMES`` plus
+# ``.git``), same order.
+PROTECTED_WRITE_NAMES = (
+    ".claude", ".mcp.json", "opencode.json", "opencode.jsonc", ".opencode", ".clinerules",
+    ".cline", ".agents", ".cursorrules", ".windsurfrules", "CLAUDE.md", "CLAUDE.local.md",
+    "AGENTS.md", ".git",
+)
+# The launcher's ``PROTECTED_WRITE_PROBLEM`` and ``LISTED_WITH_WRITES``, word for word.
+PROTECTED_WRITE_PROBLEM = (
+    "write path {glob!r} would make {name!r} writable: the runtime configuration, "
+    "instruction and git files stay read-only for agents (name the directories to "
+    "write instead, e.g. 'src' or 'docs/**'; the default '.' writes the workdir with "
+    "them kept read-only)"
+)
+LISTED_WITH_WRITES = (
+    "listed approvals can't protect an agent that can write \u2014 it can run project "
+    "code (tests, builds, scripts); use approval 'always' or 'auto' until approvals ship"
+)
+_GENERIC_GLOB_PARTS = frozenset({"*", "**"})
+
+
+def protected_write_problem(globs: list[str]) -> str | None:
+    """The launcher's ``protected_write_problem``: why one of the write ``globs``
+    targets a protected name, else None. Every ``/``-separated part is compared with
+    every name at any depth: a literal part equal to one (``.git``,
+    ``src/.git/hooks``, ``**/AGENTS.md``) or a wildcard part that matches one
+    (``.gi?``, ``AGENTS.*``, ``*.md``; case-sensitive ``fnmatch``) is refused. Parts
+    that are only ``*`` or ``**`` (and ``.``) are generic: ``.``, ``**``, ``src/**``
+    stay allowed (the sandbox keeps the protected files read-only under them)."""
+    for glob in globs:
+        for part in glob.split("/"):
+            if not part or part == "." or part in _GENERIC_GLOB_PARTS:
+                continue
+            wild = any(c in part for c in _GLOB_CHARS)
+            for name in PROTECTED_WRITE_NAMES:
+                if (fnmatch.fnmatchcase(name, part) if wild else part == name):
+                    return PROTECTED_WRITE_PROBLEM.format(glob=glob, name=name)
+    return None
+
+
+def _write_rules(d: dict[str, Any]) -> None:
+    """The launcher's write checks, in its order (before the listed-approval rules):
+    the write globs (an operator's empty list is the default ``.``; approval "always"
+    does not excuse a bad glob) never name a protected file, and approval ``listed``
+    with patterns is refused for an agent that can write (it can run project code)."""
+    observer = d["kind"] == "observer"
+    writes = [] if observer else (d["access"]["files"]["write"] or ["."])
+    if (why := protected_write_problem(writes)) is not None:
+        raise DefinitionError(why)
+    approval = d["approval"]
+    if (
+        approval["policy"] == "listed" and approval["patterns"]
+        and d["access"]["commands"]["mode"] != "none" and writes
+    ):
+        raise DefinitionError(LISTED_WITH_WRITES)
+
+
 # The launcher's ``LIST_RUNNER_WITH_WRITES`` (``list_runner_problem``), word for word.
 LIST_RUNNER_WITH_WRITES = (
     "'{entry}' can run other commands, so it can't be in the list of an agent that can "
@@ -770,6 +840,7 @@ def validate_definition(raw: Any, machine: Machine) -> dict[str, Any]:
     out["access"] = _access(raw.get("access"), kind, machine)
     out["limits"] = _limits(raw.get("limits"))
     out["approval"] = _approval(raw.get("approval"))
+    _write_rules(out)
     _listed_overlap(kind, out["access"]["commands"], out["approval"])
     _launcher_rules(out, machine)
     instructions = raw.get("instructions", "")

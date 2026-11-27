@@ -617,10 +617,23 @@ components:
         Command runners: commands that run other commands (shells, `env`, `xargs`,
         `sudo`, `time`, interpreters such as `python*`, `perl`, `node`, also with a
         version suffix like `perl5.36` or `node18`, `find`, `awk`, `sed`, `ssh`, and
-        `git`, which runs commands from repository config; the launcher's
-        `COMMAND_WRAPPERS`). In commands mode `list`, an agent that can write (an
-        operator unless approval is `always`) may not list one in `allow` or
-        `privileged`. With approval `listed` patterns: commands mode `list` (not
+        `git`, which runs commands from repository config, and shell builtins that run a
+        string or a file: `eval`, `source`, `.`, `builtin`, `trap`, `alias`, ...; the
+        launcher's `COMMAND_WRAPPERS`). In commands mode `list`, an agent that can write
+        (an operator unless approval is `always`; an empty write list means `.`) may not
+        list one in `allow` or `privileged`. For such an agent a command list limits
+        convenience, not capability (test runners, builds and scripts run code it can
+        write): the sandbox (`--local`) and `run_as` are the boundary.
+
+        Write globs never name a protected file: no `/` part may equal, or as a
+        wildcard match, `.git` or a runtime configuration/instruction file (`.claude`,
+        `.mcp.json`, `opencode.json(c)`, `.opencode`, `.clinerules`, `.cline`,
+        `.agents`, `.cursorrules`, `.windsurfrules`, `CLAUDE.md`, `CLAUDE.local.md`,
+        `AGENTS.md`); `.`, `**`, `src/**`, `*.py` are fine, `.git`, `**/AGENTS.md`,
+        `*.md` are refused (also with approval `always`).
+
+        Approval `listed` with patterns is refused for an agent that can write (unless
+        commands mode is `none`). Otherwise: commands mode `list` (not
         `shell`); no `allow`/`privileged` entry may be a command runner; an entry
         sharing a pattern's command word must differ from it at a subcommand word with
         no option word before (allow `systemctl status` with `systemctl restart` is

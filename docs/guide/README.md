@@ -963,9 +963,18 @@ that session ends.
 
 **What the broker checks at deploy.** Every rule of the launcher that does not need the
 machine itself: the schema, the ceiling, the root-execution rules, the command rules
-(listed approvals, command runners such as shells, interpreters and `git` in the list of
-an agent that can write), host and glob syntax, the model name and what the runtime can
-enforce (see the OpenAPI `AgentDefinition`). A deploy the broker accepts can still be
+(listed approvals, which are refused for an agent that can write; command runners such as
+shells, interpreters, `eval`/`source` and `git` in the list of an agent that can write;
+write globs that would name `.git` or a runtime's configuration or instruction file, such
+as `.git`, `**/AGENTS.md` or `*.md`), host and glob syntax, the model name and what the
+runtime can enforce (see the OpenAPI `AgentDefinition`). An operator's empty write list
+means `.`: it can write unless its approval is `always`.
+
+**For an agent that can write, a command list limits convenience, not capability.** Test
+runners, build tools, package managers, linters and the folder's own scripts run code the
+agent can write, so the list does not stop it from running anything. The boundary is the
+launcher's sandbox (`--local`) and `run_as` (a `--root` operator without `run_as` runs as
+root by design); choose them for what the agent must not reach. A deploy the broker accepts can still be
 `rejected` by the launcher for a machine reason: the runtime is missing or not logged in,
 a path does not exist or resolves elsewhere, the sandbox cannot run the agent, a local
 profile has the same id. **Such a rejection is not retried**: fix the machine, then deploy
