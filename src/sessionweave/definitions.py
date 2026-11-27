@@ -319,8 +319,8 @@ def _listed_overlap(kind: str, commands: dict[str, Any], approval: dict[str, Any
     spelling. A shell, and any entry that runs other commands (``COMMAND_WRAPPERS``),
     are refused: they could run a listed command under another spelling."""
     patterns = approval["patterns"]
-    if approval["policy"] != "listed" or not patterns or commands["mode"] == "none":
-        return
+    if approval["policy"] != "listed" or not patterns or _mode_of(commands) == "none":
+        return  # an empty list runs nothing: its patterns are ignored
     if commands["mode"] == "shell":
         raise DefinitionError(
             "approval.patterns: approval 'listed' with patterns needs access.commands.mode"
@@ -597,7 +597,7 @@ def _write_rules(d: dict[str, Any]) -> None:
     approval = d["approval"]
     if (
         approval["policy"] == "listed" and approval["patterns"]
-        and d["access"]["commands"]["mode"] != "none" and writes
+        and _mode_of(d["access"]["commands"]) != "none" and writes
     ):
         raise DefinitionError(LISTED_WITH_WRITES)
 
@@ -625,10 +625,10 @@ READ_ONLY_NETWORK_WARNING = (
     "read-only covers files only: commands can reach the network and call the services "
     "there (including on this machine)"
 )
-OBSERVER_AS_ROOT_NEEDS_NO_NETWORK = (
-    "observer_as_root with commands needs network \"none\" (this records intent: until "
-    "egress filtering ships, commands can still reach the network and the services on "
-    "this machine); set network to none or commands to none"
+OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS = (
+    "observer_as_root can't have commands until network isolation ships: as root its "
+    "commands could reach every socket and service on this machine; set commands to none "
+    "(its file tools still read everything)"
 )
 # The launcher's limits-summary and deny texts (shown by the Cockpit's preview; the
 # broker does not build the summary). ``DENY_ROOT_OBSERVER_WARNING`` needs the real
@@ -691,6 +691,14 @@ def access_warnings(*, read_only: bool, commands_mode: str, sandboxed: bool) -> 
     return out
 
 
+def _mode_of(cmds: dict[str, Any]) -> str:
+    """The launcher's ``_mode_of``/``effective_commands_mode``: a ``list`` with no allow
+    and no privileged entry runs nothing, so it is ``none``."""
+    if cmds["mode"] == "list" and not cmds["allow"] and not cmds["privileged"]:
+        return "none"
+    return str(cmds["mode"])
+
+
 def _effective_access(d: dict[str, Any]) -> tuple[bool, str]:
     """``(cannot_write, commands_mode)`` as the launcher resolves them
     (``cannot_write(perms)`` and ``commands_of(perms).mode``): observers and approval
@@ -698,10 +706,7 @@ def _effective_access(d: dict[str, Any]) -> tuple[bool, str]:
     the default "."); "always" leaves no commands; a list with no allow and no
     privileged entry runs nothing."""
     always = d["approval"]["policy"] == "always"
-    cmds = d["access"]["commands"]
-    mode = "none" if always else cmds["mode"]
-    if mode == "list" and not cmds["allow"] and not cmds["privileged"]:
-        mode = "none"
+    mode = "none" if always else _mode_of(d["access"]["commands"])
     return d["kind"] == "observer" or always, mode
 
 
@@ -732,19 +737,21 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
     files, cmds, network = acc["files"], acc["commands"], acc["network"]
     # What the launcher resolves (``resolve_definition_permissions``): approval
     # "always" leaves no commands and no writes; empty file lists are the defaults.
+    # The effective commands mode (the launcher's ``effective_commands_mode``, used by
+    # every "has commands" rule): approval "always" leaves none, an empty list runs
+    # nothing.
     always = approval["policy"] == "always"
-    mode = "none" if always else cmds["mode"]
+    mode = "none" if always else _mode_of(cmds)
     listed = approval["policy"] == "listed" and mode != "none" and bool(approval["patterns"])
     read = files["read"] or ["."]
     write = [] if observer or always else (files["write"] or ["."])
     hosts = network if isinstance(network, list) else None
     root_launcher = machine.mode == "root" and machine.run_as
     sandboxed = runs_sandboxed(d["kind"], machine)
-    # The launcher's observer_as_root network rule (checked first, when it resolves the
-    # permissions; recorded intent: the web tools are off, commands still reach the network).
-    net = network if network is not None else ("none" if observer else "any")
-    if d["observer_as_root"] and mode != "none" and net != "none":
-        raise DefinitionError(OBSERVER_AS_ROOT_NEEDS_NO_NETWORK)
+    # The launcher's interim rule (checked when it resolves the permissions): as uid 0
+    # an observer's commands could reach every socket and service on the machine.
+    if d["observer_as_root"] and mode != "none":
+        raise DefinitionError(OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS)
 
     if d["run_as"] in RESERVED_RUN_AS:
         raise DefinitionError(
@@ -778,10 +785,6 @@ def _launcher_rules(d: dict[str, Any], machine: Machine) -> None:
                 raise DefinitionError(PRIVILEGED_RUNNER_PROBLEM.format(entry=entry))
     # Access model v2: read-only is the sandbox's read-only binds; a read-only agent
     # with commands is refused without one (observer_as_root has its own check above).
-    # The launcher checks this twice: ``parse_definition`` with the effective mode
-    # (``commands_of``: an empty list is "none") and ``check_runtime`` with the
-    # resolved mode (an empty list is still "list"), so an empty list counts as
-    # commands here, as its runtime check refuses it.
     read_only, _effective = _effective_access(d)
     if not d["observer_as_root"] and (why := read_only_sandbox_problem(
             read_only=read_only, commands_mode=mode, sandboxed=sandboxed)) is not None:

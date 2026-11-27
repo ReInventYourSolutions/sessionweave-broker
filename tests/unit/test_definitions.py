@@ -21,7 +21,7 @@ from sessionweave.definitions import (
     LISTED_WITH_WRITES,
     MAX_DEFINITIONS_PER_LAUNCHER,
     METRIC_KINDS,
-    OBSERVER_AS_ROOT_NEEDS_NO_NETWORK,
+    OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS,
     PRIVILEGED_RUNNER_PROBLEM,
     PROTECTED_WRITE_NAMES,
     PROTECTED_WRITE_PROBLEM,
@@ -59,6 +59,10 @@ CONFIG = dataclasses.replace(LOCAL, mode="config", ceiling=None, capabilities=[]
 def _def(**kw: Any) -> dict[str, Any]:
     return {"id": "obs", "domain": "shop", "role": "logs", "runtime": "opencode",
             "kind": "observer", "workdir": "/srv/app", "max_instances": 1, **kw}
+
+
+# observer_as_root needs commands "none" (the Runner's interim rule).
+_NO_CMDS: dict[str, Any] = {"commands": {"mode": "none"}}
 
 
 def test_constants() -> None:
@@ -286,7 +290,7 @@ def test_observer_as_root_defaults_false() -> None:
 
 
 def test_observer_as_root_only_for_observers_on_root_machines() -> None:
-    d = validate_definition(_def(observer_as_root=True), ROOT)
+    d = validate_definition(_def(observer_as_root=True, access=_NO_CMDS), ROOT)
     assert d["observer_as_root"] is True
     assert validate_definition(d, ROOT) == d  # round trip
     assert validate_definition(_def(observer_as_root=False), LOCAL)["observer_as_root"] is False
@@ -386,7 +390,7 @@ def test_root_execution_needs_a_run_as_capable_root_launcher() -> None:
         validate_definition(_def(run_as="deploy"), no_run_as)
     assert exc.value.code is ErrorCode.OUTSIDE_CEILING
     # the same definitions are accepted by a root launcher that runs as root
-    validate_definition(_def(observer_as_root=True), ROOT)
+    validate_definition(_def(observer_as_root=True, access=_NO_CMDS), ROOT)
     validate_definition(
         _def(kind="operator", workdir="/opt",
              access={"commands": {"mode": "list", "privileged": ["journalctl -u"]}}), ROOT)
@@ -672,7 +676,7 @@ def test_list_runner_rule_matches_the_launcher() -> None:
     from sessionweave import definitions as ours
     for name in ("LIST_IS_GUIDANCE", "UNSANDBOXED_WRITER_WARNING", "READ_ONLY_NEEDS_SANDBOX",
                  "PRIVILEGED_RUNNER_PROBLEM", "READ_ONLY_NETWORK_WARNING",
-                 "OBSERVER_AS_ROOT_NEEDS_NO_NETWORK", "DENY_SUMMARY_SANDBOXED",
+                 "OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS", "DENY_SUMMARY_SANDBOXED",
                  "DENY_SUMMARY_UNSANDBOXED", "DENY_SUMMARY_ROOT_OBSERVER",
                  "DENY_ROOT_OBSERVER_WARNING", "NETWORK_SUMMARY_NONE_WITH_COMMANDS"):
         assert getattr(perms, name) == getattr(ours, name), name
@@ -736,7 +740,8 @@ _LAUNCHER_RULES: list[tuple[str, dict[str, Any], set[str]]] = [
     ("run_as root", {**_OP, "run_as": "root"}, set()),
     ("run_as install user", {**_OP, "run_as": "sessionweave"}, set()),
     ("root observer without run_as", {}, {"local", "root-user"}),
-    ("observer_as_root without bwrap", {"observer_as_root": True}, {"root"}),
+    ("observer_as_root without bwrap", {"observer_as_root": True, "access": _NONE}, {"root"}),
+    ("observer_as_root with commands", {"observer_as_root": True}, set()),
     ("opencode single star", {**_OP, "access": {"files": {"read": ["src/*.py"]}}},
      set()),
     ("opencode double star", {**_OP, "access": {"files": {"read": ["src/**"]}}},
@@ -1073,7 +1078,7 @@ def test_runs_sandboxed() -> None:
 @pytest.mark.parametrize("access,refused", [
     (None, True), ({"commands": {"mode": "shell"}}, True),
     ({"commands": {"mode": "list", "allow": ["ls"]}}, True),
-    ({"commands": {"mode": "list"}}, True),     # the launcher's runtime check counts it
+    ({"commands": {"mode": "list"}}, False),    # an empty list runs nothing
     ({"commands": {"mode": "none"}}, False),
 ])
 def test_read_only_without_a_sandbox_refused(access: dict[str, Any] | None,
@@ -1151,23 +1156,41 @@ def test_access_warnings_match_the_launcher() -> None:
 # --- Runner 1edce91: observer_as_root network, read-only covers files only ------------------
 
 @pytest.mark.parametrize("access,refused", [
-    ({"network": "any"}, True),                                    # default commands: shell
-    ({"network": "any", "commands": {"mode": "list", "allow": ["ls"]}}, True),
-    ({"network": "any", "commands": {"mode": "list"}}, True),     # an empty list counts
+    ({}, True),                                                    # default commands: shell
+    ({"network": "none"}, True),
+    ({"commands": {"mode": "list", "allow": ["ls"]}}, True),
+    ({"commands": {"mode": "list"}}, False),                       # an empty list: none
+    ({"commands": {"mode": "none"}}, False),
     ({"network": "any", "commands": {"mode": "none"}}, False),
-    ({"network": "none"}, False),
-    ({}, False),                                                   # an observer's default: none
 ])
-def test_observer_as_root_needs_network_none(access: dict[str, Any], refused: bool) -> None:
+def test_observer_as_root_needs_commands_none(access: dict[str, Any], refused: bool) -> None:
     raw = _def(workdir="/var", observer_as_root=True, access=access)
     if refused:
         with pytest.raises(DefinitionError) as exc:
             validate_definition(raw, ROOT)
-        assert str(exc.value) == OBSERVER_AS_ROOT_NEEDS_NO_NETWORK
+        assert str(exc.value) == OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS
     else:
         validate_definition(raw, ROOT)
     # approval "always" leaves no commands
     validate_definition({**raw, "approval": {"policy": "always"}}, ROOT)
+
+
+def test_empty_list_is_no_commands() -> None:
+    """Runner 7f06d1f/8f6ff56: a list with no allow and no privileged entry runs
+    nothing: no read-only-without-sandbox refusal, a host list is fine, listed
+    patterns are ignored (no LISTED_WITH_WRITES), no warnings."""
+    empty = {"commands": {"mode": "list"}}
+    validate_definition(_def(workdir="/var", run_as="mon", access=empty), NO_BWRAP_ROOT)
+    validate_definition(_def(kind="operator", access={**empty, "network": ["a.com"]}), LOCAL)
+    d = validate_definition(_def(kind="operator", access=empty, approval={
+        "policy": "listed", "patterns": ["systemctl restart"]}), LOCAL)
+    assert definition_warnings(d, LOCAL) == []
+    # privileged entries only: still commands (swv-root)
+    with pytest.raises(DefinitionError) as exc:
+        validate_definition(_def(kind="operator", workdir="/opt", access={"commands": {
+            "mode": "list", "privileged": ["journalctl -u"]}}, approval={
+            "policy": "listed", "patterns": ["systemctl restart"]}), ROOT)
+    assert str(exc.value) == LISTED_WITH_WRITES
 
 
 def test_read_only_network_warning() -> None:

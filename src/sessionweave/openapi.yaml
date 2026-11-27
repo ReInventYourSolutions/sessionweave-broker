@@ -615,15 +615,18 @@ components:
         Access model v2: the limits are files (read-only or writable paths) and the
         network, enforced by the launcher's sandbox and the `run_as` user; the command
         list is guidance, not a security limit. Both kinds default to commands `shell`
-        and may use any mode and command (an empty `list` means no commands). An
+        and may use any mode and command (an empty `list`, without allow and privileged
+        entries, means no commands: no sandbox needed, a host list allowed, listed
+        patterns ignored). An
         observer (or approval `always`) is read-only: with commands (`shell` or `list`)
         it needs the sandbox (every agent of a `--local` launcher; on `--root` an
         observer on a machine with bubblewrap), else it is refused with "read-only
-        can't be guaranteed without the OS sandbox ..." (use `observer_as_root` or
+        can't be guaranteed without the OS sandbox ..." (install bubblewrap, or set
         commands `none`); with commands it gets the deploy warning "read-only covers
         files only: commands can reach the network ..." (network `none` turns the web
-        tools off, it does not isolate commands). `observer_as_root` with commands needs
-        network `none` ("observer_as_root with commands needs network \"none\" ...").
+        tools off, it does not isolate commands). `observer_as_root` needs commands `none` (or an empty
+        list) until network isolation ships ("observer_as_root can't have commands
+        ...").
         An operator gets the deploy warnings "the command list guides
         the agent; it is not a security limit ..." (list mode) and "this agent runs
         without the OS sandbox ..." (a `--root` operator with commands). `privileged`

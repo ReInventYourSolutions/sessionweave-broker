@@ -976,11 +976,14 @@ sandbox (every agent of a `--local` launcher, observers on a `--root` launcher w
 bubblewrap) and, on `--root` launchers, the `run_as` user's OS permissions enforce them.
 An observer may run any command (default `shell`) but never modify files: without the
 sandbox a read-only agent with commands is refused ("read-only can't be guaranteed
-without the OS sandbox ..."; install bubblewrap, use `observer_as_root`, or set its
+without the OS sandbox ..."; install bubblewrap, or set its
 commands to `none`). Read-only covers files only: an agent that cannot write but runs
 commands can still reach the network and the services there (network `none` turns the
 web tools off; it does not isolate commands), which its deploy warning says;
-`observer_as_root` with commands needs network `none`. An operator's command list guides the agent but does not stop it:
+`observer_as_root` needs commands `none` until network isolation ships (as root its
+commands could reach every socket and service on the machine; its file tools still read
+everything). An empty command list (no allow and no privileged entry) means no commands.
+An operator's command list guides the agent but does not stop it:
 test runners, build tools and the folder's own scripts run code it can write. The deploy
 answer shows this as a warning, and a `--root` operator gets "this agent runs without the
 OS sandbox: it can do anything its user can ..."; choose the writable paths, the sandbox

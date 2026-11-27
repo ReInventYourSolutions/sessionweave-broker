@@ -40,16 +40,19 @@ lists are relayed, never stored.
   and the `run_as` user on `--root` launchers. **The command list is guidance, not a
   security limit.**
   - Observers (read-only) default to commands `shell` and may use any mode and any
-    command (the "read commands only" rule is gone; an empty `list` means no commands).
+    command (the "read commands only" rule is gone). An empty `list` (no allow and no
+    privileged entry) means no commands everywhere: it needs no sandbox, allows a host
+    list, and its listed approval patterns are ignored.
     Without the sandbox a read-only agent with commands is refused (400, the Runner's
-    `READ_ONLY_NEEDS_SANDBOX`: install bubblewrap, use `observer_as_root`, or set
+    `READ_ONLY_NEEDS_SANDBOX`: install bubblewrap, or set
     commands to `none`); on a `--root` launcher without bubblewrap only commands
     `none` remains. An agent that cannot write but runs commands gets the deploy warning
     "read-only covers files only: commands can reach the network and call the services
     there (including on this machine)": network `none` turns the web tools off but does
-    not isolate commands. `observer_as_root` with commands needs network `none` (400,
-    the Runner's `OBSERVER_AS_ROOT_NEEDS_NO_NETWORK`; it records intent until egress
-    filtering ships).
+    not isolate commands. **`observer_as_root` needs commands `none`** (or an empty list;
+    400, the Runner's `OBSERVER_AS_ROOT_NEEDS_NO_COMMANDS`) until network isolation
+    ships: as root its commands could reach every socket and service on the machine; its
+    file tools still read everything.
   - Operators (writers) may list any command, command runners and `git` included. A
     deploy in list mode carries the note `LIST_IS_GUIDANCE`; an operator that runs
     commands without the sandbox (a `--root` operator) carries
