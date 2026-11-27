@@ -24,14 +24,79 @@ lists are relayed, never stored.
 - **Listed approvals are checked against the allowed commands** (the launcher's rule,
   refused up front with 400 `invalid_request`): with approval `listed`, an `allow` or
   `privileged` entry that shares a pattern's command word must differ from it at a
-  subcommand word, with no option word before that point. Allow `git status`, `git log`
-  with the pattern `git push` is accepted; allow `git` (it would run `git push` unasked),
-  `git push origin` (it would always ask) or `git -C x log` with `git -C x push` are
-  refused. An observer's empty allow list counts as the default read commands.
-  Listed patterns are also refused with commands mode `shell`, and with any `allow` or
-  `privileged` entry that runs other commands (shells, `env`, `xargs`, `sudo`,
-  interpreters such as `python*`, `find`, `awk`, `sed`, `ssh`, ...; compared by
-  basename), which could run a listed command unchecked.
+  subcommand word, with no option word before that point. Allow `systemctl status` with
+  the pattern `systemctl restart` is accepted; allow `systemctl` (it would run
+  `systemctl restart` unasked), `systemctl restart nginx` (it would always ask) or
+  `systemctl -H x status` with `systemctl -H x restart` are refused. An observer's empty
+  allow list counts as the default read commands. Listed patterns are also refused with
+  commands mode `shell`, and with any `allow` or `privileged` entry that runs other
+  commands (see command runners below), which could run a listed command unchecked.
+- **Command runners** (the launcher's `COMMAND_WRAPPERS`, 95 entries, copied exactly):
+  shells, `env`, `xargs`, `sudo`, `time`, `socat`, `tmux`, interpreters (`python*`,
+  `perl`, `node`, `Rscript`, ...), dynamic loaders (`ld-linux*`, `ld.so`), `find`, `awk`,
+  `sed`, `ssh`, `zip`, and `git` (it runs `core.fsmonitor`, hooks and diff/filter
+  drivers from repository config that its own `--output` can write). Compared by the
+  command word's basename with a trailing version suffix stripped (`perl5.36`,
+  `python3.12`, `node18`, `lua-5.4` count as `perl`, `python`, `node`, `lua`). They are
+  refused in `allow`/`privileged` with listed patterns, and in commands mode `list` for
+  every agent that can write (an operator unless approval is `always`): such an agent
+  could run any command through them. Read-only agents keep them. `docker`, `kubectl`
+  and `systemctl` are not runners: the subcommand rule governs them.
+- **Every launcher rule that does not need the machine is applied at deploy** (400, so
+  a definition the launcher would always reject is never stored and never sits
+  `queued` until a reconnect): a network host list (also `[]`) needs commands mode
+  `none` (or approval `always`); hosts are lowercase names, `*.name` (not on a bare
+  TLD) or `name:port`, no IPv6 literals; file globs have no `~` anywhere and no leading
+  or trailing spaces; `observe.sources`/`logs` hold no glob characters (`* ? [ ] { }`);
+  `model` starts with a letter or digit (never read as a flag) and a cline
+  `provider:model` has a lowercase provider; `run_as` is never `root` or the launcher's
+  install user `sessionweave`; an observer on a `--root` launcher running as root needs
+  `run_as` or `observer_as_root`; `observer_as_root` needs the machine's bubblewrap
+  sandbox (`outside_ceiling`) and is refused for cline. What each runtime can enforce
+  (the launcher's `RUNTIME_CAPS`): claude refuses a `files.read` list other than `.`,
+  `host:port` entries, paths with whitespace, `,` or parentheses, a command list
+  outside the sandbox (an operator on a `--root` launcher, an observer on one without
+  bubblewrap) and a command list with listed patterns; opencode refuses a single `*`
+  in read/write globs and `*.name` hosts; cline refuses host lists. `privileged`
+  entries under approval `always` (which leaves no commands) no longer need a launcher
+  running as root. Randomized comparisons against the Runner's own validator and
+  runtime checks find no difference.
+- **Ids, domains and roles are never only dots** (`.`, `..`): HTTP clients resolve such
+  a definition URL to its parent, so a Remove of `..` became forget-machine. Published
+  profiles with such ids are rejected too.
+- **Published-profiles budget** (409 `definitions_budget`, new error code): a launcher
+  publishes at most 192 KiB of profiles (the Runner's `PUBLISHED_PROFILES_BUDGET`, under
+  the 256 KiB frame cap; before, about 9 full-size definitions made its hello too large
+  and the machine could never reconnect). A deploy is refused when the machine's
+  `profiles` frame would exceed it, counted as the launcher serializes it: its
+  published profiles at the size it sent them (TOML profiles, definitions applied at
+  their stored revision, warnings included), every other stored definition and the new
+  one as the launcher would publish them with their last reported warnings. Offline,
+  TOML profiles are unknown and a new definition's warnings are not known before it is
+  applied: the launcher still checks the budget itself and rejects what does not fit.
+- **A welcome that cannot be sent no longer locks the launcher key**: the fresh key
+  secret it carried is released (the machine and its definitions stay), so the next
+  hello claims the key again instead of being refused 4409 `launcher_key_in_use`.
+- **Removals are not left waiting on a launcher in config mode**: a launcher connected
+  without the `definitions` capability holds no definitions, so its pending removals
+  are done when it connects, and a Remove while it is connected completes at once.
+- **Repeated launcher statuses are recorded once**: the same status for the same
+  revision writes nothing and emits no second `definition.applied`/`definition.rejected`
+  account event. A machine keeps the revision high-water marks of its 1000 most
+  recently purged definition ids (they were unbounded): an older id deployed again
+  starts at revision 1.
+- **Known limits** (documented in the guide): a Forget that races a launcher's
+  reconnect in the same instant can delete the row it just claimed (it answers 404
+  until it reconnects); a definition rejected for a machine reason (runtime missing,
+  not logged in, workdir missing) is not retried: deploy it again once fixed; every
+  account token can deploy to every machine of its account, root-capable definitions
+  included on `--root` launchers (owner decision: keep account tokens away from agents
+  and machines you do not trust); after a broker database restore to an older state,
+  the launcher ignores puts with a revision lower than the one it holds: deploy the
+  definition again (or remove and redeploy) to converge.
+- OpenAPI: `AgentDefinition` lists every rule above; `observe`/`access` are documented
+  as refusing unknown keys; `observer_as_root` refusal codes are exact; hello
+  prerequisites include `path`; `Machine.platform` is a string (not nullable).
 - **Upper bounds on definition limits** (the launcher's TOML profiles use the same):
   `max_duration_s` and `max_idle_s` at most 2592000 (30 days), `max_cost_usd` at most
   10000.

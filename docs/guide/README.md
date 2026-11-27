@@ -933,7 +933,7 @@ Caps: 20 machines per account (100 in open mode), 50 definitions per machine.
 | `GET /v1/me/launchers` | the caller's machines, online or not, with their agents (`status` `idle`, `in_session`, `offline`, `not_deployed`; `deploy` state) |
 | `GET /v1/me/launchers/{key}` | one machine plus its stored definitions |
 | `PUT /v1/me/launchers/{key}/definitions/{id}` | body `{"definition": {...}}`: validate against the machine's ceiling, store, send now (`sent`) or queue while offline (`queued`) |
-| `DELETE /v1/me/launchers/{key}/definitions/{id}` | ask the launcher to remove it (`removing`; 409 `definition_in_use` while the agent is in a session) |
+| `DELETE /v1/me/launchers/{key}/definitions/{id}` | ask the launcher to remove it (`removing`; 409 `definition_in_use` while the agent is in a session); done at once when the launcher never held it or is connected without `--local`/`--root` |
 | `DELETE /v1/me/launchers/{key}` | forget an offline machine: descriptor, definitions and key secret (409 `launcher_online` while connected) |
 | `GET /v1/me/launchers/{key}/browse`, `…/processes` | remote folder and process pickers (§10.5) |
 
@@ -961,13 +961,47 @@ offline machine is queued and sent when it reconnects, so the launcher always co
 to the broker's stored state. A redeploy while the agent is in a session is applied when
 that session ends.
 
+**What the broker checks at deploy.** Every rule of the launcher that does not need the
+machine itself: the schema, the ceiling, the root-execution rules, the command rules
+(listed approvals, command runners such as shells, interpreters and `git` in the list of
+an agent that can write), host and glob syntax, the model name and what the runtime can
+enforce (see the OpenAPI `AgentDefinition`). A deploy the broker accepts can still be
+`rejected` by the launcher for a machine reason: the runtime is missing or not logged in,
+a path does not exist or resolves elsewhere, the sandbox cannot run the agent, a local
+profile has the same id. **Such a rejection is not retried**: fix the machine, then deploy
+the definition again (a new revision; the Cockpit's Deploy on the same content does it).
+
+**Published-profiles budget.** A launcher publishes at most 192 KiB of profiles (its
+hello and `profiles` frames must stay under the broker's 256 KiB frame cap). The broker
+refuses a deploy that would exceed it (409 `definitions_budget`), counting the launcher's
+published profiles and every stored definition as the launcher serializes them; long
+descriptions, many capabilities and long `allowed_accounts` lists take the most room.
+Offline, the launcher's local profiles are unknown to the broker: the launcher checks the
+budget again and rejects a definition that does not fit.
+
+**Who can deploy.** In account mode every account token of the owner can deploy to
+every machine of the account, including root-capable definitions (`privileged`,
+`observer_as_root`, `run_as`) on `--root` launchers. That includes the token a launcher
+itself connects with, which an unsandboxed agent on that machine may be able to read.
+This is by design for now: keep account tokens away from agents and machines you do not
+trust, give each launcher its own token, and revoke a token you suspect.
+
+**After restoring the broker database from a backup**, definitions may carry a lower
+revision than the one their launcher holds; the launcher ignores such puts and the row
+stays `sent`. Deploy the definition again (or remove it and deploy it) until the revision
+passes the launcher's.
+
 **Launcher keys and their secret.** The first registration of a launcher key gets a
 `key_secret` in `welcome` (the broker keeps only its hash); every later hello with that
 key must present it. A connection without it is closed 4409 `launcher_key_in_use` and
 nothing is replaced. If the launcher never stored its secret (for example the `welcome`
-was lost), its key stays locked until the machine is **forgotten**: stop the launcher
-and forget the machine in the Cockpit (`DELETE …/launchers/{key}`); its next connection
-registers the key afresh. Forgetting also deletes the machine's deployed definitions. In
+was lost on the way), its key stays locked until the machine is **forgotten**: stop the
+launcher and forget the machine in the Cockpit (`DELETE …/launchers/{key}`); its next
+connection registers the key afresh. (When the broker itself cannot send the `welcome`,
+it releases that fresh secret, so the next hello simply claims the key again.) A forget
+that lands in the same instant as the launcher's reconnect can delete the row the
+launcher just claimed: the machine then answers 404 until the launcher reconnects
+(restart it). Forgetting also deletes the machine's deployed definitions. In
 open mode any LAN client can forget an offline machine and so reclaim its key (LAN trust).
 
 ### 10.5 Remote browse and process list
@@ -1125,6 +1159,7 @@ On failure the credential is invalidated and the slot released.
 | `definition_in_use` | 409 | removal refused while the agent runs in a session |
 | `definition_id_conflict` | 409 | the launcher has a local (TOML) profile with that id |
 | `definition_limit` | 409 | already 50 definitions on the machine |
+| `definitions_budget` | 409 | the machine's published agents would exceed the launcher's 192 KiB budget: remove or shorten other definitions |
 | `launcher_online` | 409 | forget refused while the launcher is connected |
 | `launcher_offline` | 409 | browse/processes: the machine is not connected (or went away before answering) |
 | `rate_limited` | 429 | browse/processes: 8 requests already waiting on that launcher |
