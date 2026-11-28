@@ -624,11 +624,19 @@ The token (`swa_...`) is shown once. An account manages itself with its own toke
 
 | route | purpose |
 |---|---|
-| `GET /v1/me`, `GET /v1/me/sessions` | the account and its sessions |
+| `GET /v1/me`, `GET /v1/me/sessions` | the account and its sessions; `/v1/me` also returns `current_token` (below) |
 | `GET` / `POST /v1/me/tokens`, `DELETE /v1/me/tokens/{token_id}` | list, mint, revoke own tokens |
 | `GET` / `PUT /v1/me/tokens/{token_id}/networks` | network policy and approved networks |
 | `GET /v1/me/network-approvals`, `POST .../{approval_id}/approve`, `POST .../{approval_id}/deny` | pending approvals |
 | `GET /v1/me/events` | the account event log |
+
+`GET /v1/me` answers the account, `tokens` (metadata of all its tokens) and
+`current_token`: the token the request used (`token_id`, `label`, `network_policy`,
+`approved_networks`, `last_used_at`, ...) plus `first_use_bound`, the network (CIDR) that
+very request bound a fresh `first_use` token to, else `null`. A client that used someone
+else's `first_use` token once (the Cockpit when linking an account) can see that it bound
+the token to its own address and reset it with
+`PUT /v1/me/tokens/{token_id}/networks {"approved_networks": []}`.
 
 Admin equivalents live under `/v1/accounts[/{account_id}[/tokens|/network-approvals]]` and
 `GET /v1/accounts/events`. The SDK wraps them (`me`, `my_tokens`, `create_my_token`,
@@ -1302,7 +1310,9 @@ sessionweave-accounts my-token-revoke TOKEN_ID
 **Lost a token?** Tokens are stored hashed, so a lost one cannot be shown again: mint a
 new one and revoke the old one. `--revoke` does both in one go. The old id is checked
 first, so a wrong id mints nothing. If the revoke fails after the mint, the new token is
-still printed and the command exits 1, so you can retry the revoke:
+still printed and the command exits 1, so you can retry the revoke. A replacement works
+even when the account is at its token limit (`SW_ACCOUNT_MAX_TOKENS`): the token being
+replaced does not count.
 
 ```bash
 sessionweave-accounts my-token-create --label laptop --revoke OLD_TOKEN_ID
@@ -1362,9 +1372,17 @@ Credentials travel as tool arguments, or as the MCP connection's
 - `account_token` (account tools, machine tools): the argument, else the Bearer header
   when it is an account token (`swa_...`). Another Bearer (a launched agent's participant
   token, the admin token) is never tried as an account token.
-- `admin_token` (admin tools): the argument, else the Bearer header. Wrong values count
-  against the same per-address limit as the REST admin routes (5 a minute, then
-  `rate_limited`).
+- `admin_token` (admin tools): the argument, else the Bearer header. A wrong
+  `admin_token` argument counts against the same per-address limit as the REST admin
+  routes (5 a minute, then `rate_limited`). The Bearer header is only a fallback: an
+  `swa_...` Bearer is never tried as the admin token, and a mismatching Bearer shaped like
+  a session token the broker issued (a participant, join, creator or supervisor token) is
+  refused without counting; any other mismatching Bearer counts, as over REST.
+- Which wins when both are given: for the `account_*`, `admin_*` and machine tools the
+  argument wins over the Bearer header; for `session_create` the Bearer header wins over
+  its `account_token` argument (as documented on that tool).
+- Error messages never repeat a submitted id (`unknown token id`, `unknown approval id`,
+  `unknown account id`), so a secret pasted into an id field does not reach the logs.
 - Machine tools without an account token act in open mode (every machine of the broker),
   like `/v1/launchers`; on an account-mode broker that is `permission_denied`.
 - Minted secrets (`token` in `account_token_create` / `admin_token_create`) appear only
@@ -1981,9 +1999,12 @@ Show the account an account token belongs to, with all its tokens.
 Returns account_id, name, status, contact, created_by, created_at and
 tokens: every token of the account (token_id, label, created_at,
 expires_at, revoked_at, last_used_at, last_used_ip, network_policy,
-approved_networks) — never a token's secret value. Same as REST GET
-/v1/me. Errors: invalid_account_token (missing, unknown, revoked or
-expired token, or an account that is not active), network_not_approved,
+approved_networks) — never a token's secret value — and current_token:
+the token this call authenticated with (same fields) plus
+first_use_bound, the network this very call bound a fresh first_use
+token to (else null). Same as REST GET /v1/me. Errors:
+invalid_account_token (missing, unknown, revoked or expired token, or an
+account that is not active), network_not_approved,
 rate_limited, accounts_unavailable (relay without accounts).
 
 #### `account_token_create`

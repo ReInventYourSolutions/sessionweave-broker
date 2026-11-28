@@ -35,8 +35,21 @@ REST route (validation, authorisation, throttling of wrong credentials, account 
   `machine_processes`. With an account token: your own machines; without one on an
   open-mode broker: every machine; without one in account mode: `permission_denied`
   (as `/v1/launchers`).
+- **`GET /v1/me` names the calling token** (additive): `current_token` is that token's
+  metadata plus `first_use_bound`, the network this very request bound a fresh
+  `first_use` token to (else `null`), so a client that used a token once can detect the
+  binding and reset it. MCP `account_me` returns the same.
+- **Replacing at the token limit works**: the token named by `revoke_token_id` does not
+  count against `SW_ACCOUNT_MAX_TOKENS`.
+- **Errors never echo a submitted id**: `unknown token id`, `unknown approval id`,
+  `unknown account id` (a secret pasted into an id field stays out of the logs).
+- **Admin tools and the Bearer header**: an `swa_` Bearer is never tried as the admin
+  token, and a mismatching Bearer shaped like a broker-issued session token is refused
+  without counting a failed admin attempt; an explicit wrong `admin_token` counts, as
+  over REST.
 - **Logs.** `sse_starlette`'s DEBUG log of every SSE chunk (whole MCP answers, one-time
-  secrets included) is kept above DEBUG.
+  secrets included) and `aiosqlite`'s DEBUG log of every statement with its parameters
+  are kept above DEBUG.
 - **Docs.** Guide: "Broker from the command line" (§16) and an "MCP tools reference"
   (§17) generated from the registered tools (a test keeps it current). Participant skill
   **0.26.0**: account tokens (§3.3), machines and definitions (§4.8), every tool in §6.1.

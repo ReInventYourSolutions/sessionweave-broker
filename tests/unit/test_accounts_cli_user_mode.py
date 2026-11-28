@@ -131,7 +131,7 @@ def test_my_token_create_revoke_unknown_id_mints_nothing(
     code, out, err = _cli(
         ["--token", token, "my-token-create", "--label", "x", "--revoke", "nope"], capsys
     )
-    assert code == 1 and out is None and "nope" in err
+    assert code == 1 and out is None and "token_not_found" in err and "nope" not in err
     code, listed, _ = _cli(["--token", token, "my-tokens"], capsys)
     assert len(listed["tokens"]) == 1
 

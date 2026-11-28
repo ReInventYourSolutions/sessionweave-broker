@@ -859,6 +859,23 @@ components:
             tokens:
               type: array
               items: { $ref: '#/components/schemas/AccountToken' }
+            current_token:
+              description: >
+                `GET /v1/me` only: the token this request authenticated with, as listed in
+                `tokens` (read after this authentication, so a first_use binding made by this
+                very request is already in `approved_networks`), plus `first_use_bound`.
+              allOf:
+                - $ref: '#/components/schemas/AccountToken'
+                - type: object
+                  properties:
+                    first_use_bound:
+                      type: string
+                      nullable: true
+                      description: >
+                        The network (CIDR) this very request bound a fresh `first_use` token
+                        to; null otherwise. A client that used someone else's token once (for
+                        example to link it) can reset it with
+                        `PUT /v1/me/tokens/{token_id}/networks {"approved_networks": []}`.
     CreateAccountRequest:
       type: object
       required: [name]

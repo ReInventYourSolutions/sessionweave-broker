@@ -300,7 +300,7 @@ def _check_revocable(client: Any, args: argparse.Namespace) -> str | None:
         return _error_message(resp)
     tokens = resp.json().get("tokens", [])
     if not any(t.get("token_id") == args.revoke for t in tokens):
-        return f"no token {args.revoke} on this account; nothing minted (token_not_found)"
+        return "--revoke names no token of this account; nothing minted (token_not_found)"
     return None
 
 

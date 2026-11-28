@@ -16,7 +16,7 @@ from starlette.routing import Route
 
 from sessionweave.access import admin_matches
 from sessionweave.account_events import EventLog, Origin
-from sessionweave.accounts import Account, AccountStore, AccountToken
+from sessionweave.accounts import Account, AccountStore, AccountToken, AuthResult
 from sessionweave.errors import ErrorCode, ToolError
 from sessionweave.http_api import (
     _bearer,
@@ -26,7 +26,7 @@ from sessionweave.http_api import (
     _request_source_ip,
     origin_from_request,
 )
-from sessionweave.tools import ToolDeps, emit_account_event, resolve_account
+from sessionweave.tools import ToolDeps, authenticate_account, emit_account_event
 
 logger = logging.getLogger(__name__)
 
@@ -107,16 +107,20 @@ def _require_admin(request: Request, deps: ToolDeps) -> JSONResponse | None:
     return None
 
 
-def check_admin(deps: ToolDeps, token: str, source_ip: str) -> None:
+def check_admin(
+    deps: ToolDeps, token: str, source_ip: str, *, count_failure: bool = True
+) -> None:
     """Raise unless ``token`` is the relay admin token. A wrong token counts as
-    a credential failure of ``source_ip`` (throttled like every other one); the
-    admin token always passes, even from a throttled address. Shared by the
-    REST admin routes and the admin MCP tools."""
+    a credential failure of ``source_ip`` (throttled like every other one)
+    unless ``count_failure`` is false; the admin token always passes, even
+    from a throttled address. Shared by the REST admin routes and the admin
+    MCP tools."""
     if admin_matches(token, deps.admin_token):
         return
     if deps.auth_limiter.is_throttled("", source_ip):
         raise ToolError(ErrorCode.RATE_LIMITED, "too many failed attempts")
-    deps.auth_limiter.record_failure("", source_ip)
+    if count_failure:
+        deps.auth_limiter.record_failure("", source_ip)
     raise ToolError(ErrorCode.PERMISSION_DENIED, "the relay admin token is required")
 
 
@@ -124,12 +128,20 @@ async def _require_self(request: Request, deps: ToolDeps) -> Account:
     return await self_account(deps, _bearer(request), origin_from_request(request))
 
 
-async def self_account(deps: ToolDeps, token: str | None, origin: Origin) -> Account:
-    """The active account ``token`` belongs to (``/v1/me`` and the account
-    MCP tools); a missing token is ``invalid_account_token``."""
+async def self_auth(deps: ToolDeps, token: str | None, origin: Origin) -> AuthResult:
+    """Authenticate the caller's account token (``/v1/me`` and the account MCP
+    tools); a missing token is ``invalid_account_token``. The result names the
+    account and the calling token."""
     if not token:
         raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "missing Authorization: Bearer header")
-    return await resolve_account(deps, token, origin=origin)
+    return await authenticate_account(deps, token, origin)
+
+
+async def self_account(deps: ToolDeps, token: str | None, origin: Origin) -> Account:
+    """The active account ``token`` belongs to; see ``self_auth``."""
+    account = (await self_auth(deps, token, origin)).account
+    assert account is not None
+    return account
 
 
 def _bad(message: str) -> ToolError:
@@ -189,9 +201,19 @@ async def _account_with_tokens(store: AccountStore, account: Account) -> dict[st
 # (``check_admin`` / ``self_account``).
 
 
-async def account_view(store: AccountStore, account: Account) -> dict[str, Any]:
-    """An account with its tokens (never a plaintext)."""
-    return await _account_with_tokens(store, account)
+async def account_view(
+    store: AccountStore, account: Account, auth: AuthResult | None = None
+) -> dict[str, Any]:
+    """An account with its tokens (never a plaintext). With the caller's
+    ``auth``, also ``current_token``: the calling token's metadata (as listed,
+    read after this authentication) plus ``first_use_bound``, the network this
+    very request bound a fresh first_use token to (else null)."""
+    out = await _account_with_tokens(store, account)
+    if auth is not None and auth.token_id is not None:
+        current = next((t for t in out["tokens"] if t["token_id"] == auth.token_id), None)
+        if current is not None:
+            out["current_token"] = {**current, "first_use_bound": auth.first_use_bound}
+    return out
 
 
 async def admin_account_view(store: AccountStore, account_id: str) -> dict[str, Any]:
@@ -240,6 +262,7 @@ async def mint_token(
         account_id, label, expires_at_ms=_expires_ms(body),
         max_tokens=deps.account_max_tokens,
         network_policy=policy, approved_networks=body.get("approved_networks"),
+        replacing=replace,
     )
     await emit_account_event(
         deps, account_id, "token.created",
@@ -542,8 +565,9 @@ async def get_me(request: Request) -> Response:
     deps = _deps(request)
     try:
         store = _store(deps)
-        account = await _require_self(request, deps)
-        return JSONResponse(await account_view(store, account))
+        auth = await self_auth(deps, _bearer(request), origin_from_request(request))
+        assert auth.account is not None
+        return JSONResponse(await account_view(store, auth.account, auth))
     except ToolError as exc:
         return _error_response(exc)
 

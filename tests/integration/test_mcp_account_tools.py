@@ -53,7 +53,9 @@ def _strip_volatile(out: dict[str, Any]) -> dict[str, Any]:
     def tok(t: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in t.items() if k not in ("last_used_at", "last_used_ip")}
     if "tokens" in out:
-        return {**out, "tokens": [tok(t) for t in out["tokens"]]}
+        out = {**out, "tokens": [tok(t) for t in out["tokens"]]}
+    if "current_token" in out:
+        out = {**out, "current_token": tok(out["current_token"])}
     return out
 
 
@@ -551,3 +553,127 @@ async def test_rest_mint_with_revoke_token_id(relay: InProc) -> None:
     resp = await r.http.post("/v1/me/tokens", headers=bearer(resp.json()["token"]),
                              json={"label": "x", "revoke_token_id": 5})
     assert resp.status_code == 400 and resp.json()["error"]["code"] == "invalid_request"
+
+
+# ---------- final-review fixes ----------
+
+PARTICIPANT_SHAPED = "A" * 43  # the shape of a broker-issued session token
+
+
+async def test_admin_bearer_fallback_does_not_count_other_credentials(relay: InProc) -> None:
+    """An swa_ or session-token-shaped Bearer is a caller's own credential:
+    the admin tools refuse it without counting a failed admin attempt. Any
+    other mismatching Bearer counts, as over REST; an explicit admin_token
+    too."""
+    r = relay
+    _, token, _ = await _account(r, "alice")
+    for header in (token, PARTICIPANT_SHAPED):
+        async with r.mcp(headers=bearer(header)) as c:
+            for _ in range(7):
+                code, _ = await mcp_outcome(c, "admin_accounts", {})
+                assert code == "permission_denied"
+    assert not r.deps.auth_limiter._buckets
+    # the account token Bearer still works for account tools afterwards
+    async with r.mcp(headers=bearer(token)) as c:
+        assert (await c.call_tool("account_me", {}))["name"] == "alice"
+    async with r.mcp(headers=bearer("wrong-admin-guess")) as c:
+        code, _ = await mcp_outcome(c, "admin_accounts", {})
+        assert code == "permission_denied"
+    assert r.deps.auth_limiter._buckets
+    r.reset_auth_limiter()
+    async with r.mcp(headers=bearer(PARTICIPANT_SHAPED)) as c:
+        code, _ = await mcp_outcome(c, "admin_accounts", {"admin_token": PARTICIPANT_SHAPED})
+        assert code == "permission_denied"
+    assert r.deps.auth_limiter._buckets  # explicit argument: counted
+    async with r.mcp(headers=bearer(ADMIN)) as c:
+        assert "accounts" in await c.call_tool("admin_accounts", {})
+
+
+async def test_submitted_ids_are_never_echoed(
+    relay: InProc, caplog: pytest.LogCaptureFixture
+) -> None:
+    r = relay
+    aid, token, _ = await _account(r, "alice")
+    secret = "swa_pasted-by-mistake-as-an-id"
+    caplog.set_level(logging.DEBUG)
+    texts: list[str] = []
+    async with r.mcp() as c:
+        for tool, args in (
+            ("account_token_revoke", {"account_token": token, "token_id": secret}),
+            ("account_token_create", {"account_token": token, "label": "x",
+                                      "revoke_token_id": secret}),
+            ("account_token_networks", {"account_token": token, "token_id": secret}),
+            ("account_approve", {"account_token": token, "approval_id": secret}),
+            ("admin_account", {"admin_token": ADMIN, "account_id": secret}),
+            ("admin_token_revoke", {"admin_token": ADMIN, "account_id": aid,
+                                    "token_id": secret}),
+        ):
+            code, out = await mcp_outcome(c, tool, args)
+            assert code is not None and code.endswith("_not_found"), (tool, code)
+            texts.append(out["text"])
+    for path in (f"/v1/me/tokens/{secret}", f"/v1/accounts/{aid}/tokens/{secret}"):
+        resp = await r.http.delete(path, headers=bearer(token if "/me/" in path else ADMIN))
+        texts.append(resp.text)
+    assert all(secret not in t for t in texts), texts
+    logged = "\n".join(
+        rec.getMessage() for rec in caplog.records
+        if not rec.name.startswith(("mcp.client", "httpx", "httpcore"))
+    )
+    assert secret not in logged
+
+
+async def test_replace_at_the_token_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = {"SW_ADMIN_TOKEN": ADMIN, "SW_SESSION_CREATION": "account",
+           "SW_PERSISTENCE_DB_PATH": str(tmp_path / "lim.db"), "SW_ACCOUNT_MAX_TOKENS": "2"}
+    async with inproc_relay(monkeypatch, env) as r, r.mcp() as c:
+        aid, token, tid = await _account(r, "alice")
+        second = await c.call_tool("account_token_create", {"account_token": token,
+                                                            "label": "two"})
+        code, _ = await mcp_outcome(c, "account_token_create", {"account_token": token,
+                                                                "label": "three"})
+        assert code == "account_token_limit"
+        # replacing frees the slot it takes: allowed at the limit (MCP and REST)
+        made = await c.call_tool("account_token_create", {
+            "account_token": token, "label": "three", "revoke_token_id": second["token_id"]})
+        assert made["revoked_token_id"] == second["token_id"]
+        resp = await r.http.post(f"/v1/accounts/{aid}/tokens", headers=bearer(ADMIN),
+                                 json={"label": "four", "revoke_token_id": tid})
+        assert resp.status_code == 201 and resp.json()["revoked_token_id"] == tid
+        # a revoke_token_id that is already revoked frees nothing
+        resp = await r.http.post(f"/v1/accounts/{aid}/tokens", headers=bearer(ADMIN),
+                                 json={"label": "five", "revoke_token_id": tid})
+        assert resp.json()["error"]["code"] == "account_token_limit"
+
+
+async def test_me_reports_the_calling_token(relay: InProc) -> None:
+    r = relay
+    _, token, tid = await _account(r, "alice")
+    me = (await r.http.get("/v1/me", headers=bearer(token))).json()
+    cur = me["current_token"]
+    assert cur["token_id"] == tid and cur["network_policy"] == "any"
+    assert cur["approved_networks"] == [] and cur["first_use_bound"] is None
+    assert "token" not in cur
+    # a fresh first_use token: this very call binds it, and says so
+    fresh = (await r.http.post("/v1/me/tokens", headers=bearer(token),
+                               json={"label": "fu", "network_policy": "first_use"})).json()
+    me = (await r.http.get("/v1/me", headers=bearer(fresh["token"]))).json()
+    cur = me["current_token"]
+    assert cur["token_id"] == fresh["token_id"] and cur["network_policy"] == "first_use"
+    assert cur["first_use_bound"] == "127.0.0.1/32"
+    assert cur["approved_networks"] == ["127.0.0.1/32"]
+    # the next call did not bind anything
+    again = (await r.http.get("/v1/me", headers=bearer(fresh["token"]))).json()
+    assert again["current_token"]["first_use_bound"] is None
+    # the caller can reset it (what the Cockpit does after a link)
+    reset = await r.http.put(f"/v1/me/tokens/{fresh['token_id']}/networks",
+                             headers=bearer(token), json={"approved_networks": []})
+    assert reset.json() == {"network_policy": "first_use", "approved_networks": []}
+    # MCP account_me carries the same
+    fresh2 = (await r.http.post("/v1/me/tokens", headers=bearer(token),
+                                json={"label": "fu2", "network_policy": "first_use"})).json()
+    async with r.mcp() as c:
+        out = await c.call_tool("account_me", {"account_token": fresh2["token"]})
+    assert out["current_token"]["token_id"] == fresh2["token_id"]
+    assert out["current_token"]["first_use_bound"] == "127.0.0.1/32"
