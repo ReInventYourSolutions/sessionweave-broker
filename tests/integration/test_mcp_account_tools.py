@@ -163,8 +163,6 @@ async def test_admin_tools(relay: InProc) -> None:
             {"admin_token": ADMIN, "account_id": aid, "token_id": made["token_id"]},
         )
         assert out == {"token_id": made["token_id"], "revoked": True}
-    async with r.mcp(headers=bearer(ADMIN)) as c:  # the admin token as Bearer header
-        assert (await c.call_tool("admin_accounts", {}))["accounts"]
 
 
 async def test_admin_mint_and_revoke_are_audited_like_rest(relay: InProc) -> None:
@@ -557,36 +555,28 @@ async def test_rest_mint_with_revoke_token_id(relay: InProc) -> None:
 
 # ---------- final-review fixes ----------
 
-PARTICIPANT_SHAPED = "A" * 43  # the shape of a broker-issued session token
-
-
-async def test_admin_bearer_fallback_does_not_count_other_credentials(relay: InProc) -> None:
-    """An swa_ or session-token-shaped Bearer is a caller's own credential:
-    the admin tools refuse it without counting a failed admin attempt. Any
-    other mismatching Bearer counts, as over REST; an explicit admin_token
-    too."""
+async def test_admin_tools_never_read_the_bearer_header(relay: InProc) -> None:
+    """The admin token is taken from the admin_token argument only: a Bearer
+    header alone (even the real admin token, an account token or a
+    session-token-shaped value) never authenticates an admin tool and is
+    never counted as a failed attempt. A wrong argument always counts."""
     r = relay
     _, token, _ = await _account(r, "alice")
-    for header in (token, PARTICIPANT_SHAPED):
+    for header in (ADMIN, token, "A" * 43, "wrong-admin-guess"):
         async with r.mcp(headers=bearer(header)) as c:
             for _ in range(7):
-                code, _ = await mcp_outcome(c, "admin_accounts", {})
-                assert code == "permission_denied"
+                code, out = await mcp_outcome(c, "admin_accounts", {})
+                assert code == "permission_denied" and "admin_token" in out["text"]
     assert not r.deps.auth_limiter._buckets
-    # the account token Bearer still works for account tools afterwards
-    async with r.mcp(headers=bearer(token)) as c:
-        assert (await c.call_tool("account_me", {}))["name"] == "alice"
-    async with r.mcp(headers=bearer("wrong-admin-guess")) as c:
-        code, _ = await mcp_outcome(c, "admin_accounts", {})
-        assert code == "permission_denied"
-    assert r.deps.auth_limiter._buckets
-    r.reset_auth_limiter()
-    async with r.mcp(headers=bearer(PARTICIPANT_SHAPED)) as c:
-        code, _ = await mcp_outcome(c, "admin_accounts", {"admin_token": PARTICIPANT_SHAPED})
-        assert code == "permission_denied"
-    assert r.deps.auth_limiter._buckets  # explicit argument: counted
+    # a wrong argument counts, whatever its shape, until the address is throttled
     async with r.mcp(headers=bearer(ADMIN)) as c:
-        assert "accounts" in await c.call_tool("admin_accounts", {})
+        for _ in range(5):
+            code, _ = await mcp_outcome(c, "admin_accounts", {"admin_token": "B" * 43})
+            assert code == "permission_denied"
+        code, _ = await mcp_outcome(c, "admin_accounts", {"admin_token": "B" * 43})
+        assert code == "rate_limited"
+        # the real admin token as the argument still passes
+        assert "accounts" in await c.call_tool("admin_accounts", {"admin_token": ADMIN})
 
 
 async def test_submitted_ids_are_never_echoed(

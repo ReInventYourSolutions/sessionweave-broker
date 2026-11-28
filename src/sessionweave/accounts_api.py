@@ -107,20 +107,16 @@ def _require_admin(request: Request, deps: ToolDeps) -> JSONResponse | None:
     return None
 
 
-def check_admin(
-    deps: ToolDeps, token: str, source_ip: str, *, count_failure: bool = True
-) -> None:
+def check_admin(deps: ToolDeps, token: str, source_ip: str) -> None:
     """Raise unless ``token`` is the relay admin token. A wrong token counts as
-    a credential failure of ``source_ip`` (throttled like every other one)
-    unless ``count_failure`` is false; the admin token always passes, even
-    from a throttled address. Shared by the REST admin routes and the admin
-    MCP tools."""
+    a credential failure of ``source_ip`` (throttled like every other one); the
+    admin token always passes, even from a throttled address. Shared by the
+    REST admin routes and the admin MCP tools."""
     if admin_matches(token, deps.admin_token):
         return
     if deps.auth_limiter.is_throttled("", source_ip):
         raise ToolError(ErrorCode.RATE_LIMITED, "too many failed attempts")
-    if count_failure:
-        deps.auth_limiter.record_failure("", source_ip)
+    deps.auth_limiter.record_failure("", source_ip)
     raise ToolError(ErrorCode.PERMISSION_DENIED, "the relay admin token is required")
 
 

@@ -31,7 +31,7 @@ _JOINED = ("this connection's join, or `session_id` + `participant_token` (also 
 _CREATOR = ("`creator_token`: the session's creator token, the owning account's token or "
             "the admin token (or the Bearer header)")
 _ACCOUNT = "account token: `account_token`, or an `swa_...` Bearer header"
-_ADMIN = "relay admin token: `admin_token`, or the Bearer header"
+_ADMIN = "relay admin token: the `admin_token` argument only (never the Bearer header)"
 _MACHINES = ("account token (`account_token` or an `swa_...` Bearer header): your own "
              "machines; none on an open-mode broker: every machine")
 _COORD = ("`participant_token`: the session coordinator's participant token, or the creator, "

@@ -118,14 +118,6 @@ def _allowed_hosts() -> list[str]:
     return out
 
 
-# Bearer prefixes of credentials that are never the relay admin token: account
-# tokens and launcher key secrets.
-_NON_ADMIN_PREFIXES = (ACCOUNT_TOKEN_PREFIX, "lks_")
-# Session credentials the broker issues (join, participant, creator, supervisor
-# tokens): ``secrets.token_urlsafe(32)``. A mismatching admin Bearer of this
-# shape is a caller's own session credential, not a guess at the admin token.
-_SESSION_TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{43}")
-
 _ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[dict[str, Any]]])
 
 def _anticipated_failures[F: Callable[..., Awaitable[dict[str, Any]]]](
@@ -324,8 +316,8 @@ AccountTokenArg = Annotated[str | None, Field(
                 "credential: keep it secret.")]
 
 AdminTokenArg = Annotated[str | None, Field(
-    description="The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted "
-                "when it arrives as the MCP Authorization: Bearer header. Wrong values "
+    description="The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin "
+                "tools never read it from the MCP Authorization header. Wrong values "
                 "are counted and throttled per address. Keep it secret.")]
 
 AdminAccountIdArg = Annotated[str, Field(
@@ -1418,28 +1410,18 @@ def _build_fastmcp(
     def _admin(explicit: str | None, ctx: Context | None) -> AccountStore:
         """The account store, once the caller proved the relay admin token.
 
-        An explicit ``admin_token`` is checked exactly like the REST admin
-        routes' Bearer (a wrong one is counted and throttled per address). The
-        MCP Bearer header is a fallback: it is often another credential of the
-        caller (an account token, a launched agent's participant token), so an
-        ``swa_``/``lks_`` Bearer is never tried, and a mismatching Bearer shaped
-        like a broker-issued session token is not counted as a failed admin
-        attempt (any other mismatching Bearer is, as over REST)."""
+        The admin token is taken from the ``admin_token`` argument only, never
+        from the MCP Bearer header (often another credential of the caller).
+        Every wrong value is counted and throttled per address exactly like the
+        REST admin routes' Bearer; a missing one is refused without counting."""
         store = accounts_api._store(deps)
-        if admin_token_arg := explicit:
-            accounts_api.check_admin(deps, admin_token_arg, _client_ip(ctx))
-            return store
-        bearer = _bearer_of(ctx)
-        if not bearer or bearer.startswith(_NON_ADMIN_PREFIXES):
+        if not explicit:
             raise ToolError(
                 ErrorCode.PERMISSION_DENIED,
-                "the relay admin token is required: pass admin_token (or send it as the "
-                "Authorization: Bearer header)",
+                "the relay admin token is required: pass it as admin_token "
+                "(the Authorization header is not used by admin tools)",
             )
-        accounts_api.check_admin(
-            deps, bearer, _client_ip(ctx),
-            count_failure=not _SESSION_TOKEN_SHAPE.fullmatch(bearer),
-        )
+        accounts_api.check_admin(deps, explicit, _client_ip(ctx))
         return store
 
     def _mint_body(

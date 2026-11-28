@@ -1366,20 +1366,18 @@ administration (`admin_*`) and machines and agent definitions (`machines_list`,
 validation, authorisation, throttling of wrong credentials and the account events are
 the same.
 
-Credentials travel as tool arguments, or as the MCP connection's
-`Authorization: Bearer` header:
+Credentials travel as tool arguments, or (except the admin token) as the MCP
+connection's `Authorization: Bearer` header:
 
 - `account_token` (account tools, machine tools): the argument, else the Bearer header
   when it is an account token (`swa_...`). Another Bearer (a launched agent's participant
   token, the admin token) is never tried as an account token.
-- `admin_token` (admin tools): the argument, else the Bearer header. A wrong
-  `admin_token` argument counts against the same per-address limit as the REST admin
-  routes (5 a minute, then `rate_limited`). The Bearer header is only a fallback: an
-  `swa_...` Bearer is never tried as the admin token, and a mismatching Bearer shaped like
-  a session token the broker issued (a participant, join, creator or supervisor token) is
-  refused without counting; any other mismatching Bearer counts, as over REST.
-- Which wins when both are given: for the `account_*`, `admin_*` and machine tools the
-  argument wins over the Bearer header; for `session_create` the Bearer header wins over
+- `admin_token` (admin tools): the argument only. Admin tools never read the Bearer
+  header, so a Bearer alone (even the admin token) does not authenticate them and is not
+  counted. Every wrong `admin_token` counts against the same per-address limit as the
+  REST admin routes (5 a minute, then `rate_limited`).
+- Which wins when both are given: for the `account_*` and machine tools the argument
+  wins over the Bearer header; for `session_create` the Bearer header wins over
   its `account_token` argument (as documented on that tool).
 - Error messages never repeat a submitted id (`unknown token id`, `unknown approval id`,
   `unknown account id`), so a secret pasted into an id field does not reach the logs.
@@ -2091,12 +2089,12 @@ as revoke_token_id of account_token_create. Same as REST GET
 
 #### `admin_account`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
 | `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Show one broker account with all its tokens (relay admin only).
 
@@ -2106,11 +2104,11 @@ Errors: account_not_found, plus those of admin_accounts.
 
 #### `admin_accounts`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 List every broker account (relay admin only).
 
@@ -2122,12 +2120,12 @@ wrong attempts from this address), accounts_unavailable.
 
 #### `admin_approvals`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
 | `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 List an account's pending network approvals (relay admin only).
 
@@ -2137,14 +2135,14 @@ plus those of admin_accounts.
 
 #### `admin_approve`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
 | `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
 | `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
 | `scope` | string | no | What to approve: "ip" (default; that exact address) or "network" (its /24 for IPv4, /64 for IPv6). |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Approve a pending network approval of any account (relay admin only).
 
@@ -2155,13 +2153,13 @@ those of admin_accounts.
 
 #### `admin_deny`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
 | `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
 | `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Deny a pending network approval of any account (relay admin only).
 
@@ -2171,7 +2169,7 @@ account_not_found, approval_not_found, plus those of admin_accounts.
 
 #### `admin_token_create`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
@@ -2181,7 +2179,7 @@ Credential: relay admin token: `admin_token`, or the Bearer header.
 | `network_policy` | string | no | Network policy: "any" (default; usable from anywhere), "first_use" (bound to the network of its first use) or "approved_only" (only from approved_networks; other addresses wait for your approval). |
 | `approved_networks` | array of string | no | Approved networks for the token, as CIDRs or IPs, e.g. ["10.0.0.0/8", "192.0.2.7"]. Omit for none. |
 | `revoke_token_id` | string | no | Replace a token: the token_id of a token of the same account to revoke once the new one exists (checked first: an unknown id mints nothing). |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Mint a token for any account (relay admin only); its secret is returned once.
 
@@ -2196,7 +2194,7 @@ admin_accounts.
 
 #### `admin_token_networks`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
@@ -2204,7 +2202,7 @@ Credential: relay admin token: `admin_token`, or the Bearer header.
 | `token_id` | string | yes | The token_id whose networks to show or change (from account_tokens or admin_account). |
 | `network_policy` | string | no | New network policy: "any", "first_use" or "approved_only". Omit to keep it (and to only read when approved_networks is omitted too). |
 | `approved_networks` | array of string | no | New approved networks (CIDRs or IPs), replacing the whole list; [] clears it. Omit to keep them. |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Show or change where a token of any account may be used from (relay admin only).
 
@@ -2215,13 +2213,13 @@ admin_accounts.
 
 #### `admin_token_revoke`
 
-Credential: relay admin token: `admin_token`, or the Bearer header.
+Credential: relay admin token: the `admin_token` argument only (never the Bearer header).
 
 | input | type | required | description |
 |---|---|---|---|
 | `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
 | `token_id` | string | yes | The token_id to revoke (from admin_account). |
-| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). Required: admin tools never read it from the MCP Authorization header. Wrong values are counted and throttled per address. Keep it secret. |
 
 Revoke a token of any account (relay admin only); it stops working at once.
 

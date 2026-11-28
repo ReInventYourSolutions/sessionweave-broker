@@ -26,8 +26,8 @@ REST route (validation, authorisation, throttling of wrong credentials, account 
   header): `account_me`, `account_tokens`, `account_token_create`,
   `account_token_revoke`, `account_token_networks`, `account_approvals`,
   `account_approve`, `account_deny`.
-- **MCP tools: administration** (admin token as `admin_token` or the Bearer header;
-  wrong values count against the REST admin limit): `admin_accounts`, `admin_account`,
+- **MCP tools: administration** (admin token as the `admin_token` argument only, never
+  the Bearer header; every wrong value counts against the REST admin limit): `admin_accounts`, `admin_account`,
   `admin_token_create`, `admin_token_revoke`, `admin_token_networks`,
   `admin_approvals`, `admin_approve`, `admin_deny`.
 - **MCP tools: machines and definitions**: `machines_list`, `machine_get`,
@@ -43,10 +43,6 @@ REST route (validation, authorisation, throttling of wrong credentials, account 
   count against `SW_ACCOUNT_MAX_TOKENS`.
 - **Errors never echo a submitted id**: `unknown token id`, `unknown approval id`,
   `unknown account id` (a secret pasted into an id field stays out of the logs).
-- **Admin tools and the Bearer header**: an `swa_` Bearer is never tried as the admin
-  token, and a mismatching Bearer shaped like a broker-issued session token is refused
-  without counting a failed admin attempt; an explicit wrong `admin_token` counts, as
-  over REST.
 - **Logs.** `sse_starlette`'s DEBUG log of every SSE chunk (whole MCP answers, one-time
   secrets included) and `aiosqlite`'s DEBUG log of every statement with its parameters
   are kept above DEBUG.
