@@ -888,6 +888,13 @@ components:
           type: array
           items: { type: string }
           description: CIDRs or exact IPs the token may be used from
+        revoke_token_id:
+          type: string
+          description: >
+            Replace a token: the token_id of a token of the same account to revoke once the
+            new one exists. Checked before minting (an unknown id is `token_not_found` and
+            nothing is minted). The answer then carries `revoked_token_id`, or `revoke_error`
+            if that revoke failed (the new token is valid either way).
     CreatedToken:
       type: object
       properties:
@@ -898,6 +905,13 @@ components:
         expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
         network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
         approved_networks: { type: array, items: { type: string } }
+        revoked_token_id: { type: string, description: "With revoke_token_id: the token revoked by this call" }
+        revoke_error:
+          type: object
+          description: With revoke_token_id, when the revoke step failed after minting
+          properties:
+            code: { type: string }
+            message: { type: string }
     OwnedSession:
       type: object
       properties:
@@ -2723,7 +2737,7 @@ paths:
           description: permission_denied (not the admin token)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
-          description: account_not_found
+          description: account_not_found / token_not_found (revoke_token_id; nothing minted)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)
@@ -2834,6 +2848,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '403':
           description: network_not_approved (an account token used here is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found (revoke_token_id is not a token of this account; nothing minted)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)

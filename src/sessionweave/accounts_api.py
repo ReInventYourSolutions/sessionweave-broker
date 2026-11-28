@@ -67,8 +67,8 @@ async def cut_streams(
         await launchers.close_for_account(account_id, token_id, reason=reason)
 
 
-async def _cut_unapproved_streams(
-    request: Request, store: AccountStore, account_id: str, token_id: str
+async def cut_unapproved_streams(
+    deps: ToolDeps, firehose: Any, store: AccountStore, account_id: str, token_id: str
 ) -> None:
     """End streams (and drop launchers) opened with the token from addresses its
     policy no longer allows."""
@@ -77,12 +77,11 @@ async def _cut_unapproved_streams(
     def unapproved(ip: str) -> bool:
         return not store.network_allows(token, ip)
 
-    firehose = getattr(request.app.state, "firehose", None)
     if firehose is not None:
         await firehose.close_for_account(
             account_id, token_id=token_id, reason="network not approved", ip_filter=unapproved,
         )
-    launchers = getattr(_deps(request), "launchers", None)
+    launchers = getattr(deps, "launchers", None)
     if launchers is not None:
         await launchers.close_for_account(
             account_id, token_id, unapproved, reason="network not approved"
@@ -216,15 +215,19 @@ async def mint_token(
     by: str,
     origin: Origin,
     firehose: Any = None,
-    replace: str | None = None,
 ) -> dict[str, Any]:
     """Mint a token for ``account_id`` from a REST-shaped ``body`` (``label``,
-    optional ``expires_at``, ``network_policy``, ``approved_networks``); the
-    answer carries the plaintext, once.
+    optional ``expires_at``, ``network_policy``, ``approved_networks``,
+    ``revoke_token_id``); the answer carries the plaintext, once.
 
-    ``replace`` names a token of the same account to revoke once the new one
-    exists (checked before minting, so an unknown id mints nothing); the
-    answer then carries ``revoked_token_id``."""
+    ``revoke_token_id`` names a token of the same account to revoke once the
+    new one exists (checked before minting, so an unknown id mints nothing);
+    the answer then carries ``revoked_token_id`` (or ``revoke_error`` if that
+    revoke failed: the new token is never lost)."""
+    await store.get(account_id)  # account_not_found first
+    replace = body.get("revoke_token_id")
+    if replace is not None and (not isinstance(replace, str) or not replace):
+        raise _bad("revoke_token_id must be a non-empty string")
     if replace is not None:
         await store.get_token(account_id, replace)  # token_not_found before minting
     label = body.get("label")
@@ -296,45 +299,79 @@ async def _mint_response(
     return JSONResponse(out, status_code=201)
 
 
-def _networks_json(token: AccountToken) -> JSONResponse:
-    return JSONResponse(
-        {
-            "network_policy": token.network_policy,
-            "approved_networks": list(token.approved_networks),
-        }
+def networks_view(token: AccountToken) -> dict[str, Any]:
+    return {
+        "network_policy": token.network_policy,
+        "approved_networks": list(token.approved_networks),
+    }
+
+
+async def token_networks(store: AccountStore, account_id: str, token_id: str) -> dict[str, Any]:
+    """A token's network policy and approved networks."""
+    return networks_view(await store.get_token(account_id, token_id))
+
+
+async def set_token_networks(
+    deps: ToolDeps, store: AccountStore, firehose: Any, account_id: str, token_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Change a token's ``network_policy`` and/or ``approved_networks`` (REST
+    body shape); streams from addresses no longer allowed are cut."""
+    policy = body.get("network_policy")
+    if policy is not None and not isinstance(policy, str):
+        raise _bad("network_policy must be a string")
+    token = await store.set_token_networks(
+        account_id, token_id, network_policy=policy,
+        approved_networks=body.get("approved_networks"),
     )
+    await cut_unapproved_streams(deps, firehose, store, account_id, token_id)
+    return networks_view(token)
 
 
-async def _get_networks(
-    request: Request, store: AccountStore, account_id: str
-) -> Response:
-    return _networks_json(await store.get_token(account_id, request.path_params["token_id"]))
+async def approvals_view(store: AccountStore, account_id: str) -> dict[str, Any]:
+    return {"approvals": await store.list_approvals(account_id)}
 
 
-def _is_admin_route(request: Request) -> bool:
-    return request.url.path.startswith("/v1/accounts/")
-
-
-async def _approve(
-    request: Request, store: AccountStore, account_id: str
-) -> Response:
-    body = await _body(request)
+async def approve(
+    store: AccountStore, account_id: str, approval_id: str, body: dict[str, Any],
+    *, by: str, origin: Origin,
+) -> dict[str, Any]:
+    """Approve a pending network approval; ``body["scope"]`` is "ip" or
+    "network". Answers the token's networks after the change."""
     scope = body.get("scope")
     if scope not in ("ip", "network"):
         raise _bad('scope must be "ip" or "network"')
-    token = await store.approve(
-        account_id, request.path_params["approval_id"], scope,
-        by="admin" if _is_admin_route(request) else "self",
-        client=origin_from_request(request).client,
+    token = await store.approve(account_id, approval_id, scope, by=by, client=origin.client)
+    return networks_view(token)
+
+
+async def deny(
+    store: AccountStore, account_id: str, approval_id: str, *, by: str, origin: Origin
+) -> None:
+    await store.deny(account_id, approval_id, by=by, client=origin.client)
+
+
+def _by(request: Request) -> str:
+    return "admin" if request.url.path.startswith("/v1/accounts/") else "self"
+
+
+async def _get_networks(request: Request, store: AccountStore, account_id: str) -> Response:
+    return JSONResponse(
+        await token_networks(store, account_id, request.path_params["token_id"])
     )
-    return _networks_json(token)
+
+
+async def _approve(request: Request, store: AccountStore, account_id: str) -> Response:
+    return JSONResponse(await approve(
+        store, account_id, request.path_params["approval_id"], await _body(request),
+        by=_by(request), origin=origin_from_request(request),
+    ))
 
 
 async def _deny(request: Request, store: AccountStore, account_id: str) -> Response:
-    await store.deny(
-        account_id, request.path_params["approval_id"],
-        by="admin" if _is_admin_route(request) else "self",
-        client=origin_from_request(request).client,
+    await deny(
+        store, account_id, request.path_params["approval_id"],
+        by=_by(request), origin=origin_from_request(request),
     )
     return Response(status_code=204)
 
@@ -342,17 +379,10 @@ async def _deny(request: Request, store: AccountStore, account_id: str) -> Respo
 async def _set_networks(
     request: Request, deps: ToolDeps, store: AccountStore, account_id: str
 ) -> Response:
-    body = await _body(request)
-    policy = body.get("network_policy")
-    if policy is not None and not isinstance(policy, str):
-        raise _bad("network_policy must be a string")
-    token_id = request.path_params["token_id"]
-    token = await store.set_token_networks(
-        account_id, token_id, network_policy=policy,
-        approved_networks=body.get("approved_networks"),
-    )
-    await _cut_unapproved_streams(request, store, account_id, token_id)
-    return _networks_json(token)
+    return JSONResponse(await set_token_networks(
+        deps, store, _firehose(request), account_id, request.path_params["token_id"],
+        await _body(request),
+    ))
 
 
 # ---------- admin routes ----------
@@ -610,7 +640,7 @@ def _self_account(handler: Any) -> Any:
 
 
 async def _list_approvals(request: Request, store: AccountStore, account_id: str) -> Response:
-    return JSONResponse({"approvals": await store.list_approvals(account_id)})
+    return JSONResponse(await approvals_view(store, account_id))
 
 
 async def list_my_sessions(request: Request) -> Response:

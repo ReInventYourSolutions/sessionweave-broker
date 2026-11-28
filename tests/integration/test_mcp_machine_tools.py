@@ -205,13 +205,16 @@ async def test_account_mode_errors_match_rest(tmp_path: Path) -> None:
 
 
 async def test_account_mode_needs_an_account_token(tmp_path: Path) -> None:
-    async with seeded_relay(tmp_path, mode="account") as s:
+    async with seeded_relay(tmp_path, mode="account") as s, \
+            httpx.AsyncClient(base_url=s.base) as c:
+        rest_code, _ = rest_outcome(await c.get("/v1/launchers"))
+        assert rest_code == "permission_denied"
         # no credential, and a Bearer that is not an account token: refused,
         # never served as open mode
         for headers in (None, bearer(ADMIN)):
             async with sw_client(s.base, headers=headers) as m:
                 code, out = await mcp_outcome(m, "machines_list", {})
-                assert code == "invalid_account_token", out
+                assert code == "permission_denied", out  # as REST /v1/launchers
                 assert "account_token" in out["text"]
         async with sw_client(s.base, headers=bearer(s.token)) as m:  # token as Bearer
             assert await m.call_tool("machines_list", {}) == {"launchers": []}

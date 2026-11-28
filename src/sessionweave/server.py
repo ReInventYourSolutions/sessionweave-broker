@@ -358,6 +358,26 @@ MachineKeyArg = Annotated[str, Field(
 DefinitionIdArg = Annotated[str, Field(
     description="The agent definition's id (its profile id on the machine), e.g. obs.")]
 
+NetworksTokenIdArg = Annotated[str, Field(
+    description="The token_id whose networks to show or change (from account_tokens "
+                "or admin_account).")]
+
+NetworksPolicyArg = Annotated[str | None, Field(
+    description='New network policy: "any", "first_use" or "approved_only". Omit to '
+                "keep it (and to only read when approved_networks is omitted too).")]
+
+NetworksListArg = Annotated[list[str] | None, Field(
+    description="New approved networks (CIDRs or IPs), replacing the whole list; [] "
+                "clears it. Omit to keep them.")]
+
+ApprovalIdArg = Annotated[str, Field(
+    description="The approval_id of a pending approval (from account_approvals or "
+                "admin_approvals).")]
+
+ApprovalScopeArg = Annotated[str, Field(
+    description='What to approve: "ip" (default; that exact address) or "network" '
+                "(its /24 for IPv4, /64 for IPv6).")]
+
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
                 "echoed to everyone who joins. Recognised keys: kind, "
@@ -1400,12 +1420,12 @@ def _build_fastmcp(
 
     def _mint_body(
         label: str, expires_at: str | None, network_policy: str | None,
-        approved_networks: list[str] | None,
+        approved_networks: list[str] | None, revoke_token_id: str | None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"label": label}
         for key, value in (
             ("expires_at", expires_at), ("network_policy", network_policy),
-            ("approved_networks", approved_networks),
+            ("approved_networks", approved_networks), ("revoke_token_id", revoke_token_id),
         ):
             if value is not None:
                 body[key] = value
@@ -1472,9 +1492,8 @@ def _build_fastmcp(
         store, account = await _self(account_token, ctx)
         return await accounts_api.mint_token(
             deps, store, account.account_id,
-            _mint_body(label, expires_at, network_policy, approved_networks),
+            _mint_body(label, expires_at, network_policy, approved_networks, revoke_token_id),
             by="self", origin=current_origin(_client_ip(ctx)), firehose=firehose,
-            replace=revoke_token_id,
         )
 
     @_tool("account_token_revoke")
@@ -1500,6 +1519,100 @@ def _build_fastmcp(
             by="self", origin=current_origin(_client_ip(ctx)),
         )
         return {"token_id": token_id, "revoked": True}
+
+    def _networks_changes(
+        network_policy: str | None, approved_networks: list[str] | None
+    ) -> dict[str, Any] | None:
+        """The REST PUT body for a networks change, or None for a read."""
+        body: dict[str, Any] = {}
+        if network_policy is not None:
+            body["network_policy"] = network_policy
+        if approved_networks is not None:
+            body["approved_networks"] = approved_networks
+        return body or None
+
+    @_tool("account_token_networks")
+    async def account_token_networks_tool(
+        token_id: NetworksTokenIdArg,
+        network_policy: NetworksPolicyArg = None,
+        approved_networks: NetworksListArg = None,
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Show or change where one of your account's tokens may be used from.
+
+    Without network_policy and approved_networks it only reads; with either
+    it changes that setting (approved_networks replaces the whole list; []
+    clears it). Live streams opened from addresses no longer allowed are
+    cut. Returns {"network_policy", "approved_networks"}. Same as REST
+    GET/PUT /v1/me/tokens/{token_id}/networks. Errors: token_not_found,
+    invalid_request (bad policy or network), plus those of account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        body = _networks_changes(network_policy, approved_networks)
+        if body is None:
+            return await accounts_api.token_networks(store, account.account_id, token_id)
+        return await accounts_api.set_token_networks(
+            deps, store, firehose, account.account_id, token_id, body
+        )
+
+    @_tool("account_approvals")
+    async def account_approvals_tool(
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List your account's pending network approvals.
+
+    A token whose policy is first_use or approved_only that is used from a
+    new address is refused with network_not_approved and leaves a pending
+    approval here (approval_id, token, ip, network, client, created_at...).
+    Approve it with account_approve or refuse it with account_deny. Returns
+    {"approvals": [...]}. Same as REST GET /v1/me/network-approvals.
+    Errors: those of account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        return await accounts_api.approvals_view(store, account.account_id)
+
+    @_tool("account_approve")
+    async def account_approve_tool(
+        approval_id: ApprovalIdArg,
+        scope: ApprovalScopeArg = "ip",
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Approve a pending network approval of your account: the token may then
+    be used from that address (scope "ip") or its whole network (scope
+    "network": its /24 or /64).
+
+    Returns the token's {"network_policy", "approved_networks"} after the
+    change. Same as REST POST /v1/me/network-approvals/{id}/approve.
+    Errors: approval_not_found, invalid_request (bad scope), plus those of
+    account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        return await accounts_api.approve(
+            store, account.account_id, approval_id, {"scope": scope},
+            by="self", origin=current_origin(_client_ip(ctx)),
+        )
+
+    @_tool("account_deny")
+    async def account_deny_tool(
+        approval_id: ApprovalIdArg,
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Deny a pending network approval of your account; the address stays refused.
+
+    Returns {"approval_id": ..., "denied": true}. Same as REST POST
+    /v1/me/network-approvals/{id}/deny. Errors: approval_not_found, plus
+    those of account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        await accounts_api.deny(
+            store, account.account_id, approval_id,
+            by="self", origin=current_origin(_client_ip(ctx)),
+        )
+        return {"approval_id": approval_id, "denied": True}
 
     @_tool("admin_accounts")
     async def admin_accounts_tool(
@@ -1555,12 +1668,10 @@ def _build_fastmcp(
     admin_accounts.
     """
         store = _admin(admin_token, ctx)
-        await store.get(account_id)  # account_not_found before anything else
         return await accounts_api.mint_token(
             deps, store, account_id,
-            _mint_body(label, expires_at, network_policy, approved_networks),
+            _mint_body(label, expires_at, network_policy, approved_networks, revoke_token_id),
             by="admin", origin=current_origin(_client_ip(ctx)), firehose=firehose,
-            replace=revoke_token_id,
         )
 
     @_tool("admin_token_revoke")
@@ -1586,6 +1697,92 @@ def _build_fastmcp(
         )
         return {"token_id": token_id, "revoked": True}
 
+    async def _admin_on(explicit: str | None, ctx: Context | None, account_id: str) -> Any:
+        """The store, once the caller is the admin and ``account_id`` exists."""
+        store = _admin(explicit, ctx)
+        await store.get(account_id)  # account_not_found
+        return store
+
+    @_tool("admin_token_networks")
+    async def admin_token_networks_tool(
+        account_id: AdminAccountIdArg,
+        token_id: NetworksTokenIdArg,
+        network_policy: NetworksPolicyArg = None,
+        approved_networks: NetworksListArg = None,
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Show or change where a token of any account may be used from (relay admin only).
+
+    As account_token_networks, for account_id. Same as REST GET/PUT
+    /v1/accounts/{account_id}/tokens/{token_id}/networks. Errors:
+    account_not_found, token_not_found, invalid_request, plus those of
+    admin_accounts.
+    """
+        store = await _admin_on(admin_token, ctx, account_id)
+        body = _networks_changes(network_policy, approved_networks)
+        if body is None:
+            return await accounts_api.token_networks(store, account_id, token_id)
+        return await accounts_api.set_token_networks(
+            deps, store, firehose, account_id, token_id, body
+        )
+
+    @_tool("admin_approvals")
+    async def admin_approvals_tool(
+        account_id: AdminAccountIdArg,
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List an account's pending network approvals (relay admin only).
+
+    As account_approvals, for account_id. Same as REST GET
+    /v1/accounts/{account_id}/network-approvals. Errors: account_not_found,
+    plus those of admin_accounts.
+    """
+        store = await _admin_on(admin_token, ctx, account_id)
+        return await accounts_api.approvals_view(store, account_id)
+
+    @_tool("admin_approve")
+    async def admin_approve_tool(
+        account_id: AdminAccountIdArg,
+        approval_id: ApprovalIdArg,
+        scope: ApprovalScopeArg = "ip",
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Approve a pending network approval of any account (relay admin only).
+
+    As account_approve, for account_id; recorded as approved by "admin".
+    Same as REST POST /v1/accounts/{account_id}/network-approvals/{id}/approve.
+    Errors: account_not_found, approval_not_found, invalid_request, plus
+    those of admin_accounts.
+    """
+        store = await _admin_on(admin_token, ctx, account_id)
+        return await accounts_api.approve(
+            store, account_id, approval_id, {"scope": scope},
+            by="admin", origin=current_origin(_client_ip(ctx)),
+        )
+
+    @_tool("admin_deny")
+    async def admin_deny_tool(
+        account_id: AdminAccountIdArg,
+        approval_id: ApprovalIdArg,
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Deny a pending network approval of any account (relay admin only).
+
+    Returns {"approval_id": ..., "denied": true}. Same as REST POST
+    /v1/accounts/{account_id}/network-approvals/{id}/deny. Errors:
+    account_not_found, approval_not_found, plus those of admin_accounts.
+    """
+        store = await _admin_on(admin_token, ctx, account_id)
+        await accounts_api.deny(
+            store, account_id, approval_id,
+            by="admin", origin=current_origin(_client_ip(ctx)),
+        )
+        return {"approval_id": approval_id, "denied": True}
+
     # ---------- machines (v2 launchers) and their agent definitions ----------
     #
     # The same shared operations as /v1/me/launchers (account token: only the
@@ -1603,7 +1800,7 @@ def _build_fastmcp(
             )
         if deps.session_creation == "account":
             raise ToolError(
-                ErrorCode.INVALID_ACCOUNT_TOKEN,
+                ErrorCode.PERMISSION_DENIED,
                 "this broker is in account mode: pass account_token (one of your "
                 "account's tokens) or send it as the Authorization: Bearer header",
             )
@@ -1617,7 +1814,8 @@ def _build_fastmcp(
         """List the machines (v2 launchers) you can deploy agents to, with their agents.
 
     With an account token: the machines your account's launchers registered.
-    On an open-mode broker without a token: every machine of the broker.
+    On an open-mode broker without a token: every machine of the broker
+    (in account mode, no token is permission_denied, as REST /v1/launchers).
     Returns {"launchers": [...]}: per machine launcher_key (the key the
     other machine tools take), machine, online, mode (config, local or
     root), ceiling, capabilities (definitions, browse, processes),

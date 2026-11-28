@@ -357,3 +357,197 @@ async def test_no_credential_reaches_the_logs(
     assert "Tool 'admin_accounts' failed" in text  # the capture saw the relay's records
     for secret in (ADMIN, WRONG_ADMIN, token, made["token"], mine["token"], "swa_wrong_guess"):
         assert secret not in text
+
+
+# ---------- follow-ups: networks, approvals, REST revoke_token_id ----------
+
+
+async def _pending_approval(r: InProc, token: str) -> tuple[str, str]:
+    """(bound token_id, approval_id): an approved_only token used from this
+    (unapproved) address leaves a pending approval."""
+    made = (await r.http.post(
+        "/v1/me/tokens", headers=bearer(token),
+        json={"label": "bound", "network_policy": "approved_only",
+              "approved_networks": ["10.0.0.0/8"]},
+    )).json()
+    refused = await r.http.get("/v1/me", headers=bearer(made["token"]))
+    assert refused.json()["error"]["code"] == "network_not_approved"
+    rows = (await r.http.get("/v1/me/network-approvals", headers=bearer(token))).json()
+    (row,) = [a for a in rows["approvals"] if a["token_id"] == made["token_id"]]
+    return made["token_id"], row["approval_id"]
+
+
+async def test_account_networks_and_approvals_tools(relay: InProc) -> None:
+    r = relay
+    _, token, tid = await _account(r, "alice")
+    async with r.mcp() as c:
+        got = await c.call_tool("account_token_networks", {"account_token": token,
+                                                           "token_id": tid})
+        assert got == {"network_policy": "any", "approved_networks": []}
+        changed = await c.call_tool("account_token_networks", {
+            "account_token": token, "token_id": tid, "network_policy": "first_use",
+            "approved_networks": ["127.0.0.0/8"]})
+        assert changed == {"network_policy": "first_use",
+                           "approved_networks": ["127.0.0.0/8"]}
+        cleared = await c.call_tool("account_token_networks", {
+            "account_token": token, "token_id": tid, "approved_networks": []})
+        assert cleared["approved_networks"] == [] and cleared["network_policy"] == "first_use"
+        bound_tid, apr = await _pending_approval(r, token)
+        listed = await c.call_tool("account_approvals", {"account_token": token})
+        rest = (await r.http.get("/v1/me/network-approvals", headers=bearer(token))).json()
+        assert listed == rest and [a["approval_id"] for a in listed["approvals"]] == [apr]
+        out = await c.call_tool("account_approve", {"account_token": token,
+                                                    "approval_id": apr})
+        assert "127.0.0.1/32" in out["approved_networks"] or "127.0.0.1" in str(out)
+        assert (await c.call_tool("account_approvals", {"account_token": token})) == {
+            "approvals": []}
+        _, apr2 = await _pending_approval(r, token)
+        assert await c.call_tool("account_deny", {"account_token": token,
+                                                  "approval_id": apr2}) == {
+            "approval_id": apr2, "denied": True}
+        code, _ = await mcp_outcome(c, "account_deny", {"account_token": token,
+                                                        "approval_id": apr2})
+        assert code == "approval_not_found"
+        assert bound_tid
+
+
+async def test_admin_networks_and_approvals_tools(relay: InProc) -> None:
+    r = relay
+    aid, token, tid = await _account(r, "alice")
+    async with r.mcp() as c:
+        base = {"admin_token": ADMIN, "account_id": aid}
+        got = await c.call_tool("admin_token_networks", {**base, "token_id": tid})
+        assert got == {"network_policy": "any", "approved_networks": []}
+        changed = await c.call_tool("admin_token_networks", {
+            **base, "token_id": tid, "network_policy": "approved_only",
+            "approved_networks": ["127.0.0.1"]})
+        assert changed["network_policy"] == "approved_only"
+        rest = (await r.http.get(f"/v1/accounts/{aid}/tokens/{tid}/networks",
+                                 headers=bearer(ADMIN))).json()
+        assert rest == changed
+        await c.call_tool("admin_token_networks", {**base, "token_id": tid,
+                                                   "network_policy": "any"})
+        _, apr = await _pending_approval(r, token)
+        listed = await c.call_tool("admin_approvals", base)
+        assert [a["approval_id"] for a in listed["approvals"]] == [apr]
+        out = await c.call_tool("admin_approve", {**base, "approval_id": apr,
+                                                  "scope": "network"})
+        assert any(n.endswith("/24") for n in out["approved_networks"])
+        _, apr2 = await _pending_approval(r, token)
+        assert (await c.call_tool("admin_deny", {**base, "approval_id": apr2}))["denied"]
+    ev = (await r.http.get("/v1/accounts/events", params={"account_id": aid},
+                           headers=bearer(ADMIN))).json()["events"]
+    kinds = [e["kind"] for e in ev]
+    assert any("approv" in k for k in kinds), kinds
+
+
+async def test_networks_and_approvals_parity(relay: InProc) -> None:
+    r = relay
+    aid, token, tid = await _account(r, "alice")
+    other_aid, other_token, other_tid = await _account(r, "bob")
+    _, apr = await _pending_approval(r, token)
+    me_net = f"/v1/me/tokens/{tid}/networks"
+    adm_net = f"/v1/accounts/{aid}/tokens/{tid}/networks"
+    cases: list[Any] = [
+        ("self networks get", "GET", me_net, None, token,
+         ("account_token_networks", {"account_token": token, "token_id": tid})),
+        ("self networks unknown token", "GET", "/v1/me/tokens/nope/networks", None, token,
+         ("account_token_networks", {"account_token": token, "token_id": "nope"})),
+        ("self networks other account's token", "GET",
+         f"/v1/me/tokens/{other_tid}/networks", None, token,
+         ("account_token_networks", {"account_token": token, "token_id": other_tid})),
+        ("self networks bad policy", "PUT", me_net, {"network_policy": "bogus"}, token,
+         ("account_token_networks", {"account_token": token, "token_id": tid,
+                                     "network_policy": "bogus"})),
+        ("self networks bad network", "PUT", me_net, {"approved_networks": ["x"]}, token,
+         ("account_token_networks", {"account_token": token, "token_id": tid,
+                                     "approved_networks": ["x"]})),
+        ("self approvals", "GET", "/v1/me/network-approvals", None, token,
+         ("account_approvals", {"account_token": token})),
+        ("self approvals bogus token", "GET", "/v1/me/network-approvals", None, "swa_bogus",
+         ("account_approvals", {"account_token": "swa_bogus"})),
+        ("self approve bad scope", "POST", f"/v1/me/network-approvals/{apr}/approve",
+         {"scope": "all"}, token,
+         ("account_approve", {"account_token": token, "approval_id": apr, "scope": "all"})),
+        ("self approve unknown", "POST", "/v1/me/network-approvals/nope/approve",
+         {"scope": "ip"}, token,
+         ("account_approve", {"account_token": token, "approval_id": "nope"})),
+        ("self approve other account's approval", "POST",
+         f"/v1/me/network-approvals/{apr}/approve", {"scope": "ip"}, other_token,
+         ("account_approve", {"account_token": other_token, "approval_id": apr})),
+        ("self deny unknown", "POST", "/v1/me/network-approvals/nope/deny", None, token,
+         ("account_deny", {"account_token": token, "approval_id": "nope"})),
+        ("admin networks get", "GET", adm_net, None, ADMIN,
+         ("admin_token_networks", {"admin_token": ADMIN, "account_id": aid,
+                                   "token_id": tid})),
+        ("admin networks wrong token", "GET", adm_net, None, WRONG_ADMIN,
+         ("admin_token_networks", {"admin_token": WRONG_ADMIN, "account_id": aid,
+                                   "token_id": tid})),
+        ("admin networks unknown account", "GET", "/v1/accounts/acc_nope/tokens/x/networks",
+         None, ADMIN, ("admin_token_networks", {"admin_token": ADMIN,
+                                                "account_id": "acc_nope", "token_id": "x"})),
+        ("admin networks token of another account", "PUT",
+         f"/v1/accounts/{other_aid}/tokens/{tid}/networks", {"network_policy": "any"}, ADMIN,
+         ("admin_token_networks", {"admin_token": ADMIN, "account_id": other_aid,
+                                   "token_id": tid, "network_policy": "any"})),
+        ("admin approvals", "GET", f"/v1/accounts/{aid}/network-approvals", None, ADMIN,
+         ("admin_approvals", {"admin_token": ADMIN, "account_id": aid})),
+        ("admin approvals unknown account", "GET", "/v1/accounts/acc_nope/network-approvals",
+         None, ADMIN, ("admin_approvals", {"admin_token": ADMIN, "account_id": "acc_nope"})),
+        ("admin approvals account token", "GET", f"/v1/accounts/{aid}/network-approvals",
+         None, token, ("admin_approvals", {"admin_token": token, "account_id": aid})),
+        ("admin approve bad scope", "POST",
+         f"/v1/accounts/{aid}/network-approvals/{apr}/approve", {"scope": "x"}, ADMIN,
+         ("admin_approve", {"admin_token": ADMIN, "account_id": aid, "approval_id": apr,
+                            "scope": "x"})),
+        ("admin approve wrong account", "POST",
+         f"/v1/accounts/{other_aid}/network-approvals/{apr}/approve", {"scope": "ip"}, ADMIN,
+         ("admin_approve", {"admin_token": ADMIN, "account_id": other_aid,
+                            "approval_id": apr})),
+        ("admin deny unknown", "POST", f"/v1/accounts/{aid}/network-approvals/nope/deny",
+         None, ADMIN, ("admin_deny", {"admin_token": ADMIN, "account_id": aid,
+                                      "approval_id": "nope"})),
+        # REST mint with revoke_token_id (replace) vs the MCP tool
+        ("self replace unknown", "POST", "/v1/me/tokens",
+         {"label": "n", "revoke_token_id": "nope"}, token,
+         ("account_token_create", {"account_token": token, "label": "n",
+                                   "revoke_token_id": "nope"})),
+        ("self replace other account's token", "POST", "/v1/me/tokens",
+         {"label": "n", "revoke_token_id": other_tid}, token,
+         ("account_token_create", {"account_token": token, "label": "n",
+                                   "revoke_token_id": other_tid})),
+        ("admin replace unknown", "POST", f"/v1/accounts/{aid}/tokens",
+         {"label": "n", "revoke_token_id": "nope"}, ADMIN,
+         ("admin_token_create", {"admin_token": ADMIN, "account_id": aid, "label": "n",
+                                 "revoke_token_id": "nope"})),
+    ]
+    async with r.mcp() as c:
+        for name, method, path, body, cred, (tool, args) in cases:
+            r.reset_auth_limiter()
+            rest_code, rest_out = rest_outcome(
+                await r.http.request(method, path, json=body, headers=bearer(cred)))
+            r.reset_auth_limiter()
+            mcp_code, mcp_out = await mcp_outcome(c, tool, args)
+            assert rest_code == mcp_code, (name, rest_out, mcp_out)
+            if rest_code is None and method == "GET":
+                assert mcp_out == rest_out, name
+    # the replace rows minted nothing
+    toks = (await r.http.get("/v1/me/tokens", headers=bearer(token))).json()["tokens"]
+    assert {t["label"] for t in toks} == {"seed", "bound"}
+
+
+async def test_rest_mint_with_revoke_token_id(relay: InProc) -> None:
+    r = relay
+    aid, token, tid = await _account(r, "alice")
+    resp = await r.http.post("/v1/me/tokens", headers=bearer(token),
+                             json={"label": "next", "revoke_token_id": tid})
+    assert resp.status_code == 201, resp.text
+    made = resp.json()
+    assert made["revoked_token_id"] == tid and set(made) == MINT_KEYS | {"revoked_token_id"}
+    assert (await r.http.get("/v1/me", headers=bearer(token))).status_code == 401
+    resp = await r.http.post(f"/v1/accounts/{aid}/tokens", headers=bearer(ADMIN),
+                             json={"label": "adm", "revoke_token_id": made["token_id"]})
+    assert resp.status_code == 201 and resp.json()["revoked_token_id"] == made["token_id"]
+    resp = await r.http.post("/v1/me/tokens", headers=bearer(resp.json()["token"]),
+                             json={"label": "x", "revoke_token_id": 5})
+    assert resp.status_code == 400 and resp.json()["error"]["code"] == "invalid_request"
