@@ -23,7 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
-from sessionweave import __version__
+from sessionweave import __version__, accounts_api
 from sessionweave.access import AuthFailureLimiter, admin_matches
 from sessionweave.account_events import (
     EventLog,
@@ -68,6 +68,7 @@ from sessionweave.tools import (
     agents_discover,
     agents_launch,
     agents_launch_status,
+    current_origin,
     session_check_inbox,
     session_create,
     session_delete,
@@ -309,6 +310,41 @@ AccessTokenArg = Annotated[str | None, Field(
                 "token, or the relay admin token. Not needed if you already joined on this same "
                 "connection. It is a credential: keep it secret.")]
 
+AccountTokenArg = Annotated[str | None, Field(
+    description="One of your account's API tokens (starts with swa_). May be omitted "
+                "when it arrives as the MCP Authorization: Bearer header. It is a "
+                "credential: keep it secret.")]
+
+AdminTokenArg = Annotated[str | None, Field(
+    description="The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted "
+                "when it arrives as the MCP Authorization: Bearer header. Wrong values "
+                "are counted and throttled per address. Keep it secret.")]
+
+AdminAccountIdArg = Annotated[str, Field(
+    description="The account to act on: an account_id from admin_accounts.")]
+
+TokenLabelArg = Annotated[str, Field(
+    description="A name for the new token, 1-64 characters, e.g. the machine or tool "
+                "that will use it.")]
+
+TokenExpiresArg = Annotated[str | None, Field(
+    description="Optional expiry, an ISO 8601 timestamp in the future, e.g. "
+                "2030-01-01T00:00:00Z (no timezone means UTC). Omit for no expiry.")]
+
+TokenPolicyArg = Annotated[str | None, Field(
+    description='Network policy: "any" (default; usable from anywhere), "first_use" '
+                "(bound to the network of its first use) or \"approved_only\" (only "
+                "from approved_networks; other addresses wait for your approval).")]
+
+TokenNetworksArg = Annotated[list[str] | None, Field(
+    description="Approved networks for the token, as CIDRs or IPs, e.g. "
+                '["10.0.0.0/8", "192.0.2.7"]. Omit for none.')]
+
+RevokeTokenIdArg = Annotated[str | None, Field(
+    description="Replace a token: the token_id of a token of the same account to revoke "
+                "once the new one exists (checked first: an unknown id mints nothing).")]
+
+
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
                 "echoed to everyone who joins. Recognised keys: kind, "
@@ -329,6 +365,7 @@ def _build_fastmcp(
     connections: ConnectionManager | None = None,
     registry: SessionRegistry | None = None,
     note_limiter: NoteRateLimiter | None = None,
+    firehose: FirehoseRegistry | None = None,
 ) -> MCPServer:
     # Shared with the HTTP notes route (``app.state.supervisor_rate``) so both
     # surfaces draw on one per-(session, source ip) budget.
@@ -1304,6 +1341,238 @@ def _build_fastmcp(
             deps, payload, handle=_optional_handle(ctx), source_ip=_client_ip(ctx)
         )
 
+    # ---------- accounts: self-service and admin ----------
+    #
+    # Each tool runs the same shared operation as its REST route
+    # (``accounts_api``): same validation, authorisation, auth-failure
+    # throttling and account events. Credentials are never logged.
+
+    def _account_token_of(explicit: str | None, ctx: Context | None) -> str:
+        """The account token: the explicit argument, else the Bearer header when
+        it is an account token (a launched agent's Bearer is its participant
+        token, which is never tried as an account token)."""
+        if explicit:
+            return explicit
+        bearer = _bearer_of(ctx)
+        if bearer and bearer.startswith(ACCOUNT_TOKEN_PREFIX):
+            return bearer
+        raise ToolError(
+            ErrorCode.INVALID_ACCOUNT_TOKEN,
+            "an account token is required: pass account_token (or send it as the "
+            "Authorization: Bearer header)",
+        )
+
+    async def _self(explicit: str | None, ctx: Context | None) -> Any:
+        """(store, account) for an account tool; 503 first, like REST."""
+        store = accounts_api._store(deps)
+        token = _account_token_of(explicit, ctx)
+        account = await accounts_api.self_account(
+            deps, token, current_origin(_client_ip(ctx))
+        )
+        return store, account
+
+    def _admin(explicit: str | None, ctx: Context | None) -> AccountStore:
+        """The account store, once the caller proved the relay admin token
+        (counted and throttled per address exactly like the REST admin routes)."""
+        store = accounts_api._store(deps)
+        token = explicit or _bearer_of(ctx)
+        if not token:
+            raise ToolError(
+                ErrorCode.PERMISSION_DENIED,
+                "the relay admin token is required: pass admin_token (or send it as the "
+                "Authorization: Bearer header)",
+            )
+        accounts_api.check_admin(deps, token, _client_ip(ctx))
+        return store
+
+    def _mint_body(
+        label: str, expires_at: str | None, network_policy: str | None,
+        approved_networks: list[str] | None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"label": label}
+        for key, value in (
+            ("expires_at", expires_at), ("network_policy", network_policy),
+            ("approved_networks", approved_networks),
+        ):
+            if value is not None:
+                body[key] = value
+        return body
+
+    @_tool("account_me")
+    async def account_me_tool(
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Show the account an account token belongs to, with all its tokens.
+
+    Returns account_id, name, status, contact, created_by, created_at and
+    tokens: every token of the account (token_id, label, created_at,
+    expires_at, revoked_at, last_used_at, last_used_ip, network_policy,
+    approved_networks) — never a token's secret value. Same as REST GET
+    /v1/me. Errors: invalid_account_token (missing, unknown, revoked or
+    expired token, or an account that is not active), network_not_approved,
+    rate_limited, accounts_unavailable (relay without accounts).
+    """
+        store, account = await _self(account_token, ctx)
+        return await accounts_api.account_view(store, account)
+
+    @_tool("account_tokens")
+    async def account_tokens_tool(
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List the tokens of your account (metadata only, never the secrets).
+
+    Returns {"tokens": [...]} with token_id, label, created_at, expires_at,
+    revoked_at, last_used_at, last_used_ip, network_policy and
+    approved_networks for each. Use a token_id with account_token_revoke or
+    as revoke_token_id of account_token_create. Same as REST GET
+    /v1/me/tokens; errors as account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        return await accounts_api.tokens_view(store, account.account_id)
+
+    @_tool("account_token_create")
+    async def account_token_create_tool(
+        label: TokenLabelArg,
+        expires_at: TokenExpiresArg = None,
+        network_policy: TokenPolicyArg = None,
+        approved_networks: TokenNetworksArg = None,
+        revoke_token_id: RevokeTokenIdArg = None,
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint a new token for your own account; its secret is returned once.
+
+    Tokens are stored hashed: a lost token cannot be shown again, so
+    "recovering" one means minting a new one here (and revoking the old one
+    with revoke_token_id, or later with account_token_revoke). Returns
+    token (the secret, shown only in this answer: hand it to whoever asked,
+    never log it), token_id, label, created_at, expires_at, network_policy,
+    approved_networks; with revoke_token_id also revoked_token_id (or
+    revoke_error if the revoke failed — the new token is valid either way).
+    Same as REST POST /v1/me/tokens. Errors: invalid_request (bad label,
+    expires_at, network_policy or approved_networks),
+    account_token_limit, token_not_found (revoke_token_id is not a token of
+    this account; nothing is minted), plus those of account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        return await accounts_api.mint_token(
+            deps, store, account.account_id,
+            _mint_body(label, expires_at, network_policy, approved_networks),
+            by="self", origin=current_origin(_client_ip(ctx)), firehose=firehose,
+            replace=revoke_token_id,
+        )
+
+    @_tool("account_token_revoke")
+    async def account_token_revoke_tool(
+        token_id: Annotated[str, Field(description=
+            "The token_id to revoke (from account_tokens). Revoking the token you "
+            "authenticate with is allowed; it stops working at once."
+        )],
+        account_token: AccountTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Revoke one of your account's tokens; it stops working at once.
+
+    Idempotent: revoking an already revoked token succeeds again. Live
+    firehose streams and launchers opened with it are cut. Returns
+    {"token_id": ..., "revoked": true}. Same as REST DELETE
+    /v1/me/tokens/{token_id}. Errors: token_not_found (no such token on
+    this account), plus those of account_me.
+    """
+        store, account = await _self(account_token, ctx)
+        await accounts_api.revoke_token(
+            deps, store, firehose, account.account_id, token_id,
+            by="self", origin=current_origin(_client_ip(ctx)),
+        )
+        return {"token_id": token_id, "revoked": True}
+
+    @_tool("admin_accounts")
+    async def admin_accounts_tool(
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List every broker account (relay admin only).
+
+    Returns {"accounts": [...]} with account_id, name, status (pending,
+    active or disabled), contact, created_by and created_at. Same as REST
+    GET /v1/accounts. Errors: permission_denied (missing or wrong admin
+    token; wrong tokens are counted per address), rate_limited (too many
+    wrong attempts from this address), accounts_unavailable.
+    """
+        store = _admin(admin_token, ctx)
+        return await accounts_api.accounts_view(store)
+
+    @_tool("admin_account")
+    async def admin_account_tool(
+        account_id: AdminAccountIdArg,
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Show one broker account with all its tokens (relay admin only).
+
+    Returns the account (as in admin_accounts) plus tokens: metadata of each
+    token, never a secret. Same as REST GET /v1/accounts/{account_id}.
+    Errors: account_not_found, plus those of admin_accounts.
+    """
+        store = _admin(admin_token, ctx)
+        return await accounts_api.admin_account_view(store, account_id)
+
+    @_tool("admin_token_create")
+    async def admin_token_create_tool(
+        account_id: AdminAccountIdArg,
+        label: TokenLabelArg,
+        expires_at: TokenExpiresArg = None,
+        network_policy: TokenPolicyArg = None,
+        approved_networks: TokenNetworksArg = None,
+        revoke_token_id: RevokeTokenIdArg = None,
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Mint a token for any account (relay admin only); its secret is returned once.
+
+    The way to give a user who lost their token a new one: mint here and
+    pass the lost token's id as revoke_token_id to retire it in the same
+    call. Returns the same fields as account_token_create (token is the
+    secret, shown only in this answer). Recorded as a token.created account
+    event by "admin". Same as REST POST /v1/accounts/{account_id}/tokens.
+    Errors: account_not_found, token_not_found (revoke_token_id; nothing is
+    minted), invalid_request, account_token_limit, plus those of
+    admin_accounts.
+    """
+        store = _admin(admin_token, ctx)
+        await store.get(account_id)  # account_not_found before anything else
+        return await accounts_api.mint_token(
+            deps, store, account_id,
+            _mint_body(label, expires_at, network_policy, approved_networks),
+            by="admin", origin=current_origin(_client_ip(ctx)), firehose=firehose,
+            replace=revoke_token_id,
+        )
+
+    @_tool("admin_token_revoke")
+    async def admin_token_revoke_tool(
+        account_id: AdminAccountIdArg,
+        token_id: Annotated[str, Field(description=
+            "The token_id to revoke (from admin_account)."
+        )],
+        admin_token: AdminTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Revoke a token of any account (relay admin only); it stops working at once.
+
+    Idempotent. Live streams and launchers opened with the token are cut.
+    Returns {"token_id": ..., "revoked": true}. Same as REST DELETE
+    /v1/accounts/{account_id}/tokens/{token_id}. Errors: account_not_found,
+    token_not_found, plus those of admin_accounts.
+    """
+        store = _admin(admin_token, ctx)
+        await accounts_api.admin_revoke_token(
+            deps, store, firehose, account_id, token_id,
+            origin=current_origin(_client_ip(ctx)),
+        )
+        return {"token_id": token_id, "revoked": True}
+
     return mcp
 
 
@@ -1311,6 +1580,10 @@ def build_app() -> Starlette:
     """Build the Starlette app exposing the MCP endpoint and health probes."""
     creation_mode = session_creation_mode(os.environ)
     deps_cfg = load_deployment_defaults(os.environ)
+    # sse_starlette logs every SSE chunk at DEBUG, i.e. whole MCP tool answers,
+    # which carry one-time secrets (minted account tokens, session tokens).
+    # Keep it above DEBUG whatever the root level is.
+    logging.getLogger("sse_starlette").setLevel(logging.INFO)
     connections = ConnectionManager()
     metrics = Metrics()
     firehose = FirehoseRegistry()
@@ -1337,7 +1610,7 @@ def build_app() -> Starlette:
     note_limiter = _note_rate_limiter()
     mcp = _build_fastmcp(
         tool_deps, handles, connections=connections, registry=registry,
-        note_limiter=note_limiter,
+        note_limiter=note_limiter, firehose=firehose,
     )
     mcp_app = mcp.streamable_http_app(
         transport_security=_transport_security(),

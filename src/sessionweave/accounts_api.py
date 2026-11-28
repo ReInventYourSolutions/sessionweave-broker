@@ -45,10 +45,24 @@ async def _cut_streams(
 ) -> None:
     """End live firehose streams and drop launchers opened with the account's
     (revoked) token(s)."""
-    firehose = getattr(request.app.state, "firehose", None)
+    await cut_streams(
+        _deps(request), _firehose(request), account_id, token_id, reason=reason
+    )
+
+
+def _firehose(request: Request) -> Any:
+    return getattr(request.app.state, "firehose", None)
+
+
+async def cut_streams(
+    deps: ToolDeps, firehose: Any, account_id: str, token_id: str | None = None,
+    *, reason: str,
+) -> None:
+    """End live firehose streams and drop launchers opened with the account's
+    (revoked) token(s). Shared by the REST routes and the MCP tools."""
     if firehose is not None:
         await firehose.close_for_account(account_id, token_id=token_id, reason=reason)
-    launchers = getattr(_deps(request), "launchers", None)
+    launchers = getattr(deps, "launchers", None)
     if launchers is not None:
         await launchers.close_for_account(account_id, token_id, reason=reason)
 
@@ -87,22 +101,36 @@ def _require_admin(request: Request, deps: ToolDeps) -> JSONResponse | None:
     token = _bearer(request)
     if not token:
         return _unauthorized()
-    source_ip = _request_source_ip(request)
+    try:
+        check_admin(deps, token, _request_source_ip(request))
+    except ToolError as exc:
+        return _error_response(exc)
+    return None
+
+
+def check_admin(deps: ToolDeps, token: str, source_ip: str) -> None:
+    """Raise unless ``token`` is the relay admin token. A wrong token counts as
+    a credential failure of ``source_ip`` (throttled like every other one); the
+    admin token always passes, even from a throttled address. Shared by the
+    REST admin routes and the admin MCP tools."""
     if admin_matches(token, deps.admin_token):
-        return None
+        return
     if deps.auth_limiter.is_throttled("", source_ip):
-        return _error_response(ToolError(ErrorCode.RATE_LIMITED, "too many failed attempts"))
+        raise ToolError(ErrorCode.RATE_LIMITED, "too many failed attempts")
     deps.auth_limiter.record_failure("", source_ip)
-    return _error_response(
-        ToolError(ErrorCode.PERMISSION_DENIED, "the relay admin token is required")
-    )
+    raise ToolError(ErrorCode.PERMISSION_DENIED, "the relay admin token is required")
 
 
 async def _require_self(request: Request, deps: ToolDeps) -> Account:
-    token = _bearer(request)
+    return await self_account(deps, _bearer(request), origin_from_request(request))
+
+
+async def self_account(deps: ToolDeps, token: str | None, origin: Origin) -> Account:
+    """The active account ``token`` belongs to (``/v1/me`` and the account
+    MCP tools); a missing token is ``invalid_account_token``."""
     if not token:
         raise ToolError(ErrorCode.INVALID_ACCOUNT_TOKEN, "missing Authorization: Bearer header")
-    return await resolve_account(deps, token, origin=origin_from_request(request))
+    return await resolve_account(deps, token, origin=origin)
 
 
 def _bad(message: str) -> ToolError:
@@ -155,7 +183,31 @@ async def _account_with_tokens(store: AccountStore, account: Account) -> dict[st
     return {**account.to_public(), "tokens": [t.to_public() for t in tokens]}
 
 
-async def _mint_token(
+# ---------- shared operations (REST routes and MCP tools) ----------
+#
+# Request-free, so the REST routes and the MCP tools run the same
+# validation, authorisation and events. Callers authenticate first
+# (``check_admin`` / ``self_account``).
+
+
+async def account_view(store: AccountStore, account: Account) -> dict[str, Any]:
+    """An account with its tokens (never a plaintext)."""
+    return await _account_with_tokens(store, account)
+
+
+async def admin_account_view(store: AccountStore, account_id: str) -> dict[str, Any]:
+    return await _account_with_tokens(store, await store.get(account_id))
+
+
+async def accounts_view(store: AccountStore) -> dict[str, Any]:
+    return {"accounts": [a.to_public() for a in await store.list_accounts()]}
+
+
+async def tokens_view(store: AccountStore, account_id: str) -> dict[str, Any]:
+    return {"tokens": [t.to_public() for t in await store.list_tokens(account_id)]}
+
+
+async def mint_token(
     deps: ToolDeps,
     store: AccountStore,
     account_id: str,
@@ -163,7 +215,18 @@ async def _mint_token(
     *,
     by: str,
     origin: Origin,
-) -> JSONResponse:
+    firehose: Any = None,
+    replace: str | None = None,
+) -> dict[str, Any]:
+    """Mint a token for ``account_id`` from a REST-shaped ``body`` (``label``,
+    optional ``expires_at``, ``network_policy``, ``approved_networks``); the
+    answer carries the plaintext, once.
+
+    ``replace`` names a token of the same account to revoke once the new one
+    exists (checked before minting, so an unknown id mints nothing); the
+    answer then carries ``revoked_token_id``."""
+    if replace is not None:
+        await store.get_token(account_id, replace)  # token_not_found before minting
     label = body.get("label")
     if not isinstance(label, str):
         raise _bad("label is required")
@@ -179,35 +242,58 @@ async def _mint_token(
         deps, account_id, "token.created",
         {"token": {"id": meta.token_id, "label": meta.label}, "by": by, "ip": origin.ip},
     )
-    return JSONResponse(
-        {
-            "token": plaintext,
-            "token_id": meta.token_id,
-            "label": meta.label,
-            "created_at": meta.created_at,
-            "expires_at": meta.expires_at,
-            "network_policy": meta.network_policy,
-            "approved_networks": list(meta.approved_networks),
-        },
-        status_code=201,
-    )
+    out: dict[str, Any] = {
+        "token": plaintext,
+        "token_id": meta.token_id,
+        "label": meta.label,
+        "created_at": meta.created_at,
+        "expires_at": meta.expires_at,
+        "network_policy": meta.network_policy,
+        "approved_networks": list(meta.approved_networks),
+    }
+    if replace is not None:
+        try:
+            await revoke_token(
+                deps, store, firehose, account_id, replace, by=by, origin=origin
+            )
+        except ToolError as exc:
+            # The new plaintext must never be lost: report, don't raise.
+            out["revoke_error"] = {"code": exc.code.value, "message": exc.message}
+        else:
+            out["revoked_token_id"] = replace
+    return out
 
 
-async def _revoke(
-    request: Request, deps: ToolDeps, store: AccountStore, account_id: str,
-    token_id: str, *, by: str,
+async def revoke_token(
+    deps: ToolDeps, store: AccountStore, firehose: Any, account_id: str,
+    token_id: str, *, by: str, origin: Origin,
 ) -> None:
+    """Revoke a token (idempotent), cut what it opened, record the event once."""
     after, changed = await store.revoke_token_changed(account_id, token_id)
-    await _cut_streams(request, account_id, token_id, reason="account token revoked")
+    await cut_streams(deps, firehose, account_id, token_id, reason="account token revoked")
     if changed:
         await emit_account_event(
             deps, account_id, "token.revoked",
-            {
-                "token": {"id": token_id, "label": after.label},
-                "by": by,
-                "ip": origin_from_request(request).ip,
-            },
+            {"token": {"id": token_id, "label": after.label}, "by": by, "ip": origin.ip},
         )
+
+
+async def admin_revoke_token(
+    deps: ToolDeps, store: AccountStore, firehose: Any, account_id: str,
+    token_id: str, *, origin: Origin,
+) -> None:
+    await store.get(account_id)  # account_not_found
+    await revoke_token(deps, store, firehose, account_id, token_id, by="admin", origin=origin)
+
+
+async def _mint_response(
+    request: Request, deps: ToolDeps, store: AccountStore, account_id: str, *, by: str
+) -> JSONResponse:
+    out = await mint_token(
+        deps, store, account_id, await _body(request), by=by,
+        origin=origin_from_request(request), firehose=_firehose(request),
+    )
+    return JSONResponse(out, status_code=201)
 
 
 def _networks_json(token: AccountToken) -> JSONResponse:
@@ -300,9 +386,7 @@ async def list_accounts(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        return JSONResponse(
-            {"accounts": [a.to_public() for a in await store.list_accounts()]}
-        )
+        return JSONResponse(await accounts_view(store))
     except ToolError as exc:
         return _error_response(exc)
 
@@ -313,8 +397,7 @@ async def get_account(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        account = await store.get(request.path_params["account_id"])
-        return JSONResponse(await _account_with_tokens(store, account))
+        return JSONResponse(await admin_account_view(store, request.path_params["account_id"]))
     except ToolError as exc:
         return _error_response(exc)
 
@@ -400,9 +483,8 @@ async def create_account_token(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        return await _mint_token(
-            deps, store, request.path_params["account_id"], await _body(request),
-            by="admin", origin=origin_from_request(request),
+        return await _mint_response(
+            request, deps, store, request.path_params["account_id"], by="admin"
         )
     except ToolError as exc:
         return _error_response(exc)
@@ -414,10 +496,10 @@ async def revoke_account_token(request: Request) -> Response:
         store = _store(deps)
         if (denied := _require_admin(request, deps)) is not None:
             return denied
-        account_id = request.path_params["account_id"]
-        await store.get(account_id)
-        token_id = request.path_params["token_id"]
-        await _revoke(request, deps, store, account_id, token_id, by="admin")
+        await admin_revoke_token(
+            deps, store, _firehose(request), request.path_params["account_id"],
+            request.path_params["token_id"], origin=origin_from_request(request),
+        )
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)
@@ -431,7 +513,7 @@ async def get_me(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        return JSONResponse(await _account_with_tokens(store, account))
+        return JSONResponse(await account_view(store, account))
     except ToolError as exc:
         return _error_response(exc)
 
@@ -441,8 +523,7 @@ async def list_my_tokens(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        tokens = await store.list_tokens(account.account_id)
-        return JSONResponse({"tokens": [t.to_public() for t in tokens]})
+        return JSONResponse(await tokens_view(store, account.account_id))
     except ToolError as exc:
         return _error_response(exc)
 
@@ -452,10 +533,7 @@ async def create_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        return await _mint_token(
-            deps, store, account.account_id, await _body(request),
-            by="self", origin=origin_from_request(request),
-        )
+        return await _mint_response(request, deps, store, account.account_id, by="self")
     except ToolError as exc:
         return _error_response(exc)
 
@@ -465,8 +543,10 @@ async def revoke_my_token(request: Request) -> Response:
     try:
         store = _store(deps)
         account = await _require_self(request, deps)
-        token_id = request.path_params["token_id"]
-        await _revoke(request, deps, store, account.account_id, token_id, by="self")
+        await revoke_token(
+            deps, store, _firehose(request), account.account_id,
+            request.path_params["token_id"], by="self", origin=origin_from_request(request),
+        )
         return Response(status_code=204)
     except ToolError as exc:
         return _error_response(exc)

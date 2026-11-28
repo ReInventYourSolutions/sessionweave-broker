@@ -52,6 +52,14 @@ REQUIRED = {
     "agents_discover": ["session_id"],
     "agents_launch": ["session_id", "task"],
     "agents_launch_status": ["launch_id", "session_id"],
+    "account_me": [],
+    "account_tokens": [],
+    "account_token_create": ["label"],
+    "account_token_revoke": ["token_id"],
+    "admin_accounts": [],
+    "admin_account": ["account_id"],
+    "admin_token_create": ["account_id", "label"],
+    "admin_token_revoke": ["account_id", "token_id"],
 }
 
 # String parameters with a closed set of values.
