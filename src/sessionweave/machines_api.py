@@ -15,21 +15,33 @@ answer 503 ``definitions_unavailable`` and the list shows live launchers only.
 ``.../{key}/browse`` and ``.../{key}/processes`` relay a request to the
 machine's connected launcher and return its (validated) answer. The results
 are never stored, and they are logged without paths or process data.
+
+The machine MCP tools (``machines_list``, ``machine_get``, ``definition_deploy``,
+``definition_remove``, ``machine_forget``, ``machine_browse``,
+``machine_processes``) call the same shared operations as these routes.
 """
 from __future__ import annotations
 
 import logging
 import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from sessionweave.accounts_api import _body, _require_self, _store
+from sessionweave.account_events import Origin
+from sessionweave.accounts_api import _body, _store, self_account
 from sessionweave.errors import ErrorCode, ToolError
-from sessionweave.http_api import _deps, _error_response, _request_source_ip
+from sessionweave.http_api import (
+    _bearer,
+    _deps,
+    _error_response,
+    _request_source_ip,
+    origin_from_request,
+)
 from sessionweave.launchers import (
     _KEY_RE,
     BROWSE_MAX_LIMIT,
@@ -71,9 +83,10 @@ def _me(handler: Any) -> Any:
     async def route(request: Request) -> Response:
         deps = _deps(request)
         try:
-            _store(deps)
-            account = await _require_self(request, deps)
-            return await handler(request, deps, account.account_id)  # type: ignore[no-any-return]
+            owner = await account_owner(
+                deps, _bearer(request), origin_from_request(request)
+            )
+            return await handler(request, deps, owner)  # type: ignore[no-any-return]
         except ToolError as exc:
             return _error_response(exc)
 
@@ -87,56 +100,111 @@ def _open_launchers(handler: Any) -> Any:
     async def route(request: Request) -> Response:
         deps = _deps(request)
         try:
-            if deps.session_creation == "account":
-                raise ToolError(
-                    ErrorCode.PERMISSION_DENIED,
-                    "use /v1/me/launchers with your account token",
-                )
-            return await handler(request, deps, OPEN_OWNER)  # type: ignore[no-any-return]
+            owner = open_owner(deps, "use /v1/me/launchers with your account token")
+            return await handler(request, deps, owner)  # type: ignore[no-any-return]
         except ToolError as exc:
             return _error_response(exc)
 
     return route
 
 
-def _key(request: Request) -> str:
-    key = str(request.path_params["key"])
+# --- shared operations (REST routes and MCP tools) ---------------------------
+#
+# Request-free, so ``/v1/me/launchers``, ``/v1/launchers`` and the machine MCP
+# tools run the same owner resolution, validation and relay code. Query-style
+# inputs (``path``, ``cursor``, ``limit``, ``hidden``, ``q``) are validated as
+# the strings a query string carries; the MCP tools hand theirs over in that
+# form.
+
+
+async def account_owner(deps: ToolDeps, token: str | None, origin: Origin) -> str:
+    """Owner of the caller's machines in account mode: its account id."""
+    _store(deps)
+    return (await self_account(deps, token, origin)).account_id
+
+
+def open_owner(deps: ToolDeps, refusal: str) -> str:
+    """Owner of every machine of an open-mode broker; refused (403
+    ``permission_denied``, with ``refusal``) in account mode."""
+    if deps.session_creation == "account":
+        raise ToolError(ErrorCode.PERMISSION_DENIED, refusal)
+    return OPEN_OWNER
+
+
+def check_key(key: str) -> str:
     if not _KEY_RE.match(key):
         raise ToolError(ErrorCode.LAUNCHER_NOT_FOUND, "no such machine")
     return key
 
 
+def _key(request: Request) -> str:
+    return check_key(str(request.path_params["key"]))
+
+
+async def list_machines(deps: ToolDeps, owner: str) -> dict[str, Any]:
+    return {"launchers": await deps.deploys.machines(owner)}
+
+
+async def machine_detail(deps: ToolDeps, owner: str, key: str) -> dict[str, Any]:
+    return await deps.deploys.machine_detail(owner, check_key(key))
+
+
+async def forget_machine(deps: ToolDeps, owner: str, key: str, *, client: str) -> None:
+    await deps.deploys.forget(owner, check_key(key), client=client)
+
+
+def _deploy_body_definition(body: dict[str, Any]) -> Any:
+    """The definition of a deploy body ``{"definition": {...}}``."""
+    extra = sorted(k for k in body if k != "definition")
+    if extra:
+        raise ToolError(ErrorCode.INVALID_REQUEST, f"unknown keys {extra}")
+    if "definition" not in body:
+        raise ToolError(ErrorCode.INVALID_REQUEST, "definition is required")
+    return body["definition"]
+
+
+async def deploy_definition(
+    deps: ToolDeps, owner: str, key: str, def_id: str, body: dict[str, Any], *, client: str
+) -> dict[str, Any]:
+    """Deploy (or redeploy) ``body["definition"]`` as ``def_id`` on the machine."""
+    key = check_key(key)
+    deps.deploys.require_store()
+    return await deps.deploys.deploy(
+        owner, key, def_id, _deploy_body_definition(body), client=client
+    )
+
+
+async def remove_definition(
+    deps: ToolDeps, owner: str, key: str, def_id: str, *, client: str
+) -> dict[str, Any]:
+    return await deps.deploys.remove(owner, check_key(key), def_id, client=client)
+
+
 async def _list(request: Request, deps: ToolDeps, owner: str) -> Response:
-    return JSONResponse({"launchers": await deps.deploys.machines(owner)})
+    return JSONResponse(await list_machines(deps, owner))
 
 
 async def _detail(request: Request, deps: ToolDeps, owner: str) -> Response:
-    return JSONResponse(await deps.deploys.machine_detail(owner, _key(request)))
+    return JSONResponse(await machine_detail(deps, owner, _key(request)))
 
 
 async def _forget(request: Request, deps: ToolDeps, owner: str) -> Response:
-    await deps.deploys.forget(owner, _key(request), client=_request_source_ip(request))
+    await forget_machine(deps, owner, _key(request), client=_request_source_ip(request))
     return Response(status_code=204)
 
 
 async def _put(request: Request, deps: ToolDeps, owner: str) -> Response:
     key = _key(request)
     deps.deploys.require_store()  # 503 before reading the body
-    body = await _body(request)
-    extra = sorted(k for k in body if k != "definition")
-    if extra:
-        raise ToolError(ErrorCode.INVALID_REQUEST, f"unknown keys {extra}")
-    if "definition" not in body:
-        raise ToolError(ErrorCode.INVALID_REQUEST, "definition is required")
-    return JSONResponse(await deps.deploys.deploy(
-        owner, key, str(request.path_params["def_id"]), body["definition"],
+    return JSONResponse(await deploy_definition(
+        deps, owner, key, str(request.path_params["def_id"]), await _body(request),
         client=_request_source_ip(request),
     ))
 
 
 async def _remove(request: Request, deps: ToolDeps, owner: str) -> Response:
-    return JSONResponse(await deps.deploys.remove(
-        owner, _key(request), str(request.path_params["def_id"]),
+    return JSONResponse(await remove_definition(
+        deps, owner, _key(request), str(request.path_params["def_id"]),
         client=_request_source_ip(request),
     ))
 
@@ -152,8 +220,8 @@ def _bad_reply(what: str) -> ToolError:
     return ToolError(ErrorCode.LAUNCHER_BAD_REPLY, f"the machine sent an invalid {what}")
 
 
-def _query_text(request: Request, name: str, limit: int) -> str | None:
-    value = request.query_params.get(name)
+def _query_text(params: Mapping[str, str], name: str, limit: int) -> str | None:
+    value = params.get(name)
     if value is None or value == "":
         return None
     if len(value) > limit or "\x00" in value:
@@ -161,9 +229,9 @@ def _query_text(request: Request, name: str, limit: int) -> str | None:
     return value
 
 
-def _query_limit(request: Request, maximum: int) -> int:
+def _query_limit(params: Mapping[str, str], maximum: int) -> int:
     """``limit`` (default 100); a value above ``maximum`` is capped."""
-    raw = request.query_params.get("limit")
+    raw = params.get("limit")
     if raw is None or raw == "":
         return min(DEFAULT_PAGE_LIMIT, maximum)
     # Digits only: int() would also take "1_000", " 5", "+5" and non-ASCII digits.
@@ -266,20 +334,24 @@ def _process(raw: Any) -> dict[str, Any]:
             "cmdline": raw.get("cmdline"), "started_at": raw.get("started_at")}
 
 
-async def _browse(request: Request, deps: ToolDeps, owner: str) -> Response:
-    key = _key(request)
-    path = _query_text(request, "path", _MAX_PATH)
+async def browse(
+    deps: ToolDeps, owner: str, key: str, params: Mapping[str, str], *, client: str
+) -> dict[str, Any]:
+    """List a directory of the machine (relayed, validated, never stored).
+    ``params``: optional ``path``, ``cursor``, ``limit``, ``hidden`` ("0"/"1")."""
+    key = check_key(key)
+    path = _query_text(params, "path", _MAX_PATH)
     if path is not None and not path.startswith("/"):
         raise _bad("path must be absolute")
-    cursor = _query_text(request, "cursor", _MAX_CURSOR)
-    limit = _query_limit(request, BROWSE_MAX_LIMIT)
-    hidden = request.query_params.get("hidden", "0")
+    cursor = _query_text(params, "cursor", _MAX_CURSOR)
+    limit = _query_limit(params, BROWSE_MAX_LIMIT)
+    hidden = params.get("hidden", "0")
     if hidden not in ("0", "1"):
         raise _bad("hidden must be 0 or 1")
     lnc = await _relay_target(deps, owner, key, "browse")
     if path is None:
         path = lnc.v2.ceiling or "/"
-    log.info("browse relayed to machine %s (client %s)", key, _request_source_ip(request))
+    log.info("browse relayed to machine %s (client %s)", key, client)
     reply = await deps.launchers.request(
         lnc.launcher_id, "browse",
         {"path": path, "cursor": cursor, "limit": limit, "hidden": hidden == "1"},
@@ -292,21 +364,24 @@ async def _browse(request: Request, deps: ToolDeps, owner: str) -> Response:
         raise _bad_reply("path")
     if not isinstance(entries, list) or len(entries) > limit:
         raise _bad_reply("entry list")
-    return JSONResponse({"path": out_path, "entries": [_entry(e) for e in entries],
-                         "next_cursor": _cursor_out(reply.get("next_cursor"))})
+    return {"path": out_path, "entries": [_entry(e) for e in entries],
+            "next_cursor": _cursor_out(reply.get("next_cursor"))}
 
 
-async def _processes(request: Request, deps: ToolDeps, owner: str) -> Response:
-    key = _key(request)
-    raw_cursor = _query_text(request, "cursor", _MAX_CURSOR)
+async def processes(
+    deps: ToolDeps, owner: str, key: str, params: Mapping[str, str], *, client: str
+) -> dict[str, Any]:
+    """List the machine's processes (relayed, validated, never stored).
+    ``params``: optional ``cursor``, ``limit``, ``q``."""
+    key = check_key(key)
+    raw_cursor = _query_text(params, "cursor", _MAX_CURSOR)
     if raw_cursor is not None and not _PID_CURSOR_RE.fullmatch(raw_cursor):
         raise _bad("cursor must be the next_cursor of the previous page")
     cursor = None if raw_cursor is None else int(raw_cursor)
-    limit = _query_limit(request, PROCESSES_MAX_LIMIT)
-    query = _query_text(request, "q", _MAX_QUERY)
+    limit = _query_limit(params, PROCESSES_MAX_LIMIT)
+    query = _query_text(params, "q", _MAX_QUERY)
     lnc = await _relay_target(deps, owner, key, "processes")
-    log.info("process list relayed to machine %s (client %s)", key,
-             _request_source_ip(request))
+    log.info("process list relayed to machine %s (client %s)", key, client)
     reply = await deps.launchers.request(
         lnc.launcher_id, "processes", {"cursor": cursor, "limit": limit, "query": query},
         timeout=deps.launchers.relay_timeout,
@@ -315,8 +390,22 @@ async def _processes(request: Request, deps: ToolDeps, owner: str) -> Response:
     procs = reply.get("processes")
     if not isinstance(procs, list) or len(procs) > limit:
         raise _bad_reply("process list")
-    return JSONResponse({"processes": [_process(p) for p in procs],
-                         "next_cursor": _cursor_out(reply.get("next_cursor"), numeric=True)})
+    return {"processes": [_process(p) for p in procs],
+            "next_cursor": _cursor_out(reply.get("next_cursor"), numeric=True)}
+
+
+async def _browse(request: Request, deps: ToolDeps, owner: str) -> Response:
+    return JSONResponse(await browse(
+        deps, owner, _key(request), request.query_params,
+        client=_request_source_ip(request),
+    ))
+
+
+async def _processes(request: Request, deps: ToolDeps, owner: str) -> Response:
+    return JSONResponse(await processes(
+        deps, owner, _key(request), request.query_params,
+        client=_request_source_ip(request),
+    ))
 
 
 def routes() -> list[Route]:

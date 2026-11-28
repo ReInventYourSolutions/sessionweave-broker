@@ -131,6 +131,9 @@ class AuthResult:
     account_id: str | None = None
     # When the token expires (ms since the epoch), if it does.
     expires_at: int | None = None
+    # The network (CIDR) this very authentication bound a fresh first_use
+    # token to, else None.
+    first_use_bound: str | None = None
 
 
 def _parse_ip(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -196,7 +199,8 @@ def _host_cidr(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
 
 
 def _approval_not_found(approval_id: str) -> ToolError:
-    return ToolError(ErrorCode.APPROVAL_NOT_FOUND, f"unknown approval: {approval_id}")
+    # Never echo the submitted id: a secret pasted by mistake would land in logs.
+    return ToolError(ErrorCode.APPROVAL_NOT_FOUND, "unknown approval id")
 
 
 def _name_taken(name: str) -> ToolError:
@@ -204,7 +208,7 @@ def _name_taken(name: str) -> ToolError:
 
 
 def _not_found(account_id: str) -> ToolError:
-    return ToolError(ErrorCode.ACCOUNT_NOT_FOUND, f"unknown account: {account_id}")
+    return ToolError(ErrorCode.ACCOUNT_NOT_FOUND, "unknown account id")
 
 
 def _check_status(status: str) -> None:
@@ -333,11 +337,14 @@ class AccountStore:
         max_tokens: int | None = None,
         network_policy: str = "any",
         approved_networks: list[str] | None = None,
+        replacing: str | None = None,
     ) -> tuple[str, AccountToken]:
         """Mint a token; the plaintext is returned here and never stored.
 
         With ``max_tokens``, refuses (``account_token_limit``) when the account
-        already has that many tokens that are neither revoked nor expired.
+        already has that many tokens that are neither revoked nor expired. The
+        token ``replacing`` (revoked by the caller right after) is not counted,
+        so an account at its limit can still replace a token.
         """
         if not 1 <= len(label.strip()) <= LABEL_MAX_LEN or len(label) > LABEL_MAX_LEN:
             raise ToolError(
@@ -365,8 +372,9 @@ class AccountStore:
             if max_tokens is not None:
                 async with conn.execute(
                     "SELECT COUNT(*) FROM account_tokens WHERE account_id = ?"
-                    " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
-                    (account_id, meta.created_at),
+                    " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
+                    " AND token_id != ?",
+                    (account_id, meta.created_at, replacing or ""),
                 ) as cur:
                     row = await cur.fetchone()
                 if row is not None and row[0] >= max_tokens:
@@ -424,7 +432,8 @@ class AccountStore:
         ) as cur:
             row = await cur.fetchone()
         if row is None:
-            raise ToolError(ErrorCode.TOKEN_NOT_FOUND, f"unknown token: {token_id}")
+            # Generic: agents confuse token and token_id, and the error text is logged.
+            raise ToolError(ErrorCode.TOKEN_NOT_FOUND, "unknown token id")
         return AccountToken.from_row(row)
 
     async def get_token(self, account_id: str, token_id: str) -> AccountToken:
@@ -552,17 +561,20 @@ class AccountStore:
             )
             return AuthResult(None, None)
         policy, networks = row[10], json.loads(row[11])
+        bound: str | None = None
         if origin is not None and policy != "any":
-            refusal = await self._check_network(
+            checked = await self._check_network(
                 account, token_id, label, policy, networks, now_ms, origin
             )
-            if refusal is not None:
-                return refusal
+            if checked is not None and checked.refusal is not None:
+                return checked
+            if checked is not None:  # allowed by binding a first_use token now
+                bound = checked.first_use_bound
         if origin is not None:
             await self._touch(token_id, row[12], now_ms, origin)
         return AuthResult(
             account, token_id, token_label=label, account_id=account.account_id,
-            expires_at=row[9],
+            expires_at=row[9], first_use_bound=bound,
         )
 
     async def _reject(
@@ -601,7 +613,9 @@ class AccountStore:
         now_ms: int,
         origin: Origin,
     ) -> AuthResult | None:
-        """None when the origin is allowed, else the refusal result."""
+        """None when the origin is allowed, else the refusal result; a result
+        without ``refusal`` but with ``first_use_bound`` when this call allowed
+        it by binding a fresh first_use token to the origin's network."""
         try:
             ip = _parse_ip(origin.ip)
         except ValueError:
@@ -643,7 +657,7 @@ class AccountStore:
                             "client": origin.client,
                         },
                     )
-                    return None
+                    return AuthResult(None, token_id, first_use_bound=bound)
         if ip is None:
             # No usable address to approve: refuse, but record nothing.
             return AuthResult(

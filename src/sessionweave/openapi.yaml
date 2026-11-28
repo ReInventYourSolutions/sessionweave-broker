@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: SessionWeave Relay
-  version: "0.36.0"
+  version: "0.37.0"
   description: |
     SessionWeave is a transport-agnostic rendezvous for multi-agent
     collaboration. The relay brokers messages between participants
@@ -859,6 +859,23 @@ components:
             tokens:
               type: array
               items: { $ref: '#/components/schemas/AccountToken' }
+            current_token:
+              description: >
+                `GET /v1/me` only: the token this request authenticated with, as listed in
+                `tokens` (read after this authentication, so a first_use binding made by this
+                very request is already in `approved_networks`), plus `first_use_bound`.
+              allOf:
+                - $ref: '#/components/schemas/AccountToken'
+                - type: object
+                  properties:
+                    first_use_bound:
+                      type: string
+                      nullable: true
+                      description: >
+                        The network (CIDR) this very request bound a fresh `first_use` token
+                        to; null otherwise. A client that used someone else's token once (for
+                        example to link it) can reset it with
+                        `PUT /v1/me/tokens/{token_id}/networks {"approved_networks": []}`.
     CreateAccountRequest:
       type: object
       required: [name]
@@ -888,6 +905,13 @@ components:
           type: array
           items: { type: string }
           description: CIDRs or exact IPs the token may be used from
+        revoke_token_id:
+          type: string
+          description: >
+            Replace a token: the token_id of a token of the same account to revoke once the
+            new one exists. Checked before minting (an unknown id is `token_not_found` and
+            nothing is minted). The answer then carries `revoked_token_id`, or `revoke_error`
+            if that revoke failed (the new token is valid either way).
     CreatedToken:
       type: object
       properties:
@@ -898,6 +922,13 @@ components:
         expires_at: { type: integer, format: int64, nullable: true, description: Unix epoch milliseconds }
         network_policy: { $ref: '#/components/schemas/NetworkPolicy' }
         approved_networks: { type: array, items: { type: string } }
+        revoked_token_id: { type: string, description: "With revoke_token_id: the token revoked by this call" }
+        revoke_error:
+          type: object
+          description: With revoke_token_id, when the revoke step failed after minting
+          properties:
+            code: { type: string }
+            message: { type: string }
     OwnedSession:
       type: object
       properties:
@@ -2723,7 +2754,7 @@ paths:
           description: permission_denied (not the admin token)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404':
-          description: account_not_found
+          description: account_not_found / token_not_found (revoke_token_id; nothing minted)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)
@@ -2834,6 +2865,9 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '403':
           description: network_not_approved (an account token used here is not approved for the caller network)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: token_not_found (revoke_token_id is not a token of this account; nothing minted)
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '409':
           description: account_token_limit (the account already has `SW_ACCOUNT_MAX_TOKENS` active tokens, default 20; revoke one first)
