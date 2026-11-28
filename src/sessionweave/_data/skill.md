@@ -1,12 +1,12 @@
 ---
 name: sessionweave-participant
-version: 0.25.3
+version: 0.26.0
 description: Use when you see a SessionWeave invite link (`https://<host>/invite/<sid>?jt=…`, `swv://…` or `swvs://…`), are given a SessionWeave `session_id` plus a join token, or are asked to join, host, or test through a SessionWeave relay so that two or more agents can exchange commands across machines. Works over plain HTTP/curl, the Python SDK, or MCP tools.
 ---
 
 # SessionWeave participant
 
-> **Skill version: 0.25.3** — when reporting your behaviour or filing
+> **Skill version: 0.26.0** — when reporting your behaviour or filing
 > issues, cite this version so the user can correlate it against the
 > changelog. To check what you're running on, look at the `version:`
 > field in the frontmatter above (or, if you only have the body in
@@ -468,6 +468,27 @@ administrator); without one you get 401 `account_token_required`. Joining never 
 - **REST:** `Authorization: Bearer $SW_ACCOUNT_TOKEN` on `POST $RELAY/v1/sessions`.
 
 The owning account's token manages the session wherever the `creator_token` is accepted.
+
+#### Your account's tokens
+
+With one valid account token you manage the account's other tokens yourself (broker
+0.37.0+): MCP `account_me`, `account_tokens`, `account_token_create`,
+`account_token_revoke` (REST `/v1/me`, `/v1/me/tokens`; CLI
+`sessionweave-accounts --token ... me|my-tokens|my-token-create|my-token-revoke`).
+
+- **A lost token cannot be recovered** (the broker keeps only a hash). Mint a new one
+  and revoke the old one in one call: `account_token_create` with `label` and
+  `revoke_token_id` (REST: `revoke_token_id` in the `POST /v1/me/tokens` body).
+- The new `token` is in that answer only. Hand it to the user who asked, labelled,
+  and never put it in a session message, a log or a file you did not create for it.
+- Network policies and approvals: `account_token_networks` (read, or change
+  `network_policy` / `approved_networks`), `account_approvals`, `account_approve`,
+  `account_deny`. A token refused with `network_not_approved` leaves a pending approval
+  that another token of the account (or the admin) approves.
+- The broker operator has the same tools for every account with the admin token:
+  `admin_accounts`, `admin_account`, `admin_token_create`, `admin_token_revoke`,
+  `admin_token_networks`, `admin_approvals`, `admin_approve`, `admin_deny`. Use them
+  only when the user gave you the admin token for that purpose.
 
 ### 3.4 You own the session
 
@@ -1056,7 +1077,8 @@ coordinator") and should ask the coordinator with a command. The coordinator is
 creator credential or the admin token while there was none; a join never replaces an
 existing coordinator, and supervisors/observers never take it); the creator/owner/admin
 moves it with
-`PUT /v1/sessions/{sid}/coordinator {"participant_id": …|null}` (SDK `set_coordinator`).
+`PUT /v1/sessions/{sid}/coordinator {"participant_id": …|null}` (SDK `set_coordinator`,
+MCP `session_set_coordinator`).
 - Check support first: `GET /v1/info` → `capabilities.launchers: true`.
 - Discover: `list_domains()` → `discover_agents(domain, role=, capability=)`
   (`GET /v1/agents/domains`, `GET /v1/agents?domain=…`, both with `session_id=`; MCP
@@ -1107,6 +1129,28 @@ Launched agents use the `sessionweave` MCP tools, and an operator keeps its undo
 journal in the session dir named in its prompt (§4.6). The metadata keys `launch_id`,
 `launcher_id`, `launcher_machine`, `profile_id` and `launched_by` are set by the
 broker only (dropped from your own join/update metadata).
+
+### 4.8 Machines and agent definitions
+
+A launcher started with `--local <folder>` or `--root` registers a **machine** you can
+deploy agent definitions to (broker 0.37.0+ as MCP tools; REST `/v1/me/launchers`).
+Pass your account token as `account_token` (or the `swa_` Bearer header); you see your
+own machines only. On an open-mode broker (`GET /v1/info` → `session_creation:
+"open"`) the tools work without a token on every machine.
+
+| tool | does |
+|---|---|
+| `machines_list` | machines with `launcher_key`, online, mode, ceiling, capabilities, agents |
+| `machine_get` | one machine with its definitions and their deploy state |
+| `definition_deploy` | store and send a definition (`key`, `definition_id`, `definition`); `sent` or `queued` |
+| `definition_remove` | remove one (refused while its agent runs) |
+| `machine_forget` | forget an offline machine |
+| `machine_browse` | list a directory inside the ceiling (pick a `workdir`) |
+| `machine_processes` | list processes (command lines redacted) |
+
+A deployed definition becomes a profile you launch with `agents_launch` (§4.7). Deploy
+only what the user asked for: the definition decides what that agent may read, write
+and run on their machine.
 
 ## 5. When things go wrong
 
@@ -1264,6 +1308,15 @@ token named in their row.
 | *(none)* | `GET /v1/sessions/{sid}/access` | Which role the presented Bearer holds in this session. |
 | *(none)* | `WS /v1/sessions/{sid}/participants/me/events?token=…` | Live event stream — see [§7.2](#72-rest--websocket). |
 | *(none)* | `WS /v1/sessions/{sid}/firehose?token=…` | Every event in the session, for a supervisor. `token` is a supervisor, creator or admin token — [§6.6](#66-persistence-and-ownership). |
+| `session_set_coordinator` | `PUT /v1/sessions/{sid}/coordinator` | `{session_id, participant_id, creator_token?}` — move the coordinator role (creator, owning account or admin). [§4.7](#47-launching-agents-the-coordinator). |
+| `agents_discover`, `agents_launch`, `agents_launch_status` | `GET /v1/agents[/domains]`, `POST /v1/sessions/{sid}/agents`, `GET /v1/sessions/{sid}/agents/{launch_id}` | the coordinator discovers and launches agents — [§4.7](#47-launching-agents-the-coordinator). |
+| `account_me`, `account_tokens` | `GET /v1/me`, `GET /v1/me/tokens` | `{account_token?}` → the account and its tokens (metadata, never secrets). |
+| `account_token_create` | `POST /v1/me/tokens` | `{label, expires_at?, network_policy?, approved_networks?, revoke_token_id?, account_token?}` → **`token`** (once), `token_id`, …, `revoked_token_id?`. |
+| `account_token_revoke` | `DELETE /v1/me/tokens/{token_id}` | `{token_id, account_token?}` → `{token_id, revoked: true}`. |
+| `account_token_networks` | `GET`/`PUT /v1/me/tokens/{token_id}/networks` | `{token_id, network_policy?, approved_networks?, account_token?}` → `{network_policy, approved_networks}`. |
+| `account_approvals`, `account_approve`, `account_deny` | `/v1/me/network-approvals[/{id}/approve\|deny]` | pending network approvals; approve with `scope` `ip` or `network`. |
+| `admin_*` (8 tools) | `/v1/accounts/...` | the same for any account, with `admin_token`. |
+| `machines_list`, `machine_get`, `definition_deploy`, `definition_remove`, `machine_forget`, `machine_browse`, `machine_processes` | `/v1/me/launchers/...` (open mode `/v1/launchers/...`) | machines and agent definitions — [§4.8](#48-machines-and-agent-definitions). |
 
 ### 6.2 Notifications catalogue
 
@@ -1799,5 +1852,5 @@ The `version:` field in the frontmatter is this skill's own SemVer,
 decoupled from the relay's. When you give a status report or hit an issue,
 cite it so the user can correlate against the changelog:
 
-> "I'm acting under `sessionweave-participant` v0.25.3 — joined as
+> "I'm acting under `sessionweave-participant` v0.26.0 — joined as
 > observer, long-polling on every turn."

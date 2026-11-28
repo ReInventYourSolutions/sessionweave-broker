@@ -5,6 +5,42 @@ All notable changes to the SessionWeave broker (`sessionweave-broker`). Versions
 
 ## [Unreleased]
 
+## [0.37.0]
+
+Account self-service and MCP parity: users mint, list, replace and revoke their own
+tokens from the CLI and as MCP tools, the admin does the same for any account, and every
+machines/definitions route of 0.36.0 is an MCP tool. Each tool runs the same code as its
+REST route (validation, authorisation, throttling of wrong credentials, account events).
+
+- **CLI user mode.** `sessionweave-accounts --token` (env `SW_ACCOUNT_TOKEN`) adds `me`,
+  `my-tokens`, `my-token-create`, `my-token-revoke`, `my-token-networks`,
+  `my-approvals`, `my-approve`, `my-deny`. Admin mode adds `tokens ACCOUNT_ID`. Both
+  create commands take `--revoke TOKEN_ID` to replace a token (checked before minting;
+  the new token is printed even if the revoke fails). Giving the wrong kind of
+  credential is a clear error that never echoes it.
+- **Replace a token over REST.** `POST /v1/me/tokens` and
+  `POST /v1/accounts/{id}/tokens` take an optional `revoke_token_id`: the token is
+  revoked once the new one exists (an unknown id is 404 `token_not_found` and nothing is
+  minted); the answer carries `revoked_token_id`, or `revoke_error` if that step failed.
+- **MCP tools: your account** (account token as `account_token` or an `swa_` Bearer
+  header): `account_me`, `account_tokens`, `account_token_create`,
+  `account_token_revoke`, `account_token_networks`, `account_approvals`,
+  `account_approve`, `account_deny`.
+- **MCP tools: administration** (admin token as `admin_token` or the Bearer header;
+  wrong values count against the REST admin limit): `admin_accounts`, `admin_account`,
+  `admin_token_create`, `admin_token_revoke`, `admin_token_networks`,
+  `admin_approvals`, `admin_approve`, `admin_deny`.
+- **MCP tools: machines and definitions**: `machines_list`, `machine_get`,
+  `definition_deploy`, `definition_remove`, `machine_forget`, `machine_browse`,
+  `machine_processes`. With an account token: your own machines; without one on an
+  open-mode broker: every machine; without one in account mode: `permission_denied`
+  (as `/v1/launchers`).
+- **Logs.** `sse_starlette`'s DEBUG log of every SSE chunk (whole MCP answers, one-time
+  secrets included) is kept above DEBUG.
+- **Docs.** Guide: "Broker from the command line" (§16) and an "MCP tools reference"
+  (§17) generated from the registered tools (a test keeps it current). Participant skill
+  **0.26.0**: account tokens (§3.3), machines and definitions (§4.8), every tool in §6.1.
+
 ## [0.36.0]
 
 Machines and remote deploy: the Cockpit (0.22.0) defines agents and deploys them through

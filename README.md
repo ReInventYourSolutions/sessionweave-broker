@@ -386,6 +386,13 @@ sessionweave-accounts token-revoke ACC_ID TOKEN_ID
 sessionweave-accounts delete ACC_ID --yes
 ```
 
+An account manages its own tokens with one of them (`--token` or `SW_ACCOUNT_TOKEN`):
+`me`, `my-tokens`, `my-token-create [--revoke OLD_ID]`, `my-token-revoke`,
+`my-token-networks`, `my-approvals`, `my-approve`, `my-deny`. The same operations, and
+the machines and definitions routes, are MCP tools too (`account_*`, `admin_*`,
+`machines_list`, `machine_*`, `definition_*`); see the
+[guide](docs/guide/README.md#16-broker-from-the-command-line).
+
 The token (`swa_...`) is shown once, at mint time. Send it as
 `Authorization: Bearer <token>`:
 

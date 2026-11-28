@@ -8,7 +8,7 @@ This guide is for:
   including a **coordinator** that discovers and launches agents through launchers.
 
 Everything here works with the broker alone: no Cockpit or Runner is required. Versions
-this guide was written against: **broker 0.36.0** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
+this guide was written against: **broker 0.37.0** (`sessionweave-broker`), **SDK 0.13.0** (`sessionweave-sdk`). The broker
 [README](../../README.md) and the OpenAPI spec the broker serves at `/api` stay the
 reference for details.
 
@@ -38,6 +38,8 @@ Contents
 13. [Troubleshooting](#13-troubleshooting)
 14. [Logs](#14-logs)
 15. [Known limitations](#15-known-limitations)
+16. [Broker from the command line](#16-broker-from-the-command-line)
+17. [MCP tools reference](#17-mcp-tools-reference)
 
 ---
 
@@ -122,7 +124,7 @@ participants and exits; the process exit code is `-SIGTERM`, which is expected.
 ### 2.3 Docker
 
 ```bash
-docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.36.0
+docker run --rm -p 8765:8765 ghcr.io/reinventyoursolutions/sessionweave-broker:v0.37.0
 ```
 
 The image runs as `nobody` (uid 65534) and starts
@@ -143,7 +145,7 @@ services:
     volumes: [broker-data:/data]
 
   broker:
-    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.36.0
+    image: ghcr.io/reinventyoursolutions/sessionweave-broker:v0.37.0
     depends_on:
       broker-init: {condition: service_completed_successfully}
     restart: unless-stopped
@@ -567,10 +569,14 @@ Join tokens expire after 15 minutes: mint another with
 | `session_post_order` | supervisor orders (§5.3) |
 | `session_get_events` | timeline of a persisted session |
 | `agents_discover`, `agents_launch`, `agents_launch_status` | the agent registry (§9) |
+| `account_me`, `account_tokens`, `account_token_create`, `account_token_revoke`, `account_token_networks`, `account_approvals`, `account_approve`, `account_deny` | your account's tokens, networks and approvals (§7) |
+| `admin_accounts`, `admin_account`, `admin_token_create`, `admin_token_revoke`, `admin_token_networks`, `admin_approvals`, `admin_approve`, `admin_deny` | administration with the admin token (§7) |
+| `machines_list`, `machine_get`, `definition_deploy`, `definition_remove`, `machine_forget`, `machine_browse`, `machine_processes` | machines and agent definitions (§10.4, §10.5) |
 
 Creator-level tools take the token as an argument (`creator_token`, `token` or
 `participant_token`, depending on the tool) or, when omitted, from the MCP connection's
-`Authorization: Bearer` header.
+`Authorization: Bearer` header. Every tool, with its credential, inputs, result and
+errors: [§17](#17-mcp-tools-reference).
 
 ---
 
@@ -582,7 +588,8 @@ Accounts are created by the admin, with the `sessionweave-accounts` CLI (it prin
 a non-2xx answer exits 1) or `POST /v1/accounts`. The CLI takes `--url` (env `SW_URL`;
 default `http://127.0.0.1:8765`, the broker's default port; an MCP URL ending in `/mcp` is
 accepted too) and `--admin-token`
-(env `SW_ADMIN_TOKEN`).
+(env `SW_ADMIN_TOKEN`). The same CLI manages your own account with an account token
+(`--token`): see [§16](#16-broker-from-the-command-line).
 
 ```bash
 export SW_URL=https://broker.example.com SW_ADMIN_TOKEN=...
@@ -1260,3 +1267,1088 @@ reverse proxy in front of it does not log `Authorization` headers or query strin
   `--root`, and a local profile always wins an id clash.
 - **Remote browse and process lists are relayed live**: an offline machine cannot be
   browsed, and nothing is cached.
+
+---
+
+## 16. Broker from the command line
+
+`sessionweave-accounts` (installed with the broker) talks to the broker's REST API and
+prints its JSON answer; a non-2xx answer prints `message (code)` on stderr and exits 1.
+It never prints a credential except a token you just minted (once, on stdout).
+
+Common options: `--url` (env `SW_URL`; default `http://127.0.0.1:8765`; an MCP URL ending
+in `/mcp` is accepted). The command decides which credential it needs:
+
+| mode | credential | commands |
+|---|---|---|
+| admin | `--admin-token` / `SW_ADMIN_TOKEN` (the relay admin token) | `create`, `list`, `show`, `tokens`, `enable`, `disable`, `delete`, `token-create`, `token-revoke`, `token-networks`, `approvals`, `approve`, `deny`, `events` |
+| user | `--token` / `SW_ACCOUNT_TOKEN` (one of your account tokens, `swa_...`) | `me`, `my-tokens`, `my-token-create`, `my-token-revoke`, `my-token-networks`, `my-approvals`, `my-approve`, `my-deny` |
+
+Giving the wrong kind is a clear error (for example `me` with only the admin token, `list`
+with only an account token, or an `swa_` token passed as `--admin-token`).
+
+### 16.1 Your own account (account token)
+
+```bash
+export SW_URL=https://broker.example.com SW_ACCOUNT_TOKEN=swa_...
+sessionweave-accounts me                       # your account and its tokens (no secrets)
+sessionweave-accounts my-tokens
+# a token for another machine or tool; the secret is printed once
+sessionweave-accounts my-token-create --label build-01 \
+  --network-policy approved_only --network 203.0.113.7/32 --expires-at 2027-06-01T00:00:00Z
+sessionweave-accounts my-token-revoke TOKEN_ID
+```
+
+**Lost a token?** Tokens are stored hashed, so a lost one cannot be shown again: mint a
+new one and revoke the old one. `--revoke` does both in one go. The old id is checked
+first, so a wrong id mints nothing. If the revoke fails after the mint, the new token is
+still printed and the command exits 1, so you can retry the revoke:
+
+```bash
+sessionweave-accounts my-token-create --label laptop --revoke OLD_TOKEN_ID
+# {"token": "swa_...", "token_id": "...", ..., "revoked_token_id": "OLD_TOKEN_ID"}
+```
+
+Networks and approvals ([§7.3](#73-network-policies-and-approvals)):
+
+```bash
+sessionweave-accounts my-token-networks TOKEN_ID                       # show
+sessionweave-accounts my-token-networks TOKEN_ID --policy first_use    # change the policy
+sessionweave-accounts my-token-networks TOKEN_ID --network 10.0.0.0/8 --network 192.0.2.7
+sessionweave-accounts my-token-networks TOKEN_ID --no-networks          # clear the list
+sessionweave-accounts my-approvals                                      # pending approvals
+sessionweave-accounts my-approve APPROVAL_ID --scope network            # or --scope ip
+sessionweave-accounts my-deny APPROVAL_ID
+```
+
+### 16.2 Administration (admin token)
+
+```bash
+export SW_URL=https://broker.example.com SW_ADMIN_TOKEN=...
+sessionweave-accounts create alice --contact alice@example.com
+sessionweave-accounts list
+sessionweave-accounts show ACC_ID              # account + tokens
+sessionweave-accounts tokens ACC_ID            # tokens only
+sessionweave-accounts token-create ACC_ID --label laptop          # first token for a user
+sessionweave-accounts token-create ACC_ID --label laptop --revoke LOST_TOKEN_ID   # replace
+sessionweave-accounts token-revoke ACC_ID TOKEN_ID
+sessionweave-accounts token-networks ACC_ID TOKEN_ID --policy approved_only --network 203.0.113.0/24
+sessionweave-accounts approvals ACC_ID
+sessionweave-accounts approve ACC_ID APPROVAL_ID --scope ip
+sessionweave-accounts deny ACC_ID APPROVAL_ID
+sessionweave-accounts events --account ACC_ID --wait 30
+```
+
+`enable`, `disable` and `delete --yes` are described in [§7.1](#71-administering-accounts).
+Over REST, both mint routes (`POST /v1/me/tokens`, `POST /v1/accounts/{id}/tokens`) also
+take `revoke_token_id` in the body to replace a token in one call; the answer then carries
+`revoked_token_id` (the CLI does the same with two calls, so it works with any broker
+version).
+
+---
+
+## 17. MCP tools reference
+
+The broker is an MCP server at `/mcp`. Besides the session tools, everything an account
+or the admin can do over REST is a tool too: account self-service (`account_*`),
+administration (`admin_*`) and machines and agent definitions (`machines_list`,
+`machine_*`, `definition_*`). Each tool runs the same code as its REST route, so
+validation, authorisation, throttling of wrong credentials and the account events are
+the same.
+
+Credentials travel as tool arguments, or as the MCP connection's
+`Authorization: Bearer` header:
+
+- `account_token` (account tools, machine tools): the argument, else the Bearer header
+  when it is an account token (`swa_...`). Another Bearer (a launched agent's participant
+  token, the admin token) is never tried as an account token.
+- `admin_token` (admin tools): the argument, else the Bearer header. Wrong values count
+  against the same per-address limit as the REST admin routes (5 a minute, then
+  `rate_limited`).
+- Machine tools without an account token act in open mode (every machine of the broker),
+  like `/v1/launchers`; on an account-mode broker that is `permission_denied`.
+- Minted secrets (`token` in `account_token_create` / `admin_token_create`) appear only
+  in the tool result. Hand them to whoever asked and never log them.
+
+The reference below is generated from the tools the broker registers.
+
+<!-- mcp-tools-reference:begin (generated by tests/unit/test_guide_mcp_reference.py) -->
+
+The broker registers 48 tools. Errors come back as an MCP tool error whose text is `<code>: <message>`; the codes are listed in [§12](#12-error-codes).
+
+### Sessions
+
+#### `session_check_inbox`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Drain the events buffered for you right now and return them, empty or not.
+
+Returns immediately — use session_wait_for_event to block until
+something arrives instead of polling this in a loop. Needed when you
+joined with delivery_mode="pull"; push-mode participants receive
+events as notifications instead. Requires session_join on this
+connection first.
+
+#### `session_create`
+
+Credential: none on an open broker; in account mode an account token (`account_token` or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `config` | object | no | Per-session overrides of relay defaults, e.g. {"idle_ttl_seconds": 3600}. Values outside the operator bounds are refused with invalid_config. Omit to use the defaults. |
+| `purpose` | object | no | Free-form JSON telling joiners what the session is for; echoed to everyone who joins. Recognised keys: kind, your_role, your_capabilities, available_roles, instructions, delivery_mode. 16 KiB cap. |
+| `persistence` | object | no | Omit for RAM-only, zero data retention (the default). Pass {"mode": "ttl", "ttl_seconds": N} or {"mode": "until_deleted"} to persist to disk. Refused with persistence_failed if this relay has persistence disabled. |
+| `account_token` | string | no | Account API token authorising session creation. Used only when the MCP HTTP request carries no Authorization: Bearer header. Required on relays running in account mode; omit on open relays. |
+
+Open a new session; returns session_id, invite_link and the one-time tokens.
+
+Save creator_token and supervisor_token: each is returned exactly once
+and nothing can recover it. creator_token manages the session
+(session_delete, minting and revoking tokens); supervisor_token lets a
+supervisor observe it. invite_link (swv:// or swvs://) and invite_url
+(HTTP) carry join_token, a credential valid for 15 minutes that anyone
+can use to join; mint a fresh one with session_mint_join_token.
+Creating a session does not put you in it — call session_join next.
+
+persistence is opt-in. Omit it and the session lives in RAM only and
+is discarded once it goes idle, so nothing touches disk. Pass
+{"mode": "ttl", "ttl_seconds": N} or {"mode": "until_deleted"} to
+persist the roster, command timeline and buffered events.
+
+purpose is free-form JSON echoed to everyone who joins, so a joiner
+can act without a separate briefing.
+
+#### `session_delete`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Delete a session permanently, for everyone in it.
+
+Requires the creator_token returned once by session_create (or the relay
+admin token, or the owning account's token, also accepted from the MCP
+Authorization: Bearer header). Every
+participant is disconnected with session.ended, and a persisted
+session's stored timeline is removed. Needs no session_join, and
+cannot be undone.
+
+#### `session_describe`
+
+Credential: `access_token`: any credential of the session (or a joined connection).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `access_token` | string | no | Any credential that may read the session: the join token from the invite link, your participant_token, a supervisor_token, the creator_token, the owning account's token, or the relay admin token. Not needed if you already joined on this same connection. It is a credential: keep it secret. |
+
+Read-only snapshot of a session: config, purpose, roster, persistence state.
+
+Allocates no participant and does not bind this connection, so it is
+the safe pre-flight before deciding whether to join. Needs an
+access_token (the join token from the invite link will do) unless this
+connection already joined the session.
+
+#### `session_get_events`
+
+Credential: `access_token`: any credential of the session (or a joined connection).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | A persisted session. An ephemeral one keeps no timeline and returns no_history. |
+| `after_seq` | integer | no | Only events with seq strictly greater than this. Pass the last seq you saw to page forward. |
+| `before_seq` | integer | no | Only events with seq strictly less than this, to page backward. |
+| `kind` | string | no | Comma-separated event names to keep, e.g. "command.received,result.received". Omit for all kinds. |
+| `participant_id` | string | no | Comma-separated participant ids; keep only events involving them. |
+| `limit` | integer | no | Maximum events to return, 1 to 1000 (default 200). |
+| `order` | "asc" \\| "desc" | no | "asc" (default) oldest first, or "desc" newest first. |
+| `access_token` | string | no | Any credential that may read the session: the join token from the invite link, your participant_token, a supervisor_token, the creator_token, the owning account's token, or the relay admin token. Not needed if you already joined on this same connection. It is a credential: keep it secret. |
+
+Browse the timeline of a persisted session without bringing it back into RAM.
+
+Returns paginated events plus session_state ("hot", "cold" or
+"ended"). Page with after_seq / before_seq and limit; order is "asc"
+(default) or "desc". Narrow with kind and participant_id. An
+ephemeral session stores no timeline and returns no_history. Needs no
+session_join, but an access_token unless this connection joined the session.
+
+#### `session_join`
+
+Credential: `join_token`: the invite's join token, the creator token, the owning account's token or the admin token.
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `role` | string | no | Who you are in this session, e.g. "worker". Take purpose.your_role if the session prescribes one. Always pass it: dispatch by role relies on it. |
+| `objective` | string | no | One line on what you are here to do, shown to the other participants in the roster. |
+| `capabilities` | array of string | no | Strings other participants target with dispatch "all"/"any", e.g. ["chat"]. Always pass them: a participant without capabilities is invisible to capability-filtered dispatch. |
+| `metadata` | object | no | Free-form JSON attached to your roster entry. |
+| `delivery_mode` | "push" \\| "pull" | no | "push" (default): events arrive as MCP notifications. "pull": events are buffered for session_check_inbox / session_wait_for_event. Choose pull if you intend to long-poll — session_wait_for_event refuses push participants. |
+| `join_token` | string | no | The join token from your invite link (the jt value). The session creator's token or the relay admin token also works. Required: without a valid one the join is refused with permission_denied; an expired link means ask the creator for a new one. |
+
+Join a session as a new participant and bind this connection to it.
+
+Needs a join token (see join_token). Returns your participant_id and
+your secret participant_token (keep it: it is your credential, shown
+once — pass it to session_resume, or as participant_token with
+session_id if your runtime opens a new connection per call), the
+current roster, the session purpose
+and relay_epoch — remember the epoch: a different value on a later
+resume means the relay restarted underneath you.
+
+One MCP connection is in at most one session at a time. A second join
+returns already_in_session; call session_leave first to move
+elsewhere.
+
+delivery_mode is "push" (default — events arrive as MCP
+notifications) or "pull" (events are buffered until you call
+session_wait_for_event or session_check_inbox). Prefer "push" unless
+your runtime cannot act on an incoming notification.
+
+#### `session_leave`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `feedback` | object | no | Exit report broadcast to the others on participant.left: {"summary": "...", "rating": 1-5, "issues": [...], "metrics": {...}}. Always send one, even {"summary": "no issues", "rating": 5, "issues": []}. 4 KiB cap. |
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Leave the session this connection joined and unbind the connection.
+
+After leaving, this connection is free to join another session.
+Broadcasts participant.left to the others; the optional feedback
+object travels with that event as a close-out note. Requires
+session_join on this connection first.
+
+#### `session_list_participants`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Return the roster of the session this connection joined.
+
+Each entry carries the participant's role, capabilities, objective
+and whether it is currently online. Requires session_join on this
+connection first.
+
+#### `session_list_supervisor_tokens`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+List a session's supervisor tokens (ids and timestamps, never the secrets).
+
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP
+Authorization: Bearer header). Each entry has
+token_id, created_at and revoked_at (null while the token is active).
+
+#### `session_mint_join_token`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Mint a fresh join token and invite link for a session.
+
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP
+Authorization: Bearer header). The join token
+is valid for 15 minutes and can be used by several joiners within that
+time; participants who already joined are unaffected when it expires.
+Returns join_token, expires_at, invite_url and invite_link.
+
+#### `session_mint_supervisor_token`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Mint an additional supervisor token for a session.
+
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP
+Authorization: Bearer header). The token is
+returned exactly once as supervisor_token, with a token_id you can
+pass to session_revoke_supervisor_token. A supervisor token cannot
+mint or revoke tokens.
+
+#### `session_post_order`
+
+Credential: `token`: a supervisor, creator, owning-account or admin token.
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `kind` | "note" \\| "halt" \\| "continue" \\| "redirect" \\| "undo" | yes | note: guidance for the work in progress (state unchanged). halt: stop all work now and wait, paused. continue: resume where stopped. redirect: follow the new instructions in message from now on. undo: stop, revert what message says (or everything you did) using your journal, report the result, and stay paused until continue or redirect. |
+| `target` | string | yes | 'all' for every participant, or one participant_id. |
+| `message` | string | no | The order's text, at most 2048 bytes. Required for note, redirect and undo; optional for halt and continue. |
+| `token` | string | no | A supervisor_token, the creator_token, the token of the account that owns the session, or the relay admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. A participant or join token is refused with permission_denied. |
+
+Send a supervisor order to one participant or to all of them.
+
+Requires a supervisor_token, the creator_token or the relay admin token;
+participants receive orders, they do not send them. kind is one of note,
+halt, continue, redirect, undo. halt and undo pause the addressed participants: they
+stay in the session but commands to them are refused with
+participant_paused until a continue or redirect. Only the addressed
+participants are affected. Rate-limited per session and source address.
+Returns note_id, kind, target, message, ts_ms and affected (the
+participants whose supervision state changed).
+
+#### `session_remove_participant`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header); or the coordinator's participant token (launched agents only).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `participant_id` | string | yes | The participant_id of the agent to remove, as shown in the roster. |
+| `creator_token` | string | no | Named creator_token for compatibility; it takes any credential that may remove participants: the one-time creator_token, the token of the account that owns the session or the relay admin token (anyone), or the session coordinator's participant_token (launched agents only). May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Remove one agent from a session.
+
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP
+Authorization: Bearer header), or the coordinator's participant token
+for launched agents (pass it in creator_token); a supervisor
+token is refused. The agent first receives a halt order, then leaves
+the session: its token stops working and the others see
+participant.left with reason removed. Every still-valid join token of
+the session is invalidated, so mint a new one to invite again. Only
+the named participant is affected. Fails with participant_not_found
+for an unknown participant_id. The session's coordinator (its participant
+token) may remove launched agents (metadata.launch_id set, whoever
+launched them), and only those. Returns removed
+(the removed ids) and join_tokens_invalidated.
+
+#### `session_reply_to_note`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `note_id` | string | yes | The note_id from the supervisor.note event you are answering. |
+| `message` | string | yes | Your reply, non-empty, at most 2048 bytes. |
+| `outcome` | any | no | Optional structured result, used when answering an undo order: status (done, partial or impossible), undone (what was reverted) and not_reversible (what could not be). The message stays required. |
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Reply in the thread under a supervisor note.
+
+note_id comes from the supervisor.note event that delivered the note.
+A note sent to all is answered in the open: every other participant and
+the supervision holders see the reply. A note sent to you alone can only
+be answered by you, and only supervision holders see the reply. The
+thread is flat: reply to the note, not to another reply. Requires
+session_join on this connection first. Returns reply_id, note_id,
+participant_id, message and ts_ms (plus outcome when given).
+
+#### `session_respond`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `command_id` | string | yes | The command_id from the command.received event you are answering. Answer before its expires_at, and not at all if command.cancelled arrived for it. |
+| `payload` | object | yes | Your answer, free-form JSON, e.g. {"body": "..."}. |
+| `status` | "ok" \\| "error" | no | "ok" (default), or "error" if you could not do the work. |
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Answer a command you received.
+
+command_id comes from the command.received event that delivered the
+command. status is "ok" or "error" (default "ok"); payload is your
+free-form answer. Requires session_join on this connection first.
+
+#### `session_resume`
+
+Credential: `participant_token` from session_join.
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `participant_token` | string | yes | The participant_token session_join returned (not your participant_id). Resuming keeps that identity; joining again would make you a second participant. |
+| `last_acked_seq` | integer | no | Highest event seq you already processed; buffered events up to it are not replayed. Omit to replay everything buffered. |
+
+Re-attach to a session you already joined, keeping the same participant.
+
+Use this after a disconnect rather than joining again, which would
+make you a second participant. Buffered events are replayed; pass
+last_acked_seq to skip the ones you already handled. Compare the
+returned relay_epoch against the one from your join — a different
+value means the relay restarted.
+
+Binds this connection just as session_join does, so it returns
+already_in_session if this connection is already in a session.
+
+#### `session_revoke_supervisor_token`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `token_id` | string | yes | The token_id of the supervisor token to revoke, from session_mint_supervisor_token, session_create or session_list_supervisor_tokens. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Revoke a supervisor token so it stops working immediately.
+
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP
+Authorization: Bearer header). Fails with
+token_not_found if token_id is unknown. Returns {"revoked": true}.
+
+#### `session_send`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `dispatch` | "specific" \\| "all" \\| "any" | yes | "specific": exactly target.participant_ids. "all": every match of target.role / target.capability, including offline participants (their copy is buffered). "any": ONE match among participants online right now, round-robin — an offline participant is never picked. |
+| `target` | object | yes | Who receives it: {"participant_ids": [...]} for specific, or {"role": "..."} / {"capability": "..."} for all and any. |
+| `payload` | object | yes | Your command body, free-form JSON, e.g. {"body": "..."}. 256 KiB cap. |
+| `timeout_seconds` | integer | no | How long recipients have to answer, in seconds (default 60, max 300). Recipients that have not answered get command.cancelled. |
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Dispatch a command to other participants of the session this connection joined.
+
+Returns as soon as the command reaches its recipients
+({command_id, delivered_to}). It does NOT wait for their answers:
+results arrive later as result.received and command.completed events,
+which you collect with session_wait_for_event or session_check_inbox.
+
+dispatch chooses the recipients:
+  "specific" - requires target.participant_ids; exactly those.
+  "all"      - requires target.role or target.capability; every
+               online match.
+  "any"      - requires target.role or target.capability; one match,
+               picked round-robin.
+
+payload is your free-form command body. Pass a stable command_id you
+generate yourself to make retries idempotent — a repeat with the same
+id returns the original dispatch's response instead of sending twice.
+Requires session_join on this connection first.
+
+#### `session_set_coordinator`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `participant_id` | string | yes | The participant_id (from the roster) to make the session's coordinator, or null to clear the role. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Assign, move or clear the session's coordinator.
+
+The coordinator is the one participant allowed to discover and launch
+agents; it is whoever first joined with the creator credential (or the
+relay admin token) while the role was vacant, until you change it here.
+Requires the creator_token (or the relay admin token, or
+the owning account's token, also accepted from the MCP Authorization:
+Bearer header). The target must be a current participant, else
+participant_not_found. Returns coordinator_id.
+
+#### `session_update_purpose`
+
+Credential: `creator_token`: the session's creator token, the owning account's token or the admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `purpose` | object | no | Free-form JSON telling joiners what the session is for; echoed to everyone who joins. Recognised keys: kind, your_role, your_capabilities, available_roles, instructions, delivery_mode. 16 KiB cap. |
+| `creator_token` | string | no | The one-time creator_token session_create returned (it cannot be recovered), the token of the account that owns the session, or the relay operator's admin token. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Replace the purpose of a session, or clear it.
+
+Pass no purpose to clear. Requires the creator_token (or the relay
+admin token, or the owning account's token, also accepted from the MCP
+Authorization: Bearer header); participants cannot change the purpose. Broadcasts
+session.purpose_updated to the participants. Needs no session_join.
+
+#### `session_update_self`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `role` | string | no | New role; replaces the old one. Omit to keep it. |
+| `objective` | string | no | New objective line; replaces the old one. Omit to keep it. |
+| `capabilities` | array of string | no | New capability list. REPLACES the old list outright — pass the full set you want, not just additions. Omit to keep it. |
+| `metadata` | object | no | New metadata object; replaces the old one, no merge. Omit to keep it. |
+| `session_id` | string | no | Only together with participant_token (or a participant token sent as the Authorization: Bearer header), for a runtime that opens a new connection per tool call. Leave unset if you joined on this same connection. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Replace your own role, objective, capabilities or metadata.
+
+Applies to the session this connection joined. Fields you omit stay
+unchanged, but a field you do pass replaces its previous value
+outright — lists are not merged. Requires session_join on this
+connection first.
+
+#### `session_wait_for_event`
+
+Credential: this connection's join, or `session_id` + `participant_token` (also as the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `names` | array of string | no | Event names to wait for, e.g. ["command.received", "supervisor.note"]. Omit to return on any event. |
+| `timeout_seconds` | number | no | How long to block, in seconds. Clamped to the relay MCP cap (default 20 s); effective_timeout_seconds in the response says what applied. timed_out=true is normal — just call again. |
+| `participant_token` | string | no | The participant_token session_join returned — not your participant_id — passed with session_id. Needed only if a call right after joining said not_in_session — your runtime opens a new connection per call. Otherwise leave unset. It is a credential: keep it secret. |
+
+Block until at least one buffered event matches, then return every match.
+
+The long-poll that keeps a turn alive without busy-polling
+session_check_inbox. names filters by event name (for example
+["command.received"]); omit it to accept anything. A response with
+timed_out=true means the budget elapsed with nothing matching — that
+is normal, loop and call again. Requires session_join on this
+connection first.
+
+### Agent registry
+
+#### `agents_discover`
+
+Credential: `participant_token`: the session coordinator's participant token, or the creator, owning-account or admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `domain` | string | no | Application domain to list agent profiles for. Omit to list the domains available to this session. |
+| `role` | string | no | Only profiles with this role. |
+| `capability` | string | no | Only profiles declaring this capability tag. |
+| `participant_token` | string | no | The coordinator's participant token, or the creator token / owning account's token / admin token acting for the session. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Find the agents you may start in this session.
+
+Only the session's coordinator (its participant token) or the creator/admin
+may call this; anyone else gets permission_denied and should ask the
+coordinator. Without a domain, returns {"domains": [...]}; with one,
+{"agents": [...]} where each item has launcher_id, machine, owner (the
+launcher owner's account name, null in open mode), own, profile_id,
+domain, role, capabilities, description, runtime, model, access_preset,
+limits, online and free_slots. Own launchers (own: true, the session
+owner's account) come first: prefer them. The machine name and
+description are chosen by the launcher's owner; launch a foreign launcher
+(own: false) only when the user asked for it — it receives the task and
+its agent reads the whole session.
+
+#### `agents_launch`
+
+Credential: `participant_token`: the session coordinator's participant token, or the creator, owning-account or admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `task` | string | yes | What the new agent should do (at most 16 KiB); added to the profile's start prompt. |
+| `launcher_id` | string | no | Launcher of the profile to start (from agents_discover); use with profile_id. |
+| `profile_id` | string | no | Profile to start on launcher_id. |
+| `domain` | string | no | Instead of launcher_id + profile_id: the domain, with role, letting the broker pick the first online launcher with a free slot. |
+| `role` | string | no | The profile role to start, with domain. |
+| `participant_token` | string | no | The coordinator's participant token, or the creator token / owning account's token / admin token acting for the session. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Start an agent profile in this session through its launcher.
+
+Only the session's coordinator (or the creator/admin) may call this;
+anyone else gets permission_denied and should ask the coordinator. Give
+launcher_id + profile_id, or domain + role. Returns {"launch_id",
+"status": "pending"}; the agent then joins by itself and you see a normal
+participant.joined. When the task is done the agent sends its result
+with session_send to the coordinator that launched it (else the
+session's coordinator), and then stays in the session for more work.
+Read the launch with agents_launch_status; a failure also arrives as
+an agent.launch_failed event. The response says owner and own (see
+agents_discover). Errors: launch_limit (the session's
+max_launched_agents reached), no_free_slot, profile_not_found,
+session_suspended. Remove the agent with session_remove_participant
+when done.
+
+#### `agents_launch_status`
+
+Credential: `participant_token`: the session coordinator's participant token, or the creator, owning-account or admin token (or the Bearer header).
+
+| input | type | required | description |
+|---|---|---|---|
+| `session_id` | string | yes | The session to act on: the id from the invite link, or the session_id returned by session_create. |
+| `launch_id` | string | yes | The launch_id agents_launch returned. |
+| `participant_token` | string | no | The coordinator's participant token, or the creator token / owning account's token / admin token acting for the session. May be omitted when it arrives as the MCP Authorization: Bearer header. |
+
+Read the result of one launch.
+
+Returns launch_id, status (pending | started | joined | failed | stopped),
+profile_id, launcher_id, machine, owner, own, and when known
+participant_id, error (why it failed: launcher_offline, join_timeout,
+cancelled, or the launcher's error such as profile_unknown, no_free_slot,
+visibility_refused, profile_rejected, runtime_unavailable, start_failed,
+join_failed*), message (the launcher's explanation, e.g. which runtime
+version is required) and reason (why it stopped: removed, left, evicted,
+session_ended, session_cold, launcher_lost, or the launcher's reason such
+as idle_limit, cost_limit, duration_limit or runtime_failed). Coordinator
+or creator/admin only.
+
+### Your account
+
+#### `account_approvals`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+List your account's pending network approvals.
+
+A token whose policy is first_use or approved_only that is used from a
+new address is refused with network_not_approved and leaves a pending
+approval here (approval_id, token, ip, network, client, created_at...).
+Approve it with account_approve or refuse it with account_deny. Returns
+{"approvals": [...]}. Same as REST GET /v1/me/network-approvals.
+Errors: those of account_me.
+
+#### `account_approve`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
+| `scope` | string | no | What to approve: "ip" (default; that exact address) or "network" (its /24 for IPv4, /64 for IPv6). |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Approve a pending network approval of your account: the token may then
+be used from that address (scope "ip") or its whole network (scope
+"network": its /24 or /64).
+
+Returns the token's {"network_policy", "approved_networks"} after the
+change. Same as REST POST /v1/me/network-approvals/{id}/approve.
+Errors: approval_not_found, invalid_request (bad scope), plus those of
+account_me.
+
+#### `account_deny`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Deny a pending network approval of your account; the address stays refused.
+
+Returns {"approval_id": ..., "denied": true}. Same as REST POST
+/v1/me/network-approvals/{id}/deny. Errors: approval_not_found, plus
+those of account_me.
+
+#### `account_me`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Show the account an account token belongs to, with all its tokens.
+
+Returns account_id, name, status, contact, created_by, created_at and
+tokens: every token of the account (token_id, label, created_at,
+expires_at, revoked_at, last_used_at, last_used_ip, network_policy,
+approved_networks) — never a token's secret value. Same as REST GET
+/v1/me. Errors: invalid_account_token (missing, unknown, revoked or
+expired token, or an account that is not active), network_not_approved,
+rate_limited, accounts_unavailable (relay without accounts).
+
+#### `account_token_create`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `label` | string | yes | A name for the new token, 1-64 characters, e.g. the machine or tool that will use it. |
+| `expires_at` | string | no | Optional expiry, an ISO 8601 timestamp in the future, e.g. 2030-01-01T00:00:00Z (no timezone means UTC). Omit for no expiry. |
+| `network_policy` | string | no | Network policy: "any" (default; usable from anywhere), "first_use" (bound to the network of its first use) or "approved_only" (only from approved_networks; other addresses wait for your approval). |
+| `approved_networks` | array of string | no | Approved networks for the token, as CIDRs or IPs, e.g. ["10.0.0.0/8", "192.0.2.7"]. Omit for none. |
+| `revoke_token_id` | string | no | Replace a token: the token_id of a token of the same account to revoke once the new one exists (checked first: an unknown id mints nothing). |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Mint a new token for your own account; its secret is returned once.
+
+Tokens are stored hashed: a lost token cannot be shown again, so
+"recovering" one means minting a new one here (and revoking the old one
+with revoke_token_id, or later with account_token_revoke). Returns
+token (the secret, shown only in this answer: hand it to whoever asked,
+never log it), token_id, label, created_at, expires_at, network_policy,
+approved_networks; with revoke_token_id also revoked_token_id (or
+revoke_error if the revoke failed — the new token is valid either way).
+Same as REST POST /v1/me/tokens. Errors: invalid_request (bad label,
+expires_at, network_policy or approved_networks),
+account_token_limit, token_not_found (revoke_token_id is not a token of
+this account; nothing is minted), plus those of account_me.
+
+#### `account_token_networks`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `token_id` | string | yes | The token_id whose networks to show or change (from account_tokens or admin_account). |
+| `network_policy` | string | no | New network policy: "any", "first_use" or "approved_only". Omit to keep it (and to only read when approved_networks is omitted too). |
+| `approved_networks` | array of string | no | New approved networks (CIDRs or IPs), replacing the whole list; [] clears it. Omit to keep them. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Show or change where one of your account's tokens may be used from.
+
+Without network_policy and approved_networks it only reads; with either
+it changes that setting (approved_networks replaces the whole list; []
+clears it). Live streams opened from addresses no longer allowed are
+cut. Returns {"network_policy", "approved_networks"}. Same as REST
+GET/PUT /v1/me/tokens/{token_id}/networks. Errors: token_not_found,
+invalid_request (bad policy or network), plus those of account_me.
+
+#### `account_token_revoke`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `token_id` | string | yes | The token_id to revoke (from account_tokens). Revoking the token you authenticate with is allowed; it stops working at once. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+Revoke one of your account's tokens; it stops working at once.
+
+Idempotent: revoking an already revoked token succeeds again. Live
+firehose streams and launchers opened with it are cut. Returns
+{"token_id": ..., "revoked": true}. Same as REST DELETE
+/v1/me/tokens/{token_id}. Errors: token_not_found (no such token on
+this account), plus those of account_me.
+
+#### `account_tokens`
+
+Credential: account token: `account_token`, or an `swa_...` Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_token` | string | no | One of your account's API tokens (starts with swa_). May be omitted when it arrives as the MCP Authorization: Bearer header. It is a credential: keep it secret. |
+
+List the tokens of your account (metadata only, never the secrets).
+
+Returns {"tokens": [...]} with token_id, label, created_at, expires_at,
+revoked_at, last_used_at, last_used_ip, network_policy and
+approved_networks for each. Use a token_id with account_token_revoke or
+as revoke_token_id of account_token_create. Same as REST GET
+/v1/me/tokens; errors as account_me.
+
+### Administration
+
+#### `admin_account`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Show one broker account with all its tokens (relay admin only).
+
+Returns the account (as in admin_accounts) plus tokens: metadata of each
+token, never a secret. Same as REST GET /v1/accounts/{account_id}.
+Errors: account_not_found, plus those of admin_accounts.
+
+#### `admin_accounts`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+List every broker account (relay admin only).
+
+Returns {"accounts": [...]} with account_id, name, status (pending,
+active or disabled), contact, created_by and created_at. Same as REST
+GET /v1/accounts. Errors: permission_denied (missing or wrong admin
+token; wrong tokens are counted per address), rate_limited (too many
+wrong attempts from this address), accounts_unavailable.
+
+#### `admin_approvals`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+List an account's pending network approvals (relay admin only).
+
+As account_approvals, for account_id. Same as REST GET
+/v1/accounts/{account_id}/network-approvals. Errors: account_not_found,
+plus those of admin_accounts.
+
+#### `admin_approve`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
+| `scope` | string | no | What to approve: "ip" (default; that exact address) or "network" (its /24 for IPv4, /64 for IPv6). |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Approve a pending network approval of any account (relay admin only).
+
+As account_approve, for account_id; recorded as approved by "admin".
+Same as REST POST /v1/accounts/{account_id}/network-approvals/{id}/approve.
+Errors: account_not_found, approval_not_found, invalid_request, plus
+those of admin_accounts.
+
+#### `admin_deny`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `approval_id` | string | yes | The approval_id of a pending approval (from account_approvals or admin_approvals). |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Deny a pending network approval of any account (relay admin only).
+
+Returns {"approval_id": ..., "denied": true}. Same as REST POST
+/v1/accounts/{account_id}/network-approvals/{id}/deny. Errors:
+account_not_found, approval_not_found, plus those of admin_accounts.
+
+#### `admin_token_create`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `label` | string | yes | A name for the new token, 1-64 characters, e.g. the machine or tool that will use it. |
+| `expires_at` | string | no | Optional expiry, an ISO 8601 timestamp in the future, e.g. 2030-01-01T00:00:00Z (no timezone means UTC). Omit for no expiry. |
+| `network_policy` | string | no | Network policy: "any" (default; usable from anywhere), "first_use" (bound to the network of its first use) or "approved_only" (only from approved_networks; other addresses wait for your approval). |
+| `approved_networks` | array of string | no | Approved networks for the token, as CIDRs or IPs, e.g. ["10.0.0.0/8", "192.0.2.7"]. Omit for none. |
+| `revoke_token_id` | string | no | Replace a token: the token_id of a token of the same account to revoke once the new one exists (checked first: an unknown id mints nothing). |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Mint a token for any account (relay admin only); its secret is returned once.
+
+The way to give a user who lost their token a new one: mint here and
+pass the lost token's id as revoke_token_id to retire it in the same
+call. Returns the same fields as account_token_create (token is the
+secret, shown only in this answer). Recorded as a token.created account
+event by "admin". Same as REST POST /v1/accounts/{account_id}/tokens.
+Errors: account_not_found, token_not_found (revoke_token_id; nothing is
+minted), invalid_request, account_token_limit, plus those of
+admin_accounts.
+
+#### `admin_token_networks`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `token_id` | string | yes | The token_id whose networks to show or change (from account_tokens or admin_account). |
+| `network_policy` | string | no | New network policy: "any", "first_use" or "approved_only". Omit to keep it (and to only read when approved_networks is omitted too). |
+| `approved_networks` | array of string | no | New approved networks (CIDRs or IPs), replacing the whole list; [] clears it. Omit to keep them. |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Show or change where a token of any account may be used from (relay admin only).
+
+As account_token_networks, for account_id. Same as REST GET/PUT
+/v1/accounts/{account_id}/tokens/{token_id}/networks. Errors:
+account_not_found, token_not_found, invalid_request, plus those of
+admin_accounts.
+
+#### `admin_token_revoke`
+
+Credential: relay admin token: `admin_token`, or the Bearer header.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_id` | string | yes | The account to act on: an account_id from admin_accounts. |
+| `token_id` | string | yes | The token_id to revoke (from admin_account). |
+| `admin_token` | string | no | The relay operator's admin token (SW_ADMIN_TOKEN). May be omitted when it arrives as the MCP Authorization: Bearer header. Wrong values are counted and throttled per address. Keep it secret. |
+
+Revoke a token of any account (relay admin only); it stops working at once.
+
+Idempotent. Live streams and launchers opened with the token are cut.
+Returns {"token_id": ..., "revoked": true}. Same as REST DELETE
+/v1/accounts/{account_id}/tokens/{token_id}. Errors: account_not_found,
+token_not_found, plus those of admin_accounts.
+
+### Machines and definitions
+
+#### `definition_deploy`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `definition_id` | string | yes | The agent definition's id (its profile id on the machine), e.g. obs. |
+| `definition` | object | yes | The agent definition, e.g. {"id": "obs", "domain": "ops", "role": "watcher", "runtime": "claude", "kind": "observer", "workdir": "/srv/app", "max_instances": 1}. Its id must equal definition_id; workdir must be inside the machine's ceiling. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+Deploy (or update) an agent definition on a machine.
+
+The broker validates and stores it, then sends it to the machine's
+launcher, now if it is online, else when it reconnects. Returns
+definition_id, revision, state ("sent" or "queued", "pending" while
+the agent runs) and warnings. Needs a machine started with --local or
+--root. Same as REST PUT /v1/me/launchers/{key}/definitions/{id}.
+Errors: invalid_request (invalid definition, with the reason),
+outside_ceiling, launcher_not_found, launcher_capability_missing,
+definition_id_conflict (a local profile of the machine has that id),
+definition_limit, definitions_budget, definitions_unavailable (broker without a
+persistence DB), plus those of machines_list.
+
+#### `definition_remove`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `definition_id` | string | yes | The agent definition's id (its profile id on the machine), e.g. obs. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+Remove a deployed agent definition from a machine.
+
+Returns definition_id, revision and state ("removing" until the
+launcher confirms). Refused while one of its agents runs. Same as REST
+DELETE /v1/me/launchers/{key}/definitions/{id}. Errors:
+definition_not_found, definition_in_use, launcher_not_found,
+definitions_unavailable, plus those of machines_list.
+
+#### `machine_browse`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `path` | string | no | Absolute directory path to list; omit for the machine's ceiling. |
+| `cursor` | string | no | next_cursor of the previous page, to continue a listing. |
+| `limit` | integer | no | Entries per page, at least 1 (default 100; larger values are capped). |
+| `hidden` | boolean | no | Include hidden (dot) entries. Default false. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+List a directory on a machine (inside its ceiling), e.g. to pick a workdir.
+
+Relayed to the machine's launcher; nothing is stored. Returns path,
+entries (name, kind: dir, file, symlink or other, optional size,
+mtime, inside) and next_cursor (null on the last page). Same as REST
+GET /v1/me/launchers/{key}/browse. Errors: invalid_request,
+outside_ceiling, path_not_found, permission_denied, launcher_offline,
+launcher_capability_missing, launcher_timeout, launcher_bad_reply,
+launcher_not_found, definitions_unavailable, plus those of
+machines_list.
+
+#### `machine_forget`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+Forget an offline machine: its record, definitions and launcher key go.
+
+Refused while the machine is online. A launcher that later connects
+with that key registers as a new machine. Returns {"key": ...,
+"forgotten": true}. Same as REST DELETE /v1/me/launchers/{key}.
+Errors: launcher_online, launcher_not_found, definitions_unavailable,
+plus those of machines_list.
+
+#### `machine_get`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+Show one machine with its deployed agent definitions.
+
+Returns the machine (as in machines_list) plus definitions: each
+stored definition with its deploy state (queued, sent, applied,
+pending, rejected, removing) and revision. Same as REST GET
+/v1/me/launchers/{key}. Errors: launcher_not_found (unknown key, or
+another account's machine), plus those of machines_list.
+
+#### `machine_processes`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `key` | string | yes | The machine's launcher_key (lk_ followed by 32 hex characters), from machines_list. |
+| `query` | string | no | Only processes whose name or command line contains this text (max 100). |
+| `cursor` | string | no | next_cursor of the previous page, to continue a listing. |
+| `limit` | integer | no | Processes per page, at least 1 (default 100; larger values are capped). |
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+List the processes running on a machine (command lines redacted by the launcher).
+
+Relayed to the machine's launcher; nothing is stored. Returns
+processes (pid, ppid, user, name, cmdline, started_at) and
+next_cursor. Same as REST GET /v1/me/launchers/{key}/processes.
+Errors: as machine_browse.
+
+#### `machines_list`
+
+Credential: account token (`account_token` or an `swa_...` Bearer header): your own machines; none on an open-mode broker: every machine.
+
+| input | type | required | description |
+|---|---|---|---|
+| `account_token` | string | no | One of your account's API tokens (starts with swa_): you see and act on your own machines only. Omit on an open-mode broker (every machine, no credential), or when it arrives as the MCP Authorization: Bearer header. Keep it secret. |
+
+List the machines (v2 launchers) you can deploy agents to, with their agents.
+
+With an account token: the machines your account's launchers registered.
+On an open-mode broker without a token: every machine of the broker
+(in account mode, no token is permission_denied, as REST /v1/launchers).
+Returns {"launchers": [...]}: per machine launcher_key (the key the
+other machine tools take), machine, online, mode (config, local or
+root), ceiling, capabilities (definitions, browse, processes),
+platform, last_seen, launcher_id and agents (each profile with its
+status, source and deploy state). Same as REST GET /v1/me/launchers
+(or /v1/launchers). Errors: invalid_account_token, network_not_approved,
+rate_limited, accounts_unavailable.
+
+<!-- mcp-tools-reference:end -->
