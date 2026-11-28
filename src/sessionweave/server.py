@@ -23,7 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
-from sessionweave import __version__, accounts_api
+from sessionweave import __version__, accounts_api, machines_api
 from sessionweave.access import AuthFailureLimiter, admin_matches
 from sessionweave.account_events import (
     EventLog,
@@ -344,6 +344,19 @@ RevokeTokenIdArg = Annotated[str | None, Field(
     description="Replace a token: the token_id of a token of the same account to revoke "
                 "once the new one exists (checked first: an unknown id mints nothing).")]
 
+
+MachinesTokenArg = Annotated[str | None, Field(
+    description="One of your account's API tokens (starts with swa_): you see and act "
+                "on your own machines only. Omit on an open-mode broker (every machine, "
+                "no credential), or when it arrives as the MCP Authorization: Bearer "
+                "header. Keep it secret.")]
+
+MachineKeyArg = Annotated[str, Field(
+    description="The machine's launcher_key (lk_ followed by 32 hex characters), "
+                "from machines_list.")]
+
+DefinitionIdArg = Annotated[str, Field(
+    description="The agent definition's id (its profile id on the machine), e.g. obs.")]
 
 PurposeArg = Annotated[dict[str, Any] | None, Field(
     description="Free-form JSON telling joiners what the session is for; "
@@ -1573,7 +1586,203 @@ def _build_fastmcp(
         )
         return {"token_id": token_id, "revoked": True}
 
+    # ---------- machines (v2 launchers) and their agent definitions ----------
+    #
+    # The same shared operations as /v1/me/launchers (account token: only the
+    # caller's own machines) and /v1/launchers (open mode, no credential).
+
+    async def _machines_owner(explicit: str | None, ctx: Context | None) -> str:
+        token = explicit
+        if not token:
+            bearer = _bearer_of(ctx)
+            if bearer and bearer.startswith(ACCOUNT_TOKEN_PREFIX):
+                token = bearer
+        if token:
+            return await machines_api.account_owner(
+                deps, token, current_origin(_client_ip(ctx))
+            )
+        if deps.session_creation == "account":
+            raise ToolError(
+                ErrorCode.INVALID_ACCOUNT_TOKEN,
+                "this broker is in account mode: pass account_token (one of your "
+                "account's tokens) or send it as the Authorization: Bearer header",
+            )
+        return machines_api.open_owner(deps, "")
+
+    @_tool("machines_list")
+    async def machines_list_tool(
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List the machines (v2 launchers) you can deploy agents to, with their agents.
+
+    With an account token: the machines your account's launchers registered.
+    On an open-mode broker without a token: every machine of the broker.
+    Returns {"launchers": [...]}: per machine launcher_key (the key the
+    other machine tools take), machine, online, mode (config, local or
+    root), ceiling, capabilities (definitions, browse, processes),
+    platform, last_seen, launcher_id and agents (each profile with its
+    status, source and deploy state). Same as REST GET /v1/me/launchers
+    (or /v1/launchers). Errors: invalid_account_token, network_not_approved,
+    rate_limited, accounts_unavailable.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        return await machines_api.list_machines(deps, owner)
+
+    @_tool("machine_get")
+    async def machine_get_tool(
+        key: MachineKeyArg,
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Show one machine with its deployed agent definitions.
+
+    Returns the machine (as in machines_list) plus definitions: each
+    stored definition with its deploy state (queued, sent, applied,
+    pending, rejected, removing) and revision. Same as REST GET
+    /v1/me/launchers/{key}. Errors: launcher_not_found (unknown key, or
+    another account's machine), plus those of machines_list.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        return await machines_api.machine_detail(deps, owner, key)
+
+    @_tool("definition_deploy")
+    async def definition_deploy_tool(
+        key: MachineKeyArg,
+        definition_id: DefinitionIdArg,
+        definition: Annotated[dict[str, Any], Field(description=
+            "The agent definition, e.g. {\"id\": \"obs\", \"domain\": \"ops\", "
+            "\"role\": \"watcher\", \"runtime\": \"claude\", \"kind\": \"observer\", "
+            "\"workdir\": \"/srv/app\", \"max_instances\": 1}. Its id must equal "
+            "definition_id; workdir must be inside the machine's ceiling."
+        )],
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Deploy (or update) an agent definition on a machine.
+
+    The broker validates and stores it, then sends it to the machine's
+    launcher, now if it is online, else when it reconnects. Returns
+    definition_id, revision, state ("sent" or "queued", "pending" while
+    the agent runs) and warnings. Needs a machine started with --local or
+    --root. Same as REST PUT /v1/me/launchers/{key}/definitions/{id}.
+    Errors: invalid_request (invalid definition, with the reason),
+    outside_ceiling, launcher_not_found, launcher_capability_missing,
+    definition_id_conflict (a local profile of the machine has that id),
+    definition_limit, definitions_budget, definitions_unavailable (broker without a
+    persistence DB), plus those of machines_list.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        return await machines_api.deploy_definition(
+            deps, owner, key, definition_id, {"definition": definition},
+            client=_client_ip(ctx),
+        )
+
+    @_tool("definition_remove")
+    async def definition_remove_tool(
+        key: MachineKeyArg,
+        definition_id: DefinitionIdArg,
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove a deployed agent definition from a machine.
+
+    Returns definition_id, revision and state ("removing" until the
+    launcher confirms). Refused while one of its agents runs. Same as REST
+    DELETE /v1/me/launchers/{key}/definitions/{id}. Errors:
+    definition_not_found, definition_in_use, launcher_not_found,
+    definitions_unavailable, plus those of machines_list.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        return await machines_api.remove_definition(
+            deps, owner, key, definition_id, client=_client_ip(ctx)
+        )
+
+    @_tool("machine_forget")
+    async def machine_forget_tool(
+        key: MachineKeyArg,
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Forget an offline machine: its record, definitions and launcher key go.
+
+    Refused while the machine is online. A launcher that later connects
+    with that key registers as a new machine. Returns {"key": ...,
+    "forgotten": true}. Same as REST DELETE /v1/me/launchers/{key}.
+    Errors: launcher_online, launcher_not_found, definitions_unavailable,
+    plus those of machines_list.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        await machines_api.forget_machine(deps, owner, key, client=_client_ip(ctx))
+        return {"key": key, "forgotten": True}
+
+    @_tool("machine_browse")
+    async def machine_browse_tool(
+        key: MachineKeyArg,
+        path: Annotated[str | None, Field(description=
+            "Absolute directory path to list; omit for the machine's ceiling."
+        )] = None,
+        cursor: Annotated[str | None, Field(description=
+            "next_cursor of the previous page, to continue a listing."
+        )] = None,
+        limit: Annotated[int | None, Field(description=
+            "Entries per page, at least 1 (default 100; larger values are capped)."
+        )] = None,
+        hidden: Annotated[bool, Field(description=
+            "Include hidden (dot) entries. Default false."
+        )] = False,
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List a directory on a machine (inside its ceiling), e.g. to pick a workdir.
+
+    Relayed to the machine's launcher; nothing is stored. Returns path,
+    entries (name, kind: dir, file, symlink or other, optional size,
+    mtime, inside) and next_cursor (null on the last page). Same as REST
+    GET /v1/me/launchers/{key}/browse. Errors: invalid_request,
+    outside_ceiling, path_not_found, permission_denied, launcher_offline,
+    launcher_capability_missing, launcher_timeout, launcher_bad_reply,
+    launcher_not_found, definitions_unavailable, plus those of
+    machines_list.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        params = _query_params(path=path, cursor=cursor, limit=limit,
+                               hidden="1" if hidden else "0")
+        return await machines_api.browse(deps, owner, key, params, client=_client_ip(ctx))
+
+    @_tool("machine_processes")
+    async def machine_processes_tool(
+        key: MachineKeyArg,
+        query: Annotated[str | None, Field(description=
+            "Only processes whose name or command line contains this text (max 100)."
+        )] = None,
+        cursor: Annotated[str | None, Field(description=
+            "next_cursor of the previous page, to continue a listing."
+        )] = None,
+        limit: Annotated[int | None, Field(description=
+            "Processes per page, at least 1 (default 100; larger values are capped)."
+        )] = None,
+        account_token: MachinesTokenArg = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List the processes running on a machine (command lines redacted by the launcher).
+
+    Relayed to the machine's launcher; nothing is stored. Returns
+    processes (pid, ppid, user, name, cmdline, started_at) and
+    next_cursor. Same as REST GET /v1/me/launchers/{key}/processes.
+    Errors: as machine_browse.
+    """
+        owner = await _machines_owner(account_token, ctx)
+        params = _query_params(cursor=cursor, limit=limit, q=query)
+        return await machines_api.processes(deps, owner, key, params, client=_client_ip(ctx))
+
     return mcp
+
+
+def _query_params(**values: str | int | None) -> dict[str, str]:
+    """Tool arguments as the query-string values the shared machine
+    operations validate (``None`` = absent)."""
+    return {k: str(v) for k, v in values.items() if v is not None}
 
 
 def build_app() -> Starlette:

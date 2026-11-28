@@ -92,8 +92,9 @@ async def mcp_outcome(
     return (m.group(1) if m else "unknown"), {"text": text}
 
 
-def rest_outcome(resp: httpx2.Response) -> tuple[str | None, dict[str, Any]]:
-    """``(None, json)`` on 2xx (``{}`` for an empty body), else ``(code, json)``."""
+def rest_outcome(resp: Any) -> tuple[str | None, dict[str, Any]]:
+    """``(None, json)`` on 2xx (``{}`` for an empty body), else ``(code, json)``.
+    ``resp``: an httpx or httpx2 response."""
     if resp.is_success:
         return None, (resp.json() if resp.content else {})
     body = resp.json()

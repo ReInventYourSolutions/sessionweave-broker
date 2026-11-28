@@ -60,6 +60,13 @@ REQUIRED = {
     "admin_account": ["account_id"],
     "admin_token_create": ["account_id", "label"],
     "admin_token_revoke": ["account_id", "token_id"],
+    "machines_list": [],
+    "machine_get": ["key"],
+    "definition_deploy": ["definition", "definition_id", "key"],
+    "definition_remove": ["definition_id", "key"],
+    "machine_forget": ["key"],
+    "machine_browse": ["key"],
+    "machine_processes": ["key"],
 }
 
 # String parameters with a closed set of values.
